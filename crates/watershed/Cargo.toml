@@ -8,8 +8,10 @@ repository.workspace = true
 
 [dependencies]
 glam.workspace = true
+ron.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+zstd.workspace = true
 
 # TODO(jb-comment): why the bake's parallelism is a target-gated dependency rather than a
 # cargo feature, and what the single-threaded wasm path costs.

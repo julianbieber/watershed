@@ -11,9 +11,10 @@ default:
     @just --list
 
 # Install system libraries used by CI (Ubuntu/Debian)
+# TODO(jb-comment): why clang is in this list — which recipe needs it and for which target.
 deps:
 	@sudo apt-get update
-	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev
+	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev clang
 
 # Format check
 fmt:

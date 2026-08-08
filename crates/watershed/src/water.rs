@@ -135,6 +135,24 @@ impl WaterState {
         }
     }
 
+    /// TODO(jb-comment): why the loader rebuilds a state from its rasters rather than
+    /// re-solving, and what it is trusted to have checked first.
+    pub(crate) fn from_parts(
+        level: Raster<f32>,
+        flow_dir: Raster<u8>,
+        flow_accum: Raster<u16>,
+        lake_id: Raster<u32>,
+        lakes: u32,
+    ) -> Self {
+        Self {
+            level,
+            flow_dir,
+            flow_accum,
+            lake_id,
+            lakes,
+        }
+    }
+
     pub fn size(&self) -> UVec2 {
         self.level.size()
     }
@@ -215,8 +233,11 @@ impl Terrain {
         self.water.as_ref()
     }
 
+    /// TODO(jb-comment): why this drops the spec as well as the state, and what a saved
+    /// document would otherwise do on the next load.
     pub fn clear_water(&mut self) {
         self.water = None;
+        self.water_spec = None;
     }
 
     /// TODO(jb-doc): what this reads, what it replaces, and why a coarse height field is
@@ -262,6 +283,7 @@ impl Terrain {
         };
 
         self.water = Some(state);
+        self.water_spec = Some(spec.clone());
         Ok(())
     }
 }

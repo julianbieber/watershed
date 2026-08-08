@@ -9,7 +9,7 @@ use crate::layer::{Blend, LayerOp, Mask, Remap};
 use crate::noise::Noise;
 use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
 use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
-use crate::water::WaterState;
+use crate::water::{WaterSpec, WaterState};
 
 #[derive(Debug, Error)]
 pub enum BakeError {
@@ -30,10 +30,15 @@ pub enum BakeError {
 ///
 /// TODO(jb-comment): why the water is not part of the serialized document, on the same
 /// terms as a field's bake.
+///
+/// TODO(jb-comment): why the spec that produced the water *is* part of the document where
+/// the water itself is not — a derived thing needs the recipe that re-derives it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Terrain {
     pub size: UVec2,
     pub fields: Vec<Field>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub water_spec: Option<WaterSpec>,
     #[serde(skip)]
     pub(crate) water: Option<WaterState>,
 }
@@ -43,6 +48,7 @@ impl Terrain {
         Self {
             size,
             fields: Vec::new(),
+            water_spec: None,
             water: None,
         }
     }
