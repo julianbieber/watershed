@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::field::FieldId;
 use crate::noise::NoiseSpec;
 use crate::raster::Raster;
+use crate::regions::{RegionOutput, RegionSpec};
 
 /// TODO(jb-doc): how a layer's value meets the value under it, and why `Replace` is a
 /// blend mode rather than a property of being the first layer.
@@ -104,6 +105,12 @@ pub enum LayerOp {
         sample_tiles: f32,
     },
     FieldRef(FieldId),
+    /// TODO(jb-doc): why this op reads no field, and what that buys the halo arithmetic
+    /// and the rect re-bake.
+    Regions {
+        spec: RegionSpec,
+        output: RegionOutput,
+    },
     /// TODO(jb-doc): what this is the escape hatch for.
     External(Raster<f32>),
 }

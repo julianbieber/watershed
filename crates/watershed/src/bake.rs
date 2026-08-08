@@ -8,6 +8,7 @@ use crate::field::{Field, FieldId};
 use crate::layer::{Blend, LayerOp, Mask, Remap};
 use crate::noise::Noise;
 use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
+use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
 
 #[derive(Debug, Error)]
 pub enum BakeError {
@@ -19,6 +20,8 @@ pub enum BakeError {
     UnknownField { referenced: String, reader: String },
     #[error("fields depend on each other in a cycle: {0}")]
     Cycle(String),
+    #[error("column `{column}`, read by `{reader}`, is not in the region table")]
+    UnknownRegionColumn { column: String, reader: String },
 }
 
 /// TODO(jb-doc): what a terrain is here — a size, a set of named fields, and nothing
@@ -97,7 +100,7 @@ impl Terrain {
             if texels.is_empty() {
                 continue;
             }
-            let layers = compile_layers(field, &index_of)?;
+            let layers = compile_layers(field, &index_of, self.size)?;
             let bounds = field.bounds();
             let shift = field.shift;
             let rows = {
@@ -287,6 +290,7 @@ enum CompiledOp<'a> {
     Raster(&'a Raster<f32>),
     Slope { of: usize, sample_tiles: f32 },
     FieldRef(usize),
+    Regions(RegionMap, CompiledOutput),
 }
 
 enum CompiledMask<'a> {
@@ -305,6 +309,7 @@ struct CompiledLayer<'a> {
 fn compile_layers<'a>(
     field: &'a Field,
     index_of: &HashMap<String, usize>,
+    size: UVec2,
 ) -> Result<Vec<CompiledLayer<'a>>, BakeError> {
     let mut compiled = Vec::with_capacity(field.layers.len());
     for layer in field.layers.iter().filter(|layer| layer.enabled) {
@@ -317,6 +322,21 @@ fn compile_layers<'a>(
                 sample_tiles: *sample_tiles,
             },
             LayerOp::FieldRef(id) => CompiledOp::FieldRef(lookup(index_of, id, &field.id)?),
+            LayerOp::Regions { spec, output } => {
+                let compiled = match output {
+                    RegionOutput::Blended(column) => {
+                        CompiledOutput::Blended(spec.column_index(column).ok_or_else(|| {
+                            BakeError::UnknownRegionColumn {
+                                column: column.clone(),
+                                reader: field.id.to_string(),
+                            }
+                        })?)
+                    }
+                    RegionOutput::RegionId => CompiledOutput::RegionId,
+                    RegionOutput::CoverClass => CompiledOutput::CoverClass,
+                };
+                CompiledOp::Regions(RegionMap::new(spec, size), compiled)
+            }
         };
         let mask = match &layer.mask {
             Mask::Constant(value) => CompiledMask::Constant(*value),
@@ -376,6 +396,7 @@ impl Evaluator<'_> {
             CompiledOp::Raster(raster) => raster.sample_over(self.size, position.x, position.y),
             CompiledOp::Slope { of, sample_tiles } => self.slope(*of, *sample_tiles, position),
             CompiledOp::FieldRef(index) => self.field(*index, position),
+            CompiledOp::Regions(map, output) => map.sample(*output, position.x, position.y),
         }
     }
 
@@ -798,6 +819,154 @@ mod tests {
                 data.len()
             );
         }
+    }
+
+    fn region_spec() -> crate::regions::RegionSpec {
+        use crate::noise::WarpSpec;
+        use crate::regions::{Region, RegionSpec};
+        RegionSpec::new(0x5eed_0036, 128, 16, ["base", "ridge"])
+            .with_region(Region::new(6, [0.20, 0.0]))
+            .with_region(Region::new(4, [0.52, 0.0]))
+            .with_region(Region::new(3, [0.70, 0.34]))
+            .with_warp(WarpSpec {
+                seed: 0x7a1d_0b37,
+                amplitude: 48.0,
+                scale: 1.0 / (128.0 * 0.75),
+                octaves: 3,
+            })
+    }
+
+    fn region_document() -> Terrain {
+        Terrain::new(UVec2::new(512, 512))
+            .with_field(
+                Field::new("ridge_weight").with_layer(
+                    Layer::new(LayerOp::Regions {
+                        spec: region_spec(),
+                        output: RegionOutput::Blended("ridge".to_owned()),
+                    })
+                    .with_blend(Blend::Replace),
+                ),
+            )
+            .with_field(
+                Field::new("height")
+                    .with_layer(
+                        Layer::new(LayerOp::Regions {
+                            spec: region_spec(),
+                            output: RegionOutput::Blended("base".to_owned()),
+                        })
+                        .with_blend(Blend::Replace),
+                    )
+                    .with_layer(
+                        Layer::new(LayerOp::Noise(NoiseSpec::new(11, NoiseKind::Ridged, 0.01)))
+                            .with_amplitude(0.4)
+                            .with_mask(Mask::Field(
+                                FieldId::from("ridge_weight"),
+                                Remap::new((0.0, 0.34), (0.0, 1.0)),
+                            )),
+                    ),
+            )
+    }
+
+    #[test]
+    fn a_regions_layer_bakes_a_blended_column_into_a_field() {
+        let mut terrain = region_document();
+        terrain.bake().unwrap();
+
+        let values = terrain.field("height").unwrap().baked().data();
+        assert!(values.iter().all(|value| value.is_finite()));
+        let lowest = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let highest = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            highest - lowest > 0.2,
+            "a region-blended height spanning only {lowest} to {highest}"
+        );
+    }
+
+    #[test]
+    fn a_rect_re_bake_of_a_regions_field_is_bit_identical_to_a_full_one() {
+        let mut terrain = region_document();
+        terrain.bake().unwrap();
+        let full: Vec<Vec<f32>> = terrain
+            .fields
+            .iter()
+            .map(|field| field.baked().data().to_vec())
+            .collect();
+
+        for field in &mut terrain.fields {
+            field.baked_mut().fill(f32::NAN);
+        }
+        let rect = CellRect::new(UVec2::new(97, 61), UVec2::new(300, 288));
+        terrain.bake_rect(rect).unwrap();
+
+        for (index, field) in terrain.fields.iter().enumerate() {
+            let texels = rect.to_texels(field.shift, field.baked().size());
+            let width = field.baked().width();
+            for j in texels.min.y..texels.max.y {
+                for i in texels.min.x..texels.max.x {
+                    let at = (j * width + i) as usize;
+                    assert_eq!(
+                        field.baked().data()[at].to_bits(),
+                        full[index][at].to_bits(),
+                        "field {} at {i},{j}",
+                        field.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_categorical_region_field_at_shift_zero_reads_back_a_whole_index() {
+        let mut terrain = Terrain::new(UVec2::new(256, 256)).with_field(
+            Field::new("region").with_range((0.0, 8.0)).with_layer(
+                Layer::new(LayerOp::Regions {
+                    spec: region_spec(),
+                    output: RegionOutput::RegionId,
+                })
+                .with_blend(Blend::Replace),
+            ),
+        );
+        terrain.bake().unwrap();
+
+        let baked = terrain.field("region").unwrap().baked();
+        assert_eq!(baked.size(), UVec2::new(256, 256));
+        for value in baked.data() {
+            assert_eq!(*value, value.round(), "a region id baked as {value}");
+            assert!((0.0..3.0).contains(value), "a region id of {value}");
+        }
+    }
+
+    #[test]
+    fn a_regions_layer_reports_no_field_dependency() {
+        let layer = Layer::new(LayerOp::Regions {
+            spec: region_spec(),
+            output: RegionOutput::CoverClass,
+        });
+        assert_eq!(layer.dependencies().count(), 0);
+    }
+
+    #[test]
+    fn a_region_column_that_is_not_in_the_table_is_an_error() {
+        let mut terrain = Terrain::new(UVec2::new(64, 64)).with_field(
+            Field::new("height").with_layer(Layer::new(LayerOp::Regions {
+                spec: region_spec(),
+                output: RegionOutput::Blended("humidity".to_owned()),
+            })),
+        );
+        let error = terrain.bake().unwrap_err();
+        assert!(
+            matches!(&error, BakeError::UnknownRegionColumn { column, reader }
+                if column == "humidity" && reader == "height"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_document_carrying_a_regions_layer_round_trips_through_serde() {
+        let terrain = region_document();
+        let encoded = serde_json::to_string(&terrain).unwrap();
+        let decoded: Terrain = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, terrain);
     }
 
     #[test]
