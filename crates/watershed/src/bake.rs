@@ -9,6 +9,7 @@ use crate::layer::{Blend, LayerOp, Mask, Remap};
 use crate::noise::Noise;
 use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
 use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
+use crate::water::WaterState;
 
 #[derive(Debug, Error)]
 pub enum BakeError {
@@ -24,14 +25,17 @@ pub enum BakeError {
     UnknownRegionColumn { column: String, reader: String },
 }
 
-/// TODO(jb-doc): what a terrain is here — a size, a set of named fields, and nothing
-/// else that the caller does not own.
+/// TODO(jb-doc): what a terrain is here — a size, a set of named fields, a solved water
+/// state, and nothing else that the caller does not own.
 ///
-/// TODO(jb-comment): stage 4 adds `water: Option<WaterState>` beside the fields.
+/// TODO(jb-comment): why the water is not part of the serialized document, on the same
+/// terms as a field's bake.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Terrain {
     pub size: UVec2,
     pub fields: Vec<Field>,
+    #[serde(skip)]
+    pub(crate) water: Option<WaterState>,
 }
 
 impl Terrain {
@@ -39,6 +43,7 @@ impl Terrain {
         Self {
             size,
             fields: Vec::new(),
+            water: None,
         }
     }
 
