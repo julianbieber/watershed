@@ -11,6 +11,11 @@ glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+# TODO(jb-comment): why the bake's parallelism is a target-gated dependency rather than a
+# cargo feature, and what the single-threaded wasm path costs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 
