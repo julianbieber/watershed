@@ -1,0 +1,70 @@
+# Generate a terrain, solve its water, and assert the lakes and channels exist — from
+# `observe water` rather than from a human looking at the PNG.
+#
+# Run with:  just drive run scenarios/water_finds_the_lakes.txt
+#
+# What makes this reproducible is that every command holds its reply until the effect has
+# happened. `new` answers when the bake has landed and `solve-water` when the solve has;
+# neither is frame-counted, because both run on the task pool and land on wall-clock time.
+
+# Before anything else: did the run complain? A shader that failed to compile draws nothing
+# rather than drawing wrong, so no capture below could show it — this is the only step that
+# can. Note `observe log` *drains*, so this must come before any other call to it or the
+# startup errors are already gone.
+observe log
+
+# A fixed delta so the captures below are comparable between runs. Generation and the solve
+# are polled per frame rather than driven by time, so they still land.
+fixed-delta 1/60
+
+# 512 square is large enough for the continent layer to make basins and small enough that a
+# debug build is still bearable.
+new 512 512 7 continents
+wait bake
+
+observe document
+observe field
+
+zoom fit
+capture /tmp/watershed-scenario/height.png
+
+solve-water
+wait water
+
+# The assertion this scenario exists for: water stands somewhere, it stands in more than
+# one basin, and the flow accumulates into channels.
+observe water
+
+# The overlay is drawn from the same two answers `observe water` counts, so this frame and
+# the numbers above cannot disagree.
+capture /tmp/watershed-scenario/water.png
+
+# Moisture is baked four shifts down, so switching to it is what proves a coarse field is
+# drawn at its own resolution rather than the document's.
+field moisture
+observe field
+capture /tmp/watershed-scenario/moisture.png
+
+field height
+
+# A round trip through the container. The save carries the water, so the load must not
+# re-solve it — `observe water` after the load has to match the one above.
+save /tmp/watershed-scenario/round-trip.watershed
+load /tmp/watershed-scenario/round-trip.watershed
+observe document
+observe water
+
+# Reset is the other half of the pair, and it is the one that proves the water is state
+# rather than something the view derives.
+reset-water
+observe water
+
+# Look at one corner close up, which is what the fitted ramp exists for: at this zoom the
+# range should be a slice of the whole document's, not all of it.
+pan 96 96
+zoom 128
+observe view
+capture /tmp/watershed-scenario/corner.png
+
+# And again at the end, for anything the solving, saving and capturing provoked.
+observe log

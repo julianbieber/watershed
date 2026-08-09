@@ -73,9 +73,20 @@ impl Default for SaveOptions {
 }
 
 impl SaveOptions {
-    /// TODO(jb-doc): why the plain document carries no bake, and what a load therefore
-    /// costs.
+    /// TODO(jb-doc): why the plain document carries the water but not the bakes — the
+    /// measured cost of re-deriving each on load, and which of the two that leaves a
+    /// reader paying. Figures in `the_default_format_measures_what_a_document_costs`.
     pub fn document() -> Self {
+        Self {
+            layers: true,
+            bakes: false,
+            water: true,
+        }
+    }
+
+    /// TODO(jb-doc): what this is for, given no caller ships it — that it is the shape a
+    /// document had before the water was carried, and what it therefore costs to load.
+    pub fn layers_only() -> Self {
         Self {
             layers: true,
             bakes: false,
@@ -357,7 +368,8 @@ impl Terrain {
 
     /// TODO(jb-doc): what "re-evaluate whatever is absent" means precisely — a missing
     /// bake is baked, a missing water is re-solved from the spec the document carries,
-    /// and a missing spec means the document has no water.
+    /// and a missing spec means the document has no water. Note the flags decide this,
+    /// not [`SaveOptions`], so a file written by any writer is read on its own terms.
     pub fn load(reader: &mut impl Read) -> Result<Self, IoError> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
@@ -641,7 +653,7 @@ mod tests {
         terrain.solve_water(&WaterSpec::new("height")).unwrap();
         let solved = terrain.water().unwrap().clone();
 
-        let header_only = round_trip(&terrain, SaveOptions::document());
+        let header_only = round_trip(&terrain, SaveOptions::layers_only());
         let carried = round_trip(&terrain, SaveOptions::full());
 
         assert_eq!(header_only.water_spec, Some(WaterSpec::new("height")));
@@ -653,6 +665,32 @@ mod tests {
         assert!(same_bits(carried.water().unwrap().level(), solved.level()));
         assert_eq!(carried.water().unwrap().flow_accum(), solved.flow_accum());
         assert_eq!(carried.water().unwrap().lake_id(), solved.lake_id());
+    }
+
+    /// TODO(jb-comment): why the spec is swapped out from under the solved state rather
+    /// than the water being scribbled on — that a re-solve and a carried block agree on
+    /// every ordinary document, so only a spec the state *disagrees* with can tell them
+    /// apart.
+    #[test]
+    fn a_document_carries_its_water_rather_than_re_solving_it() {
+        let mut terrain = baked_document();
+        terrain.solve_water(&WaterSpec::new("height")).unwrap();
+        let solved = terrain.water().unwrap().clone();
+        assert!(solved.lakes() > 0, "the fixture has to pond somewhere");
+
+        terrain.water_spec = Some(WaterSpec::new("height").with_lake_min_cells(u32::MAX));
+
+        let loaded = round_trip(&terrain, SaveOptions::document());
+        let re_solved = round_trip(&terrain, SaveOptions::layers_only());
+
+        assert!(loaded.fields.iter().all(|field| !field.layers.is_empty()));
+        assert_eq!(loaded.water().unwrap().lakes(), solved.lakes());
+        assert!(same_bits(loaded.water().unwrap().level(), solved.level()));
+        assert_ne!(
+            re_solved.water().unwrap().lakes(),
+            solved.lakes(),
+            "the swapped spec has to change the solve, or this proves nothing"
+        );
     }
 
     #[test]
@@ -763,6 +801,7 @@ mod tests {
         };
 
         println!("{side}x{side}, two fields, full bake {bake:.0?}");
+        report("layers-only", SaveOptions::layers_only());
         report("document", SaveOptions::document());
         report("full", SaveOptions::full());
         report("bakes-only", SaveOptions::bakes_only());

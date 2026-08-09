@@ -5,6 +5,7 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 RUSTFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 RUSTDOCFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 WASM_TARGET := "wasm32-unknown-unknown"
+CONTROL_SOCKET := "/tmp/watershed-control.sock"
 
 # Default: list recipes
 default:
@@ -73,3 +74,27 @@ run:
 	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
 	cargo run --package watershed_editor
+
+# Start the editor with its control socket open. Release, because a scenario solves water
+# over a whole document and a debug solve is minutes rather than seconds.
+drive-start:
+	@env \
+	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
+	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
+	WATERSHED_CONTROL="{{CONTROL_SOCKET}}" \
+	cargo run --release --package watershed_editor
+
+# Send one command to a running editor:
+#   just drive observe water
+#   just drive run scenarios/water_finds_the_lakes.txt
+drive *ARGS:
+	@env \
+	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
+	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
+	WATERSHED_CONTROL="{{CONTROL_SOCKET}}" \
+	cargo run --release --quiet --bin watershed-ctl -- {{ARGS}}
+
+# Prose the AI policy leaves to a human. Not part of `all`: a placeholder is a note to
+# myself, not a broken build.
+check-placeholders:
+	@rg -n 'TODO\(jb-(doc|comment)\)' crates/ || echo "none outstanding"
