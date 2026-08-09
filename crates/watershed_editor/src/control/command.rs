@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use watershed::SaveOptions;
 
 use super::observe::{self, Topic};
+use crate::brush::{BrushSettings, apply_stroke};
 use crate::document::Document;
-use crate::edit::{Edit, parse_op};
+use crate::edit::{BrushChange, Edit, brush_summary, parse_op};
 use crate::preset::Preset;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
 
@@ -51,6 +52,15 @@ pub(super) enum Command {
     /// effect is the bake rather than the changed number.
     Edit {
         edit: Edit,
+        applied: Option<Value>,
+    },
+    /// TODO(jb-doc): why several of the brush's numbers are set by one command rather than
+    /// one each, where a layer's are one each.
+    Brush(Vec<BrushChange>),
+    /// A stroke and the re-bake that answers it, held together for the reason [`Command::Edit`]
+    /// is — except that what it waits for is a rectangle rather than the view.
+    Stroke {
+        points: Vec<Vec2>,
         applied: Option<Value>,
     },
     Bake {
@@ -109,6 +119,8 @@ impl Command {
                 Edit::Set { .. } => "set",
                 _ => "layer",
             },
+            Self::Brush(_) => "brush",
+            Self::Stroke { .. } => "stroke",
             Self::Bake { .. } => "bake",
             Self::SolveWater { .. } => "solve-water",
             Self::ResetWater => "reset-water",
@@ -168,6 +180,30 @@ impl Command {
                         path: (*path).to_owned(),
                         words: owned(&rest[1..]),
                     },
+                    applied: None,
+                })
+            }
+            "brush" => {
+                if rest.is_empty() || !rest.len().is_multiple_of(2) {
+                    return Err(
+                        "brush takes a name and a value, and as many pairs as you like".to_owned(),
+                    );
+                }
+                rest.chunks(2)
+                    .map(|pair| BrushChange::parse(pair[0], pair[1]))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Self::Brush)
+            }
+            "stroke" => {
+                let points = rest
+                    .iter()
+                    .map(|word| point(word))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if points.is_empty() {
+                    return Err("stroke needs at least one cell to paint at".to_owned());
+                }
+                Ok(Self::Stroke {
+                    points,
                     applied: None,
                 })
             }
@@ -280,6 +316,36 @@ impl Command {
                 // observes the field on the next line is reading the world the edit made.
                 // A stack that no longer bakes — a cycle a toggle uncovered — reports the
                 // error here rather than answering with a success nothing followed.
+                let document = world.resource::<Document>();
+                if !document.is_settled() {
+                    return Poll::Running;
+                }
+                match document.error() {
+                    Some(error) => Poll::Failed(error.to_owned()),
+                    None => Poll::Done(applied.take().unwrap_or_else(|| json!({}))),
+                }
+            }
+
+            Self::Brush(changes) => {
+                let mut settings = world.resource_mut::<BrushSettings>();
+                for change in changes.iter() {
+                    change.apply(&mut settings.0);
+                }
+                Poll::Done(brush_summary(&settings.0))
+            }
+
+            Self::Stroke { points, applied } => {
+                if applied.is_none() {
+                    let brush = world.resource::<BrushSettings>().0;
+                    let mut document = world.resource_mut::<Document>();
+                    match apply_stroke(&mut document, &brush, points) {
+                        Ok(value) => *applied = Some(value),
+                        Err(error) => return Poll::Failed(error),
+                    }
+                    return Poll::Running;
+                }
+                // Held until the rectangle the stroke made stale has been baked, so a
+                // scenario reading the field on the next line is reading the painted world.
                 let document = world.resource::<Document>();
                 if !document.is_settled() {
                     return Poll::Running;
@@ -555,6 +621,14 @@ fn number<T: std::str::FromStr>(word: &str) -> Result<T, String> {
     word.parse().map_err(|_| format!("not a number: {word}"))
 }
 
+/// A cell, written as one word so a stroke's points cannot be miscounted into pairs.
+fn point(word: &str) -> Result<Vec2, String> {
+    let (x, y) = word
+        .split_once(',')
+        .ok_or_else(|| format!("a point is written x,y, not `{word}`"))?;
+    Ok(Vec2::new(number(x)?, number(y)?))
+}
+
 fn optional_number<T: std::str::FromStr>(word: Option<&&str>, fallback: T) -> Result<T, String> {
     match word {
         Some(word) => number(word),
@@ -618,6 +692,14 @@ mod tests {
             ("set height.1.mask field moisture 0.4 0.6 0 1", "set"),
             ("set height.1.op.scale 0.004", "set"),
             ("set height.shift 2", "set"),
+            ("layer add height paint", "layer"),
+            ("brush radius 24", "brush"),
+            (
+                "brush mode smooth radius 8 falloff 0.2 strength 0.5 value 0.3",
+                "brush",
+            ),
+            ("stroke 10,20", "stroke"),
+            ("stroke 10,20 30,40 50,60", "stroke"),
             ("bake", "bake"),
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),
@@ -654,5 +736,21 @@ mod tests {
         assert!(Command::parse("layer toggle height 1 maybe").is_err());
         assert!(Command::parse("layer rm height").is_err());
         assert!(Command::parse("set").is_err());
+        assert!(Command::parse("brush").is_err());
+        assert!(Command::parse("brush radius").is_err());
+        assert!(Command::parse("brush sideways 2").is_err());
+        assert!(Command::parse("brush mode sideways").is_err());
+        assert!(Command::parse("brush radius wide").is_err());
+        assert!(Command::parse("stroke").is_err());
+        assert!(Command::parse("stroke 10").is_err());
+        assert!(Command::parse("stroke 10,20 sideways").is_err());
+    }
+
+    #[test]
+    fn a_stroke_reads_its_points_as_cells_rather_than_as_a_flat_list_of_numbers() {
+        let Ok(Command::Stroke { points, .. }) = Command::parse("stroke 10,20 30.5,40") else {
+            panic!("a stroke did not parse to a stroke");
+        };
+        assert_eq!(points, vec![Vec2::new(10.0, 20.0), Vec2::new(30.5, 40.0)]);
     }
 }

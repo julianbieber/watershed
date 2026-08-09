@@ -35,6 +35,7 @@ impl Plugin for DocumentPlugin {
 /// same argument `city_panel.rs` makes in wusel, and which two sets would otherwise race.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EditorSystems {
+    Brush,
     Document,
     View,
 }
@@ -143,6 +144,9 @@ pub struct Document {
     /// A solve is waiting for the whole-document bake that has to precede it. One flag
     /// rather than a queue, because it is the only pairing of jobs there is.
     pending_solve: bool,
+    /// What a stroke has made stale since the last bake was opened. A rectangle rather than
+    /// a flag because that is the whole of what a stroke costs — see [`Document::note_stroke`].
+    stroke_rect: CellRect,
     pub size: UVec2,
     pub seed: u32,
     pub preset: Preset,
@@ -163,6 +167,7 @@ impl Default for Document {
             baking: Baked::Nothing,
             bake_failed: false,
             pending_solve: false,
+            stroke_rect: CellRect::EMPTY,
             size: UVec2::splat(1024),
             seed: 1,
             preset: Preset::default(),
@@ -244,6 +249,26 @@ impl Document {
         // is right for "Reset water" and catastrophic here — the first edit after a solve
         // would take away the recipe, and every later solve would refuse a document that
         // looks perfectly ordinary.
+        if let Some(terrain) = self.terrain.as_mut()
+            && terrain.water().is_some()
+        {
+            terrain.invalidate_water();
+            self.water_revision += 1;
+        }
+    }
+
+    /// What a stroke leaves behind, where [`Document::note_edit`] is what a change to the
+    /// *stack* leaves behind. The bake keeps the extent it had and the rectangle is added to
+    /// what the next one has to cover — so a stroke costs its own footprint rather than the
+    /// whole document, and a document that was wholly baked before one is wholly baked after.
+    ///
+    /// TODO(jb-doc): why the caller passes the rectangle a change *reaches* rather than the
+    /// one it painted, and which of the two `watershed` works out.
+    pub fn note_stroke(&mut self, reached: CellRect) {
+        self.dirty = true;
+        self.error = None;
+        self.bake_failed = false;
+        self.stroke_rect = self.stroke_rect.union(reached);
         if let Some(terrain) = self.terrain.as_mut()
             && terrain.water().is_some()
         {
@@ -348,6 +373,9 @@ impl Document {
         self.dirty = false;
         // Asked for by name, so it is tried again however the last one went.
         self.bake_failed = false;
+        // TODO(jb-comment): why this is cleared for any rectangle rather than only for one
+        // that covers it — what every caller of this is obliged to have asked for.
+        self.stroke_rect = CellRect::EMPTY;
         self.baking = covered;
         Ok(())
     }
@@ -362,6 +390,7 @@ impl Document {
         self.path = None;
         self.terrain = None;
         self.baked = Baked::Nothing;
+        self.stroke_rect = CellRect::EMPTY;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut terrain = preset.build(size, seed);
@@ -438,6 +467,7 @@ impl Document {
         self.path = Some(path.clone());
         self.terrain = None;
         self.baked = Baked::Nothing;
+        self.stroke_rect = CellRect::EMPTY;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             match Terrain::load_from_path(&path) {
@@ -465,6 +495,13 @@ impl Document {
             Some(kind) => Err(format!("a {} is already running", kind.name())),
             None => Ok(()),
         }
+    }
+
+    /// A document holding a terrain, without the task pool a job would need to make one.
+    #[cfg(test)]
+    pub(crate) fn adopt(&mut self, terrain: Terrain) {
+        self.size = terrain.size;
+        self.terrain = Some(terrain);
     }
 
     fn take_terrain(&mut self) -> Result<Terrain, String> {
@@ -554,7 +591,12 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
         CellRect::EMPTY
     };
 
-    match wanted_rebake(document.dirty, document.bake_failed, document.baked, wanted) {
+    match wanted_rebake(
+        document.bake_failed,
+        document.baked,
+        wanted,
+        document.stroke_rect,
+    ) {
         // Nothing will be baked, so nothing is waiting on one: an edit left dirty here
         // would have every caller watching for the document to settle wait forever.
         None => document.dirty = false,
@@ -570,22 +612,30 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
 ///
 /// TODO(jb-comment): why the answer is a rectangle rather than a yes, and what the margin
 /// on it buys a camera that has moved a little.
+///
+/// TODO(jb-comment): why a structural edit is read off [`Baked`] rather than off the dirty
+/// flag, and what asking for the whole view on every frame of a drag would have cost.
 fn wanted_rebake(
-    dirty: bool,
     bake_failed: bool,
     baked: Baked,
     wanted: CellRect,
+    stroke: CellRect,
 ) -> Option<CellRect> {
     // A stack that failed to bake fails the same way every frame, so retrying it would
     // burn a core and never let the document go idle. The error stands until the next
     // edit, which is the only thing that could change the answer.
-    if bake_failed || wanted.is_empty() {
+    if bake_failed {
         return None;
     }
-    if !dirty && baked.covers(wanted) {
-        return None;
-    }
-    Some(wanted.expand(REBAKE_MARGIN_CELLS))
+    let view = if wanted.is_empty() || baked.covers(wanted) {
+        CellRect::EMPTY
+    } else {
+        wanted.expand(REBAKE_MARGIN_CELLS)
+    };
+    // A union rather than two jobs, and it costs nothing to claim: the bake covers every
+    // cell of the rectangle it is given, including the ground between two distant ones.
+    let ask = view.union(stroke);
+    (!ask.is_empty()).then_some(ask)
 }
 
 #[cfg(test)]
@@ -630,20 +680,75 @@ mod tests {
     #[test]
     fn an_edit_asks_for_the_view_and_a_covered_view_asks_for_nothing() {
         let view = rect(100, 200);
-        let asked = wanted_rebake(true, false, Baked::Nothing, view).expect("an edit is answered");
+        let asked = wanted_rebake(false, Baked::Nothing, view, CellRect::EMPTY)
+            .expect("an edit is answered");
         assert!(
             asked.union(view) == asked,
             "the rebake has to cover what is on screen"
         );
 
-        assert_eq!(wanted_rebake(false, false, Baked::Whole, view), None);
         assert_eq!(
-            wanted_rebake(false, false, Baked::Rect(rect(0, 300)), view),
+            wanted_rebake(false, Baked::Whole, view, CellRect::EMPTY),
+            None
+        );
+        assert_eq!(
+            wanted_rebake(false, Baked::Rect(rect(0, 300)), view, CellRect::EMPTY),
             None
         );
         // Panning onto ground no bake has reached since the edit asks for it, with nothing
         // dirty — that is the half of this that is not about editing at all.
-        assert!(wanted_rebake(false, false, Baked::Rect(rect(0, 150)), view).is_some());
+        assert!(wanted_rebake(false, Baked::Rect(rect(0, 150)), view, CellRect::EMPTY).is_some());
+    }
+
+    /// The whole of what makes a brush usable: a stroke asks for the ground it moved and
+    /// not for the screen it was drawn on, so a drag costs its own footprint per frame
+    /// rather than a re-bake of the view sixty times a second.
+    #[test]
+    fn a_stroke_asks_for_the_ground_it_moved_and_not_for_the_whole_view() {
+        let view = rect(0, 1024);
+        let stroke = rect(100, 140);
+        let asked = wanted_rebake(false, Baked::Whole, view, stroke).expect("a stroke is answered");
+
+        assert_eq!(asked, stroke);
+        assert!(
+            asked.width() < view.width(),
+            "the stroke asked for the whole view"
+        );
+    }
+
+    /// And it is what keeps the document solvable: a solve is refused unless the bake is
+    /// whole, so a stroke that dropped the extent the way a structural edit does would make
+    /// every stroke cost a whole-document bake before any water could be solved again.
+    #[test]
+    fn a_stroke_leaves_the_bake_the_extent_it_had() {
+        let mut document = Document {
+            baked: Baked::Whole,
+            ..Document::default()
+        };
+        document.note_stroke(rect(10, 20));
+
+        assert_eq!(document.baked(), Baked::Whole);
+        assert!(document.is_dirty(), "nothing would have baked the stroke");
+        assert!(!document.is_settled());
+    }
+
+    /// A stroke made while a bake is in flight has to be asked for again, on exactly the
+    /// terms `dirty` is: the job already running took its rectangle before the paint landed.
+    #[test]
+    fn a_stroke_made_while_a_bake_runs_is_not_taken_for_answered() {
+        let mut document = Document {
+            stroke_rect: rect(10, 20),
+            dirty: true,
+            ..Document::default()
+        };
+
+        // What `start_bake` does to both, without a task pool to run one on.
+        document.stroke_rect = CellRect::EMPTY;
+        document.dirty = false;
+        document.note_stroke(rect(30, 40));
+
+        assert_eq!(document.stroke_rect, rect(30, 40));
+        assert!(document.is_dirty());
     }
 
     /// The defect this guards cost a hang rather than a wrong picture: a stack holding a
@@ -652,14 +757,20 @@ mod tests {
     #[test]
     fn a_stack_that_will_not_bake_is_not_tried_again_until_something_changes() {
         let view = rect(100, 200);
-        assert_eq!(wanted_rebake(true, true, Baked::Nothing, view), None);
-        assert_eq!(wanted_rebake(false, true, Baked::Nothing, view), None);
+        assert_eq!(
+            wanted_rebake(true, Baked::Nothing, view, CellRect::EMPTY),
+            None
+        );
+        assert_eq!(
+            wanted_rebake(true, Baked::Nothing, view, rect(10, 20)),
+            None
+        );
     }
 
     #[test]
     fn a_view_that_holds_no_cells_asks_for_no_rebake() {
         assert_eq!(
-            wanted_rebake(true, false, Baked::Nothing, CellRect::EMPTY),
+            wanted_rebake(false, Baked::Nothing, CellRect::EMPTY, CellRect::EMPTY),
             None
         );
     }

@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+mod brush;
 mod control;
 mod document;
 mod edit;
@@ -22,6 +23,7 @@ fn main() {
         .add_plugins(bevy_egui::EguiPlugin::default())
         .add_plugins((
             document::DocumentPlugin,
+            brush::BrushPlugin,
             view::ViewPlugin,
             ui::UiPlugin,
             control::ControlPlugin,

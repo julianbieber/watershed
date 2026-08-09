@@ -3,8 +3,10 @@
 // each spelling a blend mode its own way.
 
 use serde_json::{Value, json};
+use watershed::brush::{Brush, BrushMode};
 use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap};
 use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec};
+use watershed::raster::Raster;
 use watershed::regions::RegionOutput;
 use watershed::{Field, Terrain};
 
@@ -281,8 +283,79 @@ pub fn parse_op(words: &[String]) -> Result<LayerOp, String> {
             of: first(rest)?.as_str().into(),
             sample_tiles: number(rest.get(1).ok_or("a slope op needs a sample distance")?)?,
         }),
+        // Sized by the first stroke rather than here, which is what lets it be written
+        // without a document to measure against — and what makes an unpainted one inert,
+        // since an empty raster reads as zero everywhere.
+        "paint" => Ok(LayerOp::Paint(Raster::default())),
         other => Err(format!("no layer op called `{other}`")),
     }
+}
+
+pub const BRUSH_MODES: [BrushMode; 4] = [
+    BrushMode::Add,
+    BrushMode::Subtract,
+    BrushMode::Set,
+    BrushMode::Smooth,
+];
+
+pub fn brush_mode_name(mode: BrushMode) -> &'static str {
+    match mode {
+        BrushMode::Add => "add",
+        BrushMode::Subtract => "sub",
+        BrushMode::Set => "set",
+        BrushMode::Smooth => "smooth",
+    }
+}
+
+fn parse_brush_mode(word: &str) -> Result<BrushMode, String> {
+    BRUSH_MODES
+        .into_iter()
+        .find(|mode| brush_mode_name(*mode) == word)
+        .ok_or_else(|| format!("no brush mode called `{word}`"))
+}
+
+/// One of the brush's numbers, named and read the way a layer's properties are — so the
+/// panel's controls and the ctl's words cannot come to mean different things.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrushChange {
+    Radius(f32),
+    Falloff(f32),
+    Strength(f32),
+    Value(f32),
+    Mode(BrushMode),
+}
+
+impl BrushChange {
+    pub fn parse(name: &str, word: &str) -> Result<Self, String> {
+        match name {
+            "radius" => Ok(Self::Radius(number(word)?)),
+            "falloff" => Ok(Self::Falloff(number(word)?)),
+            "strength" => Ok(Self::Strength(number(word)?)),
+            "value" => Ok(Self::Value(number(word)?)),
+            "mode" => Ok(Self::Mode(parse_brush_mode(word)?)),
+            other => Err(format!("a brush has nothing called `{other}`")),
+        }
+    }
+
+    pub fn apply(self, brush: &mut Brush) {
+        match self {
+            Self::Radius(radius) => brush.radius_cells = radius.max(0.0),
+            Self::Falloff(falloff) => brush.falloff = falloff.clamp(0.0, 1.0),
+            Self::Strength(strength) => brush.strength = strength,
+            Self::Value(value) => brush.value = value,
+            Self::Mode(mode) => brush.mode = mode,
+        }
+    }
+}
+
+pub fn brush_summary(brush: &Brush) -> Value {
+    json!({
+        "mode": brush_mode_name(brush.mode),
+        "radius": brush.radius_cells,
+        "falloff": brush.falloff,
+        "strength": brush.strength,
+        "value": brush.value,
+    })
 }
 
 fn parse_mask(words: &[String]) -> Result<Mask, String> {

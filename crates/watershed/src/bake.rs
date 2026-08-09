@@ -197,28 +197,83 @@ impl Terrain {
             if required[index].is_empty() || dependencies[index].is_empty() {
                 continue;
             }
-            let field = &self.fields[index];
-            let reach = field
-                .layers
-                .iter()
-                .filter(|layer| layer.enabled)
-                .filter_map(|layer| match &layer.op {
-                    LayerOp::Slope { sample_tiles, .. } => Some(sample_tiles.abs()),
-                    _ => None,
-                })
-                .fold(0.0f32, f32::max);
-            let reach = if reach.is_finite() {
-                reach.ceil() as u32
-            } else {
-                0
-            };
             for &referenced in &dependencies[index] {
-                let halo = step(field.shift) + reach + 2 * step(self.fields[referenced].shift) + 2;
+                let halo = self.halo_between(index, referenced);
                 let widened = required[index].expand(halo).intersect(document);
                 required[referenced] = required[referenced].union(widened);
             }
         }
         required
+    }
+
+    /// How far from the cell it is about a read by `reader` of `referenced` can fall.
+    ///
+    /// TODO(jb-comment): what each of the four terms is paying for, and why the bound is
+    /// symmetric — that the same number widens what a bake *needs* and what an edit
+    /// *reaches*.
+    fn halo_between(&self, reader: usize, referenced: usize) -> u32 {
+        let field = &self.fields[reader];
+        let reach = field
+            .layers
+            .iter()
+            .filter(|layer| layer.enabled)
+            .filter_map(|layer| match &layer.op {
+                LayerOp::Slope { sample_tiles, .. } => Some(sample_tiles.abs()),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        let reach = if reach.is_finite() {
+            reach.ceil() as u32
+        } else {
+            0
+        };
+        step(field.shift) + reach + 2 * step(self.fields[referenced].shift) + 2
+    }
+
+    /// Which cells of the *whole document* could bake differently because one field changed
+    /// over `rect` — the fields that read it, the fields that read those, and the halo each
+    /// hop adds.
+    ///
+    /// TODO(jb-doc): why this is the rectangle a stroke re-bakes rather than the one it
+    /// painted, and what a document that answered with the painted rectangle would leave
+    /// behind in a field one hop downstream.
+    ///
+    /// TODO(jb-comment): why a stack that will not compile answers with the whole document
+    /// rather than with nothing.
+    pub fn influence_of(&self, changed: &str, rect: CellRect) -> CellRect {
+        let document = self.rect();
+        let rect = rect.intersect(document);
+        if rect.is_empty() {
+            return CellRect::EMPTY;
+        }
+        let Ok(index_of) = self.index_fields() else {
+            return document;
+        };
+        let Some(&start) = index_of.get(changed) else {
+            return CellRect::EMPTY;
+        };
+        let Ok(dependencies) = self.resolve_dependencies(&index_of) else {
+            return document;
+        };
+        let Ok(order) = topological_order(&dependencies, &self.fields) else {
+            return document;
+        };
+
+        // The order puts a field after everything it reads, so a dependency's rectangle is
+        // final by the time the field that reads it is reached.
+        let mut affected = vec![CellRect::EMPTY; self.fields.len()];
+        affected[start] = rect;
+        for &index in &order {
+            for &referenced in &dependencies[index] {
+                if affected[referenced].is_empty() {
+                    continue;
+                }
+                let halo = self.halo_between(index, referenced);
+                let widened = affected[referenced].expand(halo).intersect(document);
+                affected[index] = affected[index].union(widened);
+            }
+        }
+        affected.into_iter().fold(CellRect::EMPTY, CellRect::union)
     }
 }
 
@@ -1067,5 +1122,94 @@ mod tests {
         let decoded: Terrain = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, terrain);
         assert!(decoded.field("height").unwrap().baked().is_empty());
+    }
+
+    #[test]
+    fn a_change_reaches_further_than_the_rectangle_it_was_made_in() {
+        let terrain = two_field_document();
+        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        let reached = terrain.influence_of("moisture", painted);
+
+        assert!(!reached.is_empty());
+        assert_eq!(reached.union(painted), reached, "{reached:?}");
+        assert!(reached.width() > painted.width());
+    }
+
+    /// The rectangle a stroke re-bakes is what keeps the document solvable, so it has to
+    /// cover every cell a full bake would have written differently — including the ones in
+    /// the fields that only *read* the one that changed.
+    #[test]
+    fn the_rectangle_a_stroke_reaches_covers_every_cell_a_full_bake_would_move() {
+        let mut terrain = two_field_document().with_field(Field::new("relief").with_layer(
+            Layer::new(LayerOp::Slope {
+                of: FieldId::from("height"),
+                sample_tiles: 6.0,
+            }),
+        ));
+        let paint = Raster::new(
+            terrain.field("moisture").unwrap().resolution(terrain.size),
+            0.0,
+        );
+        terrain
+            .field_mut("moisture")
+            .unwrap()
+            .layers
+            .push(Layer::new(LayerOp::Paint(paint)));
+        terrain.bake().unwrap();
+
+        let before: Vec<Vec<f32>> = terrain
+            .fields
+            .iter()
+            .map(|field| field.baked().data().to_vec())
+            .collect();
+
+        // A stroke into the one field nothing else is, which `height` masks by and `relief`
+        // then reads the slope of — so most of what follows is in fields the paint is not in.
+        let brush = crate::brush::Brush {
+            radius_cells: 14.0,
+            falloff: 0.5,
+            strength: 0.8,
+            ..crate::brush::Brush::default()
+        };
+        let size = terrain.size;
+        let LayerOp::Paint(raster) = &mut terrain.field_mut("moisture").unwrap().layers[1].op
+        else {
+            panic!("the paint layer stopped being paint");
+        };
+        let painted = brush.stroke(raster, size, &[glam::Vec2::new(44.0, 34.0)]);
+        assert!(!painted.is_empty());
+
+        let reached = terrain.influence_of("moisture", painted);
+        terrain.bake().unwrap();
+
+        let mut moved = 0;
+        for (index, field) in terrain.fields.iter().enumerate() {
+            let resolution = field.baked().size();
+            for (texel, (was, now)) in before[index].iter().zip(field.baked().data()).enumerate() {
+                if was == now {
+                    continue;
+                }
+                moved += 1;
+                let x = texel_center(texel as u32 % resolution.x, field.shift) as u32;
+                let y = texel_center(texel as u32 / resolution.x, field.shift) as u32;
+                assert!(
+                    reached.contains(x, y),
+                    "{}: cell {x},{y} moved outside {reached:?}",
+                    field.id
+                );
+            }
+        }
+        assert!(moved > 0, "the stroke moved nothing at all");
+    }
+
+    #[test]
+    fn a_change_to_a_field_the_document_does_not_have_reaches_nothing() {
+        let terrain = two_field_document();
+        assert!(
+            terrain
+                .influence_of("nowhere", CellRect::new(UVec2::ZERO, UVec2::splat(8)))
+                .is_empty()
+        );
+        assert!(terrain.influence_of("moisture", CellRect::EMPTY).is_empty());
     }
 }

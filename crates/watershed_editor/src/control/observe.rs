@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 use watershed::WaterState;
 
 use super::log::LogBuffer;
+use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
-use crate::edit::{blend_name, mask_summary, op_name, op_summary};
+use crate::edit::{blend_name, brush_summary, mask_summary, op_name, op_summary};
 use crate::view::{
     CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
     view_centre_cell,
@@ -20,6 +21,7 @@ pub(super) enum Topic {
     Document,
     Field,
     Layers,
+    Brush,
     Water,
     View,
     Log,
@@ -31,6 +33,7 @@ impl Topic {
             "document" => Ok(Self::Document),
             "field" => Ok(Self::Field),
             "layers" => Ok(Self::Layers),
+            "brush" => Ok(Self::Brush),
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
@@ -44,6 +47,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Document => document(world),
         Topic::Field => field(world),
         Topic::Layers => layers(world),
+        Topic::Brush => brush(world),
         Topic::Water => water(world),
         Topic::View => view(world),
         Topic::Log => log(world),
@@ -160,6 +164,32 @@ fn layers(world: &World) -> Value {
         .collect();
 
     json!({ "available": true, "active": document.active(), "fields": fields })
+}
+
+/// The brush's numbers, and where a stroke would land — reported together because a stroke
+/// that is refused is refused for the second reason far more often than for the first.
+fn brush(world: &World) -> Value {
+    let settings = world.resource::<BrushSettings>();
+    let document = world.resource::<Document>();
+    let target = target_of(document);
+    let mut value = brush_summary(&settings.0);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "field".to_owned(),
+            match &target {
+                Some((field, _)) => json!(field),
+                None => Value::Null,
+            },
+        );
+        object.insert(
+            "layer".to_owned(),
+            match &target {
+                Some((_, index)) => json!(index),
+                None => Value::Null,
+            },
+        );
+    }
+    value
 }
 
 /// The channel threshold is the view's, not a second one: a scenario asserting on channels

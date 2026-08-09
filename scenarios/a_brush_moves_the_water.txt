@@ -1,0 +1,61 @@
+# Paint a ridge across a solved document from outside the process, and watch the water go
+# round it.
+#
+# Run with:  just drive run scenarios/a_brush_moves_the_water.txt
+#
+# TODO(jb-comment): what makes this reproducible without counting frames — which reply is
+# held until which effect has landed, and why a stroke's is the rectangle rather than the view.
+
+observe log
+
+fixed-delta 1/60
+
+new 256 256 7 continents
+wait bake
+zoom fit
+
+# TODO(jb-comment): why the layer is added before anything is painted, and what an unpainted
+# paint layer does to the bake.
+layer add height paint
+observe layers
+observe brush
+
+brush mode add radius 10 falloff 0.4 strength 0.9 value 1
+observe brush
+
+# TODO(jb-comment): why the baseline solve comes after the layer is added rather than before.
+solve-water
+wait water
+observe water
+observe document
+observe field
+
+# TODO(jb-comment): what a ridge laid across the middle of a drained landscape is expected to
+# do to it, and why the assertion is the lake count and not the picture.
+stroke 16,128 64,120 128,132 192,122 240,130
+observe field
+
+# TODO(jb-comment): the claim this line exists to make — `baked` has to still read `whole`,
+# because a stroke re-bakes the ground it moved rather than dropping the document's extent.
+observe document
+capture /tmp/watershed-scenario/painted-ridge.png
+
+solve-water
+observe water
+
+# TODO(jb-comment): why cutting the same line back out is the other half of the assertion,
+# and what it would mean if the water did not follow it back.
+brush mode sub
+stroke 16,128 64,120 128,132 192,122 240,130
+observe document
+
+solve-water
+observe water
+capture /tmp/watershed-scenario/cut-ridge.png
+
+# TODO(jb-comment): why a stroke where there is nothing to paint into has to be refused
+# rather than quietly making a layer.
+field moisture
+observe brush
+
+observe log

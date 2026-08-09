@@ -3,14 +3,17 @@
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
+use watershed::brush::Brush;
 use watershed::layer::{Layer, LayerOp, Mask, Remap};
 use watershed::noise::{NoiseKind, NoiseSpec};
+use watershed::raster::Raster;
 use watershed::{FieldId, SaveOptions};
 
+use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
 use crate::edit::{
-    BLENDS, Edit, NOISE_KINDS, blend_name, noise_kind_name, op_name, parse_region_output,
-    region_output_name,
+    BLENDS, BRUSH_MODES, Edit, NOISE_KINDS, blend_name, brush_mode_name, noise_kind_name, op_name,
+    parse_region_output, region_output_name,
 };
 use crate::material;
 use crate::preset::Preset;
@@ -80,7 +83,7 @@ const PANEL_WIDTH: f32 = 300.0;
 /// The ops a button can make, against the [`crate::edit::parse_op`] grammar the ctl takes.
 /// A regions op is deliberately absent from both — a region table is not something either
 /// a command line or a single button can write.
-const ADDABLE: [&str; 4] = ["noise", "constant", "fieldref", "slope"];
+const ADDABLE: [&str; 5] = ["noise", "constant", "fieldref", "slope", "paint"];
 
 /// Both panels in one system, because egui lays a panel out against what the panels before
 /// it have already taken: shown from two systems, each would build its own root `Ui` over
@@ -91,6 +94,7 @@ fn panels(
     mut dialog: ResMut<NewDialog>,
     mut path: ResMut<FilePath>,
     mut add: ResMut<AddLayer>,
+    mut brush: ResMut<BrushSettings>,
     mut free_view: ResMut<FreeView>,
     camera: Single<(&mut Transform, &mut Projection), With<EditorCamera>>,
 ) -> Result {
@@ -130,7 +134,7 @@ fn panels(
     egui::Panel::right("layers")
         .default_size(PANEL_WIDTH)
         .show(&mut viewport, |ui| {
-            layer_stack(ui, &mut document, &mut add);
+            layer_stack(ui, &mut document, &mut add, &mut brush);
         });
 
     // What is left after both panels is the part of the window the world can be seen in,
@@ -292,7 +296,12 @@ fn toolbar(
 
 /// The stack of the field the toolbar has selected, which is what makes moisture and
 /// temperature editable by this panel with nothing about them written here.
-fn layer_stack(ui: &mut egui::Ui, document: &mut Document, add: &mut AddLayer) {
+fn layer_stack(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    add: &mut AddLayer,
+    brush: &mut BrushSettings,
+) {
     let active = document.active().to_owned();
     let names = document.field_names();
     if document.terrain().is_none() {
@@ -308,9 +317,10 @@ fn layer_stack(ui: &mut egui::Ui, document: &mut Document, add: &mut AddLayer) {
     });
 
     let mut changed = false;
+    let from_brush = brush_controls(ui, document, &mut brush.0);
     // Structural changes are collected rather than made: the list is being iterated, and
     // an add or a remove partway through it is the one thing that cannot be done in place.
-    let mut structural: Option<Edit> = None;
+    let mut structural: Option<Edit> = from_brush;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         let Some(terrain) = document.terrain_mut() else {
@@ -436,6 +446,87 @@ fn layer_stack(ui: &mut egui::Ui, document: &mut Document, add: &mut AddLayer) {
     } else if changed {
         document.note_edit();
     }
+}
+
+/// The brush, and where a drag over the world would land. Answers with an edit rather than
+/// making one, because the only button here adds a layer to the stack the panel below is
+/// about to iterate.
+///
+/// TODO(jb-doc): why the target is shown even though nothing here can choose it, and what a
+/// panel that only offered the numbers would leave a person guessing about.
+fn brush_controls(ui: &mut egui::Ui, document: &Document, brush: &mut Brush) -> Option<Edit> {
+    let mut edit = None;
+    let active = document.active().to_owned();
+    let target = target_of(document);
+
+    egui::CollapsingHeader::new("brush")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new("brush-properties")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("mode");
+                    egui::ComboBox::from_id_salt("brush-mode")
+                        .selected_text(brush_mode_name(brush.mode))
+                        .show_ui(ui, |ui| {
+                            for mode in BRUSH_MODES {
+                                ui.selectable_value(&mut brush.mode, mode, brush_mode_name(mode));
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("radius");
+                    ui.add(
+                        egui::DragValue::new(&mut brush.radius_cells)
+                            .speed(0.5)
+                            .range(0.0..=512.0),
+                    )
+                    .on_hover_text("document cells");
+                    ui.end_row();
+
+                    ui.label("falloff");
+                    ui.add(
+                        egui::DragValue::new(&mut brush.falloff)
+                            .speed(0.01)
+                            .range(0.0..=1.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("strength");
+                    ui.add(egui::DragValue::new(&mut brush.strength).speed(0.01));
+                    ui.end_row();
+
+                    ui.label("value");
+                    ui.add(egui::DragValue::new(&mut brush.value).speed(0.01))
+                        .on_hover_text("what `set` moves toward");
+                    ui.end_row();
+                });
+
+            match &target {
+                Some((field, index)) => {
+                    ui.label(
+                        egui::RichText::new(format!("drag paints {field} layer {index}"))
+                            .small()
+                            .weak(),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(format!("{active} has no paint layer"))
+                            .small()
+                            .weak(),
+                    );
+                    if ui.button("Add paint layer").clicked() {
+                        edit = Some(Edit::Add {
+                            field: active.clone(),
+                            op: LayerOp::Paint(Raster::default()),
+                        });
+                    }
+                }
+            }
+        });
+
+    edit
 }
 
 fn layer_body(ui: &mut egui::Ui, layer: &mut Layer, names: &[String], salt: usize) -> bool {
@@ -692,7 +783,15 @@ fn op_editor(ui: &mut egui::Ui, op: &mut LayerOp, names: &[String], salt: usize)
                 });
         }
 
-        LayerOp::Paint(raster) | LayerOp::External(raster) => {
+        LayerOp::Paint(raster) => {
+            ui.label(if raster.is_empty() {
+                "unpainted".to_owned()
+            } else {
+                format!("{}x{} painted", raster.width(), raster.height())
+            });
+        }
+
+        LayerOp::External(raster) => {
             ui.label(format!("{}x{} raster", raster.width(), raster.height()));
         }
     }
@@ -735,6 +834,9 @@ fn default_op(kind: &str, names: &[String]) -> LayerOp {
             of: first_field(names),
             sample_tiles: 4.0,
         },
+        // Empty, and sized by the first stroke — see `edit::parse_op`, which is the same
+        // decision reached from the other end.
+        "paint" => LayerOp::Paint(Raster::default()),
         _ => LayerOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
     }
 }
