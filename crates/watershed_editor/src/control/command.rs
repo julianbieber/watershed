@@ -16,8 +16,9 @@ use watershed::SaveOptions;
 
 use super::observe::{self, Topic};
 use crate::document::Document;
+use crate::edit::{Edit, parse_op};
 use crate::preset::Preset;
-use crate::view::{EditorCamera, fit_camera, look_at_cell, set_cells_across};
+use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
 
 /// Ten minutes at 60 Hz. Long enough for a 4096-square solve on a slow machine, short
 /// enough that a stuck scenario reports rather than hangs.
@@ -45,6 +46,16 @@ pub(super) enum Command {
         started: bool,
     },
     Field(String),
+    /// An edit and the re-bake that answers it, held together for the reason every other
+    /// job-starting verb is: the reply says the effect has happened, and for an edit the
+    /// effect is the bake rather than the changed number.
+    Edit {
+        edit: Edit,
+        applied: Option<Value>,
+    },
+    Bake {
+        started: bool,
+    },
     SolveWater {
         started: bool,
     },
@@ -94,6 +105,11 @@ impl Command {
             Self::Wait { .. } => "wait",
             Self::New { .. } => "new",
             Self::Field(_) => "field",
+            Self::Edit { edit, .. } => match edit {
+                Edit::Set { .. } => "set",
+                _ => "layer",
+            },
+            Self::Bake { .. } => "bake",
             Self::SolveWater { .. } => "solve-water",
             Self::ResetWater => "reset-water",
             Self::Save { .. } => "save",
@@ -141,6 +157,21 @@ impl Command {
             "field" => Ok(Self::Field(
                 rest.first().ok_or("field needs a name")?.to_string(),
             )),
+            "layer" => Ok(Self::Edit {
+                edit: layer_edit(&rest)?,
+                applied: None,
+            }),
+            "set" => {
+                let path = rest.first().ok_or("set needs a path")?;
+                Ok(Self::Edit {
+                    edit: Edit::Set {
+                        path: (*path).to_owned(),
+                        words: owned(&rest[1..]),
+                    },
+                    applied: None,
+                })
+            }
+            "bake" => Ok(Self::Bake { started: false }),
             "solve-water" => Ok(Self::SolveWater { started: false }),
             "reset-water" => Ok(Self::ResetWater),
             "save" => Ok(Self::Save {
@@ -236,11 +267,52 @@ impl Command {
                 }
             }
 
+            Self::Edit { edit, applied } => {
+                if applied.is_none() {
+                    let mut document = world.resource_mut::<Document>();
+                    match document.apply(edit) {
+                        Ok(value) => *applied = Some(value),
+                        Err(error) => return Poll::Failed(error),
+                    }
+                    return Poll::Running;
+                }
+                // Held until the re-bake the edit provoked has landed, so a scenario that
+                // observes the field on the next line is reading the world the edit made.
+                // A stack that no longer bakes — a cycle a toggle uncovered — reports the
+                // error here rather than answering with a success nothing followed.
+                let document = world.resource::<Document>();
+                if !document.is_settled() {
+                    return Poll::Running;
+                }
+                match document.error() {
+                    Some(error) => Poll::Failed(error.to_owned()),
+                    None => Poll::Done(applied.take().unwrap_or_else(|| json!({}))),
+                }
+            }
+
+            Self::Bake { started } => {
+                if !*started {
+                    *started = true;
+                    let mut document = world.resource_mut::<Document>();
+                    if let Err(error) = document.start_bake(None) {
+                        return Poll::Failed(error);
+                    }
+                    return Poll::Running;
+                }
+                finished(
+                    world,
+                    |document| json!({ "baked": document.baked().name() }),
+                )
+            }
+
             Self::SolveWater { started } => {
                 if !*started {
                     *started = true;
                     let mut document = world.resource_mut::<Document>();
-                    if let Err(error) = document.start_solve() {
+                    // The same call the button makes, so the verb proves the button rather
+                    // than a narrower thing beside it: a solve needs the whole document
+                    // baked, and this bakes it when it is not.
+                    if let Err(error) = document.solve_with_bake() {
                         return Poll::Failed(error);
                     }
                     return Poll::Running;
@@ -325,6 +397,7 @@ impl Command {
                     .resource::<Document>()
                     .terrain()
                     .map(|terrain| terrain.size);
+                let free = *world.resource::<FreeView>();
                 let mut query =
                     world.query_filtered::<(&mut Transform, &mut Projection), With<EditorCamera>>();
                 let Ok((mut transform, mut projection)) = query.single_mut(world) else {
@@ -334,7 +407,7 @@ impl Command {
                 match to {
                     ZoomTo::Fit => match terrain_size {
                         Some(size) => {
-                            fit_camera(&mut transform, &mut projection, size);
+                            fit_camera(&mut transform, &mut projection, size, free);
                             Poll::Done(json!({ "fit": [size.x, size.y] }))
                         }
                         None => Poll::Failed("there is no document to fit".to_owned()),
@@ -420,9 +493,11 @@ impl Condition {
         }
     }
 
+    /// Settled rather than merely idle: an edit is answered by a bake a system opens, so a
+    /// document between the two has nothing in flight and is not finished either.
     fn met(&self, world: &World) -> bool {
         let document = world.resource::<Document>();
-        if document.is_busy() {
+        if !document.is_settled() {
             return false;
         }
         match self {
@@ -435,6 +510,45 @@ impl Condition {
                 .is_some_and(|terrain| terrain.water().is_some()),
         }
     }
+}
+
+/// TODO(jb-doc): why the four structural edits are one verb with a sub-word rather than
+/// four verbs, where `set` is a verb of its own.
+fn layer_edit(rest: &[&str]) -> Result<Edit, String> {
+    let what = *rest.first().ok_or("layer needs add, rm, move or toggle")?;
+    let field = (*rest.get(1).ok_or("layer needs a field name")?).to_owned();
+    match what {
+        "add" => Ok(Edit::Add {
+            field,
+            op: parse_op(&owned(&rest[2..]))?,
+        }),
+        "rm" => Ok(Edit::Remove {
+            field,
+            index: number(rest.get(2).ok_or("layer rm needs an index")?)?,
+        }),
+        "move" => Ok(Edit::Move {
+            field,
+            index: number(rest.get(2).ok_or("layer move needs an index")?)?,
+            to: number(rest.get(3).ok_or("layer move needs somewhere to go")?)?,
+        }),
+        "toggle" => Ok(Edit::Toggle {
+            field,
+            index: number(rest.get(2).ok_or("layer toggle needs an index")?)?,
+            // No word at all flips it, which is what a keyboard-less caller wants; a word
+            // states it, which is what a scenario wants so a re-run cannot drift.
+            enabled: match rest.get(3) {
+                None => None,
+                Some(&"on") => Some(true),
+                Some(&"off") => Some(false),
+                Some(word) => return Err(format!("a toggle is on or off, not `{word}`")),
+            },
+        }),
+        other => Err(format!("no layer edit called `{other}`")),
+    }
+}
+
+fn owned(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| (*word).to_owned()).collect()
 }
 
 fn number<T: std::str::FromStr>(word: &str) -> Result<T, String> {
@@ -492,6 +606,19 @@ mod tests {
             ("wait water 600", "wait"),
             ("new 256 256 7 ridges", "new"),
             ("field height", "field"),
+            ("layer add height noise fbm 0.01", "layer"),
+            ("layer add height constant 0.25", "layer"),
+            ("layer add height slope base 4", "layer"),
+            ("layer rm height 2", "layer"),
+            ("layer move height 2 0", "layer"),
+            ("layer toggle height 1", "layer"),
+            ("layer toggle height 1 off", "layer"),
+            ("set height.1.amplitude 0.5", "set"),
+            ("set height.1.blend mul", "set"),
+            ("set height.1.mask field moisture 0.4 0.6 0 1", "set"),
+            ("set height.1.op.scale 0.004", "set"),
+            ("set height.shift 2", "set"),
+            ("bake", "bake"),
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),
             ("save /tmp/a.watershed", "save"),
@@ -521,5 +648,11 @@ mod tests {
         assert!(Command::parse("new 256 256 1 nothing-like-this").is_err());
         assert!(Command::parse("zoom").is_err());
         assert!(Command::parse("save /tmp/a.watershed sideways").is_err());
+        assert!(Command::parse("layer").is_err());
+        assert!(Command::parse("layer add height").is_err());
+        assert!(Command::parse("layer sideways height 1").is_err());
+        assert!(Command::parse("layer toggle height 1 maybe").is_err());
+        assert!(Command::parse("layer rm height").is_err());
+        assert!(Command::parse("set").is_err());
     }
 }

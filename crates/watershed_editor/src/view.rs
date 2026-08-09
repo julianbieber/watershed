@@ -8,7 +8,7 @@ use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
-use watershed::WaterState;
+use watershed::{CellRect, WaterState};
 
 use crate::document::{Document, EditorSystems};
 use crate::material::{FieldMaterial, FieldMaterialPlugin, FieldSettings};
@@ -40,6 +40,8 @@ impl Plugin for ViewPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FieldMaterialPlugin)
             .init_resource::<ViewRange>()
+            .init_resource::<VisibleCells>()
+            .init_resource::<FreeView>()
             .add_systems(Startup, spawn_view)
             .add_systems(
                 Update,
@@ -52,7 +54,10 @@ impl Plugin for ViewPlugin {
             // `PostUpdate` — so fitting in `Update` would read the area belonging to the
             // *previous* frame's scale, and a scenario would see a stale range for one
             // frame after every zoom.
-            .add_systems(PostUpdate, fit_ramp.after(CameraUpdateSystems));
+            .add_systems(
+                PostUpdate,
+                (fit_ramp, track_visible_cells).after(CameraUpdateSystems),
+            );
     }
 }
 
@@ -70,6 +75,69 @@ pub struct ViewRange {
     pub low: f32,
     pub high: f32,
     pub diverging: bool,
+}
+
+/// The document cells the camera can see, written once a frame beside [`ViewRange`] and
+/// for the same reason: the re-bake and the screen have to be answering one question.
+///
+/// TODO(jb-doc): why this is rounded outwards, and what a rectangle one cell short of the
+/// view would leave along the edge of the screen after an edit.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct VisibleCells(pub CellRect);
+
+impl Default for VisibleCells {
+    fn default() -> Self {
+        Self(CellRect::EMPTY)
+    }
+}
+
+/// What the panels have left the world, as fractions of the window.
+///
+/// **Fractions rather than a viewport, and the reason is a loop.** `bevy_egui` takes
+/// egui's screen rectangle from `Camera::physical_viewport_rect`, so giving the camera the
+/// space the panels left over makes the panels' own screen smaller, which makes their
+/// leavings smaller again — measured, it collapsed the world into four pixels over a few
+/// frames. The world is therefore drawn across the whole window with the panels laid on
+/// top, and the only thing that has to know they are there is the fit.
+///
+/// TODO(jb-doc): why the size and the centre are both needed, and what a fit that used
+/// only the size would put behind the toolbar.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct FreeView {
+    /// The uncovered fraction of the window's width and height.
+    pub size: Vec2,
+    /// Where the uncovered rectangle's centre sits against the window's, as a fraction of
+    /// the window and counted the way the camera counts: y upwards.
+    pub centre: Vec2,
+}
+
+impl Default for FreeView {
+    fn default() -> Self {
+        // The whole window, which is what the world had before there were any panels — and
+        // what it falls back to for the frames before one has been laid out.
+        Self {
+            size: Vec2::ONE,
+            centre: Vec2::ZERO,
+        }
+    }
+}
+
+impl FreeView {
+    /// TODO(jb-comment): why a degenerate rectangle answers with the whole window rather
+    /// than with itself.
+    pub fn new(free: Rect, window: Vec2) -> Self {
+        if window.x <= 0.0 || window.y <= 0.0 || free.width() <= 0.0 || free.height() <= 0.0 {
+            return Self::default();
+        }
+        let centre = free.center();
+        Self {
+            size: Vec2::new(free.width() / window.x, free.height() / window.y),
+            centre: Vec2::new(
+                (centre.x - window.x * 0.5) / window.x,
+                (window.y * 0.5 - centre.y) / window.y,
+            ),
+        }
+    }
 }
 
 /// TODO(jb-doc): why the maps are tracked by revision rather than rebuilt when the terrain
@@ -388,21 +456,71 @@ fn fit_ramp(
     material.settings.diverging = if diverging { 1.0 } else { 0.0 };
 }
 
-/// TODO(jb-doc): why fitting is a jump rather than an animation, and what the ctl needs
-/// from that.
-pub fn fit_camera(transform: &mut Transform, projection: &mut Projection, size: UVec2) {
+/// TODO(jb-comment): why the rectangle is rounded outwards on both ends rather than being
+/// the cells whose centres are on screen.
+fn track_visible_cells(
+    document: Res<Document>,
+    mut visible: ResMut<VisibleCells>,
+    camera: Single<(&Transform, &Projection), With<EditorCamera>>,
+) {
+    let (transform, projection) = camera.into_inner();
     let Projection::Orthographic(projection) = projection else {
         return;
     };
-    transform.translation = Vec3::new(0.0, 0.0, transform.translation.z);
+    let size = document.size;
+    let view = visible_rect(transform, projection);
+
+    let bounds = size.as_vec2();
+    let low = world_to_cell(view.min, size)
+        .floor()
+        .clamp(Vec2::ZERO, bounds);
+    let high = world_to_cell(view.max, size)
+        .ceil()
+        .clamp(Vec2::ZERO, bounds);
+    visible.0 = if high.x <= low.x || high.y <= low.y {
+        CellRect::EMPTY
+    } else {
+        CellRect::new(low.as_uvec2(), high.as_uvec2())
+    };
+}
+
+/// TODO(jb-doc): why fitting is a jump rather than an animation, and what the ctl needs
+/// from that.
+///
+/// The only thing in the crate that knows the panels are there, and it has to be: the
+/// world is drawn across the whole window with the panels over it, so a document fitted to
+/// the window is partly behind them. See [`FreeView`] for why they are not cut out of the
+/// camera instead.
+pub fn fit_camera(
+    transform: &mut Transform,
+    projection: &mut Projection,
+    size: UVec2,
+    free: FreeView,
+) {
+    let Projection::Orthographic(projection) = projection else {
+        return;
+    };
 
     // The area already carries the scale, so this is a ratio against what is on screen
     // now rather than an absolute — see the note on [`visible_rect`].
     let area = projection.area.size();
-    if area.x > 0.0 && area.y > 0.0 {
-        let size = size.as_vec2();
-        projection.scale *= (size.x / area.x).max(size.y / area.y);
+    if area.x <= 0.0 || area.y <= 0.0 {
+        return;
     }
+
+    let uncovered = area * free.size;
+    if uncovered.x <= 0.0 || uncovered.y <= 0.0 {
+        return;
+    }
+    let document = size.as_vec2();
+    let factor = (document.x / uncovered.x).max(document.y / uncovered.y);
+    projection.scale *= factor;
+
+    // The area grows by the same factor the scale did, so where the uncovered rectangle's
+    // centre lands is known without waiting for `camera_system` to rewrite the area. The
+    // camera moves *against* that offset, which is what puts the document's middle in the
+    // middle of the space the panels left rather than of the window.
+    transform.translation = (-free.centre * area * factor).extend(transform.translation.z);
 }
 
 /// Centres the view on a document cell. Absolute rather than relative so a scenario says

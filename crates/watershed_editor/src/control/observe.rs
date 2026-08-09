@@ -9,12 +9,17 @@ use serde_json::{Value, json};
 use watershed::WaterState;
 
 use super::log::LogBuffer;
-use crate::document::Document;
-use crate::view::{CHANNEL_THRESHOLD, EditorCamera, ViewRange, cells_across, view_centre_cell};
+use crate::document::{Baked, Document};
+use crate::edit::{blend_name, mask_summary, op_name, op_summary};
+use crate::view::{
+    CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
+    view_centre_cell,
+};
 
 pub(super) enum Topic {
     Document,
     Field,
+    Layers,
     Water,
     View,
     Log,
@@ -25,6 +30,7 @@ impl Topic {
         match word {
             "document" => Ok(Self::Document),
             "field" => Ok(Self::Field),
+            "layers" => Ok(Self::Layers),
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
@@ -37,6 +43,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
     match topic {
         Topic::Document => document(world),
         Topic::Field => field(world),
+        Topic::Layers => layers(world),
         Topic::Water => water(world),
         Topic::View => view(world),
         Topic::Log => log(world),
@@ -47,8 +54,16 @@ fn document(world: &World) -> Value {
     let document = world.resource::<Document>();
     json!({
         "busy": document.is_busy(),
+        "settled": document.is_settled(),
         "job": document.job().map(|kind| kind.name()),
         "error": document.error(),
+        // How much of the bake matches the layers, which after an edit is the visible
+        // rectangle rather than the document — and is what a solve is refused against.
+        "baked": document.baked().name(),
+        "baked_rect": match document.baked() {
+            Baked::Rect(rect) => json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
+            _ => Value::Null,
+        },
         "size": [document.size.x, document.size.y],
         "seed": document.seed,
         "preset": document.preset.name(),
@@ -98,6 +113,53 @@ fn field(world: &World) -> Value {
         "p90": at(0.90),
         "max": at(1.0),
     })
+}
+
+/// Every field's whole stack, not just the active one's — an edit names a field, so a
+/// scenario has to be able to see the stack it is about to address without switching the
+/// view to it first.
+///
+/// TODO(jb-doc): why the summary is the same string the panel puts on a layer's header,
+/// and what a second phrasing here would let drift.
+fn layers(world: &World) -> Value {
+    let document = world.resource::<Document>();
+    let Some(terrain) = document.terrain() else {
+        return json!({ "available": false });
+    };
+
+    let fields: Vec<Value> = terrain
+        .fields
+        .iter()
+        .map(|field| {
+            let layers: Vec<Value> = field
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(index, layer)| {
+                    json!({
+                        "index": index,
+                        "op": op_name(&layer.op),
+                        "summary": op_summary(&layer.op),
+                        "blend": blend_name(layer.blend),
+                        "amplitude": layer.amplitude,
+                        "mask": mask_summary(&layer.mask),
+                        "enabled": layer.enabled,
+                    })
+                })
+                .collect();
+            json!({
+                "field": field.id.to_string(),
+                "shift": field.shift,
+                "range": [field.range.0, field.range.1],
+                // Whether this field's bake is read at its nearest texel rather than
+                // between them, which follows an op parameter rather than being set.
+                "categorical": field.is_categorical(),
+                "layers": layers,
+            })
+        })
+        .collect();
+
+    json!({ "available": true, "active": document.active(), "fields": fields })
 }
 
 /// The channel threshold is the view's, not a second one: a scenario asserting on channels
@@ -153,6 +215,8 @@ fn counts(state: &WaterState) -> (u64, u64, u64) {
 fn view(world: &mut World) -> Value {
     let size = world.resource::<Document>().size;
     let range = *world.resource::<ViewRange>();
+    let visible = world.resource::<VisibleCells>().0;
+    let free = *world.resource::<FreeView>();
 
     let mut query = world.query_filtered::<(&Transform, &Projection), With<EditorCamera>>();
     let Ok((transform, projection)) = query.single(world) else {
@@ -164,6 +228,13 @@ fn view(world: &mut World) -> Value {
         "available": true,
         "centre": [centre.x, centre.y],
         "cells_across": cells_across(projection),
+        // How much of the window the panels have left the world, which is what a fit aims
+        // at. Reported rather than derived because a panel's width is egui's to decide.
+        "free_size": [free.size.x, free.size.y],
+        "free_centre": [free.centre.x, free.centre.y],
+        // The rectangle a live re-bake covers, reported here rather than derived by the
+        // caller for the reason the fitted range is: it is what the editor acted on.
+        "cells": [visible.min.x, visible.min.y, visible.max.x, visible.max.y],
         "range": [range.low, range.high],
         "diverging": range.diverging,
     })

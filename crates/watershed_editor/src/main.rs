@@ -5,6 +5,7 @@ use bevy::prelude::*;
 
 mod control;
 mod document;
+mod edit;
 mod material;
 mod preset;
 mod ui;

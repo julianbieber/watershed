@@ -240,6 +240,15 @@ impl Terrain {
         self.water_spec = None;
     }
 
+    /// Drops the solved state and **keeps the spec**, which is the difference between
+    /// "forget about the water" and "the height moved, so this answer is stale".
+    ///
+    /// TODO(jb-doc): why an edit needs this rather than [`Terrain::clear_water`], and what
+    /// happens to a document that loses the recipe it is re-solved from.
+    pub fn invalidate_water(&mut self) {
+        self.water = None;
+    }
+
     /// TODO(jb-doc): what this reads, what it replaces, and why a coarse height field is
     /// refused rather than resampled.
     pub fn solve_water(&mut self, spec: &WaterSpec) -> Result<(), WaterError> {
@@ -761,6 +770,32 @@ mod tests {
         assert_eq!(water.size(), UVec2::new(16, 16));
         terrain.clear_water();
         assert!(terrain.water().is_none());
+    }
+
+    /// The two ways of getting rid of a solved state are not interchangeable, and the
+    /// difference is the *recipe*: forgetting about the water drops it, invalidating a
+    /// stale answer keeps it. Getting this wrong makes a document that can never be solved
+    /// again, and looks exactly like an ordinary one.
+    #[test]
+    fn invalidating_the_water_keeps_the_recipe_where_clearing_it_does_not() {
+        let mut terrain = Terrain::new(UVec2::new(16, 16))
+            .with_field(Field::new("height").with_layer(Layer::new(LayerOp::Constant(0.5))));
+        terrain.bake().unwrap();
+        terrain.solve_water(&WaterSpec::default()).unwrap();
+
+        terrain.invalidate_water();
+        assert!(terrain.water().is_none());
+        assert!(
+            terrain.water_spec.is_some(),
+            "an invalidated document has to be solvable again"
+        );
+        terrain
+            .solve_water(&terrain.water_spec.clone().unwrap())
+            .expect("the recipe survived, so the solve does");
+
+        terrain.clear_water();
+        assert!(terrain.water().is_none());
+        assert!(terrain.water_spec.is_none());
     }
 
     #[test]

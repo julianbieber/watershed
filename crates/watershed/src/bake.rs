@@ -99,6 +99,7 @@ impl Terrain {
         let required = self.required_rects(rect, &order, &dependencies);
 
         let shifts: Vec<u8> = self.fields.iter().map(|field| field.shift).collect();
+        let categorical: Vec<bool> = self.fields.iter().map(Field::is_categorical).collect();
         let mut baked: Vec<Raster<f32>> = self
             .fields
             .iter_mut()
@@ -119,6 +120,7 @@ impl Terrain {
                     size: self.size,
                     baked: &baked,
                     shifts: &shifts,
+                    categorical: &categorical,
                 };
                 map_rows(texels.min.y, texels.max.y, |j| {
                     (texels.min.x..texels.max.x)
@@ -368,15 +370,24 @@ struct Evaluator<'a> {
     size: UVec2,
     baked: &'a [Raster<f32>],
     shifts: &'a [u8],
+    /// Answered once per bake rather than per texel, where [`Field::sample`] asks the
+    /// field itself — this is the read inside the loop, and the question is a property of
+    /// the stack rather than of the position.
+    categorical: &'a [bool],
 }
 
 impl Evaluator<'_> {
+    /// TODO(jb-comment): why a categorical field is read at its nearest texel here as well
+    /// as in [`Field::sample`], and which of the two a mask goes through.
     fn field(&self, index: usize, position: Vec2) -> f32 {
         let shift = self.shifts[index];
-        self.baked[index].sample_bilinear(
-            raster_coord(position.x, shift),
-            raster_coord(position.y, shift),
-        )
+        let u = raster_coord(position.x, shift);
+        let v = raster_coord(position.y, shift);
+        if self.categorical[index] {
+            self.baked[index].sample_nearest(u, v)
+        } else {
+            self.baked[index].sample_bilinear(u, v)
+        }
     }
 
     fn mask(&self, mask: &CompiledMask<'_>, position: Vec2) -> f32 {
@@ -945,6 +956,62 @@ mod tests {
             assert_eq!(*value, value.round(), "a region id baked as {value}");
             assert!((0.0..3.0).contains(value), "a region id of {value}");
         }
+    }
+
+    /// The defect this guards: a value standing for a class has no midpoint, so a read
+    /// between region 1 and region 3 must be one of the two rather than the region 2 that
+    /// interpolating them invents.
+    #[test]
+    fn a_categorical_field_is_never_read_between_two_of_its_classes() {
+        let mut terrain = Terrain::new(UVec2::new(256, 256))
+            .with_field(
+                Field::new("region").with_range((0.0, 8.0)).with_layer(
+                    Layer::new(LayerOp::Regions {
+                        spec: region_spec(),
+                        output: RegionOutput::RegionId,
+                    })
+                    .with_blend(Blend::Replace),
+                ),
+            )
+            .with_field(Field::new("copy").with_range((0.0, 8.0)).with_layer(
+                Layer::new(LayerOp::FieldRef(FieldId::from("region"))).with_blend(Blend::Replace),
+            ));
+        terrain.bake().unwrap();
+
+        let region = terrain.field("region").unwrap();
+        assert!(region.is_categorical());
+        for value in terrain.field("copy").unwrap().baked().data() {
+            assert_eq!(*value, value.round(), "a region id read as {value}");
+        }
+
+        // The same question asked of the public read, which is the one wusel will go
+        // through — off a texel centre, where a bilinear read is at its worst.
+        for step in 0..64 {
+            let at = 4.0 * step as f32 + 2.5;
+            let value = region.sample(at, at);
+            assert_eq!(value, value.round(), "a region id sampled as {value}");
+        }
+    }
+
+    #[test]
+    fn a_field_of_blended_region_columns_is_still_read_smoothly() {
+        let terrain = region_document();
+        assert!(
+            !terrain.field("height").unwrap().is_categorical(),
+            "a blended column is a number, not a class"
+        );
+    }
+
+    #[test]
+    fn a_field_is_categorical_only_while_the_layer_saying_so_is_enabled() {
+        let field = Field::new("region").with_layer(
+            Layer::new(LayerOp::Regions {
+                spec: region_spec(),
+                output: RegionOutput::CoverClass,
+            })
+            .disabled(),
+        );
+        assert!(!field.is_categorical());
     }
 
     #[test]

@@ -170,6 +170,22 @@ impl<T: Texel> Raster<T> {
         top + (bottom - top) * fy
     }
 
+    /// TODO(jb-doc): the one reason a raster is ever read this way — that a value standing
+    /// for a *class* has no midpoint, so the texel between two of them is one of the two
+    /// rather than their average.
+    pub fn sample_nearest(&self, u: f32, v: f32) -> f32 {
+        if self.data.is_empty() {
+            return 0.0;
+        }
+        let max_x = self.size.x - 1;
+        let max_y = self.size.y - 1;
+        // NaN survives `clamp` and lands on zero through the cast rather than on an index
+        // out of bounds, which is the same fallback an empty raster reads as.
+        let x = u.round().clamp(0.0, max_x as f32) as u32;
+        let y = v.round().clamp(0.0, max_y as f32) as u32;
+        self.data[(y as usize) * (self.size.x as usize) + (x as usize)].to_f32()
+    }
+
     /// TODO(jb-doc): why a raster carried by a layer is stretched over the whole document
     /// rather than being obliged to match its resolution.
     pub fn sample_over(&self, size: UVec2, x: f32, y: f32) -> f32 {

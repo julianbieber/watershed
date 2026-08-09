@@ -6,16 +6,28 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
-use watershed::{SaveOptions, Terrain};
+use serde_json::Value;
+use watershed::{CellRect, SaveOptions, Terrain};
 
+use crate::edit::Edit;
 use crate::preset::Preset;
+use crate::view::VisibleCells;
+
+/// Cells of slack around the visible rectangle when a re-bake is started for it. A pan of
+/// less than this costs nothing, where re-baking exactly what is on screen would start a
+/// job on the first frame the camera moved.
+const REBAKE_MARGIN_CELLS: u32 = 64;
 
 pub struct DocumentPlugin;
 
 impl Plugin for DocumentPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Document>()
-            .add_systems(Update, finish_job.in_set(EditorSystems::Document));
+        app.init_resource::<Document>().add_systems(
+            Update,
+            (finish_job, start_pending_bake)
+                .chain()
+                .in_set(EditorSystems::Document),
+        );
     }
 }
 
@@ -32,6 +44,7 @@ pub enum EditorSystems {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
     New,
+    Bake,
     Solve,
     Save,
     Load,
@@ -41,9 +54,50 @@ impl JobKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::New => "new",
+            Self::Bake => "bake",
             Self::Solve => "solve",
             Self::Save => "save",
             Self::Load => "load",
+        }
+    }
+}
+
+/// How much of the document's bake matches the layers it was cut from.
+///
+/// TODO(jb-doc): why an edit drops this to [`Baked::Nothing`] rather than to the rectangle
+/// it did not touch — that a layer is a whole-field quantity and nothing here knows the
+/// reach of the one that changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Baked {
+    Nothing,
+    Rect(CellRect),
+    Whole,
+}
+
+impl Baked {
+    pub fn covers(self, rect: CellRect) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Nothing => rect.is_empty(),
+            // A union that adds nothing is a rectangle already inside this one, which is
+            // the containment test without a second way of spelling it.
+            Self::Rect(have) => have.union(rect) == have,
+        }
+    }
+
+    fn with(self, added: Self) -> Self {
+        match (self, added) {
+            (Self::Whole, _) | (_, Self::Whole) => Self::Whole,
+            (Self::Nothing, other) | (other, Self::Nothing) => other,
+            (Self::Rect(have), Self::Rect(added)) => Self::Rect(have.union(added)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Nothing => "nothing",
+            Self::Rect(_) => "rect",
+            Self::Whole => "whole",
         }
     }
 }
@@ -72,6 +126,23 @@ pub struct Document {
     revision: u64,
     water_revision: u64,
     error: Option<String>,
+    /// An edit has landed that no bake has answered yet. Separate from [`Baked`] because a
+    /// re-bake clears this the moment it *starts* — an edit made while one is in flight
+    /// has to set it again, or the job already running would be taken for its answer.
+    dirty: bool,
+    baked: Baked,
+    /// What the bake in flight will have covered when it lands, held here rather than in
+    /// the job because only the caller that started it knows whether it asked for all of
+    /// the document or a rectangle of it.
+    baking: Baked,
+    /// The stack as it stands does not bake. Nothing may re-bake it automatically until
+    /// something about it changes, or a document holding a cycle would spend every frame
+    /// re-discovering the same cycle — and would never go idle for a caller waiting on the
+    /// edit that introduced it.
+    bake_failed: bool,
+    /// A solve is waiting for the whole-document bake that has to precede it. One flag
+    /// rather than a queue, because it is the only pairing of jobs there is.
+    pending_solve: bool,
     pub size: UVec2,
     pub seed: u32,
     pub preset: Preset,
@@ -87,6 +158,11 @@ impl Default for Document {
             revision: 0,
             water_revision: 0,
             error: None,
+            dirty: false,
+            baked: Baked::Nothing,
+            baking: Baked::Nothing,
+            bake_failed: false,
+            pending_solve: false,
             size: UVec2::splat(1024),
             seed: 1,
             preset: Preset::default(),
@@ -116,6 +192,12 @@ impl Document {
         self.error.as_deref()
     }
 
+    /// A synchronous refusal, put where the toolbar shows it. Cleared by the next job or
+    /// the next edit, exactly as a job's own error is.
+    pub fn refuse(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
     pub fn job(&self) -> Option<JobKind> {
         match &self.job {
             Job::Idle => None,
@@ -125,6 +207,67 @@ impl Document {
 
     pub fn is_busy(&self) -> bool {
         matches!(self.job, Job::Running { .. })
+    }
+
+    pub fn baked(&self) -> Baked {
+        self.baked
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Nothing is in flight *and* nothing is waiting to start. A bake is opened by a system
+    /// rather than by the edit itself, so a caller that watched only [`Document::is_busy`]
+    /// would read the frame between the two as finished.
+    pub fn is_settled(&self) -> bool {
+        !self.is_busy() && !self.dirty
+    }
+
+    /// The terrain, to be edited in place. Whatever is changed through this has to be
+    /// followed by [`Document::note_edit`] — which is why the panel and
+    /// [`Document::apply`] are the only two callers, and why the second one exists at all.
+    pub fn terrain_mut(&mut self) -> Option<&mut Terrain> {
+        self.terrain.as_mut()
+    }
+
+    /// TODO(jb-doc): the three things an edit invalidates and why the water is one of them
+    /// — that a solved water state is derived from a height that has just moved.
+    pub fn note_edit(&mut self) {
+        self.dirty = true;
+        self.baked = Baked::Nothing;
+        self.error = None;
+        // The stack has changed, so whatever it failed on last time is worth trying again
+        // — which is what lets a cycle be undone by the toggle that made it.
+        self.bake_failed = false;
+        // `invalidate_water`, never `clear_water`: the latter drops the *spec* too, which
+        // is right for "Reset water" and catastrophic here — the first edit after a solve
+        // would take away the recipe, and every later solve would refuse a document that
+        // looks perfectly ordinary.
+        if let Some(terrain) = self.terrain.as_mut()
+            && terrain.water().is_some()
+        {
+            terrain.invalidate_water();
+            self.water_revision += 1;
+        }
+    }
+
+    /// TODO(jb-doc): why a structural edit goes through the document rather than through
+    /// the terrain it holds, given the terrain is reachable either way.
+    pub fn apply(&mut self, edit: &Edit) -> Result<Value, String> {
+        if self.is_busy() {
+            return Err(format!(
+                "a {} is running",
+                self.job().map(JobKind::name).unwrap_or("job")
+            ));
+        }
+        let terrain = self
+            .terrain
+            .as_mut()
+            .ok_or("there is no document to edit")?;
+        let reply = edit.apply(terrain)?;
+        self.note_edit();
+        Ok(reply)
     }
 
     /// TODO(jb-doc): why an unknown name is refused rather than silently kept — that the
@@ -160,6 +303,53 @@ impl Document {
     fn start(&mut self, kind: JobKind, task: Task<Outcome>) {
         self.error = None;
         self.job = Job::Running { kind, task };
+        self.baking = Baked::Nothing;
+        // Any job starting supersedes a solve that was waiting on a bake — including the
+        // bake it was waiting for, which is why `solve_with_bake` sets the flag *after*
+        // asking for it.
+        self.pending_solve = false;
+    }
+
+    /// What the "Solve water" button and the `solve-water` verb both do: a solve needs the
+    /// whole document baked, so bake it first when it is not.
+    ///
+    /// [`Document::start_solve`] still refuses a part-baked document — that guard is what
+    /// makes it impossible to solve a stale height, and this is the *caller* that knows
+    /// what to do about it rather than a relaxation of it.
+    pub fn solve_with_bake(&mut self) -> Result<(), String> {
+        if self.baked == Baked::Whole && !self.dirty {
+            return self.start_solve();
+        }
+        self.start_bake(None)?;
+        self.pending_solve = true;
+        Ok(())
+    }
+
+    /// A rectangle re-bakes only that much of the document and says so afterwards; `None`
+    /// is the whole of it, which is the only thing that makes a document solvable again.
+    ///
+    /// TODO(jb-doc): why the rectangle is passed in rather than read off the camera here.
+    pub fn start_bake(&mut self, rect: Option<CellRect>) -> Result<(), String> {
+        let mut terrain = self.take_terrain()?;
+        let covered = match rect {
+            Some(rect) => Baked::Rect(rect.intersect(terrain.rect())),
+            None => Baked::Whole,
+        };
+        let rect = rect.unwrap_or_else(|| terrain.rect());
+
+        let task = AsyncComputeTaskPool::get().spawn(async move {
+            let error = terrain.bake_rect(rect).err().map(|error| error.to_string());
+            Outcome {
+                terrain: Some(terrain),
+                error,
+            }
+        });
+        self.start(JobKind::Bake, task);
+        self.dirty = false;
+        // Asked for by name, so it is tried again however the last one went.
+        self.bake_failed = false;
+        self.baking = covered;
+        Ok(())
     }
 
     /// TODO(jb-doc): why building the preset happens on the pool with the bake rather than
@@ -171,6 +361,7 @@ impl Document {
         self.preset = preset;
         self.path = None;
         self.terrain = None;
+        self.baked = Baked::Nothing;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut terrain = preset.build(size, seed);
@@ -181,12 +372,20 @@ impl Document {
             }
         });
         self.start(JobKind::New, task);
+        self.dirty = false;
+        self.baking = Baked::Whole;
         Ok(())
     }
 
     /// TODO(jb-doc): why the spec is read off the document rather than passed in, and what
     /// a document with no spec is being told when this refuses.
     pub fn start_solve(&mut self) -> Result<(), String> {
+        // Refused rather than quietly solving what is there: water is derived from the
+        // height everywhere at once, and a document only part of which matches its layers
+        // would produce a drainage network for a landscape that no longer exists.
+        if self.baked != Baked::Whole || self.dirty {
+            return Err("the document is only partly baked; bake it before solving".to_owned());
+        }
         let mut terrain = self.take_terrain()?;
         let Some(spec) = terrain.water_spec.clone() else {
             self.terrain = Some(terrain);
@@ -238,6 +437,7 @@ impl Document {
         self.busy_check()?;
         self.path = Some(path.clone());
         self.terrain = None;
+        self.baked = Baked::Nothing;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             match Terrain::load_from_path(&path) {
@@ -252,6 +452,11 @@ impl Document {
             }
         });
         self.start(JobKind::Load, task);
+        self.dirty = false;
+        // A load answers with a document whose bake is complete however the file carried
+        // it — the reader re-derives what the file left out, which is the same contract
+        // `SaveOptions` documents from the writing end.
+        self.baking = Baked::Whole;
         Ok(())
     }
 
@@ -290,6 +495,16 @@ fn finish_job(mut document: ResMut<Document>) {
     document.revision += 1;
     document.water_revision += 1;
 
+    // A bake that failed wrote nothing worth claiming — the document keeps the extent it
+    // had, so a cycle introduced by a toggle leaves the last good bake on screen rather
+    // than a rectangle of whatever the error interrupted.
+    if outcome.error.is_none() {
+        document.baked = document.baked.with(document.baking);
+    } else if matches!(kind, JobKind::Bake | JobKind::New) {
+        document.bake_failed = true;
+    }
+    document.baking = Baked::Nothing;
+
     if let Some(error) = outcome.error {
         error!("{} failed: {error}", kind.name());
         document.error = Some(error);
@@ -305,5 +520,147 @@ fn finish_job(mut document: ResMut<Document>) {
             names[0].clone()
         };
         document.active = fallback;
+    }
+
+    // The solve that was standing behind a whole-document bake. Nothing is started if the
+    // bake failed — that error is the answer, and a solve over a stack that would not bake
+    // has nothing to read.
+    if kind == JobKind::Bake && document.pending_solve {
+        document.pending_solve = false;
+        if document.error.is_none()
+            && let Err(error) = document.start_solve()
+        {
+            error!("solve failed: {error}");
+            document.error = Some(error);
+        }
+    }
+}
+
+/// Opens the re-bake an edit is waiting for, and the one a pan into unbaked ground needs.
+///
+/// Both are the same job because they answer the same question — the rectangle on screen
+/// does not match the layers — and separating them would mean two callers racing for the
+/// one slot a document has.
+///
+/// TODO(jb-comment): why an edit made while a bake is in flight costs a second whole job
+/// rather than being folded into the one already running.
+fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>) {
+    if document.is_busy() {
+        return;
+    }
+    let wanted = if document.terrain().is_some() {
+        visible.0
+    } else {
+        CellRect::EMPTY
+    };
+
+    match wanted_rebake(document.dirty, document.bake_failed, document.baked, wanted) {
+        // Nothing will be baked, so nothing is waiting on one: an edit left dirty here
+        // would have every caller watching for the document to settle wait forever.
+        None => document.dirty = false,
+        Some(rect) => {
+            if let Err(error) = document.start_bake(Some(rect)) {
+                warn!("{error}");
+            }
+        }
+    }
+}
+
+/// The decision [`start_pending_bake`] makes, separated from the world it reads it out of.
+///
+/// TODO(jb-comment): why the answer is a rectangle rather than a yes, and what the margin
+/// on it buys a camera that has moved a little.
+fn wanted_rebake(
+    dirty: bool,
+    bake_failed: bool,
+    baked: Baked,
+    wanted: CellRect,
+) -> Option<CellRect> {
+    // A stack that failed to bake fails the same way every frame, so retrying it would
+    // burn a core and never let the document go idle. The error stands until the next
+    // edit, which is the only thing that could change the answer.
+    if bake_failed || wanted.is_empty() {
+        return None;
+    }
+    if !dirty && baked.covers(wanted) {
+        return None;
+    }
+    Some(wanted.expand(REBAKE_MARGIN_CELLS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(min: u32, max: u32) -> CellRect {
+        CellRect::new(UVec2::splat(min), UVec2::splat(max))
+    }
+
+    #[test]
+    fn a_whole_bake_covers_every_rectangle_and_nothing_covers_one_a_rebake_has_not_reached() {
+        assert!(Baked::Whole.covers(rect(0, 4096)));
+        assert!(Baked::Rect(rect(0, 100)).covers(rect(10, 90)));
+        assert!(Baked::Rect(rect(0, 100)).covers(rect(0, 100)));
+        assert!(!Baked::Rect(rect(0, 100)).covers(rect(50, 150)));
+        assert!(!Baked::Nothing.covers(rect(0, 1)));
+    }
+
+    /// An empty rectangle is covered by anything, including a document with no bake at
+    /// all — which is what lets a camera that is nowhere near the document leave a
+    /// pending edit answered rather than waiting for a bake with nothing to show.
+    #[test]
+    fn an_empty_rectangle_is_covered_by_a_document_with_no_bake() {
+        assert!(Baked::Nothing.covers(CellRect::EMPTY));
+        assert!(Baked::Rect(rect(0, 10)).covers(CellRect::EMPTY));
+    }
+
+    #[test]
+    fn rebaked_rectangles_accumulate_and_a_whole_bake_swallows_them() {
+        let grown = Baked::Nothing
+            .with(Baked::Rect(rect(0, 10)))
+            .with(Baked::Rect(rect(20, 30)));
+        assert_eq!(grown, Baked::Rect(rect(0, 30)));
+        assert!(grown.covers(rect(5, 25)));
+
+        assert_eq!(grown.with(Baked::Whole), Baked::Whole);
+        // A job that covered nothing — a save, a solve — leaves the extent where it was.
+        assert_eq!(grown.with(Baked::Nothing), grown);
+    }
+
+    #[test]
+    fn an_edit_asks_for_the_view_and_a_covered_view_asks_for_nothing() {
+        let view = rect(100, 200);
+        let asked = wanted_rebake(true, false, Baked::Nothing, view).expect("an edit is answered");
+        assert!(
+            asked.union(view) == asked,
+            "the rebake has to cover what is on screen"
+        );
+
+        assert_eq!(wanted_rebake(false, false, Baked::Whole, view), None);
+        assert_eq!(
+            wanted_rebake(false, false, Baked::Rect(rect(0, 300)), view),
+            None
+        );
+        // Panning onto ground no bake has reached since the edit asks for it, with nothing
+        // dirty — that is the half of this that is not about editing at all.
+        assert!(wanted_rebake(false, false, Baked::Rect(rect(0, 150)), view).is_some());
+    }
+
+    /// The defect this guards cost a hang rather than a wrong picture: a stack holding a
+    /// cycle failed, was retried the next frame, and the document never went idle for the
+    /// caller waiting on the edit that introduced it.
+    #[test]
+    fn a_stack_that_will_not_bake_is_not_tried_again_until_something_changes() {
+        let view = rect(100, 200);
+        assert_eq!(wanted_rebake(true, true, Baked::Nothing, view), None);
+        assert_eq!(wanted_rebake(false, true, Baked::Nothing, view), None);
+    }
+
+    #[test]
+    fn a_view_that_holds_no_cells_asks_for_no_rebake() {
+        assert_eq!(
+            wanted_rebake(true, false, Baked::Nothing, CellRect::EMPTY),
+            None
+        );
     }
 }

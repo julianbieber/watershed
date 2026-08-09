@@ -1,0 +1,112 @@
+# Edit a field's layer stack from outside the process and watch the bake follow it.
+#
+# Run with:  just drive run scenarios/a_layer_moves_the_bake.txt
+#
+# What makes this reproducible is that an edit holds its reply until the re-bake it
+# provoked has landed — `layer` and `set` answer when the document is settled, not when the
+# number in the stack changed. Nothing below counts frames.
+
+# Before anything else: did the run complain? A shader that failed to compile draws nothing
+# rather than drawing wrong. `observe log` drains, so this must come before any other call
+# to it or the startup errors are already gone.
+observe log
+
+fixed-delta 1/60
+
+# 256 square, and fitted — so the visible rectangle a live re-bake covers is the whole
+# document, which is what lets `observe field` below be a statement about all of it rather
+# than about the part that happened to be on screen.
+new 256 256 7 continents
+wait bake
+zoom fit
+
+# The stack as the preset built it, and the field it bakes. Both are the "before" the rest
+# of this scenario is measured against.
+observe layers
+observe field
+
+# The assertion this scenario exists for: a layer added through the ctl moves the bake.
+# A constant added on top raises every cell, so the quantiles below must all be above the
+# ones above — and `baked` must have fallen from `whole` to `rect`, because a live re-bake
+# covers what is on screen and says so.
+layer add height constant 0.25
+observe field
+observe document
+
+# The op's parameters, one at a time, without rewriting the op around them. The amplitude
+# and the blend belong to the layer; the value belongs to the op.
+set height.2.amplitude 0.5
+set height.2.blend add
+set height.2.op.value 0.4
+observe field
+
+# Switching it off has to put the field back exactly where it started — that is what makes
+# `enabled` data rather than the caller keeping a copy of the stack.
+layer toggle height 2 off
+observe field
+
+layer toggle height 2 on
+capture /tmp/watershed-scenario/layer-added.png
+
+# Reordering, and the result is worth knowing before tuning a stack: moving the constant
+# below the continent layer erases it entirely, because that layer blends with `replace`
+# and replace discards everything under it. The quantiles come back to the ones at the top
+# of this run — a layer's position decides whether it is read at all, not just how much.
+layer move height 2 0
+observe layers
+observe field
+
+# And removing it leaves the stack the preset built, so the field comes back to the numbers
+# at the top of this run.
+layer rm height 0
+observe field
+
+# A masked layer, which is the other half of what a layer can be told: this one applies only
+# where moisture is high, so it changes the field without changing all of it.
+layer add height noise ridged 0.01 4 99
+set height.2.amplitude 0.3
+set height.2.mask field moisture 0.5 0.8 0 1
+observe layers
+observe field
+capture /tmp/watershed-scenario/masked-layer.png
+
+# A field property rather than a layer's. A shift changes the raster the field is written
+# onto, so it is the one edit that discards the bake rather than patching it.
+set moisture.shift 3
+observe layers
+
+# Water is refused while the document is only part baked, because a drainage network solved
+# against a stale height is wrong everywhere the height moved. `bake` is what answers that,
+# and it is the whole document rather than the view.
+bake
+observe document
+solve-water
+wait water
+observe water
+
+# Solve, edit, solve again. This is the sequence that was reported broken from the running
+# editor: an edit invalidates the water it produced, and used to take the water *spec* with
+# it — so the first edit after the first solve left a document that looked entirely ordinary
+# and could never be solved again. Both solves below have to answer with water, and with
+# *different* lake counts, since the height under them moved.
+#
+# Note there is no `bake` here and none is needed: a solve bakes the whole document first
+# when it has to, which is what the button does and therefore what this verb does.
+set height.1.op.scale 0.05
+solve-water
+observe water
+
+set height.1.amplitude 0.4
+solve-water
+observe water
+
+# Close up on one corner. The re-bake covers the visible rectangle, so panning somewhere
+# that has not been baked since the last edit has to bring it up to date on its own.
+pan 64 64
+zoom 96
+observe view
+observe document
+capture /tmp/watershed-scenario/corner.png
+
+# And again at the end, for anything the editing, baking and capturing provoked.
+observe log

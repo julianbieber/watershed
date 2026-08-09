@@ -3,8 +3,9 @@ use std::fmt;
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 
-use crate::layer::Layer;
+use crate::layer::{Layer, LayerOp};
 use crate::raster::{Raster, raster_coord, resolution};
+use crate::regions::RegionOutput;
 
 /// TODO(jb-doc): why a field is named rather than numbered, and what that costs against
 /// what it buys in a header a person edits.
@@ -115,11 +116,40 @@ impl Field {
         self.baked = raster;
     }
 
+    /// TODO(jb-doc): why this is derived from the ops rather than declared beside the
+    /// shift — that it follows an op parameter in the same edit that changes it, and that
+    /// a document written before it existed needs no migration.
+    ///
+    /// TODO(jb-comment): why a disabled layer does not make a field categorical, on the
+    /// same terms as [`Field::dependencies`].
+    pub fn is_categorical(&self) -> bool {
+        self.layers
+            .iter()
+            .filter(|layer| layer.enabled)
+            .any(|layer| {
+                matches!(
+                    &layer.op,
+                    LayerOp::Regions {
+                        output: RegionOutput::RegionId | RegionOutput::CoverClass,
+                        ..
+                    }
+                )
+            })
+    }
+
     /// TODO(jb-doc): the coordinate space this takes — document cells, a cell centre at
     /// `x + 0.5` — and why a coarse field is read bilinearly rather than as blocks.
+    ///
+    /// TODO(jb-doc): the exception, and what the value halfway between two region ids
+    /// would name if it were interpolated.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
-        self.baked
-            .sample_bilinear(raster_coord(x, self.shift), raster_coord(y, self.shift))
+        let u = raster_coord(x, self.shift);
+        let v = raster_coord(y, self.shift);
+        if self.is_categorical() {
+            self.baked.sample_nearest(u, v)
+        } else {
+            self.baked.sample_bilinear(u, v)
+        }
     }
 
     /// TODO(jb-comment): why a disabled layer contributes no dependency, and what that
