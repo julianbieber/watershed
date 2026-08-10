@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::field::{Field, FieldId};
-use crate::layer::{Blend, LayerOp, Mask, Remap};
+use crate::layer::{Blend, LayerOp, Mask, Remap, SlopeMode};
 use crate::noise::Noise;
 use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
 use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
@@ -80,6 +80,148 @@ impl Terrain {
         self.bake_rect(self.rect())
     }
 
+    /// The order a bake visits the fields in: every field after the ones it reads.
+    ///
+    /// This is the whole of what a caller needs to drive a bake a stage at a time, and it
+    /// is a *plan* rather than a running bake — nothing is borrowed, so the document
+    /// stays readable between stages and the caller decides the pacing. Anything that
+    /// would make a bake fail late (a cycle, a missing field, a duplicate id) fails here
+    /// instead, before a single texel is written.
+    ///
+    /// TODO(jb-doc): why this hands back ids rather than indices, given the caller then
+    /// looks each one up again.
+    pub fn bake_order(&self) -> Result<Vec<FieldId>, BakeError> {
+        let index_of = self.index_fields()?;
+        let dependencies = self.resolve_dependencies(&index_of)?;
+        let order = topological_order(&dependencies, &self.fields)?;
+        Ok(order
+            .into_iter()
+            .map(|index| self.fields[index].id.clone())
+            .collect())
+    }
+
+    /// Bake one field over the whole document, assuming everything it reads is baked.
+    ///
+    /// **The assumption is the caller's to keep**, and [`Terrain::bake_order`] is how:
+    /// walking that order calls this on a field only after its dependencies. Called out
+    /// of order it does not fail — it reads whatever those fields currently hold, which
+    /// for an unbaked one is zero. That is the same fallback a document has before any
+    /// bake at all, and it is what makes a partially baked document *displayable* rather
+    /// than an error state.
+    pub fn bake_field(&mut self, id: &str) -> Result<(), BakeError> {
+        if self.size.x == 0 || self.size.y == 0 {
+            return Err(BakeError::ZeroSize(self.size.x, self.size.y));
+        }
+        let index_of = self.index_fields()?;
+        let reader = FieldId::from(id);
+        let target = lookup(&index_of, &reader, &reader)?;
+        // **Only the target**, where a whole-document bake reallocates everything. That
+        // is what makes [`Terrain::release`] mean something: reallocating every field
+        // here would hand a released one its full-size raster straight back, and a
+        // staged bake would peak at the sum of the document however carefully the caller
+        // dropped things. A field still empty when something reads it samples as zero,
+        // which is the documented reading of an unbaked field either way.
+        let wanted = resolution(self.size, self.fields[target].shift);
+        if self.fields[target].baked().size() != wanted {
+            *self.fields[target].baked_mut() = Raster::new(wanted, 0.0);
+        }
+
+        let shifts: Vec<u8> = self.fields.iter().map(|field| field.shift).collect();
+        let categorical: Vec<bool> = self.fields.iter().map(Field::is_categorical).collect();
+        let mut baked: Vec<Raster<f32>> = self
+            .fields
+            .iter_mut()
+            .map(|field| field.take_baked())
+            .collect();
+
+        let rect = self.rect();
+        let result = self.evaluate(target, rect, &index_of, &shifts, &categorical, &mut baked);
+
+        for (field, raster) in self.fields.iter_mut().zip(baked) {
+            field.put_baked(raster);
+        }
+        result
+    }
+
+    /// Drop a field's baked raster, keeping the layers that would rebuild it.
+    ///
+    /// **This is what makes a staged bake affordable rather than merely visible.** A
+    /// document's fields do not all have to be resident at once: an intermediate is dead
+    /// as soon as everything downstream of it has been baked, and at a whole-world size a
+    /// single shift-0 field is tens of megabytes. Releasing as the order advances turns
+    /// the peak from the sum of every field into the widest live set.
+    ///
+    /// A released field samples as zero, exactly as one that has never been baked — so
+    /// releasing something still to be read is not an error, it is a wrong answer, and
+    /// the caller owns that distinction the same way it owns the bake order.
+    pub fn release(&mut self, id: &str) -> bool {
+        match self.field_mut(id) {
+            Some(field) => {
+                *field.baked_mut() = Raster::default();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many bytes the baked rasters currently hold.
+    ///
+    /// TODO(jb-doc): why this counts only the bakes and not the layers, given a painted
+    /// layer carries a raster of its own.
+    pub fn baked_bytes(&self) -> usize {
+        self.fields
+            .iter()
+            .map(|field| {
+                let size = field.baked().size();
+                size.x as usize * size.y as usize * size_of::<f32>()
+            })
+            .sum()
+    }
+
+    /// One field's texels, written into `baked[target]`.
+    ///
+    /// The one implementation of "evaluate this stack here", shared by the whole-document
+    /// bake, the rect re-bake and the staged one, so a stage cannot drift from a bake.
+    fn evaluate(
+        &self,
+        target: usize,
+        rect: CellRect,
+        index_of: &HashMap<String, usize>,
+        shifts: &[u8],
+        categorical: &[bool],
+        baked: &mut [Raster<f32>],
+    ) -> Result<(), BakeError> {
+        let field = &self.fields[target];
+        let texels = rect.to_texels(field.shift, baked[target].size());
+        if texels.is_empty() {
+            return Ok(());
+        }
+        let layers = compile_layers(field, index_of, self.size)?;
+        let bounds = field.bounds();
+        let shift = field.shift;
+        let rows = {
+            let context = Evaluator {
+                size: self.size,
+                baked,
+                shifts,
+                categorical,
+            };
+            map_rows(texels.min.y, texels.max.y, |j| {
+                (texels.min.x..texels.max.x)
+                    .map(|i| context.texel(&layers, shift, bounds, i, j))
+                    .collect()
+            })
+        };
+        let target_raster = &mut baked[target];
+        for (offset, row) in rows.into_iter().enumerate() {
+            let j = texels.min.y + offset as u32;
+            for (n, value) in row.into_iter().enumerate() {
+                target_raster.set(texels.min.x + n as u32, j, value);
+            }
+        }
+        Ok(())
+    }
+
     /// TODO(jb-doc): the contract this carries — that the document is already baked, and
     /// that what comes back inside the rectangle is what a full bake would have written.
     pub fn bake_rect(&mut self, rect: CellRect) -> Result<(), BakeError> {
@@ -106,41 +248,25 @@ impl Terrain {
             .map(|field| field.take_baked())
             .collect();
 
+        let mut result = Ok(());
         for &target in &order {
-            let field = &self.fields[target];
-            let texels = required[target].to_texels(field.shift, baked[target].size());
-            if texels.is_empty() {
-                continue;
-            }
-            let layers = compile_layers(field, &index_of, self.size)?;
-            let bounds = field.bounds();
-            let shift = field.shift;
-            let rows = {
-                let context = Evaluator {
-                    size: self.size,
-                    baked: &baked,
-                    shifts: &shifts,
-                    categorical: &categorical,
-                };
-                map_rows(texels.min.y, texels.max.y, |j| {
-                    (texels.min.x..texels.max.x)
-                        .map(|i| context.texel(&layers, shift, bounds, i, j))
-                        .collect()
-                })
-            };
-            let target_raster = &mut baked[target];
-            for (offset, row) in rows.into_iter().enumerate() {
-                let j = texels.min.y + offset as u32;
-                for (n, value) in row.into_iter().enumerate() {
-                    target_raster.set(texels.min.x + n as u32, j, value);
-                }
+            result = self.evaluate(
+                target,
+                required[target],
+                &index_of,
+                &shifts,
+                &categorical,
+                &mut baked,
+            );
+            if result.is_err() {
+                break;
             }
         }
 
         for (field, raster) in self.fields.iter_mut().zip(baked) {
             field.put_baked(raster);
         }
-        Ok(())
+        result
     }
 
     // TODO(jb-comment): why the index owns its keys rather than borrowing the ids out of
@@ -356,7 +482,11 @@ enum CompiledOp<'a> {
     Constant(f32),
     Noise(Noise),
     Raster(&'a Raster<f32>),
-    Slope { of: usize, sample_tiles: f32 },
+    Slope {
+        of: usize,
+        sample_tiles: f32,
+        mode: SlopeMode,
+    },
     FieldRef(usize),
     Regions(RegionMap, CompiledOutput),
 }
@@ -385,9 +515,14 @@ fn compile_layers<'a>(
             LayerOp::Constant(value) => CompiledOp::Constant(*value),
             LayerOp::Noise(spec) => CompiledOp::Noise(Noise::new(spec)),
             LayerOp::Paint(raster) | LayerOp::External(raster) => CompiledOp::Raster(raster),
-            LayerOp::Slope { of, sample_tiles } => CompiledOp::Slope {
+            LayerOp::Slope {
+                of,
+                sample_tiles,
+                mode,
+            } => CompiledOp::Slope {
                 of: lookup(index_of, of, &field.id)?,
                 sample_tiles: *sample_tiles,
+                mode: *mode,
             },
             LayerOp::FieldRef(id) => CompiledOp::FieldRef(lookup(index_of, id, &field.id)?),
             LayerOp::Regions { spec, output } => {
@@ -456,14 +591,24 @@ impl Evaluator<'_> {
 
     /// TODO(jb-comment): why the slope is a central difference in document cells rather
     /// than in texels of the field it reads.
-    fn slope(&self, index: usize, sample_tiles: f32, position: Vec2) -> f32 {
+    fn slope(&self, index: usize, sample_tiles: f32, mode: SlopeMode, position: Vec2) -> f32 {
         let reach = sample_tiles.abs().max(f32::EPSILON);
-        let dx = self.field(index, position + Vec2::new(reach, 0.0))
-            - self.field(index, position - Vec2::new(reach, 0.0));
-        let dy = self.field(index, position + Vec2::new(0.0, reach))
-            - self.field(index, position - Vec2::new(0.0, reach));
-        let scale = 2.0 * reach;
-        ((dx / scale).powi(2) + (dy / scale).powi(2)).sqrt()
+        match mode {
+            SlopeMode::Gradient => {
+                let dx = self.field(index, position + Vec2::new(reach, 0.0))
+                    - self.field(index, position - Vec2::new(reach, 0.0));
+                let dy = self.field(index, position + Vec2::new(0.0, reach))
+                    - self.field(index, position - Vec2::new(0.0, reach));
+                let scale = 2.0 * reach;
+                ((dx / scale).powi(2) + (dy / scale).powi(2)).sqrt()
+            }
+            SlopeMode::SteepestAxis => {
+                let here = self.field(index, position);
+                let dx = (self.field(index, position + Vec2::new(reach, 0.0)) - here).abs();
+                let dy = (self.field(index, position + Vec2::new(0.0, reach)) - here).abs();
+                dx.max(dy) / reach
+            }
+        }
     }
 
     fn value(&self, op: &CompiledOp<'_>, position: Vec2) -> f32 {
@@ -471,7 +616,11 @@ impl Evaluator<'_> {
             CompiledOp::Constant(value) => *value,
             CompiledOp::Noise(noise) => noise.sample(position.x, position.y),
             CompiledOp::Raster(raster) => raster.sample_over(self.size, position.x, position.y),
-            CompiledOp::Slope { of, sample_tiles } => self.slope(*of, *sample_tiles, position),
+            CompiledOp::Slope {
+                of,
+                sample_tiles,
+                mode,
+            } => self.slope(*of, *sample_tiles, *mode, position),
             CompiledOp::FieldRef(index) => self.field(*index, position),
             CompiledOp::Regions(map, output) => map.sample(*output, position.x, position.y),
         }
@@ -549,6 +698,130 @@ mod tests {
                         Remap::new((0.3, 0.7), (0.0, 1.0)),
                     ))),
             )
+    }
+
+    /// The whole point of the staged bake: a caller that walks the order one field at a
+    /// time has to end up with exactly the document a single `bake()` would have written,
+    /// or the intermediate results it showed were of a different world.
+    #[test]
+    fn baking_a_stage_at_a_time_writes_what_one_bake_would_have() {
+        let mut whole = two_field_document().with_field(
+            Field::new("relief")
+                .with_range((-1.0, 1.0))
+                .with_layer(Layer::new(LayerOp::Slope {
+                    of: FieldId::from("height"),
+                    sample_tiles: 5.0,
+                    mode: SlopeMode::SteepestAxis,
+                })),
+        );
+        let mut staged = whole.clone();
+
+        whole.bake().unwrap();
+        for id in staged.bake_order().unwrap() {
+            staged.bake_field(id.as_str()).unwrap();
+        }
+
+        for field in &whole.fields {
+            let one = field.baked();
+            let other = staged.field(field.id.as_str()).unwrap().baked();
+            assert_eq!(one.size(), other.size(), "{} changed size", field.id);
+            assert!(
+                one.data().iter().zip(other.data()).all(|(a, b)| a == b),
+                "{} differs between a staged bake and a whole one",
+                field.id
+            );
+        }
+    }
+
+    /// Releasing is what keeps a staged bake's peak below the sum of its fields, and it
+    /// has to leave the document able to rebuild what it dropped.
+    #[test]
+    fn a_released_field_reads_as_zero_and_bakes_back() {
+        let mut terrain = two_field_document();
+        terrain.bake().unwrap();
+
+        let before = terrain.baked_bytes();
+        let sampled = terrain.sample("height", 12.5, 9.5).unwrap();
+        assert!(
+            sampled != 0.0,
+            "the sample to compare against is already zero"
+        );
+
+        assert!(terrain.release("height"));
+        assert!(terrain.baked_bytes() < before);
+        assert_eq!(terrain.sample("height", 12.5, 9.5), Some(0.0));
+
+        terrain.bake_field("height").unwrap();
+        assert_eq!(terrain.baked_bytes(), before);
+        assert_eq!(terrain.sample("height", 12.5, 9.5), Some(sampled));
+    }
+
+    /// The guard on the whole point of releasing: a staged bake that drops what it no
+    /// longer needs must actually *hold* less, not hand the raster straight back on the
+    /// next stage.
+    #[test]
+    fn a_staged_bake_does_not_re_allocate_what_the_caller_released() {
+        let mut terrain = two_field_document();
+        let order = terrain.bake_order().unwrap();
+        terrain.bake_field(order[0].as_str()).unwrap();
+
+        let with_first = terrain.baked_bytes();
+        terrain.release(order[0].as_str());
+        let released = terrain.baked_bytes();
+        assert!(released < with_first);
+
+        // Baking the *next* field must not resurrect the one just dropped.
+        terrain.bake_field(order[1].as_str()).unwrap();
+        assert_eq!(
+            terrain.field(order[0].as_str()).unwrap().baked().size(),
+            UVec2::ZERO,
+            "a released field came back when the next stage baked"
+        );
+    }
+
+    #[test]
+    fn releasing_a_field_that_is_not_there_says_so_rather_than_panicking() {
+        let mut terrain = two_field_document();
+        assert!(!terrain.release("nowhere"));
+    }
+
+    /// A stage list has to be an order rather than a listing: a field that reads another
+    /// cannot come first, or the caller walking it would bake against zeros.
+    #[test]
+    fn the_stage_order_puts_a_field_after_everything_it_reads() {
+        let terrain = two_field_document();
+        let order = terrain.bake_order().unwrap();
+        let position = |id: &str| order.iter().position(|got| got.as_str() == id).unwrap();
+        assert!(position("moisture") < position("height"));
+        assert_eq!(order.len(), terrain.fields.len());
+    }
+
+    /// The failures a bake can only discover late are the ones a caller most wants early,
+    /// because a staged bake has already drawn half a world by the time it hits one.
+    #[test]
+    fn a_stage_list_refuses_a_document_a_bake_would_refuse() {
+        let cyclic = Terrain::new(UVec2::splat(16))
+            .with_field(Field::new("a").with_layer(Layer::new(LayerOp::FieldRef("b".into()))))
+            .with_field(Field::new("b").with_layer(Layer::new(LayerOp::FieldRef("a".into()))));
+        assert!(matches!(cyclic.bake_order(), Err(BakeError::Cycle(_))));
+
+        let dangling = Terrain::new(UVec2::splat(16))
+            .with_field(Field::new("a").with_layer(Layer::new(LayerOp::FieldRef("gone".into()))));
+        assert!(matches!(
+            dangling.bake_order(),
+            Err(BakeError::UnknownField { .. })
+        ));
+    }
+
+    /// Baking a field the document does not carry is the caller's mistake and has to say
+    /// so, rather than quietly doing nothing.
+    #[test]
+    fn baking_a_field_that_is_not_there_says_which_one() {
+        let mut terrain = two_field_document();
+        assert!(matches!(
+            terrain.bake_field("nowhere"),
+            Err(BakeError::UnknownField { .. })
+        ));
     }
 
     #[test]
@@ -643,6 +916,7 @@ mod tests {
                     Layer::new(LayerOp::Slope {
                         of: FieldId::from("height"),
                         sample_tiles: 2.0,
+                        mode: SlopeMode::default(),
                     })
                     .with_blend(Blend::Replace),
                 ),
@@ -869,6 +1143,7 @@ mod tests {
                     Layer::new(LayerOp::Slope {
                         of: FieldId::from("height"),
                         sample_tiles: 2.0,
+                        mode: SlopeMode::default(),
                     })
                     .with_blend(Blend::Replace)
                     .with_amplitude(20.0),
@@ -910,6 +1185,7 @@ mod tests {
                 amplitude: 48.0,
                 scale: 1.0 / (128.0 * 0.75),
                 octaves: 3,
+                salts: None,
             })
     }
 
@@ -1135,6 +1411,56 @@ mod tests {
         assert!(reached.width() > painted.width());
     }
 
+    /// The two slope modes answer different questions, and on a plane tilted along one
+    /// axis the difference is arithmetic rather than a matter of degree: a gradient of a
+    /// pure x-slope is that slope, and so is the steepest axis, so a plane cannot tell
+    /// them apart. A plane tilted along *both* can — the gradient takes the hypotenuse
+    /// where the steepest axis takes the longer leg.
+    #[test]
+    fn the_two_slope_modes_differ_by_the_hypotenuse_on_a_tilted_plane() {
+        let rise = 0.001_f32;
+        let plane = |mode| {
+            let mut terrain =
+                Terrain::new(UVec2::splat(64))
+                    .with_field(
+                        Field::new("ground")
+                            .with_range((-10.0, 10.0))
+                            .with_layer(Layer::new(LayerOp::Constant(0.0))),
+                    )
+                    .with_field(Field::new("tilt").with_range((-10.0, 10.0)).with_layer(
+                        Layer::new(LayerOp::Slope {
+                            of: FieldId::from("ground"),
+                            sample_tiles: 4.0,
+                            mode,
+                        }),
+                    ));
+            // A plane written straight into the baked raster, so the slope reads exactly
+            // what the arithmetic says and no noise enters the comparison.
+            let size = terrain.size;
+            let mut raster = Raster::new(size, 0.0);
+            for y in 0..size.y {
+                for x in 0..size.x {
+                    raster.set(x, y, (x as f32 + y as f32) * rise);
+                }
+            }
+            let layer = Layer::new(LayerOp::External(raster)).with_blend(Blend::Replace);
+            terrain.field_mut("ground").unwrap().layers.push(layer);
+            terrain.bake().unwrap();
+            terrain.sample("tilt", 32.5, 32.5).unwrap()
+        };
+
+        let gradient = plane(SlopeMode::Gradient);
+        let steepest = plane(SlopeMode::SteepestAxis);
+        assert!(
+            (gradient - rise * 2.0_f32.sqrt()).abs() < 1e-6,
+            "a gradient of a doubly tilted plane is {gradient}, not the hypotenuse"
+        );
+        assert!(
+            (steepest - rise).abs() < 1e-6,
+            "the steepest axis of a doubly tilted plane is {steepest}, not one leg"
+        );
+    }
+
     /// The rectangle a stroke re-bakes is what keeps the document solvable, so it has to
     /// cover every cell a full bake would have written differently — including the ones in
     /// the fields that only *read* the one that changed.
@@ -1144,6 +1470,7 @@ mod tests {
             Layer::new(LayerOp::Slope {
                 of: FieldId::from("height"),
                 sample_tiles: 6.0,
+                mode: SlopeMode::default(),
             }),
         ));
         let paint = Raster::new(

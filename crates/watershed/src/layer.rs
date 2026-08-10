@@ -91,6 +91,26 @@ impl Default for Mask {
     }
 }
 
+/// How a slope reads the field under it.
+///
+/// The two answer different questions about the same ground, and which one a caller
+/// wants depends on what the slope is *for* rather than on accuracy. A gradient is the
+/// better estimate of the surface's true steepness; the steepest axis is what a thing
+/// travelling on the lattice — water, a walker, a wagon — actually has to climb, and it
+/// reads one sample further ahead rather than one either side, so it is a forward
+/// question rather than a symmetric one.
+///
+/// TODO(jb-doc): why a forward run is not just a cheaper central one — what the two do
+/// differently at a crest, and why that shows up in a field thresholded near zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SlopeMode {
+    /// A central difference on each axis, taken as a euclidean magnitude.
+    #[default]
+    Gradient,
+    /// A forward difference on each axis, taken as the larger of the two.
+    SteepestAxis,
+}
+
 /// TODO(jb-doc): what each op reads and what it deliberately does not — that amplitude,
 /// blending and masking belong to the layer and never to the op.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -103,6 +123,10 @@ pub enum LayerOp {
     Slope {
         of: FieldId,
         sample_tiles: f32,
+        /// TODO(jb-comment): why the default has to stay the gradient for a document
+        /// written before this existed.
+        #[serde(default)]
+        mode: SlopeMode,
     },
     FieldRef(FieldId),
     /// TODO(jb-doc): why this op reads no field, and what that buys the halo arithmetic

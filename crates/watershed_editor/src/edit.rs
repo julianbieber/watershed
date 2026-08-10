@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 use watershed::brush::{Brush, BrushMode};
-use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap};
+use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
 use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec};
 use watershed::raster::Raster;
 use watershed::regions::RegionOutput;
@@ -242,6 +242,7 @@ fn set_op(op: &mut LayerOp, property: &str, words: &[String]) -> Result<(), Stri
         (LayerOp::Slope { sample_tiles, .. }, "sample_tiles") => {
             *sample_tiles = number(first(words)?)?;
         }
+        (LayerOp::Slope { mode, .. }, "mode") => *mode = parse_slope_mode(first(words)?)?,
 
         (LayerOp::FieldRef(id), "field") => *id = first(words)?.as_str().into(),
 
@@ -282,6 +283,10 @@ pub fn parse_op(words: &[String]) -> Result<LayerOp, String> {
         "slope" => Ok(LayerOp::Slope {
             of: first(rest)?.as_str().into(),
             sample_tiles: number(rest.get(1).ok_or("a slope op needs a sample distance")?)?,
+            mode: match rest.get(2) {
+                Some(mode) => parse_slope_mode(mode)?,
+                None => SlopeMode::default(),
+            },
         }),
         // Sized by the first stroke rather than here, which is what lets it be written
         // without a document to measure against — and what makes an unpainted one inert,
@@ -390,6 +395,7 @@ fn parse_warp(words: &[String]) -> Result<Option<WarpSpec>, String> {
         amplitude: number(&words[1])?,
         scale: number(&words[2])?,
         octaves: number(&words[3])?,
+        salts: None,
     }))
 }
 
@@ -437,6 +443,25 @@ fn parse_noise_kind(word: &str) -> Result<NoiseKind, String> {
 
 /// A bare word is a column name, so the two categorical outputs take names no column
 /// would: an unknown column is caught by the bake, which is where the table is known.
+pub fn parse_slope_mode(word: &str) -> Result<SlopeMode, String> {
+    match word {
+        "gradient" => Ok(SlopeMode::Gradient),
+        "steepest_axis" => Ok(SlopeMode::SteepestAxis),
+        other => Err(format!(
+            "no slope mode called `{other}` — it is `gradient` or `steepest_axis`"
+        )),
+    }
+}
+
+pub fn slope_mode_name(mode: SlopeMode) -> &'static str {
+    match mode {
+        SlopeMode::Gradient => "gradient",
+        SlopeMode::SteepestAxis => "steepest_axis",
+    }
+}
+
+pub const SLOPE_MODES: [SlopeMode; 2] = [SlopeMode::Gradient, SlopeMode::SteepestAxis];
+
 pub fn parse_region_output(word: &str) -> RegionOutput {
     match word {
         "region_id" => RegionOutput::RegionId,
@@ -475,7 +500,14 @@ pub fn op_summary(op: &LayerOp) -> String {
             spec.octaves
         ),
         LayerOp::Paint(raster) => format!("paint {}x{}", raster.width(), raster.height()),
-        LayerOp::Slope { of, sample_tiles } => format!("slope of {of} over {sample_tiles}"),
+        LayerOp::Slope {
+            of,
+            sample_tiles,
+            mode,
+        } => format!(
+            "slope of {of} over {sample_tiles} by {}",
+            slope_mode_name(*mode)
+        ),
         LayerOp::FieldRef(id) => format!("fieldref {id}"),
         LayerOp::Regions { output, .. } => format!("regions {}", region_output_name(output)),
         LayerOp::External(raster) => format!("external {}x{}", raster.width(), raster.height()),

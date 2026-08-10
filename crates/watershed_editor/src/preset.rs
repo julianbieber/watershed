@@ -146,6 +146,7 @@ fn regions(size: UVec2, seed: u32) -> Terrain {
         amplitude: 160.0,
         scale: 1.0 / 288.0,
         octaves: 3,
+        salts: None,
     })
     .with_region(Region::new(3, [0.22, 0.04]))
     .with_region(Region::new(3, [0.52, 0.10]))

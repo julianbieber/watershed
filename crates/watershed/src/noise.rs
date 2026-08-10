@@ -18,10 +18,10 @@ pub const NOISE_GAIN: f32 = 2.6;
 /// gets near its nominal range.
 const RIDGE_GAIN: f32 = 2.0;
 
-// TODO(jb-comment): why a field's domain offset is derived from its own seed here
-// rather than from a master seed and a salt, and why the offset stays small.
-fn domain_offset(seed: u32) -> Vec2 {
-    let h = hash2(seed as i32, 0);
+// TODO(jb-comment): why the offset stays small, and why a salt of zero has to keep
+// hashing to exactly what a bare seed always did.
+fn domain_offset(seed: u32, salt: u32) -> Vec2 {
+    let h = hash2(seed as i32, salt as i32);
     Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0)
 }
 
@@ -40,16 +40,16 @@ pub struct NoiseField {
 }
 
 impl NoiseField {
-    pub fn new(seed: u32, scale: f32) -> Self {
-        Self::with_octaves(seed, scale, NOISE_OCTAVES)
+    pub fn new(seed: u32, salt: u32, scale: f32) -> Self {
+        Self::with_octaves(seed, salt, scale, NOISE_OCTAVES)
     }
 
     /// A field with a chosen octave count. The low-frequency layers of the terrain
     /// want fewer: an octave finer than the feature the layer is there to make is
     /// paid for on every tile and then buried under the layer above it.
-    pub fn with_octaves(seed: u32, scale: f32, octaves: u32) -> Self {
+    pub fn with_octaves(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
         Self {
-            offset: domain_offset(seed),
+            offset: domain_offset(seed, salt),
             scale,
             octaves,
         }
@@ -88,9 +88,9 @@ pub struct SignedNoiseField {
 }
 
 impl SignedNoiseField {
-    pub fn new(seed: u32, scale: f32, octaves: u32) -> Self {
+    pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
         Self {
-            offset: domain_offset(seed),
+            offset: domain_offset(seed, salt),
             scale,
             octaves,
         }
@@ -129,9 +129,9 @@ pub struct RidgedNoiseField {
 }
 
 impl RidgedNoiseField {
-    pub fn new(seed: u32, scale: f32, octaves: u32) -> Self {
+    pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
         Self {
-            offset: domain_offset(seed),
+            offset: domain_offset(seed, salt),
             scale,
             octaves,
         }
@@ -174,7 +174,7 @@ impl TilingNoiseField {
             "a tiling period must be a power of two"
         );
         Self {
-            offset: domain_offset(seed),
+            offset: domain_offset(seed, 0),
             period,
             octaves,
         }
@@ -406,6 +406,11 @@ pub struct WarpSpec {
     pub amplitude: f32,
     pub scale: f32,
     pub octaves: u32,
+    /// TODO(jb-doc): why the two component fields can be salted explicitly, what
+    /// `None` keeps meaning for a document written before this existed, and which
+    /// kind of caller has an offset it does not get to choose.
+    #[serde(default)]
+    pub salts: Option<(u32, u32)>,
 }
 
 /// TODO(jb-doc): why the warp is two fields rather than one.
@@ -417,9 +422,19 @@ pub struct Warp {
 
 impl Warp {
     pub fn new(spec: &WarpSpec) -> Self {
+        let (x, y) = match spec.salts {
+            Some((salt_x, salt_y)) => (
+                NoiseField::with_octaves(spec.seed, salt_x, spec.scale, spec.octaves),
+                NoiseField::with_octaves(spec.seed, salt_y, spec.scale, spec.octaves),
+            ),
+            None => (
+                NoiseField::with_octaves(sub_seed(spec.seed, 0), 0, spec.scale, spec.octaves),
+                NoiseField::with_octaves(sub_seed(spec.seed, 1), 0, spec.scale, spec.octaves),
+            ),
+        };
         Self {
-            x: NoiseField::with_octaves(sub_seed(spec.seed, 0), spec.scale, spec.octaves),
-            y: NoiseField::with_octaves(sub_seed(spec.seed, 1), spec.scale, spec.octaves),
+            x,
+            y,
             amplitude: spec.amplitude,
         }
     }
@@ -450,6 +465,11 @@ pub struct NoiseSpec {
     pub kind: NoiseKind,
     pub scale: f32,
     pub octaves: u32,
+    /// TODO(jb-doc): what the salt separates that the seed does not — one seed owning
+    /// a whole document's worth of independent fields — and why zero has to keep
+    /// hashing to what a bare seed always did.
+    #[serde(default)]
+    pub salt: u32,
     #[serde(default)]
     pub transform: SampleTransform,
     #[serde(default)]
@@ -463,6 +483,7 @@ impl NoiseSpec {
             kind,
             scale,
             octaves: NOISE_OCTAVES,
+            salt: 0,
             transform: SampleTransform::IDENTITY,
             warp: None,
         }
@@ -470,6 +491,11 @@ impl NoiseSpec {
 
     pub fn with_octaves(mut self, octaves: u32) -> Self {
         self.octaves = octaves;
+        self
+    }
+
+    pub fn with_salt(mut self, salt: u32) -> Self {
+        self.salt = salt;
         self
     }
 
@@ -503,15 +529,22 @@ impl Noise {
         let source = match spec.kind {
             NoiseKind::Fbm => NoiseSource::Fbm(NoiseField::with_octaves(
                 spec.seed,
+                spec.salt,
                 spec.scale,
                 spec.octaves,
             )),
-            NoiseKind::Signed => {
-                NoiseSource::Signed(SignedNoiseField::new(spec.seed, spec.scale, spec.octaves))
-            }
-            NoiseKind::Ridged => {
-                NoiseSource::Ridged(RidgedNoiseField::new(spec.seed, spec.scale, spec.octaves))
-            }
+            NoiseKind::Signed => NoiseSource::Signed(SignedNoiseField::new(
+                spec.seed,
+                spec.salt,
+                spec.scale,
+                spec.octaves,
+            )),
+            NoiseKind::Ridged => NoiseSource::Ridged(RidgedNoiseField::new(
+                spec.seed,
+                spec.salt,
+                spec.scale,
+                spec.octaves,
+            )),
         };
         Self {
             source,
@@ -595,6 +628,70 @@ mod tests {
         }
     }
 
+    /// A document written before the salt existed deserializes with `salt: 0`, so
+    /// zero has to keep meaning exactly what a bare seed meant — otherwise every
+    /// terrain already saved to disk bakes into a different landscape.
+    #[test]
+    fn an_unsalted_field_samples_where_a_bare_seed_always_put_it() {
+        let seed = 0xc0ff_ee01;
+        assert_eq!(
+            domain_offset(seed, 0),
+            Vec2::new(
+                (hash2(seed as i32, 0) & 0xffff) as f32 / 64.0,
+                (hash2(seed as i32, 0) >> 16) as f32 / 64.0,
+            )
+        );
+        assert_eq!(NoiseSpec::new(seed, NoiseKind::Fbm, 0.01).salt, 0);
+    }
+
+    /// The salt is what lets one seed own a whole document's worth of fields that
+    /// are independent of each other rather than views of one landscape.
+    #[test]
+    fn two_salts_off_one_seed_do_not_sample_the_same_landscape() {
+        let seed = 0xc0ff_ee01;
+        let one = Noise::new(&NoiseSpec::new(seed, NoiseKind::Fbm, 0.01).with_salt(0x0000_0001));
+        let two = Noise::new(&NoiseSpec::new(seed, NoiseKind::Fbm, 0.01).with_salt(0x9e37_79b9));
+        let differing = (0..256)
+            .filter(|i| {
+                let x = *i as f32 * 3.0;
+                (one.sample(x, 17.0) - two.sample(x, 17.0)).abs() > 1e-3
+            })
+            .count();
+        assert!(
+            differing > 200,
+            "only {differing} of 256 samples differ between two salts"
+        );
+    }
+
+    /// A warp that names its salts must place its two component fields where those
+    /// salts put them, not where `sub_seed` would have.
+    #[test]
+    fn a_salted_warp_moves_a_position_somewhere_a_sub_seeded_one_does_not() {
+        let base = WarpSpec {
+            seed: 0x5eed_0036,
+            amplitude: 160.0,
+            scale: 1.0 / 288.0,
+            octaves: 3,
+            salts: None,
+        };
+        let salted = WarpSpec {
+            salts: Some((0x7a1d_0b37, 0x9c3f_1102)),
+            ..base
+        };
+        let unsalted = Warp::new(&base);
+        let salted = Warp::new(&salted);
+        let differing = (0..256)
+            .filter(|i| {
+                let at = Vec2::new(*i as f32 * 13.0, 91.0);
+                unsalted.apply(at).distance(salted.apply(at)) > 1.0
+            })
+            .count();
+        assert!(
+            differing > 200,
+            "only {differing} of 256 positions warp differently"
+        );
+    }
+
     #[test]
     fn a_field_built_twice_from_one_seed_samples_the_same_both_times() {
         let spec = NoiseSpec::new(0xc0ff_ee01, NoiseKind::Fbm, 0.01)
@@ -607,6 +704,7 @@ mod tests {
                 amplitude: 40.0,
                 scale: 0.004,
                 octaves: 3,
+                salts: None,
             });
         let one = Noise::new(&spec);
         let two = Noise::new(&spec);
@@ -687,6 +785,7 @@ mod tests {
             amplitude,
             scale: 0.0035,
             octaves: 3,
+            salts: None,
         });
         for i in 0..256 {
             let at = Vec2::new(i as f32 * 11.0 - 1000.0, i as f32 * -6.0 + 500.0);
@@ -711,6 +810,7 @@ mod tests {
             amplitude: 160.0,
             scale,
             octaves: 3,
+            salts: None,
         });
         let base_wavelength = 1.0 / scale;
         let step = base_wavelength / 8.0;
@@ -737,6 +837,7 @@ mod tests {
             amplitude: 160.0,
             scale: 0.0035,
             octaves: 3,
+            salts: None,
         });
         let plain = Noise::new(&plain);
         let warped = Noise::new(&warped);
@@ -791,6 +892,7 @@ mod tests {
                 amplitude: 160.0,
                 scale: 0.0035,
                 octaves: 3,
+                salts: None,
             });
 
         let encoded = serde_json::to_string(&spec).expect("a spec serializes");

@@ -15,7 +15,7 @@ pub use bake::{BakeError, Terrain};
 pub use brush::{Brush, BrushMode};
 pub use field::{Field, FieldId};
 pub use io::{IoError, SaveOptions};
-pub use layer::{Blend, Layer, LayerOp, Mask, Remap};
+pub use layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
 pub use raster::{CellRect, Raster};
 pub use regions::{Region, RegionMap, RegionOutput, RegionSpec};
 pub use water::{WaterError, WaterSpec, WaterState};

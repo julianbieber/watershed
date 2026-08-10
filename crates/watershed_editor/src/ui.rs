@@ -4,7 +4,7 @@
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use watershed::brush::Brush;
-use watershed::layer::{Layer, LayerOp, Mask, Remap};
+use watershed::layer::{Layer, LayerOp, Mask, Remap, SlopeMode};
 use watershed::noise::{NoiseKind, NoiseSpec};
 use watershed::raster::Raster;
 use watershed::{FieldId, SaveOptions};
@@ -12,8 +12,8 @@ use watershed::{FieldId, SaveOptions};
 use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
 use crate::edit::{
-    BLENDS, BRUSH_MODES, Edit, NOISE_KINDS, blend_name, brush_mode_name, noise_kind_name, op_name,
-    parse_region_output, region_output_name,
+    BLENDS, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, blend_name, brush_mode_name,
+    noise_kind_name, op_name, parse_region_output, region_output_name, slope_mode_name,
 };
 use crate::material;
 use crate::preset::Preset;
@@ -701,7 +701,11 @@ fn op_editor(ui: &mut egui::Ui, op: &mut LayerOp, names: &[String], salt: usize)
             }
         }
 
-        LayerOp::Slope { of, sample_tiles } => {
+        LayerOp::Slope {
+            of,
+            sample_tiles,
+            mode,
+        } => {
             changed |= field_combo(ui, ("slope-of", salt), of, names);
             ui.horizontal(|ui| {
                 ui.label("sample tiles");
@@ -712,6 +716,18 @@ fn op_editor(ui: &mut egui::Ui, op: &mut LayerOp, names: &[String], salt: usize)
                             .range(0.5..=64.0),
                     )
                     .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("mode");
+                egui::ComboBox::from_id_salt(("slope-mode", salt))
+                    .selected_text(slope_mode_name(*mode))
+                    .show_ui(ui, |ui| {
+                        for candidate in SLOPE_MODES {
+                            changed |= ui
+                                .selectable_value(mode, candidate, slope_mode_name(candidate))
+                                .changed();
+                        }
+                    });
             });
         }
 
@@ -833,6 +849,7 @@ fn default_op(kind: &str, names: &[String]) -> LayerOp {
         "slope" => LayerOp::Slope {
             of: first_field(names),
             sample_tiles: 4.0,
+            mode: SlopeMode::default(),
         },
         // Empty, and sized by the first stroke — see `edit::parse_op`, which is the same
         // decision reached from the other end.

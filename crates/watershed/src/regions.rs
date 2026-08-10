@@ -409,6 +409,7 @@ mod tests {
                 amplitude: 160.0,
                 scale: 1.0 / (384.0 * 0.75),
                 octaves: 3,
+                salts: None,
             })
     }
 
