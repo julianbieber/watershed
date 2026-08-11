@@ -196,8 +196,15 @@ impl WaterState {
             .unwrap_or(0.0)
     }
 
+    /// TODO(jb-doc): what a caller does with a raw code that it cannot do with the
+    /// accumulation, what monotonicity of the quantization buys it, and what it may not
+    /// assume about the code.
+    pub fn accumulation_code(&self, x: u32, y: u32) -> u16 {
+        self.flow_accum.get(x, y).copied().unwrap_or(0)
+    }
+
     pub fn channel(&self, x: u32, y: u32, threshold: f32) -> bool {
-        self.accumulation(x, y) >= threshold
+        self.accumulation_code(x, y) >= quantize_accumulation(threshold)
     }
 
     /// TODO(jb-doc): why this is derived on read, and what `None` means.
@@ -488,7 +495,9 @@ fn direction_index(code: u8) -> Option<usize> {
     Some(code as usize - 1)
 }
 
-fn quantize_accumulation(value: f32) -> u16 {
+/// TODO(jb-doc): the inverse of [`dequantize_accumulation`], and why both directions are
+/// public where only one is used inside this module.
+pub fn quantize_accumulation(value: f32) -> u16 {
     let code = value.max(0.0).ln_1p() * ACCUM_QUANT;
     code.round().clamp(0.0, u16::MAX as f32) as u16
 }
@@ -746,6 +755,42 @@ mod tests {
                 "{value} came back as {found}"
             );
         }
+    }
+
+    /// TODO(jb-doc): that the two ways of asking agree except within one quantization
+    /// step; that a cell holding exactly 1.0 returns 0.99985945 from its round trip, so
+    /// the code compare is the more faithful of the two there; and what a caller wanting
+    /// a hard count has to decide for itself.
+    #[test]
+    fn comparing_codes_answers_what_comparing_accumulations_does() {
+        let size = UVec2::new(37, 29);
+        let height = raster_from(size, |x, y| {
+            let u = x as f32 * 0.23;
+            let v = y as f32 * 0.19;
+            (u.sin() + v.cos()) * 0.3 - (x + y) as f32 * 0.008
+        });
+        let state = solved(&height);
+
+        let mut channels = 0u32;
+        for threshold in [1.0f32, 2.5, 8.0, 40.0, 250.0] {
+            let code = quantize_accumulation(threshold);
+            for y in 0..size.y {
+                for x in 0..size.x {
+                    let value = state.accumulation(x, y);
+                    let by_code = state.accumulation_code(x, y) >= code;
+                    channels += u32::from(by_code);
+                    if by_code == (value >= threshold) {
+                        continue;
+                    }
+                    assert!(
+                        (value - threshold).abs() <= threshold * 1e-3,
+                        "cell {x},{y} at {value} disagrees about {threshold} by more than \
+                         the quantization step"
+                    );
+                }
+            }
+        }
+        assert!(channels > 0, "no cell cleared any threshold");
     }
 
     #[test]
