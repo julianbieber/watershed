@@ -8,7 +8,7 @@ use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
 use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec};
 use watershed::raster::Raster;
 use watershed::regions::RegionOutput;
-use watershed::{Field, Terrain};
+use watershed::{Field, FieldRole, TerrainSpec};
 
 /// TODO(jb-doc): why a structural change is a value applied to a terrain rather than a
 /// method on the document — that the same four verbs reach it from a button and from a
@@ -41,7 +41,7 @@ pub enum Edit {
 }
 
 impl Edit {
-    pub fn apply(&self, terrain: &mut Terrain) -> Result<Value, String> {
+    pub fn apply(&self, terrain: &mut TerrainSpec) -> Result<Value, String> {
         match self {
             Self::Add { field, op } => {
                 let name = op_name(op);
@@ -92,7 +92,7 @@ impl Edit {
     }
 }
 
-fn field_mut<'a>(terrain: &'a mut Terrain, name: &str) -> Result<&'a mut Field, String> {
+fn field_mut<'a>(terrain: &'a mut TerrainSpec, name: &str) -> Result<&'a mut Field, String> {
     terrain
         .field_mut(name)
         .ok_or_else(|| format!("no field named `{name}`"))
@@ -112,7 +112,7 @@ fn bounds(layers: &[Layer], index: usize) -> Result<(), String> {
 /// TODO(jb-doc): the grammar — that a path names a *place* and the words that follow are
 /// the value, and why a mask is addressed as one place taking several words rather than as
 /// a place per shape it can take.
-fn set(terrain: &mut Terrain, path: &str, words: &[String]) -> Result<Value, String> {
+fn set(terrain: &mut TerrainSpec, path: &str, words: &[String]) -> Result<Value, String> {
     let parts: Vec<&str> = path.split('.').collect();
     let name = *parts.first().ok_or("a path needs a field name")?;
 
@@ -165,7 +165,7 @@ fn set(terrain: &mut Terrain, path: &str, words: &[String]) -> Result<Value, Str
 }
 
 fn set_field(
-    terrain: &mut Terrain,
+    terrain: &mut TerrainSpec,
     name: &str,
     parts: &[&str],
     words: &[String],
@@ -190,21 +190,77 @@ fn set_field(
             field.shift = shift;
             Ok(json!({ "shift": field.shift }))
         }
+        Some("role") => set_field_role(terrain, name, words),
         _ => set_other_field_property(terrain, name, parts, words),
     }
 }
 
+/// TODO(jb-doc): why taking a role takes it from whichever field held it rather than
+/// refusing, and why the water is the one thing a role change cannot be allowed to strand.
+fn set_field_role(
+    terrain: &mut TerrainSpec,
+    name: &str,
+    words: &[String],
+) -> Result<Value, String> {
+    let word = first(words)?;
+    let role =
+        FieldRole::parse(word).ok_or_else(|| format!("a field has no role called `{word}`"))?;
+
+    let field = field_mut(terrain, name)?;
+    let previous = field.role;
+    if previous == role {
+        return Ok(json!({ "role": role.as_str() }));
+    }
+    // Refused here on the same terms the shift control refuses a coarse height: the solve
+    // reads its height one texel per cell and will not resample one.
+    if role == FieldRole::Height && field.shift != 0 {
+        return Err(format!(
+            "`{name}` is at shift {} and a height field has to stay at shift 0",
+            field.shift
+        ));
+    }
+
+    let displaced: Vec<String> = if role == FieldRole::Custom {
+        Vec::new()
+    } else {
+        terrain
+            .fields
+            .iter_mut()
+            .filter(|field| field.role == role && field.id.as_str() != name)
+            .map(|field| {
+                field.role = FieldRole::Custom;
+                field.id.to_string()
+            })
+            .collect()
+    };
+
+    field_mut(terrain, name)?.role = role;
+
+    // Resetting the water is how a terrain stops having a height field; an edit that took
+    // the last one away would leave a document that can never solve.
+    if terrain.water_spec.is_some() && terrain.field_with_role(FieldRole::Height).is_none() {
+        field_mut(terrain, name)?.role = previous;
+        for id in &displaced {
+            field_mut(terrain, id)?.role = role;
+        }
+        return Err(format!(
+            "`{name}` is the height field of a terrain that declares water — reset the water first"
+        ));
+    }
+
+    Ok(json!({ "role": role.as_str(), "displaced": displaced }))
+}
+
 /// Whether the water solve would read this field as its height, which is the one thing
 /// that pins a field's resolution.
-pub fn is_solve_height(terrain: &Terrain, name: &str) -> bool {
+pub fn is_solve_height(terrain: &TerrainSpec, name: &str) -> bool {
     terrain
-        .water_spec
-        .as_ref()
-        .is_some_and(|spec| spec.height.as_str() == name)
+        .field_with_role(FieldRole::Height)
+        .is_some_and(|field| field.id.as_str() == name)
 }
 
 fn set_other_field_property(
-    terrain: &mut Terrain,
+    terrain: &mut TerrainSpec,
     name: &str,
     parts: &[&str],
     words: &[String],
@@ -547,14 +603,15 @@ mod tests {
     use bevy::math::UVec2;
     use watershed::{FieldId, WaterSpec};
 
-    fn document() -> Terrain {
-        Terrain::new(UVec2::new(64, 64))
+    fn document() -> TerrainSpec {
+        TerrainSpec::new(UVec2::new(64, 64))
             .with_field(
                 Field::new("base")
                     .with_layer(Layer::new(LayerOp::Constant(0.25)).with_blend(Blend::Replace)),
             )
             .with_field(
                 Field::new("height")
+                    .with_role(FieldRole::Height)
                     .with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("base"))))
                     .with_layer(Layer::new(LayerOp::Noise(NoiseSpec::new(
                         1,
@@ -568,7 +625,7 @@ mod tests {
         line.split_whitespace().map(str::to_owned).collect()
     }
 
-    fn set_line(terrain: &mut Terrain, line: &str) -> Result<Value, String> {
+    fn set_line(terrain: &mut TerrainSpec, line: &str) -> Result<Value, String> {
         let words = words(line);
         Edit::Set {
             path: words[0].clone(),
@@ -624,7 +681,7 @@ mod tests {
     #[test]
     fn a_layer_added_to_a_stack_moves_the_bake_it_produces() {
         let mut terrain = document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let before = terrain.field("height").unwrap().baked().data().to_vec();
 
         Edit::Add {
@@ -633,7 +690,7 @@ mod tests {
         }
         .apply(&mut terrain)
         .unwrap();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let after = terrain.field("height").unwrap().baked().data().to_vec();
 
         assert_ne!(before, after);
@@ -656,7 +713,7 @@ mod tests {
         }
         .apply(&mut terrain)
         .unwrap();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.field("height").unwrap().baked().data(), &before[..]);
     }
 
@@ -740,9 +797,9 @@ mod tests {
     #[test]
     fn a_field_property_is_told_apart_from_a_layer_index_by_being_unreadable_as_a_number() {
         let mut terrain = document();
-        set_line(&mut terrain, "height.shift 2").unwrap();
-        set_line(&mut terrain, "height.range -1 1").unwrap();
-        let field = terrain.field("height").unwrap();
+        set_line(&mut terrain, "base.shift 2").unwrap();
+        set_line(&mut terrain, "base.range -1 1").unwrap();
+        let field = terrain.field("base").unwrap();
         assert_eq!(field.shift, 2);
         assert_eq!(field.range, (-1.0, 1.0));
     }
@@ -774,7 +831,7 @@ mod tests {
     fn an_edit_after_a_solve_leaves_the_document_solvable() {
         let mut terrain = document();
         terrain.water_spec = Some(WaterSpec::new("height"));
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let spec = terrain.water_spec.clone().unwrap();
         terrain.solve_water(&spec).unwrap();
 
@@ -794,16 +851,72 @@ mod tests {
         );
     }
 
-    /// Zero has to stay reachable, or a document that got into the coarse state before the
-    /// guard existed could never be put back.
+    /// Zero has to stay reachable, or a document that arrived at a coarse height some other
+    /// way — a file written before the guard existed — could never be put back.
     #[test]
     fn a_height_field_can_always_be_returned_to_one_texel_per_cell() {
         let mut terrain = document();
-        set_line(&mut terrain, "height.shift 3").unwrap();
+        terrain.field_mut("height").unwrap().shift = 3;
         terrain.water_spec = Some(WaterSpec::new("height"));
 
         set_line(&mut terrain, "height.shift 0").unwrap();
         assert_eq!(terrain.field("height").unwrap().shift, 0);
+    }
+
+    /// A role is what the bake reads, so the panel cannot be allowed to leave two fields
+    /// claiming one: taking it takes it from whoever held it.
+    #[test]
+    fn taking_a_role_takes_it_from_the_field_that_held_it() {
+        let mut terrain = document();
+        set_line(&mut terrain, "base.role height").unwrap();
+
+        assert_eq!(terrain.field("base").unwrap().role, FieldRole::Height);
+        assert_eq!(terrain.field("height").unwrap().role, FieldRole::Custom);
+    }
+
+    /// The same rule the shift control carries, arrived at from the other side: a coarse
+    /// field cannot become the height field either.
+    #[test]
+    fn a_coarse_field_cannot_take_the_height_role() {
+        let mut terrain = document();
+        terrain.field_mut("base").unwrap().shift = 4;
+
+        let refused = set_line(&mut terrain, "base.role height").unwrap_err();
+        assert!(refused.contains("shift 0"), "{refused}");
+        assert_eq!(terrain.field("base").unwrap().role, FieldRole::Custom);
+    }
+
+    /// Resetting the water is how a terrain stops having a height field. An edit that took
+    /// the last one away would leave a document that can never solve.
+    #[test]
+    fn a_terrain_that_declares_water_cannot_be_left_without_a_height_field() {
+        let mut terrain = document();
+        terrain.water_spec = Some(WaterSpec::new("height"));
+
+        let refused = set_line(&mut terrain, "height.role custom").unwrap_err();
+        assert!(refused.contains("reset the water"), "{refused}");
+        assert_eq!(terrain.field("height").unwrap().role, FieldRole::Height);
+    }
+
+    /// The refusal has to put back everything it moved, or a rejected edit leaves the
+    /// document holding a role the panel never showed being taken.
+    #[test]
+    fn a_refused_role_change_leaves_every_other_field_as_it_was() {
+        let mut terrain = document();
+        terrain.field_mut("base").unwrap().role = FieldRole::Moisture;
+        terrain.water_spec = Some(WaterSpec::new("height"));
+
+        set_line(&mut terrain, "height.role moisture").unwrap_err();
+
+        assert_eq!(terrain.field("height").unwrap().role, FieldRole::Height);
+        assert_eq!(terrain.field("base").unwrap().role, FieldRole::Moisture);
+    }
+
+    #[test]
+    fn a_role_the_vocabulary_does_not_have_is_refused() {
+        let mut terrain = document();
+        let refused = set_line(&mut terrain, "height.role elevation").unwrap_err();
+        assert!(refused.contains("elevation"), "{refused}");
     }
 
     #[test]

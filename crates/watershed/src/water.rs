@@ -6,7 +6,7 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::bake::Terrain;
+use crate::bake::TerrainSpec;
 use crate::field::FieldId;
 use crate::raster::Raster;
 
@@ -93,7 +93,7 @@ impl WaterSpec {
 /// TODO(jb-comment): why no flow vector is stored per cell.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WaterState {
-    level: Raster<f32>,
+    depth: Raster<f32>,
     flow_dir: Raster<u8>,
     flow_accum: Raster<u16>,
     lake_id: Raster<u32>,
@@ -120,14 +120,14 @@ impl WaterState {
         let (lake_id, lakes) = label_lakes(&filled, height.data(), width, rows, lake_min_cells);
 
         let source = height.data();
-        let level: Vec<f32> = filled
+        let depth: Vec<f32> = filled
             .iter()
             .zip(source)
             .map(|(surface, ground)| (surface - ground).max(0.0))
             .collect();
 
         Self {
-            level: Raster::from_vec(size, level).unwrap_or_default(),
+            depth: Raster::from_vec(size, depth).unwrap_or_default(),
             flow_dir: Raster::from_vec(size, flow_dir).unwrap_or_default(),
             flow_accum: Raster::from_vec(size, flow_accum).unwrap_or_default(),
             lake_id: Raster::from_vec(size, lake_id).unwrap_or_default(),
@@ -138,14 +138,14 @@ impl WaterState {
     /// TODO(jb-comment): why the loader rebuilds a state from its rasters rather than
     /// re-solving, and what it is trusted to have checked first.
     pub(crate) fn from_parts(
-        level: Raster<f32>,
+        depth: Raster<f32>,
         flow_dir: Raster<u8>,
         flow_accum: Raster<u16>,
         lake_id: Raster<u32>,
         lakes: u32,
     ) -> Self {
         Self {
-            level,
+            depth,
             flow_dir,
             flow_accum,
             lake_id,
@@ -154,15 +154,15 @@ impl WaterState {
     }
 
     pub fn size(&self) -> UVec2 {
-        self.level.size()
+        self.depth.size()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.level.is_empty()
+        self.depth.is_empty()
     }
 
-    pub fn level(&self) -> &Raster<f32> {
-        &self.level
+    pub fn depth(&self) -> &Raster<f32> {
+        &self.depth
     }
 
     pub fn flow_dir(&self) -> &Raster<u8> {
@@ -181,10 +181,16 @@ impl WaterState {
         self.lakes
     }
 
+    /// TODO(jb-doc): what this measures from and what it is measured in, and why a cell
+    /// outside the extent answers nothing rather than zero.
+    pub fn depth_at(&self, x: u32, y: u32) -> Option<f32> {
+        self.depth.get(x, y).copied()
+    }
+
     /// TODO(jb-doc): what counts as water here, and why it is the fill depth rather than
     /// the lake labelling.
     pub fn is_water(&self, x: u32, y: u32) -> bool {
-        self.level.get(x, y).is_some_and(|depth| *depth > 0.0)
+        self.depth.get(x, y).is_some_and(|depth| *depth > 0.0)
     }
 
     /// TODO(jb-doc): the unit this answers in, and the precision the stored quantization
@@ -235,7 +241,7 @@ impl WaterState {
     }
 }
 
-impl Terrain {
+impl TerrainSpec {
     pub fn water(&self) -> Option<&WaterState> {
         self.water.as_ref()
     }
@@ -250,7 +256,7 @@ impl Terrain {
     /// Drops the solved state and **keeps the spec**, which is the difference between
     /// "forget about the water" and "the height moved, so this answer is stale".
     ///
-    /// TODO(jb-doc): why an edit needs this rather than [`Terrain::clear_water`], and what
+    /// TODO(jb-doc): why an edit needs this rather than [`TerrainSpec::clear_water`], and what
     /// happens to a document that loses the recipe it is re-solved from.
     pub fn invalidate_water(&mut self) {
         self.water = None;
@@ -706,12 +712,12 @@ mod tests {
         for y in 0..size.y {
             for x in 0..size.x {
                 let ground = *height.get(x, y).unwrap();
-                let surface = ground + state.level().get(x, y).unwrap();
+                let surface = ground + state.depth().get(x, y).unwrap();
                 if ground < 1.0 && x > 1 && y > 1 && x + 2 < size.x && y + 2 < size.y {
                     assert_eq!(surface, 1.0, "cell {x},{y} stands at {surface}");
                     assert!(state.is_water(x, y));
                 } else {
-                    assert_eq!(*state.level().get(x, y).unwrap(), 0.0);
+                    assert_eq!(*state.depth().get(x, y).unwrap(), 0.0);
                 }
             }
         }
@@ -806,9 +812,9 @@ mod tests {
 
     #[test]
     fn a_document_solves_water_over_the_field_it_names() {
-        let mut terrain = Terrain::new(UVec2::new(16, 16))
+        let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
             .with_field(Field::new("height").with_layer(Layer::new(LayerOp::Constant(0.5))));
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert!(terrain.water().is_none());
         terrain.solve_water(&WaterSpec::default()).unwrap();
         let water = terrain.water().unwrap();
@@ -823,9 +829,9 @@ mod tests {
     /// again, and looks exactly like an ordinary one.
     #[test]
     fn invalidating_the_water_keeps_the_recipe_where_clearing_it_does_not() {
-        let mut terrain = Terrain::new(UVec2::new(16, 16))
+        let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
             .with_field(Field::new("height").with_layer(Layer::new(LayerOp::Constant(0.5))));
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         terrain.solve_water(&WaterSpec::default()).unwrap();
 
         terrain.invalidate_water();
@@ -846,14 +852,14 @@ mod tests {
     #[test]
     fn a_named_moisture_field_weights_what_the_sinks_deliver() {
         let size = UVec2::new(24, 24);
-        let mut terrain = Terrain::new(size)
+        let mut terrain = TerrainSpec::new(size)
             .with_field(Field::new("height").with_layer(Layer::new(LayerOp::Constant(0.5))))
             .with_field(
                 Field::new("moisture")
                     .with_layer(Layer::new(LayerOp::Constant(0.25)))
                     .with_range((0.0, 1.0)),
             );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         terrain
             .solve_water(&WaterSpec::default().with_moisture("moisture"))
             .unwrap();
@@ -876,10 +882,10 @@ mod tests {
 
     #[test]
     fn a_solve_refuses_a_field_it_cannot_read() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8))
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
             .with_field(Field::new("height").with_layer(Layer::new(LayerOp::Constant(0.5))))
             .with_field(Field::new("coarse").with_shift(2));
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         assert!(matches!(
             terrain.solve_water(&WaterSpec::new("absent")),
@@ -898,14 +904,14 @@ mod tests {
 
     #[test]
     fn a_solve_of_an_unbaked_document_is_refused() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8))
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
             .with_field(Field::new("height").with_layer(Layer::new(LayerOp::Constant(0.5))));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::default()),
             Err(WaterError::UnbakedHeight(_))
         ));
 
-        let mut empty = Terrain::new(UVec2::ZERO);
+        let mut empty = TerrainSpec::new(UVec2::ZERO);
         assert!(matches!(
             empty.solve_water(&WaterSpec::default()),
             Err(WaterError::ZeroSize(0, 0))

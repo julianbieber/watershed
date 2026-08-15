@@ -7,7 +7,7 @@ use watershed::brush::Brush;
 use watershed::layer::{Layer, LayerOp, Mask, Remap, SlopeMode};
 use watershed::noise::{NoiseKind, NoiseSpec};
 use watershed::raster::Raster;
-use watershed::{FieldId, SaveOptions};
+use watershed::{FieldId, FieldRole, SaveOptions};
 
 use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
@@ -355,6 +355,26 @@ fn layer_stack(
                     structural = Some(Edit::Set {
                         path: format!("{active}.shift"),
                         words: vec![shift.to_string()],
+                    });
+                }
+                ui.end_row();
+
+                // Routed through `Edit::Set` on the same terms as the shift: taking a role
+                // from whichever field held it, and refusing to strand a water spec, are
+                // rules the ctl verb already carries.
+                ui.label("role");
+                let mut role = field.role;
+                egui::ComboBox::from_id_salt("field-role")
+                    .selected_text(role.as_str())
+                    .show_ui(ui, |ui| {
+                        for choice in FieldRole::ALL {
+                            ui.selectable_value(&mut role, choice, choice.as_str());
+                        }
+                    });
+                if role != field.role {
+                    structural = Some(Edit::Set {
+                        path: format!("{active}.role"),
+                        words: vec![role.as_str().to_owned()],
                     });
                 }
                 ui.end_row();

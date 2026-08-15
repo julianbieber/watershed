@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap};
 use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
 use watershed::regions::{Region, RegionOutput, RegionSpec};
-use watershed::{Field, Terrain, WaterSpec};
+use watershed::{Field, FieldRole, TerrainSpec, WaterSpec};
 
 /// TODO(jb-doc): why the list is an array over the enum rather than a registry, and what
 /// stops it drifting from [`Preset::ALL`].
@@ -34,12 +34,21 @@ impl Preset {
 
     /// TODO(jb-doc): why every preset carries a moisture field and a water spec, and what
     /// a preset that carried neither would leave the editor unable to show.
-    pub fn build(self, size: UVec2, seed: u32) -> Terrain {
+    pub fn build(self, size: UVec2, seed: u32) -> TerrainSpec {
         let mut terrain = match self {
             Self::Continents => continents(size, seed),
             Self::Ridges => ridges(size, seed),
             Self::Regions => regions(size, seed),
         };
+        // TODO(jb-comment): why the roles are set here rather than on each preset's own
+        // fields, and what a preset that named its height something else would need to do.
+        for field in &mut terrain.fields {
+            field.role = match field.id.as_str() {
+                "height" => FieldRole::Height,
+                "moisture" => FieldRole::Moisture,
+                _ => FieldRole::Custom,
+            };
+        }
         terrain.water_spec = Some(WaterSpec::new("height").with_moisture("moisture"));
         terrain
     }
@@ -62,31 +71,34 @@ fn moisture(seed: u32) -> Field {
 const CONTINENT_SCALE: f32 = 0.0015;
 const RELIEF_SCALE: f32 = 0.04;
 
-fn continents(size: UVec2, seed: u32) -> Terrain {
-    Terrain::new(size).with_field(moisture(seed)).with_field(
-        Field::new("height")
-            .with_layer(
-                Layer::new(LayerOp::Noise(
-                    NoiseSpec::new(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE)
-                        .with_octaves(4),
-                ))
-                .with_blend(Blend::Replace),
-            )
-            .with_layer(
-                Layer::new(LayerOp::Noise(
-                    NoiseSpec::new(sub_seed(seed, 2), NoiseKind::Fbm, RELIEF_SCALE).with_octaves(4),
-                ))
-                .with_blend(Blend::Add)
-                .with_amplitude(0.18),
-            ),
-    )
+fn continents(size: UVec2, seed: u32) -> TerrainSpec {
+    TerrainSpec::new(size)
+        .with_field(moisture(seed))
+        .with_field(
+            Field::new("height")
+                .with_layer(
+                    Layer::new(LayerOp::Noise(
+                        NoiseSpec::new(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE)
+                            .with_octaves(4),
+                    ))
+                    .with_blend(Blend::Replace),
+                )
+                .with_layer(
+                    Layer::new(LayerOp::Noise(
+                        NoiseSpec::new(sub_seed(seed, 2), NoiseKind::Fbm, RELIEF_SCALE)
+                            .with_octaves(4),
+                    ))
+                    .with_blend(Blend::Add)
+                    .with_amplitude(0.18),
+                ),
+        )
 }
 
-fn ridges(size: UVec2, seed: u32) -> Terrain {
+fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
     // The continent is a field of its own rather than the height's first layer, because
     // the ridge is masked by it — and a field masked by itself is a cycle the bake
     // refuses, not a read of the layers underneath.
-    Terrain::new(size)
+    TerrainSpec::new(size)
         .with_field(moisture(seed))
         .with_field(
             Field::new("base").with_layer(
@@ -134,7 +146,7 @@ const REGION_BLEND_TILES: u32 = 48;
 /// TODO(jb-doc): what the column means to the layer that reads it — that a region carries
 /// numbers only, and the blend at a cell is the distance-weighted mix of the nearby
 /// sites'.
-fn regions(size: UVec2, seed: u32) -> Terrain {
+fn regions(size: UVec2, seed: u32) -> TerrainSpec {
     let spec = RegionSpec::new(
         sub_seed(seed, 7),
         REGION_CELL_TILES,
@@ -154,7 +166,7 @@ fn regions(size: UVec2, seed: u32) -> Terrain {
     .with_region(Region::new(2, [0.74, 0.42]))
     .with_region(Region::new(2, [0.48, 0.06]));
 
-    Terrain::new(size)
+    TerrainSpec::new(size)
         .with_field(moisture(seed))
         .with_field(
             Field::new("base").with_shift(2).with_layer(
@@ -203,7 +215,7 @@ mod tests {
         for preset in Preset::ALL {
             let mut terrain = preset.build(SIZE, 7);
             terrain
-                .bake()
+                .bake_in_place()
                 .unwrap_or_else(|error| panic!("{} did not bake: {error}", preset.name()));
             assert!(
                 terrain.field("height").is_some(),
@@ -219,7 +231,7 @@ mod tests {
     fn every_preset_produces_a_height_that_varies() {
         for preset in Preset::ALL {
             let mut terrain = preset.build(SIZE, 7);
-            terrain.bake().unwrap();
+            terrain.bake_in_place().unwrap();
 
             let baked = terrain.field("height").unwrap().baked();
             let (low, high) = baked
@@ -257,7 +269,7 @@ mod tests {
     fn every_preset_solves_water_that_ponds_somewhere() {
         for preset in Preset::ALL {
             let mut terrain = preset.build(SIZE, 7);
-            terrain.bake().unwrap();
+            terrain.bake_in_place().unwrap();
             let spec = terrain.water_spec.clone().unwrap();
             terrain
                 .solve_water(&spec)

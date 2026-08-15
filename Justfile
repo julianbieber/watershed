@@ -62,7 +62,7 @@ check-web:
 	cargo check --locked --package watershed --profile ci --target {{WASM_TARGET}}
 
 # Run everything in CI order
-all: fmt docs clippy bevy-lints test check-web
+all: fmt docs clippy bevy-lints test check-web check-goals
 
 # Clean
 clean:
@@ -93,6 +93,13 @@ drive *ARGS:
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
 	WATERSHED_CONTROL="{{CONTROL_SOCKET}}" \
 	cargo run --release --quiet --bin watershed-ctl -- {{ARGS}}
+
+# Build the example that spells out what the crate interface is meant to do.
+check-goals:
+	@env \
+	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
+	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
+	cargo build --locked --package watershed --profile ci --example load_terrain
 
 # Prose the AI policy leaves to a human. Not part of `all`: a placeholder is a note to
 # myself, not a broken build.

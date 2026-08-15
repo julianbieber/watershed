@@ -46,15 +46,56 @@ impl fmt::Display for FieldId {
     }
 }
 
+/// TODO(jb-doc): what a role is — what the bake does with a field, never how it is read —
+/// and why at most one field holds Height and at most one holds Moisture.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum FieldRole {
+    Height,
+    Moisture,
+    #[default]
+    Custom,
+}
+
+impl FieldRole {
+    pub const ALL: [Self; 3] = [Self::Height, Self::Moisture, Self::Custom];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Height => "height",
+            Self::Moisture => "moisture",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == word)
+    }
+}
+
+impl fmt::Display for FieldRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
 /// TODO(jb-doc): what a field is — a named stack evaluated onto its own raster — and the
 /// three things a caller has to choose: its resolution, its range, and its layers.
 ///
 /// TODO(jb-doc): why `baked` is not part of the serialized document.
+///
+/// TODO(jb-doc): why `role` and `export` are separate — what a Custom field that is not
+/// exported is for.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     pub id: FieldId,
+    #[serde(default)]
+    pub role: FieldRole,
     pub shift: u8,
     pub range: (f32, f32),
+    #[serde(default)]
+    pub export: bool,
     pub layers: Vec<Layer>,
     #[serde(skip)]
     baked: Raster<f32>,
@@ -64,11 +105,23 @@ impl Field {
     pub fn new(id: impl Into<FieldId>) -> Self {
         Self {
             id: id.into(),
+            role: FieldRole::Custom,
             shift: 0,
             range: (0.0, 1.0),
+            export: false,
             layers: Vec::new(),
             baked: Raster::default(),
         }
+    }
+
+    pub fn with_role(mut self, role: FieldRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    pub fn with_export(mut self, export: bool) -> Self {
+        self.export = export;
+        self
     }
 
     pub fn with_shift(mut self, shift: u8) -> Self {
