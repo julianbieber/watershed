@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use serde_json::Value;
-use watershed::{CellRect, SaveOptions, Terrain};
+use watershed::{CellRect, SaveOptions, TerrainSpec};
 
 use crate::edit::Edit;
 use crate::preset::Preset;
@@ -106,7 +106,7 @@ impl Baked {
 /// TODO(jb-doc): why every job answers with the same shape — that a save hands back the
 /// terrain it borrowed and a load invents one, and the caller cannot tell which.
 struct Outcome {
-    terrain: Option<Terrain>,
+    terrain: Option<TerrainSpec>,
     error: Option<String>,
 }
 
@@ -119,7 +119,7 @@ enum Job {
 
 #[derive(Resource)]
 pub struct Document {
-    terrain: Option<Terrain>,
+    terrain: Option<TerrainSpec>,
     job: Job,
     active: String,
     /// TODO(jb-doc): why the view watches a counter rather than the terrain itself, given
@@ -177,7 +177,7 @@ impl Default for Document {
 }
 
 impl Document {
-    pub fn terrain(&self) -> Option<&Terrain> {
+    pub fn terrain(&self) -> Option<&TerrainSpec> {
         self.terrain.as_ref()
     }
 
@@ -232,7 +232,7 @@ impl Document {
     /// The terrain, to be edited in place. Whatever is changed through this has to be
     /// followed by [`Document::note_edit`] — which is why the panel and
     /// [`Document::apply`] are the only two callers, and why the second one exists at all.
-    pub fn terrain_mut(&mut self) -> Option<&mut Terrain> {
+    pub fn terrain_mut(&mut self) -> Option<&mut TerrainSpec> {
         self.terrain.as_mut()
     }
 
@@ -394,7 +394,7 @@ impl Document {
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut terrain = preset.build(size, seed);
-            let error = terrain.bake().err().map(|error| error.to_string());
+            let error = terrain.bake_in_place().err().map(|error| error.to_string());
             Outcome {
                 terrain: Some(terrain),
                 error,
@@ -470,7 +470,7 @@ impl Document {
         self.stroke_rect = CellRect::EMPTY;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            match Terrain::load_from_path(&path) {
+            match TerrainSpec::load_from_path(&path) {
                 Ok(terrain) => Outcome {
                     terrain: Some(terrain),
                     error: None,
@@ -499,12 +499,12 @@ impl Document {
 
     /// A document holding a terrain, without the task pool a job would need to make one.
     #[cfg(test)]
-    pub(crate) fn adopt(&mut self, terrain: Terrain) {
+    pub(crate) fn adopt(&mut self, terrain: TerrainSpec) {
         self.size = terrain.size;
         self.terrain = Some(terrain);
     }
 
-    fn take_terrain(&mut self) -> Result<Terrain, String> {
+    fn take_terrain(&mut self) -> Result<TerrainSpec, String> {
         self.busy_check()?;
         self.terrain
             .take()

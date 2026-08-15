@@ -215,7 +215,7 @@ fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use watershed::Terrain;
+    use watershed::TerrainSpec;
     use watershed::layer::Layer;
     use watershed::raster::CellRect;
 
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn a_stroke_lands_in_the_layer_and_leaves_the_bake_where_it_was() {
         let mut document = Document::default();
-        let terrain = Terrain::new(UVec2::splat(64)).with_field(
+        let terrain = TerrainSpec::new(UVec2::splat(64)).with_field(
             Field::new("height")
                 .with_layer(Layer::new(LayerOp::Constant(0.25)))
                 .with_layer(Layer::new(LayerOp::Paint(Raster::default()))),

@@ -4,7 +4,7 @@ use std::path::Path;
 use glam::UVec2;
 use thiserror::Error;
 
-use crate::bake::{BakeError, Terrain};
+use crate::bake::{PlanError, TerrainSpec};
 use crate::field::Field;
 use crate::layer::{LayerOp, Mask};
 use crate::raster::Raster;
@@ -52,7 +52,7 @@ pub enum IoError {
         expected: UVec2,
     },
     #[error("bake: {0}")]
-    Bake(#[from] BakeError),
+    Bake(#[from] PlanError),
     #[error("water: {0}")]
     Water(#[from] WaterError),
 }
@@ -121,7 +121,7 @@ enum Slot {
     MaskPainted(usize, usize),
 }
 
-fn painted_slots(terrain: &Terrain) -> Vec<Slot> {
+fn painted_slots(terrain: &TerrainSpec) -> Vec<Slot> {
     let mut slots = Vec::new();
     for (field_index, field) in terrain.fields.iter().enumerate() {
         for (layer_index, layer) in field.layers.iter().enumerate() {
@@ -270,8 +270,8 @@ fn stripped_mask(mask: &Mask) -> Mask {
 
 /// TODO(jb-comment): why the header is built by hand rather than by cloning the document,
 /// and what a clone would have cost at 4096 squared.
-fn header_document(terrain: &Terrain, layers: bool) -> Terrain {
-    let mut header = Terrain::new(terrain.size);
+fn header_document(terrain: &TerrainSpec, layers: bool) -> TerrainSpec {
+    let mut header = TerrainSpec::new(terrain.size);
     header.water_spec = terrain.water_spec.clone();
     for field in &terrain.fields {
         let mut stripped = Field::new(field.id.clone())
@@ -294,7 +294,7 @@ fn header_document(terrain: &Terrain, layers: bool) -> Terrain {
     header
 }
 
-impl Terrain {
+impl TerrainSpec {
     /// TODO(jb-doc): the shape of what this writes — magic, version, flags, a RON header,
     /// then one compressed block per raster in a fixed order.
     pub fn save(&self, writer: &mut impl Write, options: SaveOptions) -> Result<(), IoError> {
@@ -356,7 +356,7 @@ impl Terrain {
 
         if let Some(state) = water {
             write_u32(writer, state.lakes())?;
-            write_raster(writer, state.level())?;
+            write_raster(writer, state.depth())?;
             write_raster(writer, state.flow_dir())?;
             write_raster(writer, state.flow_accum())?;
             write_raster(writer, state.lake_id())?;
@@ -392,7 +392,7 @@ impl Terrain {
         reader.read_exact(&mut bytes)?;
         let text =
             std::str::from_utf8(&bytes).map_err(|error| IoError::Header(error.to_string()))?;
-        let mut terrain: Terrain =
+        let mut terrain: TerrainSpec =
             ron::from_str(text).map_err(|error| IoError::Header(error.to_string()))?;
 
         for slot in painted_slots(&terrain) {
@@ -429,25 +429,25 @@ impl Terrain {
                 *terrain.fields[index].baked_mut() = raster;
             }
         } else {
-            terrain.bake()?;
+            terrain.bake_in_place()?;
         }
 
         if flags & FLAG_WATER != 0 {
             let lakes = read_u32(reader)?;
-            let level = read_raster(reader)?;
+            let depth = read_raster(reader)?;
             let flow_dir = read_raster(reader)?;
             let flow_accum = read_raster(reader)?;
             let lake_id = read_raster(reader)?;
-            if level.size() != terrain.size {
+            if depth.size() != terrain.size {
                 return Err(IoError::BlockShape {
                     kind: "water",
-                    width: level.width(),
-                    height: level.height(),
+                    width: depth.width(),
+                    height: depth.height(),
                     expected: terrain.size,
                 });
             }
             terrain.water = Some(WaterState::from_parts(
-                level, flow_dir, flow_accum, lake_id, lakes,
+                depth, flow_dir, flow_accum, lake_id, lakes,
             ));
         } else if let Some(spec) = terrain.water_spec.clone() {
             terrain.solve_water(&spec)?;
@@ -514,8 +514,8 @@ mod tests {
             .with_blend(Blend::Replace)
     }
 
-    fn painted_document() -> Terrain {
-        Terrain::new(SIZE)
+    fn painted_document() -> TerrainSpec {
+        TerrainSpec::new(SIZE)
             .with_field(
                 Field::new("moisture")
                     .with_shift(2)
@@ -536,8 +536,8 @@ mod tests {
             )
     }
 
-    fn baked_document() -> Terrain {
-        let mut terrain = Terrain::new(SIZE)
+    fn baked_document() -> TerrainSpec {
+        let mut terrain = TerrainSpec::new(SIZE)
             .with_field(
                 Field::new("moisture")
                     .with_shift(2)
@@ -548,14 +548,14 @@ mod tests {
                     .with_layer(Layer::new(LayerOp::Paint(ramp())).with_blend(Blend::Replace))
                     .with_layer(noise_layer(9)),
             );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         terrain
     }
 
-    fn round_trip(terrain: &Terrain, options: SaveOptions) -> Terrain {
+    fn round_trip(terrain: &TerrainSpec, options: SaveOptions) -> TerrainSpec {
         let mut bytes = Vec::new();
         terrain.save(&mut bytes, options).unwrap();
-        Terrain::load(&mut &bytes[..]).unwrap()
+        TerrainSpec::load(&mut &bytes[..]).unwrap()
     }
 
     #[test]
@@ -579,14 +579,14 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits())
     }
 
-    fn paint_of(terrain: &Terrain, field: usize, layer: usize) -> &Raster<f32> {
+    fn paint_of(terrain: &TerrainSpec, field: usize, layer: usize) -> &Raster<f32> {
         match &terrain.fields[field].layers[layer].op {
             LayerOp::Paint(raster) | LayerOp::External(raster) => raster,
             other => panic!("layer {layer} is {other:?}"),
         }
     }
 
-    fn mask_of(terrain: &Terrain, field: usize, layer: usize) -> &Raster<u8> {
+    fn mask_of(terrain: &TerrainSpec, field: usize, layer: usize) -> &Raster<u8> {
         match &terrain.fields[field].layers[layer].mask {
             Mask::Painted(raster) => raster,
             other => panic!("layer {layer} mask is {other:?}"),
@@ -659,10 +659,10 @@ mod tests {
         assert_eq!(header_only.water_spec, Some(WaterSpec::new("height")));
         assert_eq!(carried.water().unwrap().lakes(), solved.lakes());
         assert!(same_bits(
-            header_only.water().unwrap().level(),
-            solved.level()
+            header_only.water().unwrap().depth(),
+            solved.depth()
         ));
-        assert!(same_bits(carried.water().unwrap().level(), solved.level()));
+        assert!(same_bits(carried.water().unwrap().depth(), solved.depth()));
         assert_eq!(carried.water().unwrap().flow_accum(), solved.flow_accum());
         assert_eq!(carried.water().unwrap().lake_id(), solved.lake_id());
     }
@@ -685,7 +685,7 @@ mod tests {
 
         assert!(loaded.fields.iter().all(|field| !field.layers.is_empty()));
         assert_eq!(loaded.water().unwrap().lakes(), solved.lakes());
-        assert!(same_bits(loaded.water().unwrap().level(), solved.level()));
+        assert!(same_bits(loaded.water().unwrap().depth(), solved.depth()));
         assert_ne!(
             re_solved.water().unwrap().lakes(),
             solved.lakes(),
@@ -761,7 +761,7 @@ mod tests {
             })
             .collect();
 
-        let mut terrain = Terrain::new(size)
+        let mut terrain = TerrainSpec::new(size)
             .with_field(
                 Field::new("moisture")
                     .with_shift(4)
@@ -776,7 +776,7 @@ mod tests {
             );
 
         let started = std::time::Instant::now();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let bake = started.elapsed();
 
         terrain.solve_water(&WaterSpec::new("height")).unwrap();
@@ -788,7 +788,7 @@ mod tests {
             let wrote = started.elapsed();
 
             let started = std::time::Instant::now();
-            let loaded = Terrain::load(&mut &bytes[..]).unwrap();
+            let loaded = TerrainSpec::load(&mut &bytes[..]).unwrap();
             let read = started.elapsed();
 
             println!(
@@ -811,7 +811,7 @@ mod tests {
     fn a_file_that_is_not_a_watershed_file_is_refused() {
         let bytes = b"NOPE\x01\x00\x00\x00\x00\x00\x00\x00".to_vec();
         assert!(matches!(
-            Terrain::load(&mut &bytes[..]),
+            TerrainSpec::load(&mut &bytes[..]),
             Err(IoError::BadMagic(_))
         ));
     }
@@ -824,7 +824,7 @@ mod tests {
         bytes[4] = 99;
 
         assert!(matches!(
-            Terrain::load(&mut &bytes[..]),
+            TerrainSpec::load(&mut &bytes[..]),
             Err(IoError::UnsupportedVersion(99))
         ));
     }
@@ -836,6 +836,6 @@ mod tests {
         terrain.save(&mut bytes, SaveOptions::full()).unwrap();
         bytes.truncate(bytes.len() / 2);
 
-        assert!(Terrain::load(&mut &bytes[..]).is_err());
+        assert!(TerrainSpec::load(&mut &bytes[..]).is_err());
     }
 }

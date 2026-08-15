@@ -4,15 +4,16 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::field::{Field, FieldId};
+use crate::field::{Field, FieldId, FieldRole};
 use crate::layer::{Blend, LayerOp, Mask, Remap, SlopeMode};
 use crate::noise::Noise;
 use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
 use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
-use crate::water::{WaterSpec, WaterState};
+use crate::terrain::{FieldInfo, Terrain};
+use crate::water::{WaterError, WaterSpec, WaterState};
 
 #[derive(Debug, Error)]
-pub enum BakeError {
+pub enum PlanError {
     #[error("terrain size has a zero component: {0} by {1}")]
     ZeroSize(u32, u32),
     #[error("two fields share the id `{0}`")]
@@ -23,6 +24,26 @@ pub enum BakeError {
     Cycle(String),
     #[error("column `{column}`, read by `{reader}`, is not in the region table")]
     UnknownRegionColumn { column: String, reader: String },
+    #[error("two fields claim the role `{0}`")]
+    DuplicateRole(FieldRole),
+    #[error("water is declared and no field holds the role `height`")]
+    MissingHeightField,
+    #[error("field `{0}` holds the role `height` at shift {1}")]
+    CoarseHeight(String, u8),
+}
+
+/// TODO(jb-doc): why only a step run out of order or a failed solve reaches here, and
+/// where every structural failure went instead.
+#[derive(Debug, Error)]
+pub enum BakeError {
+    #[error("the plan has no step left to advance")]
+    NoStepRemaining,
+    #[error("{0} step(s) of the plan have not run")]
+    StepsRemaining(u32),
+    #[error(transparent)]
+    WaterSolve(#[from] WaterError),
+    #[error(transparent)]
+    Plan(#[from] PlanError),
 }
 
 /// TODO(jb-doc): what a terrain is here — a size, a set of named fields, a solved water
@@ -34,7 +55,7 @@ pub enum BakeError {
 /// TODO(jb-comment): why the spec that produced the water *is* part of the document where
 /// the water itself is not — a derived thing needs the recipe that re-derives it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Terrain {
+pub struct TerrainSpec {
     pub size: UVec2,
     pub fields: Vec<Field>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,7 +64,7 @@ pub struct Terrain {
     pub(crate) water: Option<WaterState>,
 }
 
-impl Terrain {
+impl TerrainSpec {
     pub fn new(size: UVec2) -> Self {
         Self {
             size,
@@ -76,7 +97,7 @@ impl Terrain {
         CellRect::from_size(self.size)
     }
 
-    pub fn bake(&mut self) -> Result<(), BakeError> {
+    pub fn bake_in_place(&mut self) -> Result<(), PlanError> {
         self.bake_rect(self.rect())
     }
 
@@ -90,7 +111,7 @@ impl Terrain {
     ///
     /// TODO(jb-doc): why this hands back ids rather than indices, given the caller then
     /// looks each one up again.
-    pub fn bake_order(&self) -> Result<Vec<FieldId>, BakeError> {
+    pub fn bake_order(&self) -> Result<Vec<FieldId>, PlanError> {
         let index_of = self.index_fields()?;
         let dependencies = self.resolve_dependencies(&index_of)?;
         let order = topological_order(&dependencies, &self.fields)?;
@@ -102,21 +123,21 @@ impl Terrain {
 
     /// Bake one field over the whole document, assuming everything it reads is baked.
     ///
-    /// **The assumption is the caller's to keep**, and [`Terrain::bake_order`] is how:
+    /// **The assumption is the caller's to keep**, and [`TerrainSpec::bake_order`] is how:
     /// walking that order calls this on a field only after its dependencies. Called out
     /// of order it does not fail — it reads whatever those fields currently hold, which
     /// for an unbaked one is zero. That is the same fallback a document has before any
     /// bake at all, and it is what makes a partially baked document *displayable* rather
     /// than an error state.
-    pub fn bake_field(&mut self, id: &str) -> Result<(), BakeError> {
+    pub fn bake_field(&mut self, id: &str) -> Result<(), PlanError> {
         if self.size.x == 0 || self.size.y == 0 {
-            return Err(BakeError::ZeroSize(self.size.x, self.size.y));
+            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
         }
         let index_of = self.index_fields()?;
         let reader = FieldId::from(id);
         let target = lookup(&index_of, &reader, &reader)?;
         // **Only the target**, where a whole-document bake reallocates everything. That
-        // is what makes [`Terrain::release`] mean something: reallocating every field
+        // is what makes [`TerrainSpec::release`] mean something: reallocating every field
         // here would hand a released one its full-size raster straight back, and a
         // staged bake would peak at the sum of the document however carefully the caller
         // dropped things. A field still empty when something reads it samples as zero,
@@ -190,7 +211,7 @@ impl Terrain {
         shifts: &[u8],
         categorical: &[bool],
         baked: &mut [Raster<f32>],
-    ) -> Result<(), BakeError> {
+    ) -> Result<(), PlanError> {
         let field = &self.fields[target];
         let texels = rect.to_texels(field.shift, baked[target].size());
         if texels.is_empty() {
@@ -224,9 +245,9 @@ impl Terrain {
 
     /// TODO(jb-doc): the contract this carries — that the document is already baked, and
     /// that what comes back inside the rectangle is what a full bake would have written.
-    pub fn bake_rect(&mut self, rect: CellRect) -> Result<(), BakeError> {
+    pub fn bake_rect(&mut self, rect: CellRect) -> Result<(), PlanError> {
         if self.size.x == 0 || self.size.y == 0 {
-            return Err(BakeError::ZeroSize(self.size.x, self.size.y));
+            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
         }
 
         let index_of = self.index_fields()?;
@@ -271,11 +292,11 @@ impl Terrain {
 
     // TODO(jb-comment): why the index owns its keys rather than borrowing the ids out of
     // the fields it indexes.
-    fn index_fields(&self) -> Result<HashMap<String, usize>, BakeError> {
+    fn index_fields(&self) -> Result<HashMap<String, usize>, PlanError> {
         let mut index_of = HashMap::with_capacity(self.fields.len());
         for (index, field) in self.fields.iter().enumerate() {
             if index_of.insert(field.id.to_string(), index).is_some() {
-                return Err(BakeError::DuplicateField(field.id.to_string()));
+                return Err(PlanError::DuplicateField(field.id.to_string()));
             }
         }
         Ok(index_of)
@@ -284,7 +305,7 @@ impl Terrain {
     fn resolve_dependencies(
         &self,
         index_of: &HashMap<String, usize>,
-    ) -> Result<Vec<Vec<usize>>, BakeError> {
+    ) -> Result<Vec<Vec<usize>>, PlanError> {
         let mut dependencies = vec![Vec::new(); self.fields.len()];
         for (index, field) in self.fields.iter().enumerate() {
             for id in field.dependencies() {
@@ -407,11 +428,11 @@ fn lookup(
     index_of: &HashMap<String, usize>,
     referenced: &FieldId,
     reader: &FieldId,
-) -> Result<usize, BakeError> {
+) -> Result<usize, PlanError> {
     index_of
         .get(referenced.as_str())
         .copied()
-        .ok_or_else(|| BakeError::UnknownField {
+        .ok_or_else(|| PlanError::UnknownField {
             referenced: referenced.to_string(),
             reader: reader.to_string(),
         })
@@ -429,7 +450,7 @@ enum Mark {
 fn topological_order(
     dependencies: &[Vec<usize>],
     fields: &[Field],
-) -> Result<Vec<usize>, BakeError> {
+) -> Result<Vec<usize>, PlanError> {
     let mut marks = vec![Mark::Unvisited; dependencies.len()];
     let mut order = Vec::with_capacity(dependencies.len());
     let mut stack = Vec::new();
@@ -453,7 +474,7 @@ fn visit(
     marks: &mut [Mark],
     order: &mut Vec<usize>,
     stack: &mut Vec<usize>,
-) -> Result<(), BakeError> {
+) -> Result<(), PlanError> {
     match marks[index] {
         Mark::Done => return Ok(()),
         Mark::InProgress => {
@@ -463,7 +484,7 @@ fn visit(
                 .map(|&i| fields[i].id.to_string())
                 .collect();
             names.push(fields[index].id.to_string());
-            return Err(BakeError::Cycle(names.join(" -> ")));
+            return Err(PlanError::Cycle(names.join(" -> ")));
         }
         Mark::Unvisited => {}
     }
@@ -508,7 +529,7 @@ fn compile_layers<'a>(
     field: &'a Field,
     index_of: &HashMap<String, usize>,
     size: UVec2,
-) -> Result<Vec<CompiledLayer<'a>>, BakeError> {
+) -> Result<Vec<CompiledLayer<'a>>, PlanError> {
     let mut compiled = Vec::with_capacity(field.layers.len());
     for layer in field.layers.iter().filter(|layer| layer.enabled) {
         let op = match &layer.op {
@@ -529,7 +550,7 @@ fn compile_layers<'a>(
                 let compiled = match output {
                     RegionOutput::Blended(column) => {
                         CompiledOutput::Blended(spec.column_index(column).ok_or_else(|| {
-                            BakeError::UnknownRegionColumn {
+                            PlanError::UnknownRegionColumn {
                                 column: column.clone(),
                                 reader: field.id.to_string(),
                             }
@@ -672,6 +693,252 @@ where
     (start..end).map(row).collect()
 }
 
+/// TODO(jb-doc): what a step stands for — one whole field, or the water solve — and why a
+/// row-band is not one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    Field,
+    Water,
+}
+
+/// TODO(jb-doc): what `releases` is for, and why the water step counts as a reader of the
+/// height and moisture fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BakeStep {
+    pub kind: StepKind,
+    pub field: String,
+    pub releases: Vec<String>,
+}
+
+/// TODO(jb-doc): why the plan is fixed once made, and what a caller may read off it before
+/// a single texel is written.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BakePlan {
+    steps: Vec<BakeStep>,
+}
+
+impl BakePlan {
+    pub fn steps(&self) -> &[BakeStep] {
+        &self.steps
+    }
+
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+/// TODO(jb-doc): why a caller drives the loop on what this answers rather than asking the
+/// bake whether it is finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BakeProgress {
+    Advanced,
+    Finished,
+}
+
+/// TODO(jb-doc): what `live_bytes` counts and what it deliberately leaves out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BakeReport {
+    pub step: u32,
+    pub total: u32,
+    pub field: String,
+    pub live_bytes: u64,
+}
+
+/// TODO(jb-doc): what a bake owns while it runs — the spec and the rasters its steps have
+/// written — and why nothing is allocated until a step runs.
+#[derive(Debug)]
+pub struct Bake {
+    spec: TerrainSpec,
+    plan: BakePlan,
+    next_step: u32,
+    last_field: String,
+}
+
+impl Bake {
+    pub fn plan(&self) -> &BakePlan {
+        &self.plan
+    }
+
+    pub fn spec(&self) -> &TerrainSpec {
+        &self.spec
+    }
+
+    /// TODO(jb-doc): what a report says between two steps, and what it says before the
+    /// first one has run.
+    pub fn report(&self) -> BakeReport {
+        BakeReport {
+            step: self.next_step,
+            total: self.plan.steps.len() as u32,
+            field: self.last_field.clone(),
+            live_bytes: self.spec.baked_bytes() as u64,
+        }
+    }
+
+    /// TODO(jb-doc): why advancing past the last step refuses rather than answering
+    /// Finished twice.
+    pub fn advance(&mut self) -> Result<BakeProgress, BakeError> {
+        let index = self.next_step as usize;
+        let Some(step) = self.plan.steps.get(index).cloned() else {
+            return Err(BakeError::NoStepRemaining);
+        };
+
+        match step.kind {
+            StepKind::Field => self.spec.bake_field(&step.field)?,
+            StepKind::Water => {
+                let water_spec = self
+                    .spec
+                    .water_spec
+                    .clone()
+                    .ok_or(BakeError::NoStepRemaining)?;
+                self.spec.solve_water(&water_spec)?;
+            }
+        }
+
+        for released in &step.releases {
+            self.spec.release(released);
+        }
+
+        self.next_step += 1;
+        self.last_field = step.field;
+        if self.next_step as usize >= self.plan.steps.len() {
+            Ok(BakeProgress::Finished)
+        } else {
+            Ok(BakeProgress::Advanced)
+        }
+    }
+
+    /// TODO(jb-doc): what finishing drops, and why a caller that will edit again wants
+    /// [`Bake::finish_keeping_spec`] instead.
+    pub fn finish(self) -> Result<Terrain, BakeError> {
+        let (terrain, _) = self.finish_keeping_spec()?;
+        Ok(terrain)
+    }
+
+    /// TODO(jb-doc): why the spec comes back beside the terrain, and who needs it.
+    pub fn finish_keeping_spec(mut self) -> Result<(Terrain, TerrainSpec), BakeError> {
+        let remaining = self.plan.steps.len() as u32 - self.next_step;
+        if remaining > 0 {
+            return Err(BakeError::StepsRemaining(remaining));
+        }
+
+        let mut fields = Vec::with_capacity(self.spec.fields.len());
+        let mut baked = HashMap::with_capacity(self.spec.fields.len());
+        for field in &mut self.spec.fields {
+            fields.push(FieldInfo {
+                name: field.id.to_string(),
+                role: field.role,
+                shift: field.shift,
+                range_low: field.bounds().0,
+                range_high: field.bounds().1,
+                categorical: field.is_categorical(),
+            });
+            baked.insert(field.id.to_string(), field.baked().clone());
+        }
+
+        let terrain = Terrain {
+            size: self.spec.size,
+            fields,
+            baked,
+            water: self.spec.water.clone(),
+        };
+        Ok((terrain, self.spec))
+    }
+}
+
+impl TerrainSpec {
+    /// TODO(jb-doc): why planning refuses before a raster is allocated, and what a caller
+    /// may assume of a spec that plans.
+    pub fn plan_bake(&self) -> Result<BakePlan, PlanError> {
+        if self.size.x == 0 || self.size.y == 0 {
+            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
+        }
+        self.validate_roles()?;
+
+        let index_of = self.index_fields()?;
+        let dependencies = self.resolve_dependencies(&index_of)?;
+        let order = topological_order(&dependencies, &self.fields)?;
+
+        let mut steps: Vec<BakeStep> = Vec::with_capacity(order.len() + 1);
+        for &index in &order {
+            let field = &self.fields[index];
+            if field.baked().size() == resolution(self.size, field.shift) {
+                continue;
+            }
+            steps.push(BakeStep {
+                kind: StepKind::Field,
+                field: field.id.to_string(),
+                releases: Vec::new(),
+            });
+        }
+
+        if self.water_spec.is_some() {
+            steps.push(BakeStep {
+                kind: StepKind::Water,
+                field: self
+                    .field_with_role(FieldRole::Height)
+                    .map(|field| field.id.to_string())
+                    .unwrap_or_default(),
+                releases: Vec::new(),
+            });
+        }
+
+        // TODO(jb-comment): why no step releases a field yet — which two spec invariants
+        // pull against each other, and what a released field would do to a Terrain that is
+        // supposed to answer at every cell of every field it names.
+        Ok(BakePlan { steps })
+    }
+
+    /// TODO(jb-doc): why beginning a bake allocates nothing.
+    pub fn begin_bake(self) -> Result<Bake, PlanError> {
+        let plan = self.plan_bake()?;
+        Ok(Bake {
+            spec: self,
+            plan,
+            next_step: 0,
+            last_field: String::new(),
+        })
+    }
+
+    /// TODO(jb-doc): what this is the one-call spelling of.
+    pub fn bake(self) -> Result<Terrain, BakeError> {
+        let mut bake = self.begin_bake()?;
+        while !bake.plan().is_empty() && bake.next_step < bake.plan().len() as u32 {
+            bake.advance()?;
+        }
+        bake.finish()
+    }
+
+    pub fn field_with_role(&self, role: FieldRole) -> Option<&Field> {
+        if role == FieldRole::Custom {
+            return None;
+        }
+        self.fields.iter().find(|field| field.role == role)
+    }
+
+    /// TODO(jb-doc): which of these the editor's role dropdown is obliged to keep true,
+    /// and which the loader checks for a file it did not write.
+    pub fn validate_roles(&self) -> Result<(), PlanError> {
+        for role in [FieldRole::Height, FieldRole::Moisture] {
+            if self.fields.iter().filter(|f| f.role == role).count() > 1 {
+                return Err(PlanError::DuplicateRole(role));
+            }
+        }
+        if let Some(height) = self.field_with_role(FieldRole::Height)
+            && height.shift != 0
+        {
+            return Err(PlanError::CoarseHeight(height.id.to_string(), height.shift));
+        }
+        if self.water_spec.is_some() && self.field_with_role(FieldRole::Height).is_none() {
+            return Err(PlanError::MissingHeightField);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,8 +950,8 @@ mod tests {
             .with_blend(Blend::Replace)
     }
 
-    fn two_field_document() -> Terrain {
-        Terrain::new(UVec2::new(96, 80))
+    fn two_field_document() -> TerrainSpec {
+        TerrainSpec::new(UVec2::new(96, 80))
             .with_field(
                 Field::new("moisture")
                     .with_shift(3)
@@ -716,7 +983,7 @@ mod tests {
         );
         let mut staged = whole.clone();
 
-        whole.bake().unwrap();
+        whole.bake_in_place().unwrap();
         for id in staged.bake_order().unwrap() {
             staged.bake_field(id.as_str()).unwrap();
         }
@@ -738,7 +1005,7 @@ mod tests {
     #[test]
     fn a_released_field_reads_as_zero_and_bakes_back() {
         let mut terrain = two_field_document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let before = terrain.baked_bytes();
         let sampled = terrain.sample("height", 12.5, 9.5).unwrap();
@@ -800,16 +1067,16 @@ mod tests {
     /// because a staged bake has already drawn half a world by the time it hits one.
     #[test]
     fn a_stage_list_refuses_a_document_a_bake_would_refuse() {
-        let cyclic = Terrain::new(UVec2::splat(16))
+        let cyclic = TerrainSpec::new(UVec2::splat(16))
             .with_field(Field::new("a").with_layer(Layer::new(LayerOp::FieldRef("b".into()))))
             .with_field(Field::new("b").with_layer(Layer::new(LayerOp::FieldRef("a".into()))));
-        assert!(matches!(cyclic.bake_order(), Err(BakeError::Cycle(_))));
+        assert!(matches!(cyclic.bake_order(), Err(PlanError::Cycle(_))));
 
-        let dangling = Terrain::new(UVec2::splat(16))
+        let dangling = TerrainSpec::new(UVec2::splat(16))
             .with_field(Field::new("a").with_layer(Layer::new(LayerOp::FieldRef("gone".into()))));
         assert!(matches!(
             dangling.bake_order(),
-            Err(BakeError::UnknownField { .. })
+            Err(PlanError::UnknownField { .. })
         ));
     }
 
@@ -820,14 +1087,14 @@ mod tests {
         let mut terrain = two_field_document();
         assert!(matches!(
             terrain.bake_field("nowhere"),
-            Err(BakeError::UnknownField { .. })
+            Err(PlanError::UnknownField { .. })
         ));
     }
 
     #[test]
     fn a_two_field_document_with_a_field_masked_layer_bakes() {
         let mut terrain = two_field_document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let moisture = terrain.field("moisture").unwrap();
         assert_eq!(moisture.baked().size(), UVec2::new(12, 10));
@@ -844,7 +1111,7 @@ mod tests {
     #[test]
     fn a_rect_re_bake_is_bit_identical_to_a_full_one() {
         let mut terrain = two_field_document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let full: Vec<Vec<f32>> = terrain
             .fields
             .iter()
@@ -877,7 +1144,7 @@ mod tests {
     #[test]
     fn a_rect_re_bake_of_the_whole_document_reproduces_every_texel() {
         let mut terrain = two_field_document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let full: Vec<Vec<f32>> = terrain
             .fields
             .iter()
@@ -906,7 +1173,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let mut terrain = Terrain::new(size)
+        let mut terrain = TerrainSpec::new(size)
             .with_field(
                 Field::new("height")
                     .with_layer(Layer::new(LayerOp::External(ramp)).with_blend(Blend::Replace)),
@@ -921,7 +1188,7 @@ mod tests {
                     .with_blend(Blend::Replace),
                 ),
             );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let slope = terrain.sample("soil", 32.5, 32.5).unwrap();
         assert!(
@@ -932,7 +1199,7 @@ mod tests {
 
     #[test]
     fn a_field_is_baked_before_the_field_that_reads_it() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8))
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
             .with_field(
                 Field::new("derived").with_range((0.0, 10.0)).with_layer(
                     Layer::new(LayerOp::FieldRef(FieldId::from("source")))
@@ -945,26 +1212,26 @@ mod tests {
                     .with_range((0.0, 10.0))
                     .with_layer(Layer::new(LayerOp::Constant(3.0)).with_blend(Blend::Replace)),
             );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("derived", 4.5, 4.5).unwrap(), 6.0);
     }
 
     #[test]
     fn a_dependency_cycle_is_an_error_rather_than_a_hang() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8))
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
             .with_field(
                 Field::new("a").with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("b")))),
             )
             .with_field(
                 Field::new("b").with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("a")))),
             );
-        let error = terrain.bake().unwrap_err();
-        assert!(matches!(error, BakeError::Cycle(_)), "{error}");
+        let error = terrain.bake_in_place().unwrap_err();
+        assert!(matches!(error, PlanError::Cycle(_)), "{error}");
     }
 
     #[test]
     fn a_cycle_that_only_exists_through_a_disabled_layer_is_not_a_cycle() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8))
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
             .with_field(
                 Field::new("a").with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("b")))),
             )
@@ -972,17 +1239,17 @@ mod tests {
                 Field::new("b")
                     .with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("a"))).disabled()),
             );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
     }
 
     #[test]
     fn a_reference_to_a_field_that_is_not_there_is_an_error() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("a").with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("gone")))),
         );
-        let error = terrain.bake().unwrap_err();
+        let error = terrain.bake_in_place().unwrap_err();
         assert!(
-            matches!(&error, BakeError::UnknownField { referenced, reader }
+            matches!(&error, PlanError::UnknownField { referenced, reader }
                 if referenced == "gone" && reader == "a"),
             "{error}"
         );
@@ -990,19 +1257,19 @@ mod tests {
 
     #[test]
     fn two_fields_may_not_share_an_id() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8))
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
             .with_field(Field::new("height"))
             .with_field(Field::new("height"));
-        let error = terrain.bake().unwrap_err();
-        assert!(matches!(error, BakeError::DuplicateField(_)), "{error}");
+        let error = terrain.bake_in_place().unwrap_err();
+        assert!(matches!(error, PlanError::DuplicateField(_)), "{error}");
     }
 
     #[test]
     fn a_document_with_no_extent_is_an_error() {
-        let mut terrain = Terrain::new(UVec2::new(0, 16));
+        let mut terrain = TerrainSpec::new(UVec2::new(0, 16));
         assert!(matches!(
-            terrain.bake().unwrap_err(),
-            BakeError::ZeroSize(0, 16)
+            terrain.bake_in_place().unwrap_err(),
+            PlanError::ZeroSize(0, 16)
         ));
     }
 
@@ -1015,7 +1282,7 @@ mod tests {
             Blend::Max,
             Blend::Min,
         ] {
-            let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+            let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
                 Field::new("height")
                     .with_range((-10.0, 10.0))
                     .with_layer(Layer::new(LayerOp::Constant(4.0)).with_blend(Blend::Replace))
@@ -1025,7 +1292,7 @@ mod tests {
                             .with_mask(Mask::Constant(0.0)),
                     ),
             );
-            terrain.bake().unwrap();
+            terrain.bake_in_place().unwrap();
             assert_eq!(
                 terrain.sample("height", 4.5, 4.5).unwrap(),
                 4.0,
@@ -1036,7 +1303,7 @@ mod tests {
 
     #[test]
     fn a_mask_of_one_applies_the_layer_whole() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height")
                 .with_range((-20.0, 20.0))
                 .with_layer(Layer::new(LayerOp::Constant(4.0)).with_blend(Blend::Replace))
@@ -1046,13 +1313,13 @@ mod tests {
                         .with_mask(Mask::Constant(1.0)),
                 ),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 13.0);
     }
 
     #[test]
     fn a_half_mask_lands_halfway_between_blending_and_not() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height")
                 .with_range((-10.0, 10.0))
                 .with_layer(Layer::new(LayerOp::Constant(4.0)).with_blend(Blend::Replace))
@@ -1062,37 +1329,37 @@ mod tests {
                         .with_mask(Mask::Constant(0.5)),
                 ),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 8.0);
     }
 
     #[test]
     fn a_field_is_clamped_to_the_range_it_declares() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height")
                 .with_range((0.0, 1.0))
                 .with_layer(Layer::new(LayerOp::Constant(5.0)).with_blend(Blend::Replace)),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
     }
 
     #[test]
     fn a_disabled_layer_contributes_nothing() {
-        let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height")
                 .with_range((-10.0, 10.0))
                 .with_layer(Layer::new(LayerOp::Constant(4.0)).with_blend(Blend::Replace))
                 .with_layer(Layer::new(LayerOp::Constant(9.0)).disabled()),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 4.0);
     }
 
     #[test]
     fn a_painted_mask_lets_a_layer_through_where_it_is_white() {
         let mask = Raster::from_vec(UVec2::new(2, 1), vec![0u8, 255]).unwrap();
-        let mut terrain = Terrain::new(UVec2::new(8, 8)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height")
                 .with_range((-10.0, 10.0))
                 .with_layer(Layer::new(LayerOp::Constant(1.0)).with_blend(Blend::Replace))
@@ -1102,7 +1369,7 @@ mod tests {
                         .with_mask(Mask::Painted(mask)),
                 ),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 0.5, 4.5).unwrap(), 1.0);
         assert_eq!(terrain.sample("height", 7.5, 4.5).unwrap(), 5.0);
     }
@@ -1113,7 +1380,7 @@ mod tests {
     #[ignore]
     fn a_full_size_document_measures_what_a_bake_costs() {
         let size = UVec2::new(4096, 4096);
-        let mut terrain = Terrain::new(size)
+        let mut terrain = TerrainSpec::new(size)
             .with_field(
                 Field::new("moisture")
                     .with_shift(4)
@@ -1151,7 +1418,7 @@ mod tests {
             );
 
         let started = std::time::Instant::now();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let full = started.elapsed();
 
         let rect = CellRect::new(UVec2::new(1024, 1024), UVec2::new(1088, 1088));
@@ -1189,8 +1456,8 @@ mod tests {
             })
     }
 
-    fn region_document() -> Terrain {
-        Terrain::new(UVec2::new(512, 512))
+    fn region_document() -> TerrainSpec {
+        TerrainSpec::new(UVec2::new(512, 512))
             .with_field(
                 Field::new("ridge_weight").with_layer(
                     Layer::new(LayerOp::Regions {
@@ -1223,7 +1490,7 @@ mod tests {
     #[test]
     fn a_regions_layer_bakes_a_blended_column_into_a_field() {
         let mut terrain = region_document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let values = terrain.field("height").unwrap().baked().data();
         assert!(values.iter().all(|value| value.is_finite()));
@@ -1238,7 +1505,7 @@ mod tests {
     #[test]
     fn a_rect_re_bake_of_a_regions_field_is_bit_identical_to_a_full_one() {
         let mut terrain = region_document();
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let full: Vec<Vec<f32>> = terrain
             .fields
             .iter()
@@ -1270,7 +1537,7 @@ mod tests {
 
     #[test]
     fn a_categorical_region_field_at_shift_zero_reads_back_a_whole_index() {
-        let mut terrain = Terrain::new(UVec2::new(256, 256)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(256, 256)).with_field(
             Field::new("region").with_range((0.0, 8.0)).with_layer(
                 Layer::new(LayerOp::Regions {
                     spec: region_spec(),
@@ -1279,7 +1546,7 @@ mod tests {
                 .with_blend(Blend::Replace),
             ),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let baked = terrain.field("region").unwrap().baked();
         assert_eq!(baked.size(), UVec2::new(256, 256));
@@ -1294,7 +1561,7 @@ mod tests {
     /// interpolating them invents.
     #[test]
     fn a_categorical_field_is_never_read_between_two_of_its_classes() {
-        let mut terrain = Terrain::new(UVec2::new(256, 256))
+        let mut terrain = TerrainSpec::new(UVec2::new(256, 256))
             .with_field(
                 Field::new("region").with_range((0.0, 8.0)).with_layer(
                     Layer::new(LayerOp::Regions {
@@ -1307,7 +1574,7 @@ mod tests {
             .with_field(Field::new("copy").with_range((0.0, 8.0)).with_layer(
                 Layer::new(LayerOp::FieldRef(FieldId::from("region"))).with_blend(Blend::Replace),
             ));
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let region = terrain.field("region").unwrap();
         assert!(region.is_categorical());
@@ -1356,15 +1623,15 @@ mod tests {
 
     #[test]
     fn a_region_column_that_is_not_in_the_table_is_an_error() {
-        let mut terrain = Terrain::new(UVec2::new(64, 64)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(64, 64)).with_field(
             Field::new("height").with_layer(Layer::new(LayerOp::Regions {
                 spec: region_spec(),
                 output: RegionOutput::Blended("humidity".to_owned()),
             })),
         );
-        let error = terrain.bake().unwrap_err();
+        let error = terrain.bake_in_place().unwrap_err();
         assert!(
-            matches!(&error, BakeError::UnknownRegionColumn { column, reader }
+            matches!(&error, PlanError::UnknownRegionColumn { column, reader }
                 if column == "humidity" && reader == "height"),
             "{error}"
         );
@@ -1374,18 +1641,18 @@ mod tests {
     fn a_document_carrying_a_regions_layer_round_trips_through_serde() {
         let terrain = region_document();
         let encoded = serde_json::to_string(&terrain).unwrap();
-        let decoded: Terrain = serde_json::from_str(&encoded).unwrap();
+        let decoded: TerrainSpec = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, terrain);
     }
 
     #[test]
     fn a_bake_leaves_no_texel_of_a_field_untouched() {
-        let mut terrain = Terrain::new(UVec2::new(37, 23)).with_field(
+        let mut terrain = TerrainSpec::new(UVec2::new(37, 23)).with_field(
             Field::new("height")
                 .with_shift(2)
                 .with_layer(Layer::new(LayerOp::Constant(0.5)).with_blend(Blend::Replace)),
         );
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
         let field = terrain.field("height").unwrap();
         assert_eq!(field.baked().size(), UVec2::new(10, 6));
         assert!(field.baked().data().iter().all(|value| *value == 0.5));
@@ -1395,7 +1662,7 @@ mod tests {
     fn a_document_round_trips_through_serde_without_its_bakes() {
         let terrain = two_field_document();
         let encoded = serde_json::to_string(&terrain).unwrap();
-        let decoded: Terrain = serde_json::from_str(&encoded).unwrap();
+        let decoded: TerrainSpec = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, terrain);
         assert!(decoded.field("height").unwrap().baked().is_empty());
     }
@@ -1421,7 +1688,7 @@ mod tests {
         let rise = 0.001_f32;
         let plane = |mode| {
             let mut terrain =
-                Terrain::new(UVec2::splat(64))
+                TerrainSpec::new(UVec2::splat(64))
                     .with_field(
                         Field::new("ground")
                             .with_range((-10.0, 10.0))
@@ -1445,7 +1712,7 @@ mod tests {
             }
             let layer = Layer::new(LayerOp::External(raster)).with_blend(Blend::Replace);
             terrain.field_mut("ground").unwrap().layers.push(layer);
-            terrain.bake().unwrap();
+            terrain.bake_in_place().unwrap();
             terrain.sample("tilt", 32.5, 32.5).unwrap()
         };
 
@@ -1482,7 +1749,7 @@ mod tests {
             .unwrap()
             .layers
             .push(Layer::new(LayerOp::Paint(paint)));
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let before: Vec<Vec<f32>> = terrain
             .fields
@@ -1507,7 +1774,7 @@ mod tests {
         assert!(!painted.is_empty());
 
         let reached = terrain.influence_of("moisture", painted);
-        terrain.bake().unwrap();
+        terrain.bake_in_place().unwrap();
 
         let mut moved = 0;
         for (index, field) in terrain.fields.iter().enumerate() {
@@ -1538,5 +1805,156 @@ mod tests {
                 .is_empty()
         );
         assert!(terrain.influence_of("moisture", CellRect::EMPTY).is_empty());
+    }
+
+    fn roled_document() -> TerrainSpec {
+        TerrainSpec::new(UVec2::new(64, 64))
+            .with_field(
+                Field::new("moisture")
+                    .with_role(FieldRole::Moisture)
+                    .with_shift(3)
+                    .with_layer(noise_layer(7)),
+            )
+            .with_field(
+                Field::new("height")
+                    .with_role(FieldRole::Height)
+                    .with_layer(noise_layer(11)),
+            )
+    }
+
+    /// The plan is what a caller reads before a texel is written, so a step per field in
+    /// dependency order is the whole of what it promises.
+    #[test]
+    fn a_plan_carries_one_step_per_field_in_the_order_a_bake_visits_them() {
+        let plan = roled_document().plan_bake().unwrap();
+        let fields: Vec<_> = plan.steps().iter().map(|step| step.field.clone()).collect();
+        assert_eq!(fields, vec!["moisture", "height"]);
+        assert!(plan.steps().iter().all(|step| step.kind == StepKind::Field));
+    }
+
+    #[test]
+    fn a_spec_that_declares_water_plans_a_water_step_last() {
+        let mut spec = roled_document();
+        spec.water_spec = Some(WaterSpec::new("height").with_moisture("moisture"));
+
+        let plan = spec.plan_bake().unwrap();
+        assert_eq!(plan.steps().last().unwrap().kind, StepKind::Water);
+        assert_eq!(plan.steps().len(), 3);
+    }
+
+    /// Advancing answers Finished on the last step and nothing after it — the caller drives
+    /// its loop on that rather than asking the bake a second question.
+    #[test]
+    fn advancing_answers_finished_on_the_last_step_and_refuses_after_it() {
+        let mut bake = roled_document().begin_bake().unwrap();
+        assert_eq!(bake.advance().unwrap(), BakeProgress::Advanced);
+        assert_eq!(bake.advance().unwrap(), BakeProgress::Finished);
+        assert!(matches!(
+            bake.advance().unwrap_err(),
+            BakeError::NoStepRemaining
+        ));
+    }
+
+    #[test]
+    fn a_report_names_the_field_whose_step_ran_and_counts_the_rest() {
+        let mut bake = roled_document().begin_bake().unwrap();
+        bake.advance().unwrap();
+
+        let report = bake.report();
+        assert_eq!((report.step, report.total), (1, 2));
+        assert_eq!(report.field, "moisture");
+        assert!(report.live_bytes > 0);
+    }
+
+    /// A Terrain exists only when every step has run, or it would carry a field that reads
+    /// as zero everywhere while looking exactly like one that was baked.
+    #[test]
+    fn finishing_before_every_step_has_run_is_refused() {
+        let mut bake = roled_document().begin_bake().unwrap();
+        bake.advance().unwrap();
+
+        assert!(matches!(
+            bake.finish().unwrap_err(),
+            BakeError::StepsRemaining(1)
+        ));
+    }
+
+    /// The one-call spelling and the stepped one are the same bake, or the progress a
+    /// caller watched was of a different world.
+    #[test]
+    fn stepping_a_bake_writes_what_the_one_call_spelling_writes() {
+        let stepped = {
+            let mut bake = roled_document().begin_bake().unwrap();
+            while bake.advance().unwrap() == BakeProgress::Advanced {}
+            bake.finish().unwrap()
+        };
+        let whole = roled_document().bake().unwrap();
+
+        for view in whole.fields() {
+            let other = stepped.field(view.name()).unwrap();
+            assert_eq!(view.texels(), other.texels(), "{} differs", view.name());
+        }
+    }
+
+    #[test]
+    fn two_fields_claiming_one_role_is_refused_before_a_raster_is_allocated() {
+        let mut spec = roled_document();
+        spec.fields[0].role = FieldRole::Height;
+
+        assert!(matches!(
+            spec.plan_bake().unwrap_err(),
+            PlanError::DuplicateRole(FieldRole::Height)
+        ));
+    }
+
+    /// The solve reads its height one texel per cell and will not resample one, so a coarse
+    /// height is refused at plan time rather than discovered at the water step.
+    #[test]
+    fn a_coarse_height_field_is_refused_at_plan_time() {
+        let mut spec = roled_document();
+        spec.fields[1].shift = 2;
+
+        assert!(matches!(
+            spec.plan_bake().unwrap_err(),
+            PlanError::CoarseHeight(_, 2)
+        ));
+    }
+
+    #[test]
+    fn declaring_water_without_a_height_field_is_refused_at_plan_time() {
+        let mut spec = roled_document();
+        spec.fields[1].role = FieldRole::Custom;
+        spec.water_spec = Some(WaterSpec::new("height"));
+
+        assert!(matches!(
+            spec.plan_bake().unwrap_err(),
+            PlanError::MissingHeightField
+        ));
+    }
+
+    /// A spec whose file carried every bake plans no steps at all — that is what a
+    /// bakes-only export is, and it reaches a Terrain without evaluating a texel.
+    #[test]
+    fn a_spec_that_carries_every_bake_plans_no_steps() {
+        let mut spec = roled_document();
+        spec.bake_in_place().unwrap();
+
+        assert!(spec.plan_bake().unwrap().is_empty());
+    }
+
+    /// A document written before roles existed loads with every field defaulted to Custom,
+    /// so a water spec it carried names a height field the plan can no longer find.
+    #[test]
+    fn a_document_that_carries_no_roles_refuses_to_plan_its_water() {
+        let mut spec = TerrainSpec::new(UVec2::new(32, 32)).with_field(
+            Field::new("height")
+                .with_layer(Layer::new(LayerOp::Constant(0.5)).with_blend(Blend::Replace)),
+        );
+        spec.water_spec = Some(WaterSpec::new("height"));
+
+        assert!(matches!(
+            spec.plan_bake().unwrap_err(),
+            PlanError::MissingHeightField
+        ));
     }
 }
