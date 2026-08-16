@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 watershed.workspace = true
 bevy.workspace = true
-bevy_egui.workspace = true
 serde_json.workspace = true
 log.workspace = true
 tracing.workspace = true

@@ -1,9 +1,9 @@
 // TODO(jb-doc): module docs — that the brush writes into a layer like any other edit, and
 // why a stroke is the one edit that names a rectangle instead of dropping the whole bake.
 
+use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use bevy_egui::input::EguiWantsInput;
 use serde_json::{Value, json};
 use watershed::Field;
 use watershed::brush::Brush;
@@ -149,11 +149,12 @@ pub fn apply_stroke(
     }))
 }
 
-/// TODO(jb-comment): why egui is asked only on the frame a stroke starts, and what a drag
-/// that wandered over the panel would otherwise paint.
+/// TODO(jb-comment): why the panels are asked only on the frame a stroke starts, and what a
+/// drag that wandered over one would otherwise paint.
 fn paint(
     buttons: Res<ButtonInput<MouseButton>>,
-    wants: Option<Res<EguiWantsInput>>,
+    hover: Res<HoverMap>,
+    nodes: Query<(), With<Node>>,
     window: Option<Single<&Window, With<PrimaryWindow>>>,
     camera: Single<(&Transform, &Projection), With<EditorCamera>>,
     settings: Res<BrushSettings>,
@@ -168,11 +169,7 @@ fn paint(
     if painting.blocked {
         return;
     }
-    if painting.pending.is_empty()
-        && wants
-            .as_deref()
-            .is_some_and(EguiWantsInput::wants_any_pointer_input)
-    {
+    if painting.pending.is_empty() && crate::ui::pointer_over_ui(&hover, &nodes) {
         painting.blocked = true;
         return;
     }

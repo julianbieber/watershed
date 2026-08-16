@@ -11,7 +11,6 @@ repository = "https://github.com/julianbieber/watershed"
 [workspace.dependencies]
 watershed = { path = "crates/watershed" }
 bevy = { version = "0.19", features = ["bevy_feathers"] }
-bevy_egui = "0.41"
 glam = { version = "0.32", features = ["serde"] }
 rayon = "1.11"
 ron = "0.12"

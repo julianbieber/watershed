@@ -5,9 +5,12 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::CameraUpdateSystems;
 use bevy::image::{ImageSampler, TextureFormatPixelInfo};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::input_focus::InputFocus;
+use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
+use bevy::text::EditableText;
 use watershed::{CellRect, WaterState};
 
 use crate::document::{Document, EditorSystems};
@@ -93,12 +96,12 @@ impl Default for VisibleCells {
 
 /// What the panels have left the world, as fractions of the window.
 ///
-/// **Fractions rather than a viewport, and the reason is a loop.** `bevy_egui` takes
-/// egui's screen rectangle from `Camera::physical_viewport_rect`, so giving the camera the
-/// space the panels left over makes the panels' own screen smaller, which makes their
-/// leavings smaller again — measured, it collapsed the world into four pixels over a few
-/// frames. The world is therefore drawn across the whole window with the panels laid on
-/// top, and the only thing that has to know they are there is the fit.
+/// The world is drawn across the whole window with the panels laid on top, and the only
+/// thing that has to know they are there is the fit.
+///
+/// TODO(jb-doc): why this is still fractions of the window rather than a camera viewport
+/// now that the panels are `bevy_ui` nodes — the feedback loop the egui version had is
+/// gone, so the reason has to be restated or the decision revisited.
 ///
 /// TODO(jb-doc): why the size and the centre are both needed, and what a fit that used
 /// only the size would put behind the toolbar.
@@ -330,6 +333,10 @@ fn cell_to_world(cell: Vec2, size: UVec2) -> Vec2 {
 
 fn pan_zoom(
     keys: Res<ButtonInput<KeyCode>>,
+    focus: Option<Res<InputFocus>>,
+    fields: Query<(), With<EditableText>>,
+    hover: Res<HoverMap>,
+    nodes: Query<(), With<Node>>,
     mut wheel: MessageReader<MouseWheel>,
     time: Res<Time>,
     camera: Single<(&mut Transform, &mut Projection), With<EditorCamera>>,
@@ -339,18 +346,29 @@ fn pan_zoom(
         return;
     };
 
+    // A field with the keyboard in it owns every key, or a document could not be saved
+    // under a name with a `w` in it.
+    let typing = focus
+        .as_deref()
+        .and_then(InputFocus::get)
+        .is_some_and(|entity| fields.contains(entity));
+
+    // WASD and nothing else: the arrows belong to whatever text field has the keyboard,
+    // where they move the caret.
     let mut direction = Vec2::ZERO;
-    if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
-        direction.x -= 1.0;
-    }
-    if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
-        direction.x += 1.0;
-    }
-    if keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown]) {
-        direction.y -= 1.0;
-    }
-    if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
-        direction.y += 1.0;
+    if !typing {
+        if keys.pressed(KeyCode::KeyA) {
+            direction.x -= 1.0;
+        }
+        if keys.pressed(KeyCode::KeyD) {
+            direction.x += 1.0;
+        }
+        if keys.pressed(KeyCode::KeyS) {
+            direction.y -= 1.0;
+        }
+        if keys.pressed(KeyCode::KeyW) {
+            direction.y += 1.0;
+        }
     }
     if direction != Vec2::ZERO {
         // Scaled by the zoom, so a drag covers the same fraction of the screen however far
@@ -359,6 +377,8 @@ fn pan_zoom(
         transform.translation += (step * time.delta_secs()).extend(0.0);
     }
 
+    // Drained whether or not it is ours, so a turn spent on a panel is not delivered here a
+    // frame late.
     let mut steps = 0.0;
     for message in wheel.read() {
         steps += match message.unit {
@@ -366,11 +386,18 @@ fn pan_zoom(
             MouseScrollUnit::Pixel => message.y / 32.0,
         };
     }
-    if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
-        steps += 1.0;
+    // The wheel goes to whatever is under the pointer: over a panel it scrolls that panel,
+    // and only over the world does it zoom. See [`crate::ui::scroll`] for the other half.
+    if crate::ui::pointer_over_ui(&hover, &nodes) {
+        steps = 0.0;
     }
-    if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
-        steps -= 1.0;
+    if !typing {
+        if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {
+            steps += 1.0;
+        }
+        if keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract) {
+            steps -= 1.0;
+        }
     }
     if steps != 0.0 {
         projection.scale = (projection.scale / ZOOM_PER_STEP.powf(steps)).max(1e-4);

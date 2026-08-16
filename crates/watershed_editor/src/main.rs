@@ -1,6 +1,9 @@
 // TODO(jb-doc): crate-level docs — what the editor is for, and the standing rule that
 // nothing it can do may be unreachable from `watershed-ctl`.
 
+use bevy::feathers::FeathersPlugins;
+use bevy::feathers::dark_theme::create_dark_theme;
+use bevy::feathers::theme::UiTheme;
 use bevy::prelude::*;
 
 mod brush;
@@ -20,7 +23,8 @@ fn main() {
             custom_layer: control::log_layer,
             ..default()
         }))
-        .add_plugins(bevy_egui::EguiPlugin::default())
+        .add_plugins(FeathersPlugins)
+        .insert_resource(UiTheme(create_dark_theme()))
         .add_plugins((
             document::DocumentPlugin,
             brush::BrushPlugin,

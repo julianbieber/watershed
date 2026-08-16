@@ -259,7 +259,7 @@ fn view(world: &mut World) -> Value {
         "centre": [centre.x, centre.y],
         "cells_across": cells_across(projection),
         // How much of the window the panels have left the world, which is what a fit aims
-        // at. Reported rather than derived because a panel's width is egui's to decide.
+        // at. Reported rather than derived because a panel's width is the layout's to decide.
         "free_size": [free.size.x, free.size.y],
         "free_centre": [free.centre.x, free.centre.y],
         // The rectangle a live re-bake covers, reported here rather than derived by the
