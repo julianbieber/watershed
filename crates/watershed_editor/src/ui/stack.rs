@@ -25,11 +25,24 @@ use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{ADDABLE, AddLayer, Expanded, PANEL_WIDTH, report};
 
-/// The panel's children are thrown away and rebuilt whenever this changes. Everything a
+/// The panel's children are thrown away and rebuilt whenever the key changes. Everything a
 /// caption prints and everything that decides how many widgets there are is in it;
 /// nothing a number field holds is.
-#[derive(Resource, Default, PartialEq, Eq)]
-pub struct Shape(String);
+#[derive(Resource, Default)]
+pub struct Shape {
+    key: String,
+    generation: u64,
+}
+
+/// Which rebuild a child belongs to.
+///
+/// A rebuild queues its children rather than spawning them, because a scene waits on the
+/// fonts it names. So a despawn cannot reach a spawn that has not happened yet: at startup
+/// the empty panel's contents landed *after* the first document had already replaced them,
+/// and the panel said "no document" over a document. Anything that arrives late carries an
+/// old number and is taken out again.
+#[derive(Component, Default, Clone)]
+pub struct StackEntry(u64);
 
 #[derive(Component, Default, Clone)]
 pub struct StackBody;
@@ -64,16 +77,40 @@ pub fn rebuild(
     body: Single<Entity, With<StackBody>>,
     mut commands: Commands,
 ) {
-    let current = Shape(fingerprint(&document, &brush, &expanded, &add));
-    if *shape == current {
+    let key = fingerprint(&document, &brush, &expanded, &add);
+    if shape.key == key {
         return;
     }
-    *shape = current;
+    shape.key = key;
+    shape.generation += 1;
+    let generation = shape.generation;
+
+    let entries: Vec<Box<dyn SceneList>> = contents(&document, &brush, &expanded, &add)
+        .into_iter()
+        .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
+        .collect();
 
     commands
         .entity(*body)
         .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(contents(&document, &brush, &expanded, &add));
+        .queue_spawn_related_scenes::<Children>(entries);
+}
+
+/// Whatever a rebuild could not despawn because it had not been spawned yet.
+pub fn prune(
+    shape: Res<Shape>,
+    body: Single<&Children, With<StackBody>>,
+    entries: Query<&StackEntry>,
+    mut commands: Commands,
+) {
+    for child in body.iter() {
+        if entries
+            .get(child)
+            .is_ok_and(|entry| entry.0 != shape.generation)
+        {
+            commands.entity(child).despawn();
+        }
+    }
 }
 
 /// What the panel prints that is neither a choice nor a number: whether the bake on screen
@@ -183,24 +220,24 @@ fn contents(
     brush: &BrushSettings,
     expanded: &Expanded,
     add: &AddLayer,
-) -> Vec<Box<dyn SceneList>> {
+) -> Vec<Box<dyn Scene>> {
     let active = document.active().to_owned();
     let names = document.field_names();
     let Some(field) = field_of(document) else {
-        return vec![one(widgets::text("no document"))];
+        return vec![widgets::boxed(widgets::text("no document"))];
     };
 
-    let mut children: Vec<Box<dyn SceneList>> = vec![
-        one(widgets::row(vec![
+    let mut children: Vec<Box<dyn Scene>> = vec![
+        widgets::boxed(widgets::row(vec![
             one(widgets::text(active.clone())),
             one(bsn! { widgets::small("") PreviewTag }),
         ])),
-        one(brush_section(document, brush, expanded)),
-        one(properties(&active, field, shift_is_pinned(document))),
+        widgets::boxed(brush_section(document, brush, expanded)),
+        widgets::boxed(properties(&active, field, shift_is_pinned(document))),
     ];
 
     for (index, layer) in field.layers.iter().enumerate() {
-        children.push(one(layer_entry(
+        children.push(widgets::boxed(layer_entry(
             &active,
             index,
             field.layers.len(),
@@ -210,7 +247,7 @@ fn contents(
         )));
     }
 
-    children.push(one(add_row(&active, &names, add)));
+    children.push(widgets::boxed(add_row(&active, &names, add)));
     children
 }
 

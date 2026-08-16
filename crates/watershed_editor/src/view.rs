@@ -6,6 +6,7 @@ use bevy::camera::CameraUpdateSystems;
 use bevy::image::{ImageSampler, TextureFormatPixelInfo};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input_focus::InputFocus;
+use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
@@ -334,6 +335,8 @@ fn pan_zoom(
     keys: Res<ButtonInput<KeyCode>>,
     focus: Option<Res<InputFocus>>,
     fields: Query<(), With<EditableText>>,
+    hover: Res<HoverMap>,
+    nodes: Query<(), With<Node>>,
     mut wheel: MessageReader<MouseWheel>,
     time: Res<Time>,
     camera: Single<(&mut Transform, &mut Projection), With<EditorCamera>>,
@@ -344,7 +347,7 @@ fn pan_zoom(
     };
 
     // A field with the keyboard in it owns every key, or a document could not be saved
-    // under a name with a `w` in it. The wheel is not a key and keeps working.
+    // under a name with a `w` in it.
     let typing = focus
         .as_deref()
         .and_then(InputFocus::get)
@@ -374,12 +377,19 @@ fn pan_zoom(
         transform.translation += (step * time.delta_secs()).extend(0.0);
     }
 
+    // Drained whether or not it is ours, so a turn spent on a panel is not delivered here a
+    // frame late.
     let mut steps = 0.0;
     for message in wheel.read() {
         steps += match message.unit {
             MouseScrollUnit::Line => message.y,
             MouseScrollUnit::Pixel => message.y / 32.0,
         };
+    }
+    // The wheel goes to whatever is under the pointer: over a panel it scrolls that panel,
+    // and only over the world does it zoom. See [`crate::ui::scroll`] for the other half.
+    if crate::ui::pointer_over_ui(&hover, &nodes) {
+        steps = 0.0;
     }
     if !typing {
         if keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd) {

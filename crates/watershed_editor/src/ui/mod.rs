@@ -15,6 +15,7 @@ use crate::view::FreeView;
 mod bind;
 mod dialog;
 mod legend;
+mod scroll;
 mod stack;
 mod toolbar;
 mod widgets;
@@ -38,10 +39,13 @@ impl Plugin for UiPlugin {
                     toolbar::seed_path,
                     stack::rebuild,
                     stack::sync,
+                    stack::prune,
                     dialog::sync,
                     legend::sync,
+                    scroll::send,
                 ),
             )
+            .add_observer(scroll::apply)
             // After the scenes a rebuild queued have been spawned, so a field that has just
             // appeared holds its number on the frame it appears rather than the one after.
             .add_systems(

@@ -17,6 +17,12 @@ pub fn one(scene: impl Scene) -> Box<dyn SceneList> {
     Box::new(EntityScene(scene))
 }
 
+/// One scene as a boxed `Scene`, for lists whose entries still have to be patched before
+/// they become entities. `Box<dyn Scene>` is a `Scene`; `Box<dyn SceneList>` is not.
+pub fn boxed(scene: impl Scene) -> Box<dyn Scene> {
+    Box::new(scene)
+}
+
 /// A component the scene only carries when the condition holds — a checked checkbox, a
 /// button that cannot be pressed. `None` is a scene that patches nothing.
 pub fn when<C: Component + Clone + Default + Unpin>(on: bool, component: C) -> Option<impl Scene> {
