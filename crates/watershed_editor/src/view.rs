@@ -1,5 +1,10 @@
-// TODO(jb-doc): module docs — that one cell is one world unit, and what that makes the
-// camera's scale mean.
+//! Showing a document: the quad it is drawn on, the camera over it, and the
+//! conversions between what is on screen and what is in the document.
+//!
+//! One document cell is one world unit and the quad is centred on the origin, so the
+//! camera's scale is *cells per unit of projection area* — a scale of 1 puts one cell
+//! in the space one cell would take at the default zoom, and everything that talks
+//! about the view talks in cells rather than in pixels.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::CameraUpdateSystems;
@@ -16,27 +21,26 @@ use watershed::{CellRect, WaterState};
 use crate::document::{Document, EditorSystems};
 use crate::material::{FieldMaterial, FieldMaterialPlugin, FieldSettings};
 
-/// TODO(jb-doc): why the overlay and the observation share one number rather than each
-/// carrying its own — that a scenario asserting on channels must be asking about the ones
-/// it can see.
+/// How much accumulated flow makes a cell a channel, for the overlay and for anything
+/// asking the editor what it is showing.
+///
+/// One number for both: a caller asserting on channels has to be asking about the
+/// channels a person can see, and two thresholds would let the picture and the answer
+/// disagree.
 pub const CHANNEL_THRESHOLD: f32 = 64.0;
 
-/// Cells the ramp is fitted over. The visible rectangle is what a screen holds, and a
-/// screen holds a slice of the field rather than all of it.
 const FIT_SAMPLES: u32 = 24;
 
-/// TODO(jb-comment): why a fortieth is trimmed from each end, and what one deep-water cell
-/// does to a ramp fitted without it.
 const FIT_TRIM: f32 = 1.0 / 40.0;
 
-/// TODO(jb-comment): what this floor is defending — that genuinely flat ground has to look
-/// flat rather than have its last quantization step magnified to full contrast.
 const MIN_SPAN: f32 = 1.0 / 512.0;
 
 const PAN_CELLS_PER_SECOND: f32 = 600.0;
 const ZOOM_PER_STEP: f32 = 1.2;
 const MIN_CELLS_ACROSS: f32 = 8.0;
 
+/// Spawns the camera and the quad the document is drawn on, and runs the systems that
+/// keep the picture, the fitted ramp and the visible rectangle in step with it.
 pub struct ViewPlugin;
 
 impl Plugin for ViewPlugin {
@@ -53,10 +57,6 @@ impl Plugin for ViewPlugin {
                     .in_set(EditorSystems::View)
                     .after(EditorSystems::Document),
             )
-            // The fit reads `OrthographicProjection::area`, which `camera_system` writes in
-            // `PostUpdate` — so fitting in `Update` would read the area belonging to the
-            // *previous* frame's scale, and a scenario would see a stale range for one
-            // frame after every zoom.
             .add_systems(
                 PostUpdate,
                 (fit_ramp, track_visible_cells).after(CameraUpdateSystems),
@@ -64,27 +64,38 @@ impl Plugin for ViewPlugin {
     }
 }
 
+/// The camera the document is viewed through. Orthographic, and the only camera the
+/// view systems will act on.
 #[derive(Component)]
 pub struct EditorCamera;
 
 #[derive(Component)]
 struct FieldQuad;
 
-/// What the ramp is currently fitted to. Written once a frame by [`fit_ramp`] and read by
-/// everything that has to agree with the screen — the legend and the ctl — because
-/// deriving it a second time would be a second answer to what the view is showing.
+/// What the colour ramp is currently fitted to.
+///
+/// Written once a frame from what is on screen, and read by everything that has to
+/// agree with the picture — the legend, and anything asking the editor what it is
+/// showing. Deriving it a second time would be a second answer to one question.
 #[derive(Resource, Default, Clone, Copy, Debug)]
 pub struct ViewRange {
+    /// The value the ramp's low end stands for, in the field's own units.
     pub low: f32,
+    /// The value the ramp's high end stands for.
     pub high: f32,
+    /// Whether the diverging ramp is in use, which follows from `low` and `high`
+    /// straddling zero.
     pub diverging: bool,
 }
 
-/// The document cells the camera can see, written once a frame beside [`ViewRange`] and
-/// for the same reason: the re-bake and the screen have to be answering one question.
+/// The document cells the camera can see, written once a frame beside [`ViewRange`]
+/// and for the same reason: the re-bake and the screen have to be answering one
+/// question.
 ///
-/// TODO(jb-doc): why this is rounded outwards, and what a rectangle one cell short of the
-/// view would leave along the edge of the screen after an edit.
+/// Rounded outwards and clipped to the document, so a cell only half on screen is
+/// inside it. A rectangle one cell short of the view would leave the outermost row of
+/// cells unbaked after an edit — a stale fringe along the edge of the screen that
+/// moves whenever the camera does.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct VisibleCells(pub CellRect);
 
@@ -96,15 +107,11 @@ impl Default for VisibleCells {
 
 /// What the panels have left the world, as fractions of the window.
 ///
-/// The world is drawn across the whole window with the panels laid on top, and the only
-/// thing that has to know they are there is the fit.
-///
-/// TODO(jb-doc): why this is still fractions of the window rather than a camera viewport
-/// now that the panels are `bevy_ui` nodes — the feedback loop the egui version had is
-/// gone, so the reason has to be restated or the decision revisited.
-///
-/// TODO(jb-doc): why the size and the centre are both needed, and what a fit that used
-/// only the size would put behind the toolbar.
+/// The world is drawn across the whole window with the panels laid on top of it, so
+/// the only thing that has to know they are there is [`fit_camera`]. Both fractions
+/// are needed: the size says how much of the document fits, and the centre says where
+/// to put it — a fit using the size alone would centre the document on the window and
+/// leave a strip of it behind the toolbar and the panel.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct FreeView {
     /// The uncovered fraction of the window's width and height.
@@ -116,8 +123,6 @@ pub struct FreeView {
 
 impl Default for FreeView {
     fn default() -> Self {
-        // The whole window, which is what the world had before there were any panels — and
-        // what it falls back to for the frames before one has been laid out.
         Self {
             size: Vec2::ONE,
             centre: Vec2::ZERO,
@@ -126,8 +131,10 @@ impl Default for FreeView {
 }
 
 impl FreeView {
-    /// TODO(jb-comment): why a degenerate rectangle answers with the whole window rather
-    /// than with itself.
+    /// The fractions `free` is of `window`.
+    ///
+    /// A degenerate window or rectangle gives the whole window rather than itself,
+    /// which is also what a caller gets for the frames before a layout has run.
     pub fn new(free: Rect, window: Vec2) -> Self {
         if window.x <= 0.0 || window.y <= 0.0 || free.width() <= 0.0 || free.height() <= 0.0 {
             return Self::default();
@@ -143,8 +150,6 @@ impl FreeView {
     }
 }
 
-/// TODO(jb-doc): why the maps are tracked by revision rather than rebuilt when the terrain
-/// is touched.
 #[derive(Component)]
 struct MapRevisions {
     field: Option<u64>,
@@ -152,9 +157,6 @@ struct MapRevisions {
 }
 
 fn blank(format: TextureFormat) -> Image {
-    // A one-by-one of zeroes rather than no texture at all: bevy's fallback for an absent
-    // image is opaque white, which in the water map would mean water everywhere. Zero is
-    // the fallback each map already documents — no field and no water.
     let mut image = Image::new(
         Extent3d {
             width: 1,
@@ -211,8 +213,6 @@ fn spawn_view(
     ));
 }
 
-/// TODO(jb-comment): why the whole map is rebuilt and re-added rather than the texture
-/// being written in place, and what the alternative would have cost per landed bake.
 fn sync_maps(
     document: Res<Document>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -280,9 +280,6 @@ fn sync_maps(
     }
 }
 
-/// Two channels rather than four: the level says where water stands and the flow says
-/// where it runs, and neither the lake labelling nor the direction is something the eye
-/// can read off a colour.
 fn water_map(state: &WaterState) -> Image {
     let size = state.size();
     let mut bytes = Vec::with_capacity((size.x * size.y) as usize * 2);
@@ -312,17 +309,11 @@ fn water_map(state: &WaterState) -> Image {
     image
 }
 
-/// `OrthographicProjection::area` is **already multiplied by `scale`** — bevy's
-/// `camera_system` writes it that way — so it is the visible world rectangle relative to
-/// the camera, and scaling it again is the bug this whole module got wrong once. Nothing
-/// here may multiply by `scale`.
 fn visible_rect(camera: &Transform, projection: &OrthographicProjection) -> Rect {
     let centre = camera.translation.truncate();
     Rect::from_corners(centre + projection.area.min, centre + projection.area.max)
 }
 
-/// Cell coordinates of a world position. The quad is centred on the origin and one cell is
-/// one unit, so this is the document's own space shifted by half its size.
 fn world_to_cell(world: Vec2, size: UVec2) -> Vec2 {
     world + size.as_vec2() * 0.5
 }
@@ -346,15 +337,11 @@ fn pan_zoom(
         return;
     };
 
-    // A field with the keyboard in it owns every key, or a document could not be saved
-    // under a name with a `w` in it.
     let typing = focus
         .as_deref()
         .and_then(InputFocus::get)
         .is_some_and(|entity| fields.contains(entity));
 
-    // WASD and nothing else: the arrows belong to whatever text field has the keyboard,
-    // where they move the caret.
     let mut direction = Vec2::ZERO;
     if !typing {
         if keys.pressed(KeyCode::KeyA) {
@@ -371,14 +358,10 @@ fn pan_zoom(
         }
     }
     if direction != Vec2::ZERO {
-        // Scaled by the zoom, so a drag covers the same fraction of the screen however far
-        // out the view is.
         let step = direction.normalize() * PAN_CELLS_PER_SECOND * projection.scale;
         transform.translation += (step * time.delta_secs()).extend(0.0);
     }
 
-    // Drained whether or not it is ours, so a turn spent on a panel is not delivered here a
-    // frame late.
     let mut steps = 0.0;
     for message in wheel.read() {
         steps += match message.unit {
@@ -386,8 +369,6 @@ fn pan_zoom(
             MouseScrollUnit::Pixel => message.y / 32.0,
         };
     }
-    // The wheel goes to whatever is under the pointer: over a panel it scrolls that panel,
-    // and only over the world does it zoom. See [`crate::ui::scroll`] for the other half.
     if crate::ui::pointer_over_ui(&hover, &nodes) {
         steps = 0.0;
     }
@@ -404,9 +385,6 @@ fn pan_zoom(
     }
 }
 
-/// TODO(jb-comment): why the sort is over a fixed grid rather than the whole visible
-/// rectangle, and what reading every cell would cost at the zoom that shows all of a
-/// 4096-square document.
 fn fit_ramp(
     document: Res<Document>,
     mut range: ResMut<ViewRange>,
@@ -435,8 +413,6 @@ fn fit_ramp(
     let low_cell = world_to_cell(view.min, terrain.size);
     let high_cell = world_to_cell(view.max, terrain.size);
 
-    // Clamped to the document: a view that is mostly empty space would otherwise fit the
-    // ramp to whatever a read outside the raster clamps to.
     let size = terrain.size.as_vec2();
     let min = low_cell.max(Vec2::ZERO).min(size - Vec2::ONE);
     let max = high_cell.max(Vec2::ZERO).min(size - Vec2::ONE);
@@ -470,8 +446,6 @@ fn fit_ramp(
         high = middle + MIN_SPAN * 0.5;
     }
 
-    // Polarity is read off the data rather than configured: a range that straddles zero is
-    // the only thing that gives the neutral band a meaning.
     let diverging = low < 0.0 && high > 0.0;
 
     *range = ViewRange {
@@ -483,8 +457,6 @@ fn fit_ramp(
     material.settings.diverging = if diverging { 1.0 } else { 0.0 };
 }
 
-/// TODO(jb-comment): why the rectangle is rounded outwards on both ends rather than being
-/// the cells whose centres are on screen.
 fn track_visible_cells(
     document: Res<Document>,
     mut visible: ResMut<VisibleCells>,
@@ -511,13 +483,15 @@ fn track_visible_cells(
     };
 }
 
-/// TODO(jb-doc): why fitting is a jump rather than an animation, and what the ctl needs
-/// from that.
+/// Puts the whole document in the space the panels have left, in one step.
 ///
 /// The only thing in the crate that knows the panels are there, and it has to be: the
-/// world is drawn across the whole window with the panels over it, so a document fitted to
-/// the window is partly behind them. See [`FreeView`] for why they are not cut out of the
-/// camera instead.
+/// world is drawn across the whole window with the panels over it, so a document
+/// fitted to the window alone would be partly behind them.
+///
+/// A jump rather than an animation, so the camera is where it was asked to be by the
+/// time the call returns — a caller that fits and then reads what is on screen gets
+/// the fitted view, not a frame of a transition.
 pub fn fit_camera(
     transform: &mut Transform,
     projection: &mut Projection,
@@ -528,8 +502,6 @@ pub fn fit_camera(
         return;
     };
 
-    // The area already carries the scale, so this is a ratio against what is on screen
-    // now rather than an absolute — see the note on [`visible_rect`].
     let area = projection.area.size();
     if area.x <= 0.0 || area.y <= 0.0 {
         return;
@@ -543,18 +515,16 @@ pub fn fit_camera(
     let factor = (document.x / uncovered.x).max(document.y / uncovered.y);
     projection.scale *= factor;
 
-    // The area grows by the same factor the scale did, so where the uncovered rectangle's
-    // centre lands is known without waiting for `camera_system` to rewrite the area. The
-    // camera moves *against* that offset, which is what puts the document's middle in the
-    // middle of the space the panels left rather than of the window.
     transform.translation = (-free.centre * area * factor).extend(transform.translation.z);
 }
 
-/// The document cell under a window position, in the window's own coordinates — origin at
-/// the top left, y downwards, logical pixels.
+/// The document cell under a window position, in the window's own coordinates —
+/// origin at the top left, y downwards, logical pixels.
 ///
-/// TODO(jb-doc): why this converts through the camera's own `Transform` rather than its
-/// `GlobalTransform`, and why the answer keeps its fraction.
+/// The answer keeps its fraction: a stroke is written in continuous cells, and
+/// rounding here would make a brush jump between cells as the pointer crossed their
+/// boundaries. `None` for a window with no area, which is what a caller sees before
+/// the first layout.
 pub fn cell_at_cursor(
     transform: &Transform,
     projection: &Projection,
@@ -573,15 +543,18 @@ pub fn cell_at_cursor(
     Some(world_to_cell(view.min + view.size() * across, size))
 }
 
-/// Centres the view on a document cell. Absolute rather than relative so a scenario says
-/// where to look instead of how far to travel.
+/// Centres the view on a document cell. Absolute rather than relative, so a caller
+/// says where to look instead of how far to travel, and the zoom is left alone.
 pub fn look_at_cell(transform: &mut Transform, size: UVec2, cell: Vec2) {
     let world = cell_to_world(cell, size);
     transform.translation = world.extend(transform.translation.z);
 }
 
-/// TODO(jb-doc): the unit this takes and why it is cells rather than a bare scale — that a
-/// scenario can say how much of the document it wants to see without knowing the window.
+/// Zooms so that `cells` document cells span the width of the view.
+///
+/// In cells rather than as a bare scale, so a caller says how much of the document it
+/// wants to see without knowing the window's size. Floored at a few cells, and does
+/// nothing on a projection with no width yet.
 pub fn set_cells_across(projection: &mut Projection, cells: f32) {
     let Projection::Orthographic(projection) = projection else {
         return;
@@ -592,6 +565,8 @@ pub fn set_cells_across(projection: &mut Projection, cells: f32) {
     }
 }
 
+/// How many document cells currently span the width of the view. `0.0` for a
+/// projection that is not orthographic.
 pub fn cells_across(projection: &Projection) -> f32 {
     match projection {
         Projection::Orthographic(projection) => projection.area.width(),
@@ -599,6 +574,8 @@ pub fn cells_across(projection: &Projection) -> f32 {
     }
 }
 
+/// The document cell the view is centred on, fraction kept. Outside the document if
+/// the camera has been panned off it.
 pub fn view_centre_cell(transform: &Transform, size: UVec2) -> Vec2 {
     world_to_cell(transform.translation.truncate(), size)
 }
@@ -618,9 +595,9 @@ mod tests {
         )
     }
 
-    /// The window counts y downwards from its top left and the document counts it upwards
-    /// from its lower left, so the one thing this can get wrong is silent: a brush that
-    /// paints the mirror image of the stroke a person drew.
+    // The window counts y downwards from its top left and the document counts it
+    // upwards from its lower left, so the one thing this can get wrong is silent: a
+    // brush that paints the mirror image of the stroke a person drew.
     #[test]
     fn the_top_left_of_the_window_is_the_top_left_of_what_is_on_screen() {
         let size = UVec2::splat(256);
@@ -633,8 +610,9 @@ mod tests {
         assert_eq!(at(window * 0.5), Some(Vec2::splat(128.0)));
     }
 
-    /// Cells rather than pixels, so the answer has to follow the camera: the same pixel is a
-    /// different cell once the view has moved, which is why a drag is remembered in cells.
+    // Cells rather than pixels, so the answer has to follow the camera: the same pixel
+    // is a different cell once the view has moved, which is why a drag is remembered in
+    // cells.
     #[test]
     fn the_cell_under_a_pixel_follows_the_camera_and_the_zoom() {
         let size = UVec2::splat(256);
@@ -649,6 +627,8 @@ mod tests {
         assert_eq!(zoomed, Some(Vec2::new(96.0, 160.0)));
     }
 
+    // A window with no area is what the first frames report, and dividing by it would
+    // hand back a NaN cell that a stroke would then paint at.
     #[test]
     fn a_window_with_no_area_has_no_cell_under_it() {
         let (transform, projection) = view_of(256.0, Vec2::ZERO);

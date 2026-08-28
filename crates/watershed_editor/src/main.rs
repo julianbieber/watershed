@@ -1,5 +1,10 @@
-// TODO(jb-doc): crate-level docs — what the editor is for, and the standing rule that
-// nothing it can do may be unreachable from `watershed-ctl`.
+//! A graphical editor for a watershed document: authoring the fields and their layer
+//! stacks, painting into them, and previewing the baked terrain.
+//!
+//! Every capability the editor has is reachable from `watershed-ctl` as well as from
+//! the window. That is a standing rule rather than a convenience: a change that can
+//! only be exercised by a person holding the keys cannot be verified, so an action
+//! added to the UI is added to [`control`] too.
 
 use bevy::feathers::FeathersPlugins;
 use bevy::feathers::dark_theme::create_dark_theme;
@@ -18,8 +23,6 @@ mod view;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(bevy::log::LogPlugin {
-            // The layer has to exist before the logger does, and `LogPlugin` is built
-            // first — so it is wired in here rather than by `ControlPlugin`.
             custom_layer: control::log_layer,
             ..default()
         }))

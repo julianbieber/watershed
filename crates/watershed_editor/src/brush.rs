@@ -1,5 +1,15 @@
-// TODO(jb-doc): module docs — that the brush writes into a layer like any other edit, and
-// why a stroke is the one edit that names a rectangle instead of dropping the whole bake.
+//! Painting into a document with the pointer.
+//!
+//! A stroke is an ordinary edit — it writes into a paint layer of a field, and
+//! nothing about the layer stack is special-cased for it. What is special is what it
+//! tells the document afterwards: a rectangle rather than "this is stale", so a
+//! stroke provokes a re-bake of the ground it reached instead of the whole document.
+//!
+//! A drag outlives the re-bake it provokes. The cells the cursor crosses while the
+//! document is busy are queued and laid down as one polyline once it is free, so a
+//! drag is a continuous line however many frames its own baking takes; and a drag
+//! refused — started over a panel, or aimed at a field with nowhere to paint — is
+//! refused once, not once a frame while the button is down.
 
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
@@ -13,6 +23,8 @@ use watershed::raster::{Raster, resolution};
 use crate::document::{Document, EditorSystems};
 use crate::view::{EditorCamera, cell_at_cursor};
 
+/// Runs the pointer-driven painting system, ahead of the document's own systems each
+/// frame so a stroke made this frame is baked this frame.
 pub struct BrushPlugin;
 
 impl Plugin for BrushPlugin {
@@ -24,31 +36,21 @@ impl Plugin for BrushPlugin {
     }
 }
 
-/// TODO(jb-doc): why the brush is a knob that outlives a document, on the same terms the
-/// new-terrain dialog's fields are.
+/// The brush as the editor currently has it set.
+///
+/// A setting of the tool rather than of the document: it survives loading, closing
+/// and creating one, because a radius and a strength are how the person is working
+/// and not something the document has an opinion about.
 #[derive(Resource, Default, Clone, Copy, Debug)]
 pub struct BrushSettings(pub Brush);
 
-/// The drag in progress: the cells it has passed through that have not been laid down yet,
-/// starting with the last one that was.
-///
-/// Cells rather than pixels, because a stroke is written in document cells and the two part
-/// company the moment the camera moves. A queue rather than one position, because the bake a
-/// stroke provokes takes frames and the cursor does not wait for it — see [`paint`].
 #[derive(Resource, Default)]
 struct Painting {
     pending: Vec<Vec2>,
-    /// This drag belongs to something else — a panel it started over, or a refusal it has
-    /// already reported. Held until the button comes up rather than tested again each frame.
     blocked: bool,
 }
 
 impl Painting {
-    /// One frame of a drag: where the cursor is, and whether the document can take a stroke
-    /// this frame. Answers with the points to lay down, or with nothing while it cannot.
-    ///
-    /// TODO(jb-doc): what a drag laid down by this is and is not — that the cells are exact
-    /// and the *amount* at a join is not, and which of the two a person notices.
     fn advance(&mut self, cell: Vec2, busy: bool) -> Option<Vec<Vec2>> {
         if self.pending.last() != Some(&cell) {
             self.pending.push(cell);
@@ -57,17 +59,17 @@ impl Painting {
             return None;
         }
         let points = std::mem::take(&mut self.pending);
-        // The last cell stays behind as the next segment's start, or the drag would be laid
-        // down as a row of disconnected pieces with the joins between them unpainted.
         self.pending = points.last().copied().into_iter().collect();
         Some(points)
     }
 }
 
-/// The layer a stroke lands in: the topmost enabled paint layer of the field on screen.
+/// The layer a stroke would land in: the topmost enabled paint layer of `field`, or
+/// `None` if it has none.
 ///
-/// TODO(jb-doc): why the target is derived every stroke rather than being a selection the
-/// panel and the ctl would each have to keep in step with a stack that can be reordered.
+/// Derived from the stack every time rather than remembered, so reordering, disabling
+/// or deleting a layer moves the target with no separate selection to keep in step —
+/// and the panel and the control client cannot disagree about where a stroke goes.
 pub fn paint_layer(field: &Field) -> Option<usize> {
     field
         .layers
@@ -86,8 +88,23 @@ pub fn target_of(document: &Document) -> Option<(String, usize)> {
     paint_layer(field).map(|index| (field.id.to_string(), index))
 }
 
-/// A stroke, applied and noted — the one path a brush reaches the document by, whether the
-/// points came from a drag or from the ctl.
+/// Applies a stroke and tells the document what it reached — the one path a brush
+/// reaches a document by, whether the points came from a drag or from the control
+/// client.
+///
+/// `points` are in document cells. Refused, with a message fit to show, if there are
+/// no points, if a job is already running, if there is no document, or if the active
+/// field has no enabled paint layer.
+///
+/// The target layer's raster is allocated on first use at the field's own resolution,
+/// so a texel of the field reads exactly one painted texel and a stroke is never finer
+/// than what the field can hold. One that arrived at some other resolution — from a
+/// file, or from a shift changed under it — is kept and stretched over the document
+/// instead, and the reported rectangle is widened to cover the cells either side of
+/// each painted texel.
+///
+/// The reply names the field, the layer, the cells painted and the wider rectangle
+/// the change reaches through the fields that read it.
 pub fn apply_stroke(
     document: &mut Document,
     brush: &Brush,
@@ -115,14 +132,9 @@ pub fn apply_stroke(
         let LayerOp::Paint(raster) = &mut field.layers[index].op else {
             return Err("the brush's target stopped being a paint layer".to_owned());
         };
-        // One texel per texel of the field it is a layer of, so a texel of the field reads
-        // exactly one texel of this and a stroke cannot be finer than what the field holds.
         if raster.is_empty() {
             *raster = Raster::new(resolution(size, shift), 0.0);
         }
-        // A raster that arrived at some other resolution — from a file, or from a shift
-        // changed under it — is stretched over the document instead, so a painted texel is
-        // read from a cell either side of the block it covers.
         let bleed = (size.x.div_ceil(raster.width().max(1)))
             .max(size.y.div_ceil(raster.height().max(1)))
             + 1;
@@ -149,8 +161,6 @@ pub fn apply_stroke(
     }))
 }
 
-/// TODO(jb-comment): why the panels are asked only on the frame a stroke starts, and what a
-/// drag that wandered over one would otherwise paint.
 fn paint(
     buttons: Res<ButtonInput<MouseButton>>,
     hover: Res<HoverMap>,
@@ -190,9 +200,6 @@ fn paint(
         return;
     };
 
-    // The whole reason the queue exists: a stroke's own re-bake is still in flight on the
-    // frame after it, so a drag that painted only when the document was free would lay down
-    // every other frame — and one that *refused* there would lose the cells in between.
     let Some(points) = painting.advance(cell, document.is_busy()) else {
         return;
     };
@@ -200,8 +207,6 @@ fn paint(
     match apply_stroke(&mut document, &brush, &points) {
         Ok(_) => {}
         Err(error) => {
-            // The refusal a person can see, on the same terms the panel's buttons report
-            // one — once for the drag, rather than once a frame while the button is held.
             painting.blocked = true;
             warn!("{error}");
             document.refuse(error);
@@ -222,6 +227,9 @@ mod tests {
         })
     }
 
+    // Topmost rather than first: a stroke has to land in the layer the person can see
+    // on top, and a stack with two paint layers is the only case that tells the two
+    // readings apart.
     #[test]
     fn the_brush_paints_into_the_topmost_paint_layer_of_the_field() {
         let field = field_with(vec![
@@ -233,6 +241,9 @@ mod tests {
         assert_eq!(paint_layer(&field), Some(3));
     }
 
+    // Both are states the panel offers, and both have to resolve to no target rather
+    // than to some other layer — a stroke that fell through to the layer beneath a
+    // disabled one would paint somewhere the person cannot see.
     #[test]
     fn a_field_with_no_paint_layer_and_one_that_is_switched_off_are_both_no_target() {
         assert_eq!(paint_layer(&field_with(vec![LayerOp::Constant(0.5)])), None);
@@ -242,9 +253,11 @@ mod tests {
         assert_eq!(paint_layer(&field), None);
     }
 
-    /// The defect this guards was found by driving the editor: a stroke's own re-bake is
-    /// still running on the next frame, and a drag that gave up there laid down nothing at
-    /// all for as long as the button was held.
+    // The defect this guards was found by driving the editor: a stroke's own re-bake is
+    // still running on the next frame, and a drag that gave up there laid down nothing
+    // at all for as long as the button was held. The queue keeps every cell the cursor
+    // crossed while it was busy, and the one it was last laid down at, so the next
+    // piece joins the last rather than starting beside it.
     #[test]
     fn a_drag_keeps_the_cells_it_crossed_while_the_document_was_busy() {
         let mut painting = Painting::default();
@@ -259,8 +272,6 @@ mod tests {
             .advance(Vec2::new(3.0, 0.0), false)
             .expect("the queue is laid down once the document is free");
 
-        // Every cell the cursor crossed while it was busy, and the one it was last laid
-        // down at — so the piece joins the one before it rather than starting beside it.
         assert_eq!(
             laid,
             vec![
@@ -272,6 +283,9 @@ mod tests {
         );
     }
 
+    // A held button reports the same cell every frame; queuing each one would grow the
+    // polyline without bound and make a stationary brush behave differently from a
+    // moving one.
     #[test]
     fn a_cursor_that_has_not_moved_lays_the_same_cell_down_once() {
         let mut painting = Painting::default();
@@ -283,8 +297,8 @@ mod tests {
         assert_eq!(painting.advance(Vec2::splat(4.0), true), None);
     }
 
-    /// A drag is one line, so the piece laid down this frame has to start where the last one
-    /// ended — a queue that kept nothing would leave the join between them unpainted.
+    // A drag is one line, so the piece laid down this frame has to start where the last
+    // one ended — a queue that kept nothing would leave the join between them unpainted.
     #[test]
     fn every_piece_of_a_drag_starts_where_the_one_before_it_ended() {
         let mut painting = Painting::default();
@@ -300,6 +314,8 @@ mod tests {
         assert_eq!(ended, Some(Vec2::new(50.0, 0.0)));
     }
 
+    // Both refusals reach a person as a message, so they have to be errors rather than
+    // a silent no-op that looks like a brush with no effect.
     #[test]
     fn a_stroke_is_refused_where_there_is_nothing_to_paint_into() {
         let mut document = Document::default();
@@ -307,8 +323,8 @@ mod tests {
         assert!(apply_stroke(&mut document, &Brush::default(), &[]).is_err());
     }
 
-    /// The seam the whole module is written against: a stroke lands in the layer, and what
-    /// it reports to the document is a rectangle rather than "everything".
+    // The seam the whole module is written against: a stroke lands in the layer, and
+    // what it reports to the document is a rectangle rather than "everything".
     #[test]
     fn a_stroke_lands_in_the_layer_and_leaves_the_bake_where_it_was() {
         let mut document = Document::default();

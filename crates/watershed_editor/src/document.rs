@@ -1,6 +1,14 @@
-// TODO(jb-doc): module docs — that the editor owns exactly one terrain, that every
-// expensive operation on it is a job the terrain is *moved into*, and what the view is
-// therefore looking at while one is in flight.
+//! The one terrain the editor has open, and everything that happens to it.
+//!
+//! Every expensive operation — baking, solving, saving, loading — is a *job*, and a
+//! job takes the terrain: it is moved onto a task pool and moved back when the job
+//! lands. So while one is in flight the editor has no terrain at all, the view is
+//! showing the textures the last job left behind, and every other operation is
+//! refused rather than queued. There is one job slot and no queue.
+//!
+//! What the bake on screen is worth is tracked apart from the terrain, because an
+//! edit invalidates a bake without touching it: see [`Baked`] for how much of the
+//! document currently matches its own layers.
 
 use std::path::PathBuf;
 
@@ -13,11 +21,10 @@ use crate::edit::Edit;
 use crate::preset::Preset;
 use crate::view::VisibleCells;
 
-/// Cells of slack around the visible rectangle when a re-bake is started for it. A pan of
-/// less than this costs nothing, where re-baking exactly what is on screen would start a
-/// job on the first frame the camera moved.
 const REBAKE_MARGIN_CELLS: u32 = 64;
 
+/// Holds the document and runs the two systems that land finished jobs and open the
+/// re-bakes an edit or a pan has asked for.
 pub struct DocumentPlugin;
 
 impl Plugin for DocumentPlugin {
@@ -31,27 +38,41 @@ impl Plugin for DocumentPlugin {
     }
 }
 
-/// TODO(jb-doc): why the editor's frame is ordered rather than left to the executor — the
-/// same argument `city_panel.rs` makes in wusel, and which two sets would otherwise race.
+/// The order the editor's frame runs in.
+///
+/// Explicit rather than left to the scheduler, because the three read and write the
+/// same document within one frame: a stroke made now has to be noted before the
+/// document decides what to bake, and the view has to upload what that decided after
+/// it. Unordered, a stroke would be answered a frame late and the picture would lag
+/// the bake by another.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EditorSystems {
+    /// Takes the pointer and turns it into strokes.
     Brush,
+    /// Lands finished jobs and starts the ones the frame has asked for.
     Document,
+    /// Uploads what the document holds and follows the camera.
     View,
 }
 
-/// TODO(jb-doc): what each kind moves and what it hands back, and why `New` is a bake
-/// rather than a kind of its own.
+/// What the job in flight is doing. Only one runs at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
+    /// Builds a preset and bakes it whole. Distinct from `Bake` because there is no
+    /// terrain to take — it hands one back that did not exist before.
     New,
+    /// Bakes the document, or a rectangle of it.
     Bake,
+    /// Solves the water. Refused unless the whole document is baked.
     Solve,
+    /// Writes the document to a path and hands it back unchanged.
     Save,
+    /// Reads a document from a path, replacing whatever was open.
     Load,
 }
 
 impl JobKind {
+    /// The lowercase word the status line and the control client name this by.
     pub fn name(self) -> &'static str {
         match self {
             Self::New => "new",
@@ -63,25 +84,29 @@ impl JobKind {
     }
 }
 
-/// How much of the document's bake matches the layers it was cut from.
+/// How much of the document's bake still matches the layers it was cut from.
 ///
-/// TODO(jb-doc): why an edit drops this to [`Baked::Nothing`] rather than to the rectangle
-/// it did not touch — that a layer is a whole-field quantity and nothing here knows the
-/// reach of the one that changed.
+/// An edit to the stack drops this to [`Baked::Nothing`] rather than to the part it
+/// left alone: a layer applies to a whole field, and nothing here knows the reach of
+/// the one that changed. A stroke is the exception — it names the ground it moved, so
+/// it leaves the extent where it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Baked {
+    /// Nothing on screen can be trusted.
     Nothing,
+    /// Only this rectangle of the document has been baked since the last edit.
     Rect(CellRect),
+    /// The whole document matches its layers. The only state a solve will run from.
     Whole,
 }
 
 impl Baked {
+    /// Whether that rectangle of the document has been baked since the last edit. An
+    /// empty rectangle is covered by anything, including [`Baked::Nothing`].
     pub fn covers(self, rect: CellRect) -> bool {
         match self {
             Self::Whole => true,
             Self::Nothing => rect.is_empty(),
-            // A union that adds nothing is a rectangle already inside this one, which is
-            // the containment test without a second way of spelling it.
             Self::Rect(have) => have.union(rect) == have,
         }
     }
@@ -94,6 +119,8 @@ impl Baked {
         }
     }
 
+    /// The lowercase word the control client reports this by. A `Rect` does not carry
+    /// its rectangle into the name.
     pub fn name(self) -> &'static str {
         match self {
             Self::Nothing => "nothing",
@@ -103,8 +130,6 @@ impl Baked {
     }
 }
 
-/// TODO(jb-doc): why every job answers with the same shape — that a save hands back the
-/// terrain it borrowed and a load invents one, and the caller cannot tell which.
 struct Outcome {
     terrain: Option<TerrainSpec>,
     error: Option<String>,
@@ -112,18 +137,19 @@ struct Outcome {
 
 enum Job {
     Idle,
-    // TODO(jb-comment): why the task lives inside the enum rather than beside it, and what
-    // dropping the resource therefore does to a solve that is half done.
     Running { kind: JobKind, task: Task<Outcome> },
 }
 
+/// The open document and everything the editor knows about its state.
+///
+/// While a job is running the terrain is `None` — it has been moved onto the pool —
+/// so every reader has to cope with there being no document, and every operation that
+/// would need one is refused until the job lands.
 #[derive(Resource)]
 pub struct Document {
     terrain: Option<TerrainSpec>,
     job: Job,
     active: String,
-    /// TODO(jb-doc): why the view watches a counter rather than the terrain itself, given
-    /// a 4096-square bake is 64 MB and the comparison would cost more than the upload.
     revision: u64,
     water_revision: u64,
     error: Option<String>,
@@ -177,22 +203,30 @@ impl Default for Document {
 }
 
 impl Document {
+    /// The open document, or `None` while a job holds it or none has been opened.
     pub fn terrain(&self) -> Option<&TerrainSpec> {
         self.terrain.as_ref()
     }
 
+    /// The field on screen. Always a name, even when there is no document, and always
+    /// one the document carries when there is.
     pub fn active(&self) -> &str {
         &self.active
     }
 
+    /// Bumped whenever the field textures might need re-uploading. Compared against a
+    /// remembered value rather than the rasters themselves, which at a full document
+    /// size would cost more to compare than to upload.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
+    /// As [`Document::revision`], for the water overlay.
     pub fn water_revision(&self) -> u64 {
         self.water_revision
     }
 
+    /// The last refusal or job failure, until the next job or edit clears it.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -203,6 +237,7 @@ impl Document {
         self.error = Some(error);
     }
 
+    /// What is running, if anything.
     pub fn job(&self) -> Option<JobKind> {
         match &self.job {
             Job::Idle => None,
@@ -210,14 +245,18 @@ impl Document {
         }
     }
 
+    /// Whether a job is running. While it is, there is no terrain to read and every
+    /// operation that needs one is refused.
     pub fn is_busy(&self) -> bool {
         matches!(self.job, Job::Running { .. })
     }
 
+    /// How much of the document currently matches its layers.
     pub fn baked(&self) -> Baked {
         self.baked
     }
 
+    /// Whether an edit has landed that no bake has answered yet.
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -236,19 +275,17 @@ impl Document {
         self.terrain.as_mut()
     }
 
-    /// TODO(jb-doc): the three things an edit invalidates and why the water is one of them
-    /// — that a solved water state is derived from a height that has just moved.
+    /// Records that the stack has changed: the whole bake is stale, the last error no
+    /// longer applies, a stack that would not bake is worth trying again, and any
+    /// solved water is invalidated — it was derived from a height that has just moved.
+    ///
+    /// The water's *spec* is kept, so the document can be solved again. Every caller
+    /// that edits through [`Document::terrain_mut`] has to call this.
     pub fn note_edit(&mut self) {
         self.dirty = true;
         self.baked = Baked::Nothing;
         self.error = None;
-        // The stack has changed, so whatever it failed on last time is worth trying again
-        // — which is what lets a cycle be undone by the toggle that made it.
         self.bake_failed = false;
-        // `invalidate_water`, never `clear_water`: the latter drops the *spec* too, which
-        // is right for "Reset water" and catastrophic here — the first edit after a solve
-        // would take away the recipe, and every later solve would refuse a document that
-        // looks perfectly ordinary.
         if let Some(terrain) = self.terrain.as_mut()
             && terrain.water().is_some()
         {
@@ -262,8 +299,11 @@ impl Document {
     /// what the next one has to cover — so a stroke costs its own footprint rather than the
     /// whole document, and a document that was wholly baked before one is wholly baked after.
     ///
-    /// TODO(jb-doc): why the caller passes the rectangle a change *reaches* rather than the
-    /// one it painted, and which of the two `watershed` works out.
+    /// `reached` is the rectangle the change *reaches* through the fields that read the
+    /// painted one, not the rectangle the brush covered — the caller gets it from
+    /// [`TerrainSpec::influence_of`], which is the only thing that knows how far a
+    /// change travels. Passing the painted rectangle instead leaves a stale fringe in
+    /// every field downstream.
     pub fn note_stroke(&mut self, reached: CellRect) {
         self.dirty = true;
         self.error = None;
@@ -277,8 +317,13 @@ impl Document {
         }
     }
 
-    /// TODO(jb-doc): why a structural edit goes through the document rather than through
-    /// the terrain it holds, given the terrain is reachable either way.
+    /// Applies a structural edit and notes it, which is why an edit goes through here
+    /// rather than through [`Document::terrain_mut`]: the two are one operation, and
+    /// an edit applied without being noted leaves a stale bake on screen with nothing
+    /// arranged to replace it.
+    ///
+    /// Refused while a job is running or with no document open. On a refusal from the
+    /// edit itself the document is untouched.
     pub fn apply(&mut self, edit: &Edit) -> Result<Value, String> {
         if self.is_busy() {
             return Err(format!(
@@ -295,8 +340,12 @@ impl Document {
         Ok(reply)
     }
 
-    /// TODO(jb-doc): why an unknown name is refused rather than silently kept — that the
-    /// legend names the field and a name nothing baked would label an empty view.
+    /// Puts a field on screen.
+    ///
+    /// Refused if the open document has no such field: the legend prints the active
+    /// name over the picture, so a name nothing baked would caption an empty view with
+    /// a field that does not exist. Accepted with no document open, since there is
+    /// nothing yet to check against.
     pub fn set_active(&mut self, field: &str) -> Result<(), String> {
         match self.terrain.as_ref() {
             Some(terrain) if terrain.field(field).is_none() => {
@@ -312,6 +361,8 @@ impl Document {
         }
     }
 
+    /// The open document's field names in declaration order, or empty when there is no
+    /// document.
     pub fn field_names(&self) -> Vec<String> {
         self.terrain
             .as_ref()
@@ -329,9 +380,6 @@ impl Document {
         self.error = None;
         self.job = Job::Running { kind, task };
         self.baking = Baked::Nothing;
-        // Any job starting supersedes a solve that was waiting on a bake — including the
-        // bake it was waiting for, which is why `solve_with_bake` sets the flag *after*
-        // asking for it.
         self.pending_solve = false;
     }
 
@@ -353,7 +401,8 @@ impl Document {
     /// A rectangle re-bakes only that much of the document and says so afterwards; `None`
     /// is the whole of it, which is the only thing that makes a document solvable again.
     ///
-    /// TODO(jb-doc): why the rectangle is passed in rather than read off the camera here.
+    /// The rectangle is passed in rather than read off the camera, so a caller driving
+    /// the editor from outside can ask for ground nobody is looking at.
     pub fn start_bake(&mut self, rect: Option<CellRect>) -> Result<(), String> {
         let mut terrain = self.take_terrain()?;
         let covered = match rect {
@@ -371,17 +420,17 @@ impl Document {
         });
         self.start(JobKind::Bake, task);
         self.dirty = false;
-        // Asked for by name, so it is tried again however the last one went.
         self.bake_failed = false;
-        // TODO(jb-comment): why this is cleared for any rectangle rather than only for one
-        // that covers it — what every caller of this is obliged to have asked for.
         self.stroke_rect = CellRect::EMPTY;
         self.baking = covered;
         Ok(())
     }
 
-    /// TODO(jb-doc): why building the preset happens on the pool with the bake rather than
-    /// here, given only the bake is slow.
+    /// Starts building a preset and baking it whole, dropping whatever was open.
+    ///
+    /// Refused while a job is running. The document is emptied immediately, so the
+    /// view goes blank on the frame this is called rather than showing the old terrain
+    /// under the new size in the toolbar.
     pub fn start_new(&mut self, size: UVec2, seed: u32, preset: Preset) -> Result<(), String> {
         self.busy_check()?;
         self.size = size;
@@ -406,12 +455,16 @@ impl Document {
         Ok(())
     }
 
-    /// TODO(jb-doc): why the spec is read off the document rather than passed in, and what
-    /// a document with no spec is being told when this refuses.
+    /// Starts solving the water the document's own spec describes.
+    ///
+    /// Refused unless the whole document is baked and clean: water is derived from the
+    /// height everywhere at once, and solving a document only part of which matches
+    /// its layers gives a drainage network for a landscape that no longer exists. Use
+    /// [`Document::solve_with_bake`] to bake first.
+    ///
+    /// Also refused when the document carries no water spec, which is what a document
+    /// that has had its water reset is being told.
     pub fn start_solve(&mut self) -> Result<(), String> {
-        // Refused rather than quietly solving what is there: water is derived from the
-        // height everywhere at once, and a document only part of which matches its layers
-        // would produce a drainage network for a landscape that no longer exists.
         if self.baked != Baked::Whole || self.dirty {
             return Err("the document is only partly baked; bake it before solving".to_owned());
         }
@@ -432,7 +485,10 @@ impl Document {
         Ok(())
     }
 
-    /// Synchronous, unlike its opposite: dropping a solved state is a deallocation, and
+    /// Removes the water and its spec, so nothing will re-solve it. Refused while a
+    /// job is running or with no document open.
+    ///
+    /// Synchronous, unlike solving: dropping a solved state is a deallocation and
     /// there is nothing to wait for.
     pub fn reset_water(&mut self) -> Result<(), String> {
         self.busy_check()?;
@@ -445,6 +501,8 @@ impl Document {
         Ok(())
     }
 
+    /// Starts writing the document to `path`. The terrain comes back unchanged when
+    /// the job lands. Refused while a job is running or with no document open.
     pub fn start_save(&mut self, path: PathBuf, options: SaveOptions) -> Result<(), String> {
         let terrain = self.take_terrain()?;
         self.path = Some(path.clone());
@@ -462,6 +520,11 @@ impl Document {
         Ok(())
     }
 
+    /// Starts reading a document from `path`, dropping whatever was open.
+    ///
+    /// Refused while a job is running. What lands is wholly baked whatever the file
+    /// carried, because the reader re-derives what the file left out; on a failure the
+    /// editor is left with no document rather than the old one.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
         self.busy_check()?;
         self.path = Some(path.clone());
@@ -483,9 +546,6 @@ impl Document {
         });
         self.start(JobKind::Load, task);
         self.dirty = false;
-        // A load answers with a document whose bake is complete however the file carried
-        // it — the reader re-derives what the file left out, which is the same contract
-        // `SaveOptions` documents from the writing end.
         self.baking = Baked::Whole;
         Ok(())
     }
@@ -497,7 +557,8 @@ impl Document {
         }
     }
 
-    /// A document holding a terrain, without the task pool a job would need to make one.
+    /// Puts a terrain straight into the document, for tests: `start_new` and
+    /// `start_load` both need a task pool, and a test has none.
     #[cfg(test)]
     pub(crate) fn adopt(&mut self, terrain: TerrainSpec) {
         self.size = terrain.size;
@@ -512,9 +573,6 @@ impl Document {
     }
 }
 
-/// TODO(jb-comment): why both revisions are bumped for every job rather than only the one
-/// the job touched, and what a solve that left the field revision alone would leave on the
-/// GPU after a load.
 fn finish_job(mut document: ResMut<Document>) {
     let Job::Running { kind, task } = &mut document.job else {
         return;
@@ -532,9 +590,6 @@ fn finish_job(mut document: ResMut<Document>) {
     document.revision += 1;
     document.water_revision += 1;
 
-    // A bake that failed wrote nothing worth claiming — the document keeps the extent it
-    // had, so a cycle introduced by a toggle leaves the last good bake on screen rather
-    // than a rectangle of whatever the error interrupted.
     if outcome.error.is_none() {
         document.baked = document.baked.with(document.baking);
     } else if matches!(kind, JobKind::Bake | JobKind::New) {
@@ -547,8 +602,6 @@ fn finish_job(mut document: ResMut<Document>) {
         document.error = Some(error);
     }
 
-    // A document whose active field the load did not bring along would draw nothing and
-    // say nothing about why, so the name falls back to whatever the terrain does have.
     let names = document.field_names();
     if !names.is_empty() && !names.iter().any(|name| name == document.active()) {
         let fallback = if names.iter().any(|name| name == "height") {
@@ -559,9 +612,6 @@ fn finish_job(mut document: ResMut<Document>) {
         document.active = fallback;
     }
 
-    // The solve that was standing behind a whole-document bake. Nothing is started if the
-    // bake failed — that error is the answer, and a solve over a stack that would not bake
-    // has nothing to read.
     if kind == JobKind::Bake && document.pending_solve {
         document.pending_solve = false;
         if document.error.is_none()
@@ -573,14 +623,6 @@ fn finish_job(mut document: ResMut<Document>) {
     }
 }
 
-/// Opens the re-bake an edit is waiting for, and the one a pan into unbaked ground needs.
-///
-/// Both are the same job because they answer the same question — the rectangle on screen
-/// does not match the layers — and separating them would mean two callers racing for the
-/// one slot a document has.
-///
-/// TODO(jb-comment): why an edit made while a bake is in flight costs a second whole job
-/// rather than being folded into the one already running.
 fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>) {
     if document.is_busy() {
         return;
@@ -597,8 +639,6 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
         wanted,
         document.stroke_rect,
     ) {
-        // Nothing will be baked, so nothing is waiting on one: an edit left dirty here
-        // would have every caller watching for the document to settle wait forever.
         None => document.dirty = false,
         Some(rect) => {
             if let Err(error) = document.start_bake(Some(rect)) {
@@ -608,22 +648,12 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
     }
 }
 
-/// The decision [`start_pending_bake`] makes, separated from the world it reads it out of.
-///
-/// TODO(jb-comment): why the answer is a rectangle rather than a yes, and what the margin
-/// on it buys a camera that has moved a little.
-///
-/// TODO(jb-comment): why a structural edit is read off [`Baked`] rather than off the dirty
-/// flag, and what asking for the whole view on every frame of a drag would have cost.
 fn wanted_rebake(
     bake_failed: bool,
     baked: Baked,
     wanted: CellRect,
     stroke: CellRect,
 ) -> Option<CellRect> {
-    // A stack that failed to bake fails the same way every frame, so retrying it would
-    // burn a core and never let the document go idle. The error stands until the next
-    // edit, which is the only thing that could change the answer.
     if bake_failed {
         return None;
     }
@@ -632,8 +662,6 @@ fn wanted_rebake(
     } else {
         wanted.expand(REBAKE_MARGIN_CELLS)
     };
-    // A union rather than two jobs, and it costs nothing to claim: the bake covers every
-    // cell of the rectangle it is given, including the ground between two distant ones.
     let ask = view.union(stroke);
     (!ask.is_empty()).then_some(ask)
 }
@@ -646,6 +674,9 @@ mod tests {
         CellRect::new(UVec2::splat(min), UVec2::splat(max))
     }
 
+    // `covers` is what decides whether a frame starts a job, so it has to be exact at
+    // the boundary: a rectangle that only overlaps the baked one is not covered by it,
+    // and treating it as covered would leave unbaked ground on screen.
     #[test]
     fn a_whole_bake_covers_every_rectangle_and_nothing_covers_one_a_rebake_has_not_reached() {
         assert!(Baked::Whole.covers(rect(0, 4096)));
@@ -655,15 +686,19 @@ mod tests {
         assert!(!Baked::Nothing.covers(rect(0, 1)));
     }
 
-    /// An empty rectangle is covered by anything, including a document with no bake at
-    /// all — which is what lets a camera that is nowhere near the document leave a
-    /// pending edit answered rather than waiting for a bake with nothing to show.
+    // An empty rectangle is covered by anything, including a document with no bake at
+    // all — which is what lets a camera that is nowhere near the document leave a
+    // pending edit answered rather than waiting for a bake with nothing to show.
     #[test]
     fn an_empty_rectangle_is_covered_by_a_document_with_no_bake() {
         assert!(Baked::Nothing.covers(CellRect::EMPTY));
         assert!(Baked::Rect(rect(0, 10)).covers(CellRect::EMPTY));
     }
 
+    // Rect re-bakes accumulate, so panning across a document gradually makes the whole
+    // of it solvable again. The last two cases pin the absorbing and identity ends: a
+    // whole bake swallows any extent, and a job that baked nothing — a save, a solve —
+    // leaves the extent where it was.
     #[test]
     fn rebaked_rectangles_accumulate_and_a_whole_bake_swallows_them() {
         let grown = Baked::Nothing
@@ -673,10 +708,12 @@ mod tests {
         assert!(grown.covers(rect(5, 25)));
 
         assert_eq!(grown.with(Baked::Whole), Baked::Whole);
-        // A job that covered nothing — a save, a solve — leaves the extent where it was.
         assert_eq!(grown.with(Baked::Nothing), grown);
     }
 
+    // The decision the editor makes every frame. The last case is the half that is not
+    // about editing at all: panning onto ground no bake has reached asks for a job with
+    // nothing dirty, which is what keeps the picture whole as the camera moves.
     #[test]
     fn an_edit_asks_for_the_view_and_a_covered_view_asks_for_nothing() {
         let view = rect(100, 200);
@@ -695,14 +732,12 @@ mod tests {
             wanted_rebake(false, Baked::Rect(rect(0, 300)), view, CellRect::EMPTY),
             None
         );
-        // Panning onto ground no bake has reached since the edit asks for it, with nothing
-        // dirty — that is the half of this that is not about editing at all.
         assert!(wanted_rebake(false, Baked::Rect(rect(0, 150)), view, CellRect::EMPTY).is_some());
     }
 
-    /// The whole of what makes a brush usable: a stroke asks for the ground it moved and
-    /// not for the screen it was drawn on, so a drag costs its own footprint per frame
-    /// rather than a re-bake of the view sixty times a second.
+    // The whole of what makes a brush usable: a stroke asks for the ground it moved and
+    // not for the screen it was drawn on, so a drag costs its own footprint per frame
+    // rather than a re-bake of the view sixty times a second.
     #[test]
     fn a_stroke_asks_for_the_ground_it_moved_and_not_for_the_whole_view() {
         let view = rect(0, 1024);
@@ -716,9 +751,9 @@ mod tests {
         );
     }
 
-    /// And it is what keeps the document solvable: a solve is refused unless the bake is
-    /// whole, so a stroke that dropped the extent the way a structural edit does would make
-    /// every stroke cost a whole-document bake before any water could be solved again.
+    // And it is what keeps the document solvable: a solve is refused unless the bake is
+    // whole, so a stroke that dropped the extent the way a structural edit does would make
+    // every stroke cost a whole-document bake before any water could be solved again.
     #[test]
     fn a_stroke_leaves_the_bake_the_extent_it_had() {
         let mut document = Document {
@@ -732,8 +767,10 @@ mod tests {
         assert!(!document.is_settled());
     }
 
-    /// A stroke made while a bake is in flight has to be asked for again, on exactly the
-    /// terms `dirty` is: the job already running took its rectangle before the paint landed.
+    // A stroke made while a bake is in flight has to be asked for again, on exactly the
+    // terms `dirty` is: the job already running took its rectangle before the paint
+    // landed. The two assignments in the body are what `start_bake` does to both, spelled
+    // out because a test has no task pool to run a real one on.
     #[test]
     fn a_stroke_made_while_a_bake_runs_is_not_taken_for_answered() {
         let mut document = Document {
@@ -742,7 +779,6 @@ mod tests {
             ..Document::default()
         };
 
-        // What `start_bake` does to both, without a task pool to run one on.
         document.stroke_rect = CellRect::EMPTY;
         document.dirty = false;
         document.note_stroke(rect(30, 40));
@@ -751,9 +787,9 @@ mod tests {
         assert!(document.is_dirty());
     }
 
-    /// The defect this guards cost a hang rather than a wrong picture: a stack holding a
-    /// cycle failed, was retried the next frame, and the document never went idle for the
-    /// caller waiting on the edit that introduced it.
+    // The defect this guards cost a hang rather than a wrong picture: a stack holding a
+    // cycle failed, was retried the next frame, and the document never went idle for the
+    // caller waiting on the edit that introduced it.
     #[test]
     fn a_stack_that_will_not_bake_is_not_tried_again_until_something_changes() {
         let view = rect(100, 200);
@@ -767,6 +803,9 @@ mod tests {
         );
     }
 
+    // A camera pointed away from the document leaves an empty view, and asking for a
+    // bake of nothing would start a job every frame that never made the document any
+    // less dirty.
     #[test]
     fn a_view_that_holds_no_cells_asks_for_no_rebake() {
         assert_eq!(

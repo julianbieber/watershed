@@ -1,16 +1,25 @@
-//! Send commands to a running editor and print what it says back.
+//! Sends commands to a running editor and prints what it says back.
 //!
-//! Deliberately dumb: it writes a line to a socket and reads a line of JSON. Sharing no
-//! code with the editor is what lets this be a second binary — the protocol is text, so
-//! there is nothing to share.
+//! ```text
+//! watershed-ctl <command> [args...]
+//! watershed-ctl run <scenario file>
+//! ```
 //!
-//! Blocking is the feature. The editor holds each reply until the command has really
-//! happened, so `watershed-ctl solve-water` returns when the water is solved and `capture`
-//! when the PNG is on disk.
+//! The socket comes from `WATERSHED_CONTROL`, the same variable the editor was started
+//! with. One command per connection: connect, write a line, read a line of JSON.
 //!
-//! `run <scenario>` is handled entirely here rather than in the editor: a scenario is just
-//! these same commands in a file, so replaying it client-side keeps the protocol at one
-//! command per connection and keeps a script format out of the editor.
+//! **Blocking is the feature.** The editor holds each reply until the command has
+//! really happened, so `solve-water` returns when the water is solved and `capture`
+//! when the PNG is on disk. There is nothing to poll and nothing to sleep on.
+//!
+//! A scenario is these same commands in a file, one per line, `#` to the end of a line
+//! being a comment. It is replayed here rather than in the editor, which keeps the
+//! protocol at one command per connection and keeps a script format out of the editor.
+//! Replay stops at the first failure — a scenario is a sequence, and carrying on past a
+//! step that did not happen would report on a document that never existed.
+//!
+//! The exit status carries the verdict as well as the printed JSON, so a caller can
+//! branch on it without parsing.
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -54,9 +63,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Replays a scenario line by line, stopping at the first failure — a scenario is a
-/// sequence, so carrying on after a step that did not happen would report on a document
-/// that never existed.
 fn scenario(socket: &str, path: &str) -> ExitCode {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -108,7 +114,6 @@ fn scenario(socket: &str, path: &str) -> ExitCode {
     }
 }
 
-/// One command per connection: connect, say it, wait for the single line back.
 fn send(socket: &str, command: &str) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|error| format!("no editor listening on {socket}: {error}"))?;
@@ -126,7 +131,6 @@ fn entry(command: &str, reply: &str) -> String {
     format!("{{\"step\":{command:?},\"reply\":{reply}}}")
 }
 
-/// The exit status carries the verdict too, so a caller can branch without parsing.
 fn verdict(reply: &str) -> ExitCode {
     if reply.contains("\"ok\":true") {
         ExitCode::SUCCESS

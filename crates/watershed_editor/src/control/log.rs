@@ -8,11 +8,8 @@
 //! Only `WARN` and `ERROR` are kept. `INFO` is where the engine narrates startup, and a
 //! scenario that had to read past it would be no better off than reading the log by hand.
 //!
-//! A shared buffer rather than the channel-and-transfer-system that bevy's
-//! `log_layers_ecs` example uses: that example wants log lines as ECS messages, and this
-//! wants a pile that one exclusive system reads on demand. `Arc<Mutex<_>>` is `Send +
-//! Sync`, so it can be an ordinary resource and needs no per-frame system to move
-//! anything.
+//! Present only when the editor is being driven through the control socket: a buffer
+//! nobody reads is a slow leak.
 
 use std::{
     collections::VecDeque,
@@ -29,19 +26,17 @@ use bevy::{
 };
 use serde_json::{Value, json};
 
-/// Records held before the oldest start falling off. A run that is being watched gets
-/// drained every few commands; one that is not would otherwise grow without limit, and an
-/// unbounded buffer nobody reads is a leak.
 const CAPACITY: usize = 512;
 
+/// What the run has complained about, shared between the log layer that fills it and
+/// the system that drains it. Bounded: the oldest records fall off, and how many were
+/// lost is reported beside the ones that survived.
 #[derive(Resource, Clone, Default)]
 pub(super) struct LogBuffer(Arc<Mutex<Records>>);
 
 #[derive(Default)]
 struct Records {
     entries: VecDeque<Record>,
-    /// Lost to [`CAPACITY`] since the last drain. Reported rather than hidden — a
-    /// truncated log that says it is complete is worse than no log.
     dropped: u64,
 }
 
@@ -51,11 +46,12 @@ struct Record {
     message: String,
 }
 
-/// Installed through `LogPlugin::custom_layer`, which is a bare `fn` pointer and so
-/// cannot capture — the resource has to be put into the app from in here.
+/// The tracing layer that keeps warnings and errors, and the resource the drain reads
+/// them from — both installed here, because `LogPlugin::custom_layer` takes a bare
+/// `fn` pointer that cannot capture one to hand back.
 ///
-/// Returns `None` unless the editor is being driven, because a buffer with no reader is
-/// only a slow leak.
+/// `None` unless the control socket is named in the environment, which leaves the
+/// editor logging exactly as it would without this module.
 pub(super) fn layer(app: &mut App) -> Option<BoxedLayer> {
     std::env::var(super::server::SOCKET_ENV).ok()?;
 
@@ -75,8 +71,6 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
         _context: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let metadata = event.metadata();
-        // Compared rather than matched: `tracing::Level` is a struct with associated
-        // constants, not an enum whose variants can appear in a pattern.
         let level = *metadata.level();
         let level = if level == Level::ERROR {
             "ERROR"
@@ -92,9 +86,6 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
             return;
         };
 
-        // A poisoned lock means a previous logger panicked mid-push. Dropping the record
-        // is the right answer: this is a diagnostic, and panicking inside the log layer
-        // while handling a log would take the app down for the sake of one line.
         if let Ok(mut records) = self.buffer.0.lock() {
             records.push(Record {
                 level,
@@ -116,11 +107,13 @@ impl Records {
 }
 
 impl LogBuffer {
-    /// Takes what has accumulated and leaves the buffer empty.
+    /// Takes what has accumulated and leaves the buffer empty, so a caller can bracket
+    /// one step — clear, do the thing, see what it said — rather than re-reading the
+    /// whole session's startup noise on every look.
     ///
-    /// Draining rather than snapshotting so that a scenario can bracket one step — "clear,
-    /// do the thing, see what it said" — which is the question actually being asked. A
-    /// snapshot would make every read include the whole session's startup noise.
+    /// Reports how many records were lost to the capacity since the last drain: a
+    /// truncated log that says it is complete is worse than no log. `available: false`
+    /// if the buffer's lock is poisoned, which is the only failure.
     pub(super) fn drain(&self) -> Value {
         let Ok(mut records) = self.0.lock() else {
             return json!({ "available": false });
@@ -154,8 +147,6 @@ impl LogBuffer {
     }
 }
 
-/// Pulls the formatted message out of an event. A `tracing` event is a set of fields, and
-/// the one the macros put the text in is called `message`.
 struct MessageVisitor<'a>(&'a mut Option<String>);
 
 impl tracing::field::Visit for MessageVisitor<'_> {

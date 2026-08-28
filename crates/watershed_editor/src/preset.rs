@@ -1,5 +1,9 @@
-// TODO(jb-doc): module docs — what a preset is for, and why the set is deliberately
-// small rather than a library of terrains.
+//! Documents to start from: a small fixed set of worked examples, each exercising a
+//! different way of building a height field.
+//!
+//! A preset is a starting point for editing and a fixture for testing, not a terrain
+//! anyone is meant to ship. The set stays small for that reason — it is chosen to
+//! cover the ways a stack can be put together, not to be a library of landscapes.
 
 use bevy::prelude::*;
 use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap};
@@ -7,19 +11,28 @@ use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
 use watershed::regions::{Region, RegionOutput, RegionSpec};
 use watershed::{Field, FieldRole, TerrainSpec, WaterSpec};
 
-/// TODO(jb-doc): why the list is an array over the enum rather than a registry, and what
-/// stops it drifting from [`Preset::ALL`].
+/// Which starting document to build.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
+    /// Land masses at one scale with bumps at another, both in one field. The
+    /// simplest stack, and the default.
     #[default]
     Continents,
+    /// A ridged field masked by the continent it sits on, which needs the continent
+    /// to be a field of its own.
     Ridges,
+    /// A region tiling feeding two blended columns, one used as a height and one as a
+    /// mask on the relief laid over it.
     Regions,
 }
 
 impl Preset {
+    /// Every preset. The fixed-size array is what keeps this from drifting: adding a
+    /// variant will not compile until the length and the list are both updated.
     pub const ALL: [Self; 3] = [Self::Continents, Self::Ridges, Self::Regions];
 
+    /// The word this preset is named by on the command line, and the only spelling
+    /// [`Preset::parse`] accepts.
     pub fn name(self) -> &'static str {
         match self {
             Self::Continents => "continents",
@@ -28,20 +41,27 @@ impl Preset {
         }
     }
 
+    /// The preset of that exact name, or `None`. Case-sensitive, and does not trim.
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|preset| preset.name() == word)
     }
 
-    /// TODO(jb-doc): why every preset carries a moisture field and a water spec, and what
-    /// a preset that carried neither would leave the editor unable to show.
+    /// The document, unbaked and unsolved.
+    ///
+    /// Whatever the preset, the result has a field named `height` holding
+    /// [`FieldRole::Height`], one named `moisture` holding [`FieldRole::Moisture`],
+    /// and a water spec over the two — so every preset exercises the water overlay
+    /// and the role lookups, and none of them opens on an editor with half its
+    /// display inert.
+    ///
+    /// `seed` is the document's whole source of variation: two calls with the same
+    /// arguments give equal documents.
     pub fn build(self, size: UVec2, seed: u32) -> TerrainSpec {
         let mut terrain = match self {
             Self::Continents => continents(size, seed),
             Self::Ridges => ridges(size, seed),
             Self::Regions => regions(size, seed),
         };
-        // TODO(jb-comment): why the roles are set here rather than on each preset's own
-        // fields, and what a preset that named its height something else would need to do.
         for field in &mut terrain.fields {
             field.role = match field.id.as_str() {
                 "height" => FieldRole::Height,
@@ -54,9 +74,6 @@ impl Preset {
     }
 }
 
-/// TODO(jb-comment): why moisture is baked four shifts down from the height rather than
-/// at the document's own resolution, and what that costs the water solve that weights by
-/// it.
 fn moisture(seed: u32) -> Field {
     Field::new("moisture").with_shift(4).with_layer(
         Layer::new(LayerOp::Noise(
@@ -66,8 +83,6 @@ fn moisture(seed: u32) -> Field {
     )
 }
 
-// TODO(jb-comment): where these two scales come from — the wavelengths they put a land
-// mass and its bumps at, and why no threshold can cut regions out of the second alone.
 const CONTINENT_SCALE: f32 = 0.0015;
 const RELIEF_SCALE: f32 = 0.04;
 
@@ -95,9 +110,6 @@ fn continents(size: UVec2, seed: u32) -> TerrainSpec {
 }
 
 fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
-    // The continent is a field of its own rather than the height's first layer, because
-    // the ridge is masked by it — and a field masked by itself is a cycle the bake
-    // refuses, not a read of the layers underneath.
     TerrainSpec::new(size)
         .with_field(moisture(seed))
         .with_field(
@@ -112,9 +124,6 @@ fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
         .with_field(
             Field::new("height")
                 .with_layer(Layer::new(LayerOp::FieldRef("base".into())).with_blend(Blend::Replace))
-                // TODO(jb-comment): why the ridge is masked by the continent it sits on
-                // rather than laid flat across the document, and what an unmasked one does
-                // to the coast.
                 .with_layer(
                     Layer::new(LayerOp::Noise(
                         NoiseSpec::new(sub_seed(seed, 3), NoiseKind::Ridged, 0.006).with_octaves(5),
@@ -137,15 +146,9 @@ fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
         )
 }
 
-// TODO(jb-comment): why the region cell and blend are set in tiles against the document's
-// own size rather than as a fraction of it, and what a fraction would do to a 512-cell
-// preview of a 4096-cell document.
 const REGION_CELL_TILES: u32 = 384;
 const REGION_BLEND_TILES: u32 = 48;
 
-/// TODO(jb-doc): what the column means to the layer that reads it — that a region carries
-/// numbers only, and the blend at a cell is the distance-weighted mix of the nearby
-/// sites'.
 fn regions(size: UVec2, seed: u32) -> TerrainSpec {
     let spec = RegionSpec::new(
         sub_seed(seed, 7),
@@ -189,9 +192,6 @@ fn regions(size: UVec2, seed: u32) -> TerrainSpec {
         .with_field(
             Field::new("height")
                 .with_layer(Layer::new(LayerOp::FieldRef("base".into())).with_blend(Blend::Replace))
-                // TODO(jb-comment): why the relief column reaches the height as a *mask*
-                // on an ordinary noise layer rather than as an amplitude, and what that
-                // buys a boundary between two regions of unlike relief.
                 .with_layer(
                     Layer::new(LayerOp::Noise(
                         NoiseSpec::new(sub_seed(seed, 9), NoiseKind::Fbm, RELIEF_SCALE)
@@ -210,6 +210,8 @@ mod tests {
 
     const SIZE: UVec2 = UVec2::new(96, 96);
 
+    // Presets are the fixtures everything else in the editor is exercised against, so
+    // one that does not bake takes the whole editor's test coverage with it.
     #[test]
     fn every_preset_bakes_and_names_a_height_field() {
         for preset in Preset::ALL {
@@ -225,8 +227,9 @@ mod tests {
         }
     }
 
-    /// TODO(jb-comment): why this is asserted per preset rather than once — that a preset
-    /// whose height came out flat would still bake, still solve, and draw as one colour.
+    // Asserted per preset rather than once, because a flat height is a silent failure:
+    // it bakes, it solves, and it draws as a single colour that looks like a rendering
+    // fault rather than a stack that cancelled itself out.
     #[test]
     fn every_preset_produces_a_height_that_varies() {
         for preset in Preset::ALL {
@@ -249,6 +252,8 @@ mod tests {
         }
     }
 
+    // A water spec naming a field the document does not carry plans fine and fails at
+    // the water step, which is a long way from where the mistake is.
     #[test]
     fn every_preset_names_a_water_spec_over_fields_it_has() {
         for preset in Preset::ALL {
@@ -265,6 +270,8 @@ mod tests {
         }
     }
 
+    // The water overlay is only exercised if the presets actually pond; a height with
+    // no depressions would leave that whole display path untested.
     #[test]
     fn every_preset_solves_water_that_ponds_somewhere() {
         for preset in Preset::ALL {
@@ -279,6 +286,9 @@ mod tests {
         }
     }
 
+    // The names are the command-line surface of the editor, so the two directions have
+    // to agree — a name that does not parse back makes a preset unreachable from the
+    // control client.
     #[test]
     fn a_preset_is_named_by_the_word_that_parses_back_to_it() {
         for preset in Preset::ALL {

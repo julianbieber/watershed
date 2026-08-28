@@ -1,3 +1,6 @@
+//! What one named channel of a terrain is: how it is addressed, at what resolution
+//! it is evaluated, what its values mean, and how it is read back.
+
 use std::fmt;
 
 use glam::UVec2;
@@ -7,16 +10,24 @@ use crate::layer::{Layer, LayerOp};
 use crate::raster::{Raster, raster_coord, resolution};
 use crate::regions::RegionOutput;
 
-/// TODO(jb-doc): why a field is named rather than numbered, and what that costs against
-/// what it buys in a header a person edits.
+/// The name a field is addressed by, everywhere: in a document, in a layer that
+/// references another field, and in [`Terrain`](crate::terrain::Terrain) lookups.
+///
+/// Serialized as a plain string, so it is what a person editing a document by hand
+/// sees and types. Any string is accepted here; uniqueness within a document is a
+/// plan-time check ([`PlanError::DuplicateField`](crate::bake::PlanError)), and a
+/// reference to a name no field carries fails there too rather than at lookup.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FieldId(String);
 
 impl FieldId {
+    /// Takes the name verbatim — no trimming, casing or validation. Two ids are
+    /// equal exactly when their strings are.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
+    /// The name, as it appears in a serialized document.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,21 +57,37 @@ impl fmt::Display for FieldId {
     }
 }
 
-/// TODO(jb-doc): what a role is — what the bake does with a field, never how it is read —
-/// and why at most one field holds Height and at most one holds Moisture.
+/// What a field *is*, independently of what it is called, so that a consumer can
+/// find the height of a document it did not author.
+///
+/// A document may hold at most one `Height` and at most one `Moisture` field, and
+/// the `Height` field must be at shift 0; both are enforced by
+/// [`TerrainSpec::validate_roles`](crate::bake::TerrainSpec::validate_roles), not
+/// by the setters here. `Custom` carries no such constraint and any number of
+/// fields may hold it, which is why looking a `Custom` field up by role never
+/// resolves.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub enum FieldRole {
+    /// The elevation of the document. A [`WaterSpec`](crate::water::WaterSpec)
+    /// cannot be planned without one, and it must be at shift 0.
     Height,
+    /// Wetness of the document. Carries no constraint beyond uniqueness — nothing
+    /// in this crate reads a field *because* it holds this role.
     Moisture,
+    /// No bake meaning at all. The default, so a field acquires a role only by
+    /// being given one.
     #[default]
     Custom,
 }
 
 impl FieldRole {
+    /// Every role, in the order the editor offers them.
     pub const ALL: [Self; 3] = [Self::Height, Self::Moisture, Self::Custom];
 
+    /// The lowercase word this role serializes and displays as, and the only
+    /// spelling [`FieldRole::parse`] accepts.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Height => "height",
@@ -69,6 +96,8 @@ impl FieldRole {
         }
     }
 
+    /// The role spelled exactly as [`FieldRole::as_str`] writes it, or `None`.
+    /// Case-sensitive, and does not trim.
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|role| role.as_str() == word)
     }
@@ -80,28 +109,41 @@ impl fmt::Display for FieldRole {
     }
 }
 
-/// TODO(jb-doc): what a field is — a named stack evaluated onto its own raster — and the
-/// three things a caller has to choose: its resolution, its range, and its layers.
+/// A named stack of layers together with everything needed to evaluate it onto its
+/// own raster, plus that raster once it has been baked.
 ///
-/// TODO(jb-doc): why `baked` is not part of the serialized document.
-///
-/// TODO(jb-doc): why `role` and `export` are separate — what a Custom field that is not
-/// exported is for.
+/// The baked raster is not serialized: it is derived from the layers and is
+/// re-obtained by baking, so a loaded document starts with every field empty and
+/// sampling as `0.0`. Equality does compare it, so two fields differing only in
+/// bake state are not equal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
+    /// The name this field is referenced by. Changing it does not rewrite the
+    /// layers of other fields that reference the old name.
     pub id: FieldId,
+    /// What the bake may do with the field. See [`FieldRole`] for the constraints
+    /// a document carrying this has to satisfy.
     #[serde(default)]
     pub role: FieldRole,
+    /// Resolution, as the [`raster`](crate::raster) shift: one texel per cell at 0,
+    /// per `2^shift` cells above that.
     pub shift: u8,
+    /// The interval baked values are clamped into. Accepted in either order; read
+    /// it through [`Field::bounds`] rather than directly.
     pub range: (f32, f32),
+    /// Carried through the document and never read by this crate. It is for
+    /// whatever consumes a baked terrain to decide what an exported field means.
     #[serde(default)]
     pub export: bool,
+    /// Evaluated in order, each blended onto the result of the ones before it.
     pub layers: Vec<Layer>,
     #[serde(skip)]
     baked: Raster<f32>,
 }
 
 impl Field {
+    /// A field named `id` with no layers: role `Custom`, shift 0, range `0.0..=1.0`,
+    /// not exported, and unbaked — so it samples as `0.0` until it is baked.
     pub fn new(id: impl Into<FieldId>) -> Self {
         Self {
             id: id.into(),
@@ -114,33 +156,41 @@ impl Field {
         }
     }
 
+    /// Sets the role. Does not check the document-wide constraints on
+    /// [`FieldRole`]; a conflict surfaces at plan time.
     pub fn with_role(mut self, role: FieldRole) -> Self {
         self.role = role;
         self
     }
 
+    /// Sets [`Field::export`].
     pub fn with_export(mut self, export: bool) -> Self {
         self.export = export;
         self
     }
 
+    /// Sets the resolution shift. A shift on the `Height` field is rejected at plan
+    /// time, not here.
     pub fn with_shift(mut self, shift: u8) -> Self {
         self.shift = shift;
         self
     }
 
+    /// Sets the clamp interval. Either order is accepted — see [`Field::bounds`].
     pub fn with_range(mut self, range: (f32, f32)) -> Self {
         self.range = range;
         self
     }
 
+    /// Appends a layer on top of the ones already there. Order is evaluation order.
     pub fn with_layer(mut self, layer: Layer) -> Self {
         self.layers.push(layer);
         self
     }
 
-    /// TODO(jb-comment): why the range is sorted here rather than being rejected as
-    /// invalid when it is set.
+    /// [`Field::range`] as `(low, high)`, swapped if it was stored backwards. A
+    /// backwards range is not an error anywhere; this is the only correct way to
+    /// read it.
     pub fn bounds(&self) -> (f32, f32) {
         if self.range.0 <= self.range.1 {
             self.range
@@ -149,32 +199,45 @@ impl Field {
         }
     }
 
+    /// Texel dimensions this field bakes to in a `size`-cell document. Never zero
+    /// on either axis.
     pub fn resolution(&self, size: UVec2) -> UVec2 {
         resolution(size, self.shift)
     }
 
+    /// The values from the last bake. Empty for a field that has never been baked,
+    /// was released, or came from a loaded document — read it through
+    /// [`Field::sample`] unless the texel grid itself is what you want.
     pub fn baked(&self) -> &Raster<f32> {
         &self.baked
     }
 
+    /// The baked raster, writable in place. Its dimensions are the bake's
+    /// invariant, so a caller replacing texels must not change its length.
     pub(crate) fn baked_mut(&mut self) -> &mut Raster<f32> {
         &mut self.baked
     }
 
+    /// Moves the baked raster out, leaving the field unbaked and sampling as
+    /// `0.0`. Pair with [`Field::put_baked`] to borrow a raster across a bake that
+    /// needs the rest of the document mutably.
     pub(crate) fn take_baked(&mut self) -> Raster<f32> {
         std::mem::take(&mut self.baked)
     }
 
+    /// Installs `raster` as the bake result, dropping whatever was there. Nothing
+    /// checks it against [`Field::resolution`].
     pub(crate) fn put_baked(&mut self, raster: Raster<f32>) {
         self.baked = raster;
     }
 
-    /// TODO(jb-doc): why this is derived from the ops rather than declared beside the
-    /// shift — that it follows an op parameter in the same edit that changes it, and that
-    /// a document written before it existed needs no migration.
+    /// Whether this field's values name a class rather than measure a quantity,
+    /// which is what decides how [`Field::sample`] interpolates.
     ///
-    /// TODO(jb-comment): why a disabled layer does not make a field categorical, on the
-    /// same terms as [`Field::dependencies`].
+    /// Derived from the layers, not declared: true when an *enabled* layer emits
+    /// region ids or cover classes. Disabling that layer makes the field
+    /// non-categorical again, so the answer can change without the shift or the
+    /// range changing.
     pub fn is_categorical(&self) -> bool {
         self.layers
             .iter()
@@ -190,11 +253,14 @@ impl Field {
             })
     }
 
-    /// TODO(jb-doc): the coordinate space this takes — document cells, a cell centre at
-    /// `x + 0.5` — and why a coarse field is read bilinearly rather than as blocks.
+    /// The baked value at a position in document cells, where a cell centre is at
+    /// `x + 0.5`. Reads `0.0` for an unbaked field, and clamps rather than failing
+    /// outside the document.
     ///
-    /// TODO(jb-doc): the exception, and what the value halfway between two region ids
-    /// would name if it were interpolated.
+    /// A coarse field is interpolated between its texels, so it reads as a smooth
+    /// surface and not as blocks. A [categorical](Field::is_categorical) field is
+    /// read to the nearest texel instead: halfway between two region ids is not a
+    /// third region, so it must be one of the two.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         let u = raster_coord(x, self.shift);
         let v = raster_coord(y, self.shift);
@@ -205,8 +271,12 @@ impl Field {
         }
     }
 
-    /// TODO(jb-comment): why a disabled layer contributes no dependency, and what that
-    /// means for a cycle that only exists while a layer is switched off.
+    /// The fields this one reads, through the ops and masks of its *enabled* layers
+    /// only; disabling a layer removes its dependencies.
+    ///
+    /// This is what bake ordering and cycle detection run on, so a cycle that exists
+    /// only through a disabled layer is not a cycle and the document plans.
+    /// Duplicates are not removed and the order is the layer order.
     pub fn dependencies(&self) -> impl Iterator<Item = &FieldId> {
         self.layers
             .iter()
@@ -220,6 +290,9 @@ mod tests {
     use super::*;
     use crate::layer::{LayerOp, Mask, Remap};
 
+    // Four constructors reach the same string and equality is by string; a
+    // conversion that trimmed or cased would make two spellings of a name address
+    // different fields.
     #[test]
     fn a_field_id_round_trips_through_every_way_of_making_one() {
         assert_eq!(FieldId::from("height").as_str(), "height");
@@ -227,12 +300,16 @@ mod tests {
         assert_eq!(FieldId::from("height").to_string(), "height");
     }
 
+    // Shift 0 is what the `Height` field is pinned to, so a document's cell grid and
+    // its height raster have to be the same grid.
     #[test]
     fn a_field_at_shift_zero_holds_one_texel_per_cell() {
         let field = Field::new("height");
         assert_eq!(field.resolution(UVec2::new(64, 32)), UVec2::new(64, 32));
     }
 
+    // The point of a shift is the allocation it saves; this pins that the saving is
+    // quadratic in the shift and not linear.
     #[test]
     fn a_coarse_field_holds_one_texel_per_block() {
         let field = Field::new("moisture").with_shift(4);
@@ -242,12 +319,16 @@ mod tests {
         );
     }
 
+    // Nothing rejects a backwards range, so `bounds` is the only thing standing
+    // between one and a clamp that empties the field.
     #[test]
     fn a_backwards_range_is_read_in_the_order_a_clamp_needs() {
         let field = Field::new("height").with_range((1.0, -1.0));
         assert_eq!(field.bounds(), (-1.0, 1.0));
     }
 
+    // Pins both halves of what bake ordering is computed from: a mask contributes a
+    // dependency just as an op does, and a disabled layer contributes none.
     #[test]
     fn a_field_reports_the_dependencies_of_every_enabled_layer_and_no_others() {
         let field = Field::new("height")
@@ -261,6 +342,8 @@ mod tests {
         assert_eq!(deps, vec!["relief", "ridge"]);
     }
 
+    // Every loaded document is in this state until it is baked, so sampling one has
+    // to be a defined read rather than a panic on an empty raster.
     #[test]
     fn an_unbaked_field_samples_as_zero() {
         let field = Field::new("height");

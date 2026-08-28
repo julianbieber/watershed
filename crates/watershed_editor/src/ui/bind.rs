@@ -1,5 +1,10 @@
-// TODO(jb-doc): module docs — that one enum is the whole two-way binding between a number
-// field and the thing it edits, and why the read and the write have to name the same place.
+//! Two-way binding between a number field on screen and the number it edits.
+//!
+//! One enum names every editable number in the editor, and both directions are
+//! written against it: [`NumberBinding::read`] says what a field should show and
+//! `write` puts a typed value back. Both have to resolve the same name to the same
+//! place, so they live side by side — a binding that read one number and wrote
+//! another would look like a field that will not take an edit.
 
 use bevy::feathers::controls::{NumberFormat, NumberInputValue, UpdateNumberInput};
 use bevy::prelude::*;
@@ -12,9 +17,12 @@ use crate::document::Document;
 use crate::edit::Edit;
 use crate::ui::{NewDialog, report};
 
-/// Which number a number field stands for. Layer-indexed variants carry the index within
-/// the *active* field's stack, which is what the panel is built from and what a rebuild
-/// re-derives.
+/// Which number a number field stands for.
+///
+/// Layer-indexed variants carry the index within the *active* field's stack, so a
+/// binding is only meaningful against the document the panel was built from; both
+/// directions answer "not there" rather than guessing when the stack has since
+/// changed under it.
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub enum NumberBinding {
     /// A field naming nothing. Never built by the panel — it is what the scene system
@@ -55,8 +63,8 @@ pub enum NumberBinding {
 }
 
 impl NumberBinding {
-    /// Whole numbers are edited as whole numbers, so the field cannot offer a fraction the
-    /// document has nowhere to put.
+    /// How the field is to be edited. Whole-numbered bindings edit as integers, so the
+    /// field cannot offer a fraction the document has nowhere to put.
     pub fn format(self) -> NumberFormat {
         if self.is_integer() {
             NumberFormat::I32
@@ -82,10 +90,6 @@ impl NumberBinding {
         )
     }
 
-    /// The range the ctl's own verbs enforce. A field with no range answers `None`.
-    ///
-    /// TODO(jb-comment): why the clamp lives here rather than in the widget, and what the
-    /// a spinner did for the panel that a text field has to do for itself.
     fn range(self) -> Option<(f32, f32)> {
         match self {
             Self::Shift => Some((0.0, 8.0)),
@@ -116,8 +120,11 @@ impl NumberBinding {
         }
     }
 
-    /// What the field should be showing. `None` where the binding names something the
-    /// document no longer has — a stack that shrank under a panel waiting to be rebuilt.
+    /// What the field should be showing.
+    ///
+    /// `None` where the binding names something the document no longer has — a stack
+    /// that shrank under a panel waiting to be rebuilt, or a layer whose op has
+    /// changed to one with no such number.
     pub fn read(
         self,
         document: &Document,
@@ -180,11 +187,6 @@ impl NumberBinding {
         })
     }
 
-    /// Writes the value where it belongs, answering whether the bake the document holds is
-    /// no longer the bake the document describes.
-    ///
-    /// The shift goes through [`Edit::Set`] rather than being written here, so the rule
-    /// about the water spec's height field lives in one place.
     fn write(
         self,
         value: f32,
@@ -418,9 +420,10 @@ fn regions(document: &Document, index: usize) -> Option<&watershed::regions::Reg
     }
 }
 
-/// A number is taken when the entry is finished rather than as it is typed: every one of
-/// these provokes a re-bake, and a field being typed into is a half-written number for as
-/// long as it takes to write the whole one.
+/// Takes a finished float entry and writes it through its binding.
+///
+/// Only a finished entry: every one of these can provoke a re-bake, and a field part
+/// way through being typed holds a number nobody meant.
 pub fn on_f32(
     change: On<ValueChange<f32>>,
     bindings: Query<&NumberBinding>,
@@ -441,6 +444,7 @@ pub fn on_f32(
     );
 }
 
+/// As [`on_f32`], for the bindings that edit as integers.
 pub fn on_i32(
     change: On<ValueChange<i32>>,
     bindings: Query<&NumberBinding>,
@@ -479,9 +483,11 @@ fn apply(
     }
 }
 
-/// The other direction: whatever the document holds is what the fields show. A field with
-/// the keyboard in it is left alone by the widget itself, which is what keeps this from
-/// overwriting a number halfway through being typed.
+/// The other direction: writes what the document holds into every bound field.
+///
+/// Runs every frame. A field with the keyboard in it is left alone by the widget
+/// itself, so this cannot overwrite a number part way through being typed. Bindings
+/// that resolve to nothing are skipped, leaving the field as it was.
 pub fn push(
     document: Res<Document>,
     brush: Res<BrushSettings>,

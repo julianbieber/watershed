@@ -1,5 +1,11 @@
-// TODO(jb-doc): module docs — why the toolbar is built once and only dressed afterwards,
-// where the layer panel below it is thrown away and rebuilt.
+//! The strip along the top: the actions that apply to a document as a whole, the path
+//! it is read from and written to, which field is on screen, and what the run is
+//! doing.
+//!
+//! The toolbar's shape does not depend on the document, so it is built once and only
+//! dressed afterwards — captions rewritten, buttons enabled and disabled. The one
+//! part that does depend on the document, the field menu, is rebuilt when the list of
+//! fields changes and not otherwise.
 
 use bevy::feathers::controls::{
     ButtonVariant, FeathersButton, FeathersMenu, FeathersMenuButton, FeathersMenuPopup,
@@ -18,41 +24,56 @@ use crate::ui::widgets::{self, one, set_text};
 use crate::ui::{FilePath, NewDialog, report};
 use crate::view::{EditorCamera, FreeView, fit_camera};
 
+/// Opens the new-terrain dialog. Disabled while a job is running.
 #[derive(Component, Default, Clone)]
 pub struct NewButton;
 
+/// Loads the document at the path in the field. Disabled while a job is running.
 #[derive(Component, Default, Clone)]
 pub struct OpenButton;
 
+/// Writes the document to the path in the field. Disabled while a job is running or
+/// there is no document.
 #[derive(Component, Default, Clone)]
 pub struct SaveButton;
 
+/// Bakes the whole document. Disabled unless there is something left to bake — an
+/// edit only re-bakes what is on screen, and this is how the rest catches up.
 #[derive(Component, Default, Clone)]
 pub struct BakeAllButton;
 
+/// Solves the water, baking first if it has to. Enabled whenever there is a document
+/// — a button that went dead after every edit is indistinguishable from a broken one.
 #[derive(Component, Default, Clone)]
 pub struct SolveButton;
 
+/// Discards the solved water. Disabled unless there is some.
 #[derive(Component, Default, Clone)]
 pub struct ResetWaterButton;
 
+/// The line at the right-hand end that says what the run is doing.
 #[derive(Component, Default, Clone)]
 pub struct StatusLabel;
 
+/// The text field holding the path to load from and save to.
 #[derive(Component, Default, Clone)]
 pub struct PathInput;
 
+/// The field menu's button caption, which names the field on screen.
 #[derive(Component, Default, Clone)]
 pub struct FieldMenuCaption;
 
+/// The field menu's popup, whose children [`rebuild_field_menu`] replaces.
 #[derive(Component, Default, Clone)]
 pub struct FieldMenuPopup;
 
-/// The field list the menu was last built from. A document arrives with fields the popup
-/// has never heard of, and there is nowhere else the popup's children could come from.
+/// The field list the popup was last built from, so it is rebuilt when the document's
+/// fields change and not every frame. Nothing else records what the popup holds.
 #[derive(Resource, Default)]
 pub struct FieldChoices(Vec<String>);
 
+/// The toolbar's scene. Built once; everything document-dependent about it is filled
+/// in afterwards by [`sync`], [`rebuild_field_menu`] and [`seed_path`].
 pub fn toolbar() -> impl Scene {
     bsn! {
         Node {
@@ -194,8 +215,12 @@ fn separator() -> impl Scene {
     }
 }
 
-/// Whatever the run is doing takes the right-hand end, because a job in flight is the
-/// answer to every "why has nothing changed".
+/// Enables and disables the buttons for what the document can currently take, names
+/// the field on screen, and writes the status line.
+///
+/// The status line prefers the running job, then the last refusal, then a description
+/// of the document — a job in flight is the answer to most of "why has nothing
+/// changed", so it takes precedence over everything else the line could say.
 pub fn sync(
     document: Res<Document>,
     mut commands: Commands,
@@ -224,18 +249,12 @@ pub fn sync(
         *save_button,
         !busy && has_document,
     );
-    // The whole-document bake. An edit only re-bakes what is on screen, so this is how the
-    // rest of the document catches up without solving anything.
     enable(
         &mut commands,
         &disabled,
         *bake_button,
         !busy && !whole && has_document,
     );
-    // Enabled whenever there is a document, and it bakes first if it has to. Gating it on
-    // the document being wholly baked is what it did first, and a disabled button is
-    // indistinguishable from a broken one: after any edit it went quietly dead with nothing
-    // on screen saying why.
     enable(
         &mut commands,
         &disabled,
@@ -280,8 +299,8 @@ fn enable(
     }
 }
 
-/// TODO(jb-comment): why the popup is emptied and refilled rather than being built with
-/// every field a document could ever have.
+/// Replaces the field menu's items when the document's field names change, and does
+/// nothing otherwise.
 pub fn rebuild_field_menu(
     document: Res<Document>,
     mut choices: ResMut<FieldChoices>,
@@ -314,8 +333,8 @@ pub fn rebuild_field_menu(
         .queue_spawn_related_scenes::<Children>(items);
 }
 
-/// The path the toolbar starts with, put into the field once it exists — a text input is a
-/// buffer, and there is no spawn-time value to give it.
+/// Puts the starting path into the text field the frame it appears. A text input owns
+/// a buffer that cannot be given a value at spawn time, so it is written once here.
 pub fn seed_path(path: Res<FilePath>, mut inputs: Query<&mut EditableText, Added<PathInput>>) {
     for mut text in inputs.iter_mut() {
         text.queue_edit(TextEdit::SelectAll);

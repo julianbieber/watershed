@@ -1,3 +1,8 @@
+# Every way this repository is built, checked, run and driven.
+#
+# `all` is CI's order and CI runs nothing else, so a check that is not reachable from it
+# is a check that does not happen.
+
 # Use bash strict mode
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -12,7 +17,6 @@ default:
     @just --list
 
 # Install system libraries used by CI (Ubuntu/Debian)
-# TODO(jb-comment): why clang is in this list — which recipe needs it and for which target.
 deps:
 	@sudo apt-get update
 	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev clang

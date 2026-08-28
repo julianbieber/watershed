@@ -1,3 +1,6 @@
+//! Where water stands and where it runs on a baked height field, and the document
+//! operations that produce and discard that answer.
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 use std::f32::consts::SQRT_2;
@@ -10,26 +13,41 @@ use crate::bake::TerrainSpec;
 use crate::field::FieldId;
 use crate::raster::Raster;
 
+/// Why a document could not be solved. Every variant is about the document's state
+/// rather than the solve, which cannot itself fail: on a readable height field the
+/// solve always produces an answer.
 #[derive(Debug, Error)]
 pub enum WaterError {
+    /// The document has no cells to solve over.
     #[error("terrain size has a zero component: {0} by {1}")]
     ZeroSize(u32, u32),
+    /// The spec names a height field the document does not carry.
     #[error("height field `{0}` is not in the document")]
     UnknownHeightField(String),
+    /// The spec names a moisture field the document does not carry.
     #[error("moisture field `{0}` is not in the document")]
     UnknownMoistureField(String),
+    /// The height field is coarser than the document. Refused rather than
+    /// resampled: a filled surface derived from interpolated texels would route
+    /// water down slopes that are not in the document.
     #[error("height field `{0}` is at shift {1}; the solve reads one texel per cell")]
     CoarseHeight(String, u8),
+    /// The height field has no baked raster at the document's size — it has not
+    /// been baked, or was baked and released.
     #[error("height field `{0}` has not been baked at the document's size")]
     UnbakedHeight(String),
 }
 
-/// TODO(jb-doc): what a flow direction code is, why zero means no outflow, and which
-/// neighbour each of the eight remaining codes names.
+/// The flow direction code of a cell with no outflow — the bottom of a lake, or a
+/// cell on the border of the document.
+///
+/// The other codes are `1..=8`, naming the eight neighbours in order starting at
+/// `+x` and turning through `+y`: `1` is `(+1, 0)`, `2` is `(+1, +1)`, and so on
+/// round to `8` at `(+1, -1)`. The numbering is part of what a saved document means
+/// — [`WaterState::downstream`] and [`WaterState::flow_vector`] resolve it for a
+/// caller that would rather not depend on it.
 pub const SINK: u8 = 0;
 
-/// TODO(jb-comment): why the neighbour order is fixed and written out rather than
-/// generated, and what a change to it would do to a solved document.
 const D8: [(i32, i32); 8] = [
     (1, 0),
     (1, 1),
@@ -43,16 +61,23 @@ const D8: [(i32, i32); 8] = [
 
 const D8_DISTANCE: [f32; 8] = [1.0, SQRT_2, 1.0, SQRT_2, 1.0, SQRT_2, 1.0, SQRT_2];
 
-/// TODO(jb-doc): the range this scale has to cover, the relative precision it leaves, and
-/// why the quantization is logarithmic rather than linear.
 const ACCUM_QUANT: f32 = 3900.0;
 
-/// TODO(jb-doc): what a caller chooses here, and why the height field is named rather
-/// than assumed.
+/// What a solve is to be run over, and the one threshold it takes.
+///
+/// The height field is named rather than found by role, so a document can solve
+/// water over a field that is not its `Height` — a second surface, or a candidate
+/// being previewed — without changing which field its consumers read as the ground.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaterSpec {
+    /// The field to solve over. Must be in the document, at shift 0, and baked.
     pub height: FieldId,
+    /// A field weighting how much water each cell contributes. `None` gives every
+    /// cell a weight of `1.0`, so an accumulation counts cells. Sampled at cell
+    /// centres and floored at zero.
     pub moisture: Option<FieldId>,
+    /// The smallest connected body of standing water that gets a lake id. Anything
+    /// smaller keeps its depth and stays unlabelled.
     pub lake_min_cells: u32,
 }
 
@@ -67,6 +92,7 @@ impl Default for WaterSpec {
 }
 
 impl WaterSpec {
+    /// Solves over `height`, with unit weights and the default lake threshold.
     pub fn new(height: impl Into<FieldId>) -> Self {
         Self {
             height: height.into(),
@@ -75,22 +101,28 @@ impl WaterSpec {
         }
     }
 
+    /// Weights each cell's contribution by a field instead of by `1.0`.
     pub fn with_moisture(mut self, moisture: impl Into<FieldId>) -> Self {
         self.moisture = Some(moisture.into());
         self
     }
 
+    /// Sets the smallest body of water that earns a lake id.
     pub fn with_lake_min_cells(mut self, cells: u32) -> Self {
         self.lake_min_cells = cells;
         self
     }
 }
 
-/// TODO(jb-doc): what the solve produces — standing water, where each cell drains, how
-/// much reaches it, and which lake it belongs to — and what it deliberately does not
-/// store.
+/// The solved answer: how deep the standing water is, where each cell drains, how
+/// much reaches it, and which lake it belongs to.
 ///
-/// TODO(jb-comment): why no flow vector is stored per cell.
+/// Four rasters at one texel per cell, and nothing derived from them — a flow
+/// vector is two floats per cell that [`WaterState::flow_vector`] reconstructs from
+/// one byte, so it is computed on read rather than stored.
+///
+/// A default state is empty: every read answers `None`, `false` or `0.0` rather
+/// than panicking, which is what an unsolved or invalidated document holds.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WaterState {
     depth: Raster<f32>,
@@ -101,10 +133,16 @@ pub struct WaterState {
 }
 
 impl WaterState {
-    /// TODO(jb-doc): the contract this takes — a height raster at one texel per cell and
-    /// one weight per cell in the same order — and why the whole grid is solved at once.
+    /// Solves over a height raster at one texel per cell, with one weight per cell
+    /// in the same row-major order.
     ///
-    /// TODO(jb-comment): why this pass is single threaded where the bake is not.
+    /// Returns an empty state — not an error — if the raster has no cells or
+    /// `weight` is not exactly as long as it. Water leaves the document only at its
+    /// border, so the whole grid is solved at once: a rectangle cannot be re-solved
+    /// on its own, because where the water inside it goes depends on ground outside
+    /// it.
+    ///
+    /// A pure function of its arguments: the same inputs give a bit-identical state.
     pub fn solve(height: &Raster<f32>, weight: &[f32], lake_min_cells: u32) -> Self {
         let size = height.size();
         let width = size.x as usize;
@@ -135,8 +173,11 @@ impl WaterState {
         }
     }
 
-    /// TODO(jb-comment): why the loader rebuilds a state from its rasters rather than
-    /// re-solving, and what it is trusted to have checked first.
+    /// Assembles a state from rasters that were solved elsewhere, for the loader.
+    ///
+    /// Nothing is checked: the four rasters are trusted to be the same size and to
+    /// be a consistent answer for one height field. Reading a state built from
+    /// mismatched rasters is safe but meaningless.
     pub(crate) fn from_parts(
         depth: Raster<f32>,
         flow_dir: Raster<u8>,
@@ -153,48 +194,67 @@ impl WaterState {
         }
     }
 
+    /// The extent the state was solved over, in cells. Zero for an empty state.
     pub fn size(&self) -> UVec2 {
         self.depth.size()
     }
 
+    /// Whether nothing was solved. True for a default state.
     pub fn is_empty(&self) -> bool {
         self.depth.is_empty()
     }
 
+    /// Standing water depth per cell, never negative. For a single cell prefer
+    /// [`WaterState::depth_at`].
     pub fn depth(&self) -> &Raster<f32> {
         &self.depth
     }
 
+    /// Flow direction codes per cell; see [`SINK`] for what they mean.
     pub fn flow_dir(&self) -> &Raster<u8> {
         &self.flow_dir
     }
 
+    /// Quantized accumulation codes per cell. Comparable directly, but not a
+    /// quantity — put one through [`dequantize_accumulation`] first.
     pub fn flow_accum(&self) -> &Raster<u16> {
         &self.flow_accum
     }
 
+    /// Lake ids per cell: `0` for dry ground and for standing water in a body under
+    /// the spec's threshold, otherwise `1..=lakes()`.
     pub fn lake_id(&self) -> &Raster<u32> {
         &self.lake_id
     }
 
+    /// How many bodies of water met the threshold. Ids run `1..=lakes()`.
     pub fn lakes(&self) -> u32 {
         self.lakes
     }
 
-    /// TODO(jb-doc): what this measures from and what it is measured in, and why a cell
-    /// outside the extent answers nothing rather than zero.
+    /// How far the water surface stands above the ground at a cell, in the height
+    /// field's own units. Never negative.
+    ///
+    /// `None` outside the extent, and for every cell of an empty state — a caller
+    /// that would treat "no water here" and "no answer here" alike wants
+    /// [`WaterState::is_water`].
     pub fn depth_at(&self, x: u32, y: u32) -> Option<f32> {
         self.depth.get(x, y).copied()
     }
 
-    /// TODO(jb-doc): what counts as water here, and why it is the fill depth rather than
-    /// the lake labelling.
+    /// Whether any water stands at a cell, at any depth.
+    ///
+    /// Reads the depth, not the lake id, so a puddle too small to have earned a lake
+    /// id still counts as water. `false` outside the extent.
     pub fn is_water(&self, x: u32, y: u32) -> bool {
         self.depth.get(x, y).is_some_and(|depth| *depth > 0.0)
     }
 
-    /// TODO(jb-doc): the unit this answers in, and the precision the stored quantization
-    /// leaves it with.
+    /// How much water reaches a cell: its own weight plus everything draining
+    /// through it, so with unit weights it is a count of upstream cells.
+    ///
+    /// Recovered from a 16-bit log-scaled code, which costs about a part in 3900 of
+    /// the value wherever on the scale it sits. `0.0` outside the extent.
     pub fn accumulation(&self, x: u32, y: u32) -> f32 {
         self.flow_accum
             .get(x, y)
@@ -202,25 +262,42 @@ impl WaterState {
             .unwrap_or(0.0)
     }
 
-    /// TODO(jb-doc): what a caller does with a raw code that it cannot do with the
-    /// accumulation, what monotonicity of the quantization buys it, and what it may not
-    /// assume about the code.
+    /// The stored code behind [`WaterState::accumulation`], for a caller comparing
+    /// or thresholding rather than measuring.
+    ///
+    /// The quantization is monotone, so ordering codes orders accumulations and a
+    /// threshold can be converted once with [`quantize_accumulation`] instead of
+    /// decoding every cell. Nothing else about the code is a contract: it is not
+    /// proportional to the accumulation and its scale may change.
+    ///
+    /// `0` outside the extent.
     pub fn accumulation_code(&self, x: u32, y: u32) -> u16 {
         self.flow_accum.get(x, y).copied().unwrap_or(0)
     }
 
+    /// Whether at least `threshold` reaches the cell — the test that turns an
+    /// accumulation field into a river network. Compares codes, so the quantization
+    /// costs nothing here. `false` outside the extent.
     pub fn channel(&self, x: u32, y: u32, threshold: f32) -> bool {
         self.accumulation_code(x, y) >= quantize_accumulation(threshold)
     }
 
-    /// TODO(jb-doc): why this is derived on read, and what `None` means.
+    /// A unit vector pointing the way water leaves a cell, reconstructed from the
+    /// stored direction code rather than held per cell.
+    ///
+    /// `None` outside the extent and at a [`SINK`] — a cell with no outflow has no
+    /// direction, which is not the same as a zero one.
     pub fn flow_vector(&self, x: u32, y: u32) -> Option<Vec2> {
         let code = *self.flow_dir.get(x, y)?;
         let (dx, dy) = *D8.get(direction_index(code)?)?;
         Some(Vec2::new(dx as f32, dy as f32).normalize_or_zero())
     }
 
-    /// TODO(jb-doc): the coordinate this answers with, and why a sink has none.
+    /// The cell this one drains into, in document cells.
+    ///
+    /// `None` outside the extent and at a [`SINK`]. Following this from any cell
+    /// reaches a sink in finitely many steps — the routing surface strictly descends
+    /// along every step, so a flow path cannot cycle.
     pub fn downstream(&self, x: u32, y: u32) -> Option<UVec2> {
         let code = *self.flow_dir.get(x, y)?;
         let index = direction_index(code)?;
@@ -242,12 +319,16 @@ impl WaterState {
 }
 
 impl TerrainSpec {
+    /// The solved water, if the document has been solved and not invalidated since.
     pub fn water(&self) -> Option<&WaterState> {
         self.water.as_ref()
     }
 
-    /// TODO(jb-comment): why this drops the spec as well as the state, and what a saved
-    /// document would otherwise do on the next load.
+    /// Removes the water from the document entirely — the solved state *and* the
+    /// spec that produced it, so nothing will re-solve it.
+    ///
+    /// This is "this document has no water", not "this answer is stale"; for the
+    /// latter use [`TerrainSpec::invalidate_water`].
     pub fn clear_water(&mut self) {
         self.water = None;
         self.water_spec = None;
@@ -256,14 +337,21 @@ impl TerrainSpec {
     /// Drops the solved state and **keeps the spec**, which is the difference between
     /// "forget about the water" and "the height moved, so this answer is stale".
     ///
-    /// TODO(jb-doc): why an edit needs this rather than [`TerrainSpec::clear_water`], and what
-    /// happens to a document that loses the recipe it is re-solved from.
+    /// This is what an edit to the height calls: the answer no longer matches the
+    /// ground, but the document still wants water, and the spec is the only record
+    /// of what it wanted. A document that loses it looks like one that never had
+    /// water at all, and no later solve can recover it.
     pub fn invalidate_water(&mut self) {
         self.water = None;
     }
 
-    /// TODO(jb-doc): what this reads, what it replaces, and why a coarse height field is
-    /// refused rather than resampled.
+    /// Solves water over the field `spec` names and stores both the answer and the
+    /// spec on the document, replacing whatever was there.
+    ///
+    /// The height field must be in the document, at shift 0, and baked at the
+    /// document's size; a moisture field, if named, must be in the document but may
+    /// be at any shift. On any [`WaterError`] the document is left exactly as it
+    /// was.
     pub fn solve_water(&mut self, spec: &WaterSpec) -> Result<(), WaterError> {
         if self.size.x == 0 || self.size.y == 0 {
             return Err(WaterError::ZeroSize(self.size.x, self.size.y));
@@ -310,7 +398,6 @@ impl TerrainSpec {
     }
 }
 
-/// TODO(jb-comment): why two surfaces come out of one traversal, and what each is for.
 fn fill(height: &Raster<f32>) -> (Vec<f32>, Vec<f32>) {
     let width = height.width() as usize;
     let rows = height.height() as usize;
@@ -362,8 +449,6 @@ fn fill(height: &Raster<f32>) -> (Vec<f32>, Vec<f32>) {
     (filled, routing)
 }
 
-/// TODO(jb-comment): why a step is chosen on the filled surface and only broken on the
-/// epsilon one, and what choosing on the epsilon surface alone did.
 fn directions(filled: &[f32], routing: &[f32], width: usize, rows: usize) -> Vec<u8> {
     let mut flow = vec![SINK; width * rows];
     for y in 0..rows {
@@ -434,8 +519,6 @@ fn accumulate(flow: &[u8], weight: &[f32], width: usize, rows: usize) -> Vec<u16
     total.into_iter().map(quantize_accumulation).collect()
 }
 
-/// TODO(jb-comment): why a component is grown four-connected, and why a component under
-/// the threshold keeps its depth but loses its label.
 fn label_lakes(
     filled: &[f32],
     source: &[f32],
@@ -501,20 +584,26 @@ fn direction_index(code: u8) -> Option<usize> {
     Some(code as usize - 1)
 }
 
-/// TODO(jb-doc): the inverse of [`dequantize_accumulation`], and why both directions are
-/// public where only one is used inside this module.
+/// The code an accumulation is stored as. Monotone non-decreasing in `value`, which
+/// is what lets a caller convert a threshold once and then compare codes.
+///
+/// Negative values are read as zero, and anything past the top of the scale
+/// saturates at `u16::MAX` rather than wrapping.
 pub fn quantize_accumulation(value: f32) -> u16 {
     let code = value.max(0.0).ln_1p() * ACCUM_QUANT;
     code.round().clamp(0.0, u16::MAX as f32) as u16
 }
 
-/// TODO(jb-doc): the inverse of the stored quantization, and the error it carries.
+/// The accumulation a stored code stands for.
+///
+/// Inverse of [`quantize_accumulation`] up to the rounding, which costs about a
+/// part in 3900 of the value — a fixed *relative* error, so a large accumulation is
+/// no less accurate in proportion than a small one. The scale reaches a few tens of
+/// millions before it saturates.
 pub fn dequantize_accumulation(code: u16) -> f32 {
     (code as f32 / ACCUM_QUANT).exp_m1()
 }
 
-/// TODO(jb-comment): why the priority queue orders on an integer key rather than on the
-/// float it stands for, and why the cell index is part of the order.
 fn order_key(value: f32) -> u32 {
     let bits = value.to_bits();
     if bits & 0x8000_0000 != 0 {
@@ -590,6 +679,9 @@ mod tests {
         WaterState::solve(height, &unit_weights(height.size()), 4)
     }
 
+    // The one invariant everything downstream rests on: if a step could go up, a
+    // flow path could cycle and the accumulation pass would deadlock rather than
+    // give a wrong answer.
     #[test]
     fn no_cell_drains_uphill_on_the_filled_surface() {
         let size = UVec2::new(41, 37);
@@ -621,6 +713,9 @@ mod tests {
         assert!(steps > 0);
     }
 
+    // States the accumulation pass locally, which is the form an error in the
+    // topological order shows up in: a cell drained before one of its contributors
+    // is short by exactly that contributor and by nothing else.
     #[test]
     fn a_cells_accumulation_is_one_plus_what_flows_into_it() {
         let size = UVec2::new(29, 23);
@@ -653,6 +748,8 @@ mod tests {
         }
     }
 
+    // The global counterpart: every unit of weight has to leave through some sink,
+    // so nothing may be lost in a depression or counted twice on the way down.
     #[test]
     fn the_total_accumulation_equals_the_weighted_cell_count() {
         let size = UVec2::new(31, 31);
@@ -677,6 +774,9 @@ mod tests {
         );
     }
 
+    // A surface whose correct answer is known everywhere, so the routing can be
+    // checked against something other than itself — and one with no depressions, so
+    // it also pins that the fill leaves an already-draining surface alone.
     #[test]
     fn a_cone_drains_radially() {
         let size = UVec2::new(33, 33);
@@ -703,6 +803,9 @@ mod tests {
         }
     }
 
+    // Pins where the fill stops. Below the rim the depression is not resolved and
+    // the routing has nowhere to go; above it the water spills across ground it
+    // never reached.
     #[test]
     fn a_bowl_fills_to_exactly_its_rim() {
         let size = UVec2::new(11, 11);
@@ -726,6 +829,9 @@ mod tests {
         assert_eq!(*state.lake_id().get(0, 0).unwrap(), 0);
     }
 
+    // The threshold suppresses a label, not the water: a puddle still has a depth
+    // and still reads as water, so a consumer drawing surfaces and a consumer
+    // listing lakes see different things by design.
     #[test]
     fn a_lake_under_the_minimum_keeps_its_depth_and_loses_its_label() {
         let size = UVec2::new(11, 11);
@@ -736,6 +842,9 @@ mod tests {
         assert_eq!(*state.lake_id().get(5, 5).unwrap(), 0);
     }
 
+    // The two public readings of one stored byte are resolved by separate code
+    // paths; a neighbour table indexed off by one would leave them consistent with
+    // themselves and disagreeing with each other.
     #[test]
     fn a_flow_code_and_the_cell_it_names_agree() {
         let size = UVec2::new(33, 33);
@@ -752,6 +861,9 @@ mod tests {
         }
     }
 
+    // Walks the scale from zero to past sixteen million, which is what pins the
+    // error as relative: a linear quantization would pass at the small end and lose
+    // whole orders of magnitude at the large one.
     #[test]
     fn an_accumulation_round_trips_through_its_quantization() {
         for value in [0.0f32, 1.0, 2.0, 17.0, 1024.0, 65_536.0, 16_777_216.0] {
@@ -763,10 +875,12 @@ mod tests {
         }
     }
 
-    /// TODO(jb-doc): that the two ways of asking agree except within one quantization
-    /// step; that a cell holding exactly 1.0 returns 0.99985945 from its round trip, so
-    /// the code compare is the more faithful of the two there; and what a caller wanting
-    /// a hard count has to decide for itself.
+    // Thresholding by code and by value have to agree, and this pins how far they
+    // may not: only where the accumulation is within a quantization step of the
+    // threshold. There the code compare is the more faithful of the two — a cell
+    // holding exactly 1.0 comes back from the round trip as 0.99985945 — so a caller
+    // wanting an exact count of upstream cells cannot get one from either and has to
+    // decide which side of the step it wants.
     #[test]
     fn comparing_codes_answers_what_comparing_accumulations_does() {
         let size = UVec2::new(37, 29);
@@ -799,6 +913,9 @@ mod tests {
         assert!(channels > 0, "no cell cleared any threshold");
     }
 
+    // The priority flood pops equal-height cells in an order the heap does not
+    // otherwise fix; without the index tiebreak a document would solve differently
+    // between runs and its saved water would not match a re-solve.
     #[test]
     fn a_solve_is_the_same_every_time_it_is_run() {
         let size = UVec2::new(37, 29);
@@ -810,6 +927,9 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    // The document-level path, which resolves the field by name and stores the
+    // answer on the spec — everything the state tests exercise is reached through
+    // this.
     #[test]
     fn a_document_solves_water_over_the_field_it_names() {
         let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
@@ -823,10 +943,10 @@ mod tests {
         assert!(terrain.water().is_none());
     }
 
-    /// The two ways of getting rid of a solved state are not interchangeable, and the
-    /// difference is the *recipe*: forgetting about the water drops it, invalidating a
-    /// stale answer keeps it. Getting this wrong makes a document that can never be solved
-    /// again, and looks exactly like an ordinary one.
+    // The two ways of getting rid of a solved state are not interchangeable, and the
+    // difference is the *recipe*: forgetting about the water drops it, invalidating a
+    // stale answer keeps it. Getting this wrong makes a document that can never be solved
+    // again, and looks exactly like an ordinary one.
     #[test]
     fn invalidating_the_water_keeps_the_recipe_where_clearing_it_does_not() {
         let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
@@ -849,6 +969,9 @@ mod tests {
         assert!(terrain.water_spec.is_none());
     }
 
+    // The moisture field is sampled per cell and multiplies what that cell
+    // contributes; a constant field makes the total exactly predictable, so a
+    // sampling offset or a dropped weight shows up as a proportional shortfall.
     #[test]
     fn a_named_moisture_field_weights_what_the_sinks_deliver() {
         let size = UVec2::new(24, 24);
@@ -880,6 +1003,8 @@ mod tests {
         );
     }
 
+    // Each refusal is a distinct variant a caller matches on, and all three leave
+    // the document untouched — a partially applied solve would be worse than none.
     #[test]
     fn a_solve_refuses_a_field_it_cannot_read() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
@@ -902,6 +1027,8 @@ mod tests {
         assert!(terrain.water().is_none());
     }
 
+    // An unbaked field has an empty raster rather than a wrong one, so without this
+    // check the solve would quietly return an empty state instead of an error.
     #[test]
     fn a_solve_of_an_unbaked_document_is_refused() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
@@ -918,6 +1045,8 @@ mod tests {
         ));
     }
 
+    // Every reader has to answer on an empty state, because that is what a document
+    // holds between an invalidation and the next solve.
     #[test]
     fn an_empty_height_raster_solves_to_nothing() {
         let state = WaterState::solve(&Raster::default(), &[], 4);
@@ -927,6 +1056,9 @@ mod tests {
         assert_eq!(state.accumulation(0, 0), 0.0);
     }
 
+    // Not a pass/fail test: it prints what one solve of a full-size document costs,
+    // which is the figure that decides whether the editor can re-solve on an edit or
+    // has to defer it. Ignored because it is a measurement.
     #[test]
     #[ignore]
     fn a_full_size_document_measures_what_a_water_solve_costs() {

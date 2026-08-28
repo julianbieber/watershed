@@ -13,20 +13,19 @@ const NOISE_LACUNARITY: f32 = 2.0;
 /// makes the terrain thresholds mean what they say on a [0, 1] scale.
 pub const NOISE_GAIN: f32 = 2.6;
 
-/// Spreads `|gradient_noise_2d|` over most of [0, 1] before it is inverted. Without
-/// it the creases in a ridged field are shallow, because 2D gradient noise rarely
-/// gets near its nominal range.
 const RIDGE_GAIN: f32 = 2.0;
 
-// TODO(jb-comment): why the offset stays small, and why a salt of zero has to keep
-// hashing to exactly what a bare seed always did.
 fn domain_offset(seed: u32, salt: u32) -> Vec2 {
     let h = hash2(seed as i32, salt as i32);
     Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0)
 }
 
-/// TODO(jb-doc): what a sub-seed is for — one spec owns one seed, but a warp needs
-/// two independent fields out of it.
+/// A seed derived from `seed` and `index`, for a caller that needs several
+/// independent fields but was given one seed.
+///
+/// Distinct indices give unrelated fields. `index` is offset before hashing, so
+/// `sub_seed(s, 0)` is not `hash2(s, 0)` and therefore not the offset an unsalted
+/// field of seed `s` lands on.
 pub fn sub_seed(seed: u32, index: u32) -> u32 {
     hash2(seed as i32, index.wrapping_add(1) as i32)
 }
@@ -40,6 +39,8 @@ pub struct NoiseField {
 }
 
 impl NoiseField {
+    /// A field at the module's default octave count. `scale` multiplies the
+    /// position, so a smaller scale means larger features.
     pub fn new(seed: u32, salt: u32, scale: f32) -> Self {
         Self::with_octaves(seed, salt, scale, NOISE_OCTAVES)
     }
@@ -88,6 +89,9 @@ pub struct SignedNoiseField {
 }
 
 impl SignedNoiseField {
+    /// Octaves are explicit and deliberately few: the field is useful for the way
+    /// its sign holds over a long run and then reverses, and a fine octave only adds
+    /// a wobble on top of that.
     pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
         Self {
             offset: domain_offset(seed, salt),
@@ -129,6 +133,8 @@ pub struct RidgedNoiseField {
 }
 
 impl RidgedNoiseField {
+    /// Two fields differing only in `salt` have unrelated ridge lines; two differing
+    /// only in `scale` have the same lines at a different size.
     pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
         Self {
             offset: domain_offset(seed, salt),
@@ -137,6 +143,7 @@ impl RidgedNoiseField {
         }
     }
 
+    /// Sample at a global tile position, in [0, 1] and never negative.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         ridged_fbm(
             x * self.scale + self.offset.x,
@@ -195,8 +202,12 @@ impl TilingNoiseField {
     }
 }
 
-/// Hash function to generate pseudo-random gradients from integer coordinates.
-/// No external crates — uses a simple bit-mixing hash.
+/// The crate's one hash: a pure function of two integers, the same on every
+/// platform and in every build.
+///
+/// Every field's lattice and every domain offset comes off this, so its exact
+/// output is part of what a saved document means — changing it re-generates every
+/// world already on disk. A test pins specific values for that reason.
 pub fn hash2(x: i32, y: i32) -> u32 {
     let mut h = (x as u32).wrapping_mul(0x27d4eb2d);
     h ^= (y as u32).wrapping_mul(0x165667b1);
@@ -208,15 +219,12 @@ pub fn hash2(x: i32, y: i32) -> u32 {
     h
 }
 
-/// Returns a pseudo-random unit gradient vector for a lattice point.
 fn gradient(ix: i32, iy: i32) -> (f32, f32) {
     let h = hash2(ix, iy);
-    // Map hash to an angle in [0, 2*pi)
     let angle = (h as f32 / u32::MAX as f32) * std::f32::consts::TAU;
     (angle.cos(), angle.sin())
 }
 
-/// Smoothstep-style fade curve (6t^5 - 15t^4 + 10t^3), as used in Perlin noise.
 fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
@@ -225,14 +233,15 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + t * (b - a)
 }
 
-/// 2D gradient (Perlin-style) noise, returns values roughly in [-1, 1].
+/// One octave of gradient noise at a position in lattice units, roughly in
+/// [-1, 1] — "roughly" because the nominal bound is rarely approached, which is why
+/// the fields built on it stretch their output.
+///
+/// Exactly zero at every integer lattice point.
 pub fn gradient_noise_2d(x: f32, y: f32) -> f32 {
     gradient_noise_with(x, y, gradient)
 }
 
-/// The same lattice, with the corner lookups wrapped, so the noise repeats every
-/// `period` units. Generic over the lookup so the untiled path above monomorphizes
-/// to exactly what it was before — this is the only interpolation in the crate.
 fn tiling_gradient_noise_2d(x: f32, y: f32, period: i32) -> f32 {
     gradient_noise_with(x, y, |ix, iy| {
         gradient(ix.rem_euclid(period), iy.rem_euclid(period))
@@ -248,7 +257,6 @@ fn gradient_noise_with(x: f32, y: f32, grad: impl Fn(i32, i32) -> (f32, f32)) ->
     let sx = x - x0 as f32;
     let sy = y - y0 as f32;
 
-    // Dot product of gradient and distance vector at each corner.
     let dot_grad = |ix: i32, iy: i32, dx: f32, dy: f32| -> f32 {
         let (gx, gy) = grad(ix, iy);
         gx * dx + gy * dy
@@ -268,15 +276,15 @@ fn gradient_noise_with(x: f32, y: f32, grad: impl Fn(i32, i32) -> (f32, f32)) ->
     lerp(nx0, nx1, v)
 }
 
-/// Fractal Brownian Motion: sums multiple octaves of gradient noise
-/// with increasing frequency and decreasing amplitude, then normalizes.
-pub fn fbm(
-    x: f32,
-    y: f32,
-    octaves: u32,
-    persistence: f32, // amplitude multiplier per octave, e.g. 0.5
-    lacunarity: f32,  // frequency multiplier per octave, e.g. 2.0
-) -> f32 {
+/// Fractional Brownian motion: `octaves` of [`gradient_noise_2d`] summed, each at
+/// `lacunarity` times the frequency and `persistence` times the amplitude of the
+/// one before, divided by the total amplitude.
+///
+/// That division is what makes the result independent of `octaves`, so changing the
+/// octave count refines a field rather than rescaling it. Roughly in [-1, 1], and
+/// in practice much narrower — the octaves seldom align. Zero octaves is not an
+/// error and gives NaN.
+pub fn fbm(x: f32, y: f32, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
     let mut total = 0.0;
     let mut amplitude = 1.0;
     let mut frequency = 1.0;
@@ -289,7 +297,6 @@ pub fn fbm(
         frequency *= lacunarity;
     }
 
-    // Normalize so output stays roughly in [-1, 1] regardless of octave count.
     total / max_amplitude
 }
 
@@ -298,7 +305,13 @@ pub fn fbm(
 /// out as the high ground. Squaring sharpens the crest; without it a ridge is a
 /// broad welt.
 ///
-/// Output is in [0, 1] with no midpoint, unlike [`fbm`].
+/// Output is in [0, 1] with no midpoint, unlike [`fbm`], and never negative — a
+/// ridged field only ever raises the ground it is added to.
+///
+/// Each octave is stretched before it is inverted, because gradient noise rarely
+/// reaches its nominal range and an unstretched crease comes out as a broad welt.
+/// The stretch clips: positions where the underlying octave is far from zero all
+/// contribute exactly nothing rather than a small negative.
 pub fn ridged_fbm(x: f32, y: f32, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
     let mut total = 0.0;
     let mut amplitude = 1.0;
@@ -344,15 +357,27 @@ pub fn tiling_fbm(
     total / max_amplitude
 }
 
-/// TODO(jb-doc): what strike and aspect mean, and why an isotropic spec cannot
-/// express a fold belt or a dune crest.
+/// A direction and an elongation, which is what turns a field of blobs into a field
+/// of bands.
+///
+/// Plain gradient noise is isotropic: its features are the same size in every
+/// direction, so it can make hills but not a fold belt or a run of dunes, both of
+/// which are long in one direction and short across it. This states that direction
+/// and how much longer.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SampleTransform {
+    /// The direction the field varies *fastest* in, in degrees counterclockwise
+    /// from the x axis. The bands therefore run perpendicular to it.
     pub strike_degrees: f32,
+    /// How many times further you must travel along a band to see it change as
+    /// across it. `1.0` is isotropic; below `1.0` is clamped up to it, so the
+    /// elongation is always along the bands and never across them.
     pub aspect: f32,
 }
 
 impl SampleTransform {
+    /// No rotation and no elongation — the field is left exactly as it was. The
+    /// default, and what a document written before this type existed reads as.
     pub const IDENTITY: Self = Self {
         strike_degrees: 0.0,
         aspect: 1.0,
@@ -365,7 +390,10 @@ impl Default for SampleTransform {
     }
 }
 
-/// TODO(jb-doc): why the rotation is precomputed here rather than taken per sample.
+/// A [`SampleTransform`] with its rotation resolved, ready to apply per sample.
+///
+/// The sine and cosine are taken once when this is built rather than at every
+/// position, so a caller constructs one per field and reuses it across the bake.
 #[derive(Clone, Copy, Debug)]
 pub struct Anisotropy {
     axis: Vec2,
@@ -373,12 +401,13 @@ pub struct Anisotropy {
 }
 
 impl Anisotropy {
+    /// An aspect below `1.0` is raised to it rather than being read as an
+    /// elongation the other way, so `strike_degrees` alone decides which way the
+    /// bands run and the two settings cannot contradict each other.
     pub fn new(transform: SampleTransform) -> Self {
         let (sin, cos) = transform.strike_degrees.to_radians().sin_cos();
         Self {
             axis: Vec2::new(cos, sin),
-            // TODO(jb-comment): why an aspect below one is clamped away rather than
-            // being read as the perpendicular strike.
             aspect: transform.aspect.max(1.0),
         }
     }
@@ -398,22 +427,40 @@ impl Anisotropy {
     }
 }
 
-/// TODO(jb-doc): what a domain warp buys, and the constraint that its finest octave
-/// has to be shorter than the feature it is meant to bend.
+/// A displacement applied to a position before a field is sampled at it, which
+/// bends the field's features instead of moving them.
+///
+/// The bending only happens because the displacement *differs* over short
+/// distances: a warp whose finest octave is longer than the feature it is meant to
+/// bend translates that feature bodily and leaves its edges exactly as straight as
+/// it found them. So `scale` has to be fine relative to the field being warped.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WarpSpec {
+    /// Seed of the displacement, independent of the seed of the field it warps.
     pub seed: u32,
+    /// Bound on the displacement, in the same units as the position: neither
+    /// component ever moves further than this.
     pub amplitude: f32,
+    /// Scale of the displacement field. Must be fine relative to the field being
+    /// warped for the warp to bend rather than translate.
     pub scale: f32,
+    /// Octaves of the displacement field.
     pub octaves: u32,
-    /// TODO(jb-doc): why the two component fields can be salted explicitly, what
-    /// `None` keeps meaning for a document written before this existed, and which
-    /// kind of caller has an offset it does not get to choose.
+    /// Salts for the two component fields, for a caller that must place them
+    /// exactly — a document assembled elsewhere, or one that needs a warp to match
+    /// a field it was authored against.
+    ///
+    /// `None` derives both from `seed` via [`sub_seed`], which is what a document
+    /// written before this field existed reads as and must keep meaning.
     #[serde(default)]
     pub salts: Option<(u32, u32)>,
 }
 
-/// TODO(jb-doc): why the warp is two fields rather than one.
+/// A [`WarpSpec`] with its two component fields built.
+///
+/// Two independent fields, one per axis: a single field would displace x and y by
+/// the same amount at every position, which is a slide along the diagonal rather
+/// than a warp.
 pub struct Warp {
     x: NoiseField,
     y: NoiseField,
@@ -421,6 +468,8 @@ pub struct Warp {
 }
 
 impl Warp {
+    /// Builds both component fields, from `spec.salts` if it names them and from
+    /// [`sub_seed`] of `spec.seed` otherwise.
     pub fn new(spec: &WarpSpec) -> Self {
         let (x, y) = match spec.salts {
             Some((salt_x, salt_y)) => (
@@ -439,6 +488,8 @@ impl Warp {
         }
     }
 
+    /// The displaced position. Neither component moves further than the spec's
+    /// amplitude, so the result stays inside a square of that half-width.
     pub fn apply(&self, position: Vec2) -> Vec2 {
         let displacement = Vec2::new(
             self.x.sample(position.x, position.y) - 0.5,
@@ -448,35 +499,57 @@ impl Warp {
     }
 }
 
-/// TODO(jb-doc): which reading of the lattice each kind is, and what range each
-/// one hands back.
+/// Which reading of the same lattice a [`NoiseSpec`] asks for. The three differ in
+/// the range they hand back, so they are not interchangeable in a stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoiseKind {
+    /// Summed octaves, stretched and remapped to [0, 1]. The general-purpose
+    /// reading: a height, a wetness, a density.
     Fbm,
+    /// The same sum in [-1, 1], for a quantity whose natural zero is "neither way"
+    /// rather than "lowest" — a lean or a bias.
     Signed,
+    /// The lattice read for its zero crossings, in [0, 1] and never negative. Its
+    /// maxima form connected lines rather than isolated lumps, which is what a
+    /// mountain range needs and no amount of thresholding gets out of `Fbm`.
     Ridged,
 }
 
-/// TODO(jb-doc): what a spec owns and what it deliberately leaves to the layer that
-/// holds it — amplitude, blending and masking are not this type's business.
+/// A complete description of one noise field: everything needed to reproduce it,
+/// and nothing about what is done with the result.
+///
+/// Scaling the value, deciding where it applies and combining it with anything else
+/// belong to the [`Layer`](crate::layer::Layer) holding the spec, so the same spec
+/// means the same field wherever it is used.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NoiseSpec {
+    /// The document's seed. Two specs differing only here sample unrelated
+    /// landscapes.
     pub seed: u32,
+    /// Which reading of the lattice, and so which range the samples are in.
     pub kind: NoiseKind,
+    /// Multiplies the position; a smaller scale gives larger features.
     pub scale: f32,
+    /// Octaves summed. More refines the field rather than rescaling it.
     pub octaves: u32,
-    /// TODO(jb-doc): what the salt separates that the seed does not — one seed owning
-    /// a whole document's worth of independent fields — and why zero has to keep
-    /// hashing to what a bare seed always did.
+    /// Separates fields that share a seed, so one document seed can own as many
+    /// independent fields as it has layers.
+    ///
+    /// A salt of `0` is what a document written before this field existed
+    /// deserializes to, and it has to keep landing exactly where a bare seed always
+    /// did — otherwise every terrain already saved bakes into different ground.
     #[serde(default)]
     pub salt: u32,
+    /// Direction and elongation. Defaults to isotropic.
     #[serde(default)]
     pub transform: SampleTransform,
+    /// Optional domain warp, applied to the position before the transform.
     #[serde(default)]
     pub warp: Option<WarpSpec>,
 }
 
 impl NoiseSpec {
+    /// The module's default octave count, no salt, isotropic and unwarped.
     pub fn new(seed: u32, kind: NoiseKind, scale: f32) -> Self {
         Self {
             seed,
@@ -489,21 +562,25 @@ impl NoiseSpec {
         }
     }
 
+    /// Sets the octave count.
     pub fn with_octaves(mut self, octaves: u32) -> Self {
         self.octaves = octaves;
         self
     }
 
+    /// Sets the salt. A non-zero salt moves the field somewhere unrelated.
     pub fn with_salt(mut self, salt: u32) -> Self {
         self.salt = salt;
         self
     }
 
+    /// Sets the direction and elongation.
     pub fn with_transform(mut self, transform: SampleTransform) -> Self {
         self.transform = transform;
         self
     }
 
+    /// Sets the domain warp, replacing any already set.
     pub fn with_warp(mut self, warp: WarpSpec) -> Self {
         self.warp = Some(warp);
         self
@@ -516,8 +593,10 @@ enum NoiseSource {
     Ridged(RidgedNoiseField),
 }
 
-/// TODO(jb-doc): the compiled counterpart of a [`NoiseSpec`] — what is precomputed
-/// and why a caller builds one per field rather than per sample.
+/// A [`NoiseSpec`] with its field, rotation and warp built, ready to sample.
+///
+/// Everything derivable from the spec is resolved here rather than per position, so
+/// a caller builds one per field before a bake and samples it for every texel.
 pub struct Noise {
     source: NoiseSource,
     anisotropy: Anisotropy,
@@ -525,6 +604,8 @@ pub struct Noise {
 }
 
 impl Noise {
+    /// Builds from the spec. Two `Noise` built from equal specs sample identically,
+    /// which is what makes a document reproducible.
     pub fn new(spec: &NoiseSpec) -> Self {
         let source = match spec.kind {
             NoiseKind::Fbm => NoiseSource::Fbm(NoiseField::with_octaves(
@@ -553,7 +634,12 @@ impl Noise {
         }
     }
 
-    // TODO(jb-comment): why the warp is applied before the stretch and not after.
+    /// The field's value at a position, in whatever range the spec's
+    /// [`NoiseKind`] hands back.
+    ///
+    /// The warp displaces the position first and the transform stretches the
+    /// result, so the warp bends the bands the transform makes. Applied the other
+    /// way the warp would be stretched along with them and could not break them up.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         let mut position = Vec2::new(x, y);
         if let Some(warp) = &self.warp {
@@ -572,9 +658,9 @@ impl Noise {
 mod tests {
     use super::*;
 
-    /// The seam is the whole reason the field exists: the weather overlay bakes one
-    /// period into a texture and scrolls it forever, so a discontinuity at the wrap
-    /// would be a line marching across the sky.
+    // The seam is the whole reason the field exists: the weather overlay bakes one
+    // period into a texture and scrolls it forever, so a discontinuity at the wrap
+    // would be a line marching across the sky.
     #[test]
     fn a_tiling_field_matches_itself_across_the_seam() {
         let field = TilingNoiseField::new(0x5eed, 8, 4);
@@ -591,8 +677,8 @@ mod tests {
         }
     }
 
-    /// Wrapping the lattice must not flatten the field into a constant — a tiling
-    /// field that is all one value would also "match across the seam".
+    // Wrapping the lattice must not flatten the field into a constant — a tiling
+    // field that is all one value would also "match across the seam".
     #[test]
     fn a_tiling_field_still_varies_across_its_period() {
         let field = TilingNoiseField::new(0x5eed, 8, 4);
@@ -604,8 +690,9 @@ mod tests {
         assert!(max - min > 0.2, "a tiling field spanning only {min}..{max}");
     }
 
-    // TODO(jb-comment): what a change to these numbers would mean for a world
-    // already saved to disk.
+    // The whole crate is a pure function of this hash, so these literals are the
+    // file format's real compatibility surface: changing any of them silently
+    // re-generates every world already on disk rather than failing to load it.
     #[test]
     fn the_lattice_hands_back_the_numbers_it_always_has() {
         assert_eq!(hash2(0, 0), 0x0000_0000);
@@ -628,9 +715,9 @@ mod tests {
         }
     }
 
-    /// A document written before the salt existed deserializes with `salt: 0`, so
-    /// zero has to keep meaning exactly what a bare seed meant — otherwise every
-    /// terrain already saved to disk bakes into a different landscape.
+    // A document written before the salt existed deserializes with `salt: 0`, so
+    // zero has to keep meaning exactly what a bare seed meant — otherwise every
+    // terrain already saved to disk bakes into a different landscape.
     #[test]
     fn an_unsalted_field_samples_where_a_bare_seed_always_put_it() {
         let seed = 0xc0ff_ee01;
@@ -644,8 +731,8 @@ mod tests {
         assert_eq!(NoiseSpec::new(seed, NoiseKind::Fbm, 0.01).salt, 0);
     }
 
-    /// The salt is what lets one seed own a whole document's worth of fields that
-    /// are independent of each other rather than views of one landscape.
+    // The salt is what lets one seed own a whole document's worth of fields that
+    // are independent of each other rather than views of one landscape.
     #[test]
     fn two_salts_off_one_seed_do_not_sample_the_same_landscape() {
         let seed = 0xc0ff_ee01;
@@ -663,8 +750,8 @@ mod tests {
         );
     }
 
-    /// A warp that names its salts must place its two component fields where those
-    /// salts put them, not where `sub_seed` would have.
+    // A warp that names its salts must place its two component fields where those
+    // salts put them, not where `sub_seed` would have.
     #[test]
     fn a_salted_warp_moves_a_position_somewhere_a_sub_seeded_one_does_not() {
         let base = WarpSpec {
@@ -692,6 +779,9 @@ mod tests {
         );
     }
 
+    // Reproducibility is what a seed is for, and the transform and the warp are the
+    // two stages with state of their own — either caching a value across
+    // construction would break it.
     #[test]
     fn a_field_built_twice_from_one_seed_samples_the_same_both_times() {
         let spec = NoiseSpec::new(0xc0ff_ee01, NoiseKind::Fbm, 0.01)
@@ -716,6 +806,8 @@ mod tests {
         }
     }
 
+    // The other half of what a seed is for. A hash that mixed its arguments too
+    // weakly would still be reproducible and would still pass every test above.
     #[test]
     fn two_seeds_do_not_sample_the_same_landscape() {
         let one = Noise::new(&NoiseSpec::new(1, NoiseKind::Fbm, 0.01));
@@ -732,6 +824,8 @@ mod tests {
         );
     }
 
+    // Every unstretched field goes through `Anisotropy::apply` anyway, so an error
+    // in the rotation would move fields nobody configured.
     #[test]
     fn an_identity_transform_leaves_a_position_where_it_found_it() {
         let anisotropy = Anisotropy::new(SampleTransform::IDENTITY);
@@ -741,8 +835,9 @@ mod tests {
         }
     }
 
-    // TODO(jb-comment): which way round the angle runs — the bands come out
-    // perpendicular to it, which is the convention wusel's `stretch` already had.
+    // Pins which way round `strike_degrees` runs: the bands come out perpendicular
+    // to it. A transposed sine and cosine still produces bands, just at ninety
+    // degrees to the ones asked for, which nothing else here would catch.
     #[test]
     fn a_stretched_field_holds_its_value_along_the_bands_it_makes() {
         let strike_degrees = 24.0_f32;
@@ -777,6 +872,9 @@ mod tests {
         );
     }
 
+    // `amplitude` is a bound callers rely on to know how far outside a rectangle a
+    // warped bake has to read; the centring subtraction and the doubling have to
+    // cancel exactly or the bound is out by a factor of two.
     #[test]
     fn a_warp_moves_a_position_no_further_than_its_amplitude() {
         let amplitude = 160.0;
@@ -799,9 +897,9 @@ mod tests {
         }
     }
 
-    /// A warp that only translates a region bodily leaves every edge exactly as
-    /// straight as it found it — the displacement has to differ over a distance
-    /// shorter than the feature being bent.
+    // A warp that only translates a region bodily leaves every edge exactly as
+    // straight as it found it — the displacement has to differ over a distance
+    // shorter than the feature being bent.
     #[test]
     fn a_warp_displaces_nearby_positions_differently() {
         let scale = 0.0035_f32;
@@ -829,6 +927,8 @@ mod tests {
         );
     }
 
+    // A warp built but never applied — dropped on a code path, or applied after the
+    // sample — leaves the field intact and fails silently.
     #[test]
     fn a_warped_field_is_not_the_field_it_warped() {
         let plain = NoiseSpec::new(0x51de_51de, NoiseKind::Fbm, 0.006);
@@ -851,6 +951,9 @@ mod tests {
         assert!(differing > 200, "the warp changed only {differing} of 256");
     }
 
+    // Callers add a ridged field rather than blending it, so a negative sample
+    // would carve holes where it was meant to raise mountains. The `max(0.0)` in
+    // `ridged_fbm` is the only thing preventing that.
     #[test]
     fn a_ridged_field_never_falls_below_the_ground_it_is_added_to() {
         let noise = Noise::new(&NoiseSpec::new(0xa11e, NoiseKind::Ridged, 0.02));
@@ -865,6 +968,8 @@ mod tests {
         }
     }
 
+    // A signed field is useful only if its sign actually reverses; one that stayed
+    // on one side of zero would still be in range and would still look like noise.
     #[test]
     fn a_signed_field_leans_both_ways() {
         let noise = Noise::new(&NoiseSpec::new(0x1ea5, NoiseKind::Signed, 0.01).with_octaves(2));
@@ -879,6 +984,9 @@ mod tests {
         );
     }
 
+    // A spec is what a saved document holds, so the round trip has to preserve not
+    // just the fields but the field they build: the sample comparison catches a
+    // value that survives serde but is read differently on the way back.
     #[test]
     fn a_noise_spec_survives_a_serde_round_trip() {
         let spec = NoiseSpec::new(0xdead_beef, NoiseKind::Ridged, 0.0015)
@@ -907,8 +1015,8 @@ mod tests {
         }
     }
 
-    /// A spec written before the transform and the warp existed must still read, or
-    /// every terrain saved to disk is invalidated by adding a field.
+    // A spec written before the transform and the warp existed must still read, or
+    // every terrain saved to disk is invalidated by adding a field.
     #[test]
     fn a_spec_with_no_transform_or_warp_reads_as_the_plain_field() {
         let decoded: NoiseSpec =
