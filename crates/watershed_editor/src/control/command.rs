@@ -3,7 +3,7 @@
 //! Every command is polled once a frame until it reports [`Poll::Done`], so "wait for
 //! something" and "start a job and see it finish" are the same mechanism rather than two.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bevy::{
@@ -275,9 +275,7 @@ impl Command {
                 path: PathBuf::from(rest.first().ok_or("save needs a path")?),
                 options: match rest.get(1) {
                     Some(&"document") | None => SaveOptions::document(),
-                    Some(&"full") => SaveOptions::full(),
-                    Some(&"bakes-only") => SaveOptions::bakes_only(),
-                    Some(&"layers-only") => SaveOptions::layers_only(),
+                    Some(&"export") => SaveOptions::export(),
                     Some(word) => return Err(format!("no save option named `{word}`")),
                 },
                 started: false,
@@ -473,7 +471,7 @@ impl Command {
                 }
                 let path = path.clone();
                 finished(world, move |_| {
-                    let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                    let bytes = directory_bytes(&path);
                     json!({ "path": path.display().to_string(), "bytes": bytes })
                 })
             }
@@ -585,6 +583,18 @@ impl Command {
             }
         }
     }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 fn finished(world: &mut World, fields: impl FnOnce(&Document) -> Value) -> Poll {
@@ -746,9 +756,9 @@ mod tests {
             ("bake", "bake"),
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),
-            ("save /tmp/a.watershed", "save"),
-            ("save /tmp/a.watershed full", "save"),
-            ("load /tmp/a.watershed", "load"),
+            ("save /tmp/a-terrain", "save"),
+            ("save /tmp/a-terrain export", "save"),
+            ("load /tmp/a-terrain", "load"),
             ("pan 100 200", "pan"),
             ("zoom fit", "zoom"),
             ("zoom 512", "zoom"),
@@ -774,7 +784,7 @@ mod tests {
         assert!(Command::parse("new 256").is_err());
         assert!(Command::parse("new 256 256 1 nothing-like-this").is_err());
         assert!(Command::parse("zoom").is_err());
-        assert!(Command::parse("save /tmp/a.watershed sideways").is_err());
+        assert!(Command::parse("save /tmp/a-terrain sideways").is_err());
         assert!(Command::parse("layer").is_err());
         assert!(Command::parse("layer add height").is_err());
         assert!(Command::parse("layer sideways height 1").is_err());

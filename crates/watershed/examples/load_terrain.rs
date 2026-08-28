@@ -1,22 +1,21 @@
-//! Worked example of consuming a terrain from an application: loading a document,
-//! driving its bake, and reading fields back by role, by name and by cell.
+//! Worked example of consuming a terrain from an application: opening a terrain
+//! directory and reading fields back by role, by name, by cell and by layer.
+//!
+//! Nothing here bakes. A terrain directory holds the values already, so a consuming
+//! project reads them straight out of it — which is the whole reason the format
+//! stores images beside its metadata rather than a recipe to re-derive them from.
 
-use watershed::{BakeProgress, Error, FieldRole, FieldView, Terrain, TerrainSpec};
+use watershed::{Error, FieldRole, FieldView, Terrain};
 
 fn main() -> Result<(), Error> {
-    let mut args = std::env::args().skip(1);
-    let path = args
-        .next()
-        .unwrap_or_else(|| "terrain.watershed".to_owned());
-    let quiet = args.next().as_deref() == Some("--quiet");
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "terrain".to_owned());
 
-    let terrain = if quiet {
-        load(&path)?
-    } else {
-        load_showing_progress(&path)?
-    };
+    let terrain = Terrain::load_from_dir(&path)?;
 
     report_fields(&terrain);
+    report_layers(&terrain);
     sample_a_cell(&terrain, 512, 512);
 
     if let Some(fields) = WorldFields::resolve(&terrain) {
@@ -32,45 +31,32 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn load(path: &str) -> Result<Terrain, Error> {
-    Ok(TerrainSpec::load_from_path(path)?.bake()?)
-}
-
-fn load_showing_progress(path: &str) -> Result<Terrain, Error> {
-    let spec = TerrainSpec::load_from_path(path)?;
-    let mut bake = spec.begin_bake()?;
-
-    println!("{path}: {} step(s)", bake.plan().steps().len());
-
-    while !bake.plan().is_empty() {
-        let progress = bake.advance()?;
-        let report = bake.report();
-        println!(
-            "  {}/{}  {}  {} MiB live",
-            report.step,
-            report.total,
-            report.field,
-            report.live_bytes >> 20,
-        );
-        if progress == BakeProgress::Finished {
-            break;
-        }
-    }
-
-    Ok(bake.finish()?)
-}
-
 fn report_fields(terrain: &Terrain) {
     println!("{}x{} cells", terrain.width(), terrain.height());
     for view in terrain.fields() {
         println!(
-            "  {:12} {:8} {}x{} texels  {}..{}",
+            "  {:12} {:8} {}x{} texels  {}..{}  layer {} channel {}",
             view.name(),
             view.role(),
             view.texel_width(),
             view.texel_height(),
             view.range_low(),
             view.range_high(),
+            view.offset(),
+            view.stride(),
+        );
+    }
+}
+
+fn report_layers(terrain: &Terrain) {
+    for index in 0..terrain.layer_count() {
+        let Some(layer) = terrain.layer(index) else {
+            continue;
+        };
+        println!(
+            "  layer {index}: {} channel(s), {} bytes",
+            layer.channels(),
+            layer.bytes().len(),
         );
     }
 }
@@ -98,6 +84,9 @@ fn sample_a_cell(terrain: &Terrain, x: u32, y: u32) {
         && depth > 0.0
     {
         println!("  water {depth} deep, surface at {}", ground + depth);
+        if let Some(flow) = water.flow_at(x, y) {
+            println!("  flowing towards {flow}");
+        }
     }
 }
 

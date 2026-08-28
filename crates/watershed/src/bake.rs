@@ -8,12 +8,14 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
 use crate::field::{Field, FieldId, FieldRole};
 use crate::layer::{Blend, LayerOp, Mask, Remap, SlopeMode};
+use crate::meta::WaterInfo;
 use crate::noise::Noise;
 use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
 use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
-use crate::terrain::{FieldInfo, Terrain};
+use crate::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 use crate::water::{WaterError, WaterSpec, WaterState};
 
 /// Everything structurally wrong with a document, all of it detectable without
@@ -85,6 +87,11 @@ pub enum BakeError {
     /// baking. See [`PlanError`].
     #[error(transparent)]
     Plan(#[from] PlanError),
+    /// A field's values could not be stored in the channel they were destined for.
+    /// In practice a categorical field holding something that is not a class index.
+    /// See [`ChannelError`].
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
 }
 
 /// An authored document: an extent, the fields in it, and optionally a description
@@ -928,34 +935,175 @@ impl Bake {
     ///
     /// The two are independent afterwards: the terrain holds copies of the baked
     /// rasters, so editing the document does not disturb it.
-    pub fn finish_keeping_spec(mut self) -> Result<(Terrain, TerrainSpec), BakeError> {
+    pub fn finish_keeping_spec(self) -> Result<(Terrain, TerrainSpec), BakeError> {
         let remaining = self.plan.steps.len() as u32 - self.next_step;
         if remaining > 0 {
             return Err(BakeError::StepsRemaining(remaining));
         }
 
-        let mut fields = Vec::with_capacity(self.spec.fields.len());
-        let mut baked = HashMap::with_capacity(self.spec.fields.len());
-        for field in &mut self.spec.fields {
-            fields.push(FieldInfo {
-                name: field.id.to_string(),
-                role: field.role,
-                shift: field.shift,
-                range_low: field.bounds().0,
-                range_high: field.bounds().1,
-                categorical: field.is_categorical(),
-            });
-            baked.insert(field.id.to_string(), field.baked().clone());
-        }
-
-        let terrain = Terrain {
-            size: self.spec.size,
-            fields,
-            baked,
-            water: self.spec.water.clone(),
-        };
+        let terrain = quantize(&self.spec)?;
         Ok((terrain, self.spec))
     }
+}
+
+fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
+    let readable: Vec<&Field> = spec
+        .fields
+        .iter()
+        .filter(|field| field.baked().size() == field.resolution(spec.size))
+        .collect();
+
+    let shifts: Vec<u8> = readable.iter().map(|field| field.shift).collect();
+    let (placements, layer_shifts) = plan_layers(&shifts);
+
+    let mut layers: Vec<LayerBuild> = layer_shifts
+        .iter()
+        .map(|shift| LayerBuild::new(Some(*shift), resolution(spec.size, *shift)))
+        .collect();
+
+    let mut fields = Vec::with_capacity(readable.len());
+    for (field, place) in readable.iter().zip(&placements) {
+        let categorical = field.is_categorical();
+        let meta = if categorical {
+            if let Some(value) = stray_class(field.baked().data()) {
+                return Err(ChannelError::StrayClass {
+                    field: field.id.to_string(),
+                    value,
+                }
+                .into());
+            }
+            ChannelMeta::categorical()
+        } else {
+            value_range(field.baked().data())
+        };
+
+        let layer = &mut layers[place.layer as usize];
+        layer.push(
+            meta,
+            field.baked().data().iter().map(|value| meta.encode(*value)),
+        );
+
+        fields.push(FieldInfo {
+            name: field.id.to_string(),
+            role: field.role,
+            shift: field.shift,
+            categorical,
+            layer: place.layer,
+            channel: place.channel,
+        });
+    }
+
+    let water = spec
+        .water
+        .as_ref()
+        .filter(|state| state.size() == spec.size)
+        .map(|state| {
+            let index = layers.len();
+            layers.push(water_layer(state, spec.size));
+            WaterInfo {
+                lakes: state.lakes(),
+                layer: index as u8,
+            }
+        });
+
+    Ok(Terrain {
+        size: spec.size,
+        fields,
+        layers: layers.into_iter().map(LayerBuild::finish).collect(),
+        water,
+    })
+}
+
+fn value_range(values: &[f32]) -> ChannelMeta {
+    let mut low = f32::INFINITY;
+    let mut high = f32::NEG_INFINITY;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        low = low.min(value);
+        high = high.max(value);
+    }
+    if low > high {
+        return ChannelMeta::linear(0.0, 0.0);
+    }
+    ChannelMeta::linear(low, high)
+}
+
+struct LayerBuild {
+    shift: Option<u8>,
+    size: UVec2,
+    channels: Vec<ChannelMeta>,
+    columns: Vec<Vec<u8>>,
+}
+
+impl LayerBuild {
+    fn new(shift: Option<u8>, size: UVec2) -> Self {
+        Self {
+            shift,
+            size,
+            channels: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, meta: ChannelMeta, bytes: impl Iterator<Item = u8>) {
+        self.channels.push(meta);
+        self.columns.push(bytes.collect());
+    }
+
+    fn finish(self) -> TerrainLayer {
+        let channels = self.columns.len();
+        let texels = (self.size.x as usize) * (self.size.y as usize);
+        let mut interleaved = vec![0u8; texels * channels];
+        for (index, column) in self.columns.iter().enumerate() {
+            for (texel, byte) in column.iter().enumerate() {
+                interleaved[texel * channels + index] = *byte;
+            }
+        }
+        let texels = LayerTexels::from_bytes(self.size, channels, interleaved)
+            .expect("a layer is built at its own extent with one byte per channel");
+        TerrainLayer::new(self.shift, self.channels, texels)
+    }
+}
+
+fn water_layer(state: &WaterState, size: UVec2) -> LayerBuild {
+    let mut layer = LayerBuild::new(Some(0), size);
+
+    let deepest = state
+        .depth()
+        .data()
+        .iter()
+        .copied()
+        .filter(|depth| depth.is_finite())
+        .fold(0.0f32, f32::max);
+    let depth_meta = ChannelMeta::log(deepest);
+    layer.push(
+        depth_meta,
+        state.depth().data().iter().map(|depth| {
+            let byte = depth_meta.encode(*depth);
+            if *depth > 0.0 { byte.max(1) } else { byte }
+        }),
+    );
+
+    let unit = ChannelMeta::unit();
+    let flow: Vec<Vec2> = (0..size.y)
+        .flat_map(|y| (0..size.x).map(move |x| (x, y)))
+        .map(|(x, y)| state.flow_vector(x, y).unwrap_or(Vec2::ZERO))
+        .collect();
+    layer.push(unit, flow.iter().map(|vector| unit.encode(vector.x)));
+    layer.push(unit, flow.iter().map(|vector| unit.encode(vector.y)));
+
+    let largest = (0..size.y)
+        .flat_map(|y| (0..size.x).map(move |x| (x, y)))
+        .map(|(x, y)| state.accumulation(x, y))
+        .fold(0.0f32, f32::max);
+    let accum_meta = ChannelMeta::log(largest);
+    layer.push(
+        accum_meta,
+        (0..size.y)
+            .flat_map(|y| (0..size.x).map(move |x| (x, y)))
+            .map(|(x, y)| accum_meta.encode(state.accumulation(x, y))),
+    );
+
+    layer
 }
 
 impl TerrainSpec {
@@ -2099,7 +2247,7 @@ mod tests {
 
         for view in whole.fields() {
             let other = stepped.field(view.name()).unwrap();
-            assert_eq!(view.texels(), other.texels(), "{} differs", view.name());
+            assert_eq!(view.bytes(), other.bytes(), "{} differs", view.name());
         }
     }
 

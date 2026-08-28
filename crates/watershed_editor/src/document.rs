@@ -501,14 +501,18 @@ impl Document {
         Ok(())
     }
 
-    /// Starts writing the document to `path`. The terrain comes back unchanged when
-    /// the job lands. Refused while a job is running or with no document open.
+    /// Starts writing the document to the directory at `path`, creating it if it is
+    /// not there. The terrain comes back unchanged when the job lands. Refused while
+    /// a job is running or with no document open.
+    ///
+    /// The save removes images in that directory it no longer names; see
+    /// [`TerrainSpec::save_to_dir`] for when that sweep runs.
     pub fn start_save(&mut self, path: PathBuf, options: SaveOptions) -> Result<(), String> {
         let terrain = self.take_terrain()?;
         self.path = Some(path.clone());
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let error = terrain
-                .save_to_path(&path, options)
+                .save_to_dir(&path, options)
                 .err()
                 .map(|error| error.to_string());
             Outcome {
@@ -533,7 +537,7 @@ impl Document {
         self.stroke_rect = CellRect::EMPTY;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            match TerrainSpec::load_from_path(&path) {
+            match TerrainSpec::load_from_dir(&path) {
                 Ok(terrain) => Outcome {
                     terrain: Some(terrain),
                     error: None,

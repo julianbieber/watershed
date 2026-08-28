@@ -173,27 +173,6 @@ impl WaterState {
         }
     }
 
-    /// Assembles a state from rasters that were solved elsewhere, for the loader.
-    ///
-    /// Nothing is checked: the four rasters are trusted to be the same size and to
-    /// be a consistent answer for one height field. Reading a state built from
-    /// mismatched rasters is safe but meaningless.
-    pub(crate) fn from_parts(
-        depth: Raster<f32>,
-        flow_dir: Raster<u8>,
-        flow_accum: Raster<u16>,
-        lake_id: Raster<u32>,
-        lakes: u32,
-    ) -> Self {
-        Self {
-            depth,
-            flow_dir,
-            flow_accum,
-            lake_id,
-            lakes,
-        }
-    }
-
     /// The extent the state was solved over, in cells. Zero for an empty state.
     pub fn size(&self) -> UVec2 {
         self.depth.size()
