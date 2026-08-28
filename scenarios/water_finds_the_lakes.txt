@@ -47,10 +47,11 @@ capture /tmp/watershed-scenario/moisture.png
 
 field height
 
-# A round trip through the container. The save carries the water, so the load must not
-# re-solve it — `observe water` after the load has to match the one above.
-save /tmp/watershed-scenario/round-trip.watershed
-load /tmp/watershed-scenario/round-trip.watershed
+# A round trip through the terrain directory. The save writes the values as images and
+# the load re-bakes from the paint it reads back, so `observe water` after the load is a
+# statement about what survives eight-bit quantisation rather than about an exact copy.
+save /tmp/watershed-scenario/round-trip
+load /tmp/watershed-scenario/round-trip
 observe document
 observe water
 

@@ -19,10 +19,12 @@
 
 pub mod bake;
 pub mod brush;
+pub mod channel;
 pub mod error;
 pub mod field;
 pub mod io;
 pub mod layer;
+pub mod meta;
 pub mod noise;
 pub mod raster;
 pub mod regions;
@@ -33,11 +35,15 @@ pub use bake::{
     Bake, BakeError, BakePlan, BakeProgress, BakeReport, BakeStep, PlanError, StepKind, TerrainSpec,
 };
 pub use brush::{Brush, BrushMode};
+pub use channel::{ChannelEncoding, ChannelMeta, ChannelTable, MAX_CHANNELS};
 pub use error::Error;
 pub use field::{Field, FieldId, FieldRole};
 pub use io::{IoError, SaveOptions};
 pub use layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
+pub use meta::{FieldStack, LayerMeta, PaintRef, PaintSlot, TerrainMeta, WaterInfo};
 pub use raster::{CellRect, Raster};
 pub use regions::{Region, RegionMap, RegionOutput, RegionSpec};
-pub use terrain::{FieldInfo, FieldView, Terrain};
+pub use terrain::{
+    ChannelView, FieldInfo, FieldView, LayerTexels, LayerView, Terrain, TerrainLayer, WaterView,
+};
 pub use water::{WaterError, WaterSpec, WaterState};

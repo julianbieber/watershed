@@ -98,7 +98,7 @@ pub struct FilePath(pub String);
 
 impl Default for FilePath {
     fn default() -> Self {
-        Self("terrain.watershed".to_owned())
+        Self("terrain".to_owned())
     }
 }
 
