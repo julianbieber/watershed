@@ -1,4 +1,5 @@
-// This exmaple shows how to integrate a terrain into an application.
+//! Worked example of consuming a terrain from an application: loading a document,
+//! driving its bake, and reading fields back by role, by name and by cell.
 
 use watershed::{BakeProgress, Error, FieldRole, FieldView, Terrain, TerrainSpec};
 

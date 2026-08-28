@@ -1,5 +1,9 @@
-// TODO(jb-doc): module docs — what belongs here rather than beside the panel that uses it,
-// and why a helper takes a boxed scene list rather than a closure.
+//! The pieces every panel is built out of.
+//!
+//! Anything used by more than one panel belongs here; anything shaped by a single
+//! panel stays beside it. Children arrive as `Box<dyn SceneList>` rather than as
+//! closures because a panel's children are counted and assembled at run time, and a
+//! list of boxes is the one form that can be built up and handed over.
 
 use bevy::feathers::controls::{
     FeathersMenu, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup, FeathersNumberInput,
@@ -133,6 +137,7 @@ pub fn text(body: impl Into<String>) -> impl Scene {
     label(body.into())
 }
 
+/// As [`text`], smaller — for a caption or a detail beside something else.
 pub fn small(body: impl Into<String>) -> impl Scene {
     label_small(body.into())
 }

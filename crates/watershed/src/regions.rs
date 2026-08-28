@@ -1,32 +1,49 @@
-// TODO(jb-doc): module docs — what a region is here (a weight and a row of numbers),
-// why the enum, the kind triple and the recipe table are deliberately not in this crate,
-// and what a caller has to supply instead.
+//! Partitioning a document into irregular areas and reading a number off whichever
+//! one a position falls in.
+//!
+//! A region here is a draw weight and a row of numbers, nothing more. What the rows
+//! mean — which column is rainfall, which region is a salt flat — is the caller's,
+//! supplied as column names in the spec; this module carries no vocabulary of its
+//! own, so a document can define regions the crate has never heard of.
 
 use glam::{IVec2, UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::noise::{Warp, WarpSpec, hash2};
 
-/// TODO(jb-doc): what confines a site to the middle of its cell, and the two things that
-/// stop short of filling the whole cell buy.
+/// The fraction of its cell a region's site may wander over.
+///
+/// At `1.0` a site could land anywhere in its cell including on an edge; at `0.0`
+/// every site would sit dead centre and the regions would be a square grid. This
+/// keeps a site inside the middle 85% of its cell, so the tiling looks irregular
+/// while two sites in adjacent cells cannot end up arbitrarily close together.
 pub const SITE_JITTER: f32 = 0.85;
 
 const CELL_SALT: u32 = 0x51de_51de;
 const COVER_SALT: i32 = 0x2f6b_1e59;
 
-// TODO(jb-comment): why the cell table is bounded at all, and what a document that
-// exceeds the bound falls back to.
 const MAX_CACHED_CELLS: usize = 1 << 20;
 
-/// TODO(jb-doc): why a region is a draw weight and a row of numbers, and why a name for
-/// the region itself would be the thing this crate must not carry.
+/// One row of the region table: how often it is drawn, and what it is worth in each
+/// of the spec's columns.
+///
+/// It has no name and no identity beyond its position in
+/// [`RegionSpec::regions`] — that index is what [`RegionOutput::RegionId`] emits.
+/// Naming the regions is the caller's business, kept out of the document so this
+/// crate need not know what any of them are.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Region {
+    /// Relative draw weight against the other regions. A region of weight `0` is
+    /// never drawn, so long as some other region has a weight.
     pub weight: u32,
+    /// One value per column of the spec, in the spec's column order. Short rows read
+    /// as `0.0` in the missing columns rather than failing.
     pub values: Vec<f32>,
 }
 
 impl Region {
+    /// Takes the values verbatim; they are not checked against any column count,
+    /// because a region is written before the spec that holds it.
     pub fn new(weight: u32, values: impl Into<Vec<f32>>) -> Self {
         Self {
             weight,
@@ -35,20 +52,36 @@ impl Region {
     }
 }
 
-/// TODO(jb-doc): the four things a caller chooses — the lattice, the band, the warp and
-/// the table — and which of them a region's *interior* depends on.
+/// A complete description of a tiling: where the regions are, how wide their seams
+/// are, and what each is worth.
+///
+/// Only the seam depends on `blend_tiles`; in the interior of a region every column
+/// reads that region's own value exactly, whatever the band is set to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RegionSpec {
+    /// Seed of the lattice. Two specs differing only here tile the document
+    /// completely differently.
     pub seed: u32,
+    /// Spacing of the lattice in document cells — roughly how far apart two regions
+    /// are. Read as at least `1`.
     pub cell_tiles: u32,
+    /// How far, in document cells, a blend reaches either side of a boundary. Read
+    /// as at least `1`.
     pub blend_tiles: u32,
+    /// Optional warp of the query position, which makes the region boundaries wander
+    /// rather than following the lattice.
     #[serde(default)]
     pub warp: Option<WarpSpec>,
+    /// Column names, in the order every [`Region::values`] row is written in. What
+    /// a name means is the caller's; this is the only place they are declared.
     pub columns: Vec<String>,
+    /// The table. A region's index here is its id.
     pub regions: Vec<Region>,
 }
 
 impl RegionSpec {
+    /// A spec with the given columns and no regions and no warp. A spec with no
+    /// regions is legal and samples as `0.0` everywhere.
     pub fn new(
         seed: u32,
         cell_tiles: u32,
@@ -65,36 +98,59 @@ impl RegionSpec {
         }
     }
 
+    /// Sets the warp, replacing any already set.
     pub fn with_warp(mut self, warp: WarpSpec) -> Self {
         self.warp = Some(warp);
         self
     }
 
+    /// Appends a region. Its index — and so its id — is its position in the order
+    /// added, so inserting one renumbers every region after it.
     pub fn with_region(mut self, region: Region) -> Self {
         self.regions.push(region);
         self
     }
 
+    /// The position of that exact column name, or `None`. Case-sensitive. This is
+    /// what a [`RegionOutput::Blended`] is resolved through at plan time, which is
+    /// where an unknown column becomes an error.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|column| column == name)
     }
 }
 
-/// TODO(jb-doc): the three questions a region map can answer, and why two of them are
-/// categorical in a crate whose fields are all `f32`.
+/// Which question a layer asks of the tiling.
+///
+/// The last two answer with a region index rather than a quantity. Every field in
+/// this crate is `f32`, so the index is carried as one — which is exactly why a
+/// field reading either of them is
+/// [categorical](crate::field::Field::is_categorical) and must never be
+/// interpolated: halfway between region 2 and region 4 is not region 3.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegionOutput {
+    /// The named column, weighted across every region reaching the position, so it
+    /// is continuous across a boundary. A name no column carries is a plan-time
+    /// error.
     Blended(String),
+    /// The index of the region the position is in.
     RegionId,
+    /// The index of a region drawn at random from those reaching the position,
+    /// weighted the same way a blend would be — a hard-edged mixture in a seam
+    /// where a blend would be a gradient.
     CoverClass,
 }
 
-/// TODO(jb-doc): why the column is resolved to an index once per bake rather than looked
-/// up by name per texel.
+/// A [`RegionOutput`] with its column resolved to an index.
+///
+/// The name lookup happens once, when the plan is built, so a bake never does a
+/// string comparison per texel and an unknown column fails before any work is done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompiledOutput {
+    /// Index into a region's [`Region::values`] row.
     Blended(usize),
+    /// As [`RegionOutput::RegionId`].
     RegionId,
+    /// As [`RegionOutput::CoverClass`].
     CoverClass,
 }
 
@@ -104,12 +160,6 @@ struct Site {
     region: u16,
 }
 
-// TODO(jb-comment): why the table is precomputed for the whole document rather than
-// filled in as texels ask for cells, and what that buys the rect re-bake guard.
-//
-// TODO(jb-doc): what the table does *not* take off — the measured split between the cell
-// lookups and the domain warp, and what that implies for the shift a region column should
-// be baked at. Figures in `the_cell_table_measures_what_it_takes_off_a_blend`.
 struct CellCache {
     origin: IVec2,
     size: UVec2,
@@ -139,8 +189,11 @@ impl CellCache {
     }
 }
 
-/// TODO(jb-doc): the compiled counterpart of a [`RegionSpec`], and why the whole
-/// neighbourhood is read for every answer it gives.
+/// A [`RegionSpec`] compiled for sampling: the warp built, the draw weights
+/// totalled, the value rows flattened, and the lattice sites precomputed.
+///
+/// Sampling is a pure function of position — a map built twice from equal specs
+/// answers identically, and the precomputed sites change nothing but the speed.
 pub struct RegionMap {
     cell_tiles: f32,
     blend_tiles: f32,
@@ -155,6 +208,12 @@ pub struct RegionMap {
 }
 
 impl RegionMap {
+    /// Compiles the spec for a `size`-cell document.
+    ///
+    /// `size` bounds the lattice sites that are worth precomputing, including the
+    /// margin a warp can reach outside the document. A document large enough that
+    /// the table would not be worth holding is sampled without one, which is slower
+    /// and gives bit-identical answers.
     pub fn new(spec: &RegionSpec, size: UVec2) -> Self {
         Self::with_cache_limit(spec, size, MAX_CACHED_CELLS)
     }
@@ -226,8 +285,6 @@ impl RegionMap {
         }
     }
 
-    // TODO(jb-comment): why the jitter comes off the low bytes and the draw off the high
-    // ones, and what a second hash per cell would cost per texel.
     fn site_at(&self, cell: IVec2) -> Site {
         let h = hash2(cell.x ^ self.cell_salt, cell.y);
 
@@ -265,8 +322,14 @@ impl RegionMap {
             .unwrap_or(0.0)
     }
 
-    /// TODO(jb-doc): the coordinate space this takes, and why the query is warped where
-    /// the lattice is not.
+    /// Everything the tiling has to say about a position in document cells.
+    ///
+    /// The position is warped and the lattice is not, so the regions keep their even
+    /// spacing while their boundaries wander — warping the lattice instead would
+    /// bunch sites together and leave gaps.
+    ///
+    /// Reads the 3x3 cell neighbourhood around the warped position, so one call
+    /// answers for the dominant region, the cover draw and every column at once.
     pub fn blended(&self, x: f32, y: f32) -> Blended<'_> {
         let position = Vec2::new(x, y);
         let query = match &self.warp {
@@ -276,8 +339,6 @@ impl RegionMap {
 
         let base = (query / self.cell_tiles).floor().as_ivec2();
 
-        // TODO(jb-comment): why a 3x3 neighbourhood is enough given the jitter bound, and
-        // what a miss would cost against what 5x5 would.
         let mut sites = [Site {
             position: Vec2::ZERO,
             region: 0,
@@ -301,8 +362,6 @@ impl RegionMap {
         let mut dominant = 0u16;
         let mut dominant_weight = -1.0;
         for slot in 0..9 {
-            // TODO(jb-comment): what the excess measures, and why a tile B from a
-            // boundary is 2B further from the loser than from the winner.
             let excess = (distances[slot] - nearest) / (2.0 * self.blend_tiles);
             if excess >= 1.0 {
                 continue;
@@ -316,8 +375,6 @@ impl RegionMap {
             }
         }
 
-        // TODO(jb-comment): why the cover draw is hashed on the unwarped tile, and why
-        // nothing about it is random at run time.
         let mut cover = dominant;
         if total > 0.0 {
             let draw =
@@ -345,6 +402,11 @@ impl RegionMap {
         }
     }
 
+    /// One answer at a position in document cells, as an `f32` — a blended column
+    /// as itself, an id or a cover class as its index cast.
+    ///
+    /// Asking for two outputs at one position costs two neighbourhood searches; use
+    /// [`RegionMap::blended`] to pay for one.
     pub fn sample(&self, output: CompiledOutput, x: f32, y: f32) -> f32 {
         let blended = self.blended(x, y);
         match output {
@@ -355,18 +417,32 @@ impl RegionMap {
     }
 }
 
-/// TODO(jb-doc): what this holds and why it borrows the map rather than copying a row of
-/// blended numbers out of it.
+/// The neighbourhood search at one position, held so that several answers can be
+/// read off it.
+///
+/// Borrows the map rather than copying a blended row out of it: a spec may have any
+/// number of columns and a caller usually wants one, so the columns are combined on
+/// demand instead of up front.
 pub struct Blended<'a> {
     map: &'a RegionMap,
     sites: [Site; 9],
     weights: [f32; 9],
     total: f32,
+    /// Index of the region with the largest share at this position — the region the
+    /// position is *in*.
     pub dominant: u16,
+    /// Index of the region drawn for this position's cover class. Equal to
+    /// `dominant` everywhere except in a seam, and a pure function of the document
+    /// cell: nothing about it is decided at run time.
     pub cover: u16,
 }
 
 impl Blended<'_> {
+    /// The column's value, weighted across every region reaching this position.
+    ///
+    /// Continuous across a boundary, and always within the range of the values
+    /// being mixed. A column index the spec does not have reads `0.0` rather than
+    /// panicking, as does a position no region reaches.
     pub fn column(&self, index: usize) -> f32 {
         if self.total <= 0.0 {
             return 0.0;
@@ -382,8 +458,11 @@ impl Blended<'_> {
         sum
     }
 
-    /// TODO(jb-doc): what makes a tile interior, and why that is the question every guard
-    /// in this module asks first.
+    /// Whether exactly one region reaches this position — that is, it is not in a
+    /// seam.
+    ///
+    /// Everything the seam does is off here: a column reads its region's own value
+    /// exactly, and the cover draw cannot pick anything but the dominant region.
     pub fn is_interior(&self) -> bool {
         self.weights.iter().filter(|weight| **weight > 0.0).count() == 1
     }
@@ -417,6 +496,10 @@ mod tests {
         RegionMap::new(&spec(), UVec2::splat(4096))
     }
 
+    // Separates the blend arithmetic from the values it mixes: if every region
+    // carries the same number, any weighting of them is that number, so a weight
+    // that is misnormalised or a share that does not sum to one shows up as a
+    // deviation with nothing else to hide behind.
     #[test]
     fn a_blend_of_like_regions_is_that_region() {
         let flat = RegionSpec::new(0x1111, 384, 48, ["base"])
@@ -435,6 +518,9 @@ mod tests {
         }
     }
 
+    // The cover draw runs at every position, interior or not, so it has to be a
+    // no-op where only one region reaches: an off-by-one in the cumulative walk
+    // would scatter foreign cover through the middle of every region.
     #[test]
     fn the_cover_draw_is_a_no_op_inside_a_region() {
         let map = map();
@@ -456,6 +542,9 @@ mod tests {
         assert!(interior > 1000, "only {interior} interior tiles sampled");
     }
 
+    // The other side of the same guarantee: outside a seam a blended column has to
+    // be its own region's value exactly, or `blend_tiles` would tint the whole
+    // document rather than only its boundaries.
     #[test]
     fn a_weight_is_zero_beyond_the_blend_band() {
         let map = map();
@@ -482,6 +571,9 @@ mod tests {
         );
     }
 
+    // Every texel of a baked region column depends on this: two bakes of one
+    // document must agree bit for bit, so nothing in the neighbourhood search may
+    // depend on call order or accumulated state.
     #[test]
     fn a_blend_is_a_pure_function_of_position() {
         let map = map();
@@ -495,6 +587,9 @@ mod tests {
         }
     }
 
+    // A blend is a weighted mean, so it can never leave the range of the values it
+    // mixes; a share that does not sum to one would push a column past the highest
+    // region in the table and out of whatever range the field was given.
     #[test]
     fn a_blended_column_stays_within_the_range_of_its_parts() {
         let spec = spec();
@@ -520,6 +615,9 @@ mod tests {
         }
     }
 
+    // Continuity is the whole reason a blend exists rather than a hard lookup: a
+    // step between adjacent cells would be a visible seam in the baked field. The
+    // bound is relative to the table's own spread, so it holds for any table.
     #[test]
     fn a_blended_column_is_continuous_across_a_boundary() {
         let spec = spec();
@@ -553,6 +651,9 @@ mod tests {
         );
     }
 
+    // The complement of the interior test: a cover draw that always fell to the
+    // dominant region would pass every other test here and would make cover class
+    // an exact copy of region id.
     #[test]
     fn the_cover_draw_mixes_both_regions_across_a_boundary() {
         let map = map();
@@ -570,6 +671,9 @@ mod tests {
         );
     }
 
+    // Pins the weighted draw against a table of six: an error in the cumulative
+    // subtraction typically starves the first or last row, which no single-region
+    // test would notice.
     #[test]
     fn every_region_is_drawn_somewhere() {
         let map = map();
@@ -582,6 +686,10 @@ mod tests {
         }
     }
 
+    // Weight zero is how a document keeps a region in the table while taking it out
+    // of circulation, so it has to be excluded exactly — the draw assigns the index
+    // before it tests the remainder, which is where an off-by-one would let it
+    // through.
     #[test]
     fn a_zero_weight_region_is_never_drawn() {
         let spec = RegionSpec::new(0x2222, 64, 8, ["base"])
@@ -595,6 +703,9 @@ mod tests {
         }
     }
 
+    // The site table is an optimisation and nothing else. Compared bit for bit,
+    // because a table that is merely close would drift a baked document away from
+    // one baked on a machine that fell back to computing the sites.
     #[test]
     fn the_cell_cache_does_not_change_a_single_sample() {
         let spec = spec();
@@ -621,6 +732,9 @@ mod tests {
         }
     }
 
+    // A warp displaces a query off the document, so the table has to extend past its
+    // edges by the warp's amplitude; a table sized to the document alone would miss
+    // there and fall back silently, costing speed at exactly the corners.
     #[test]
     fn the_cell_cache_covers_what_the_warp_can_reach_outside_the_document() {
         let map = map();
@@ -638,6 +752,8 @@ mod tests {
         }
     }
 
+    // An empty table is what a document has while its regions are being authored, so
+    // it has to sample rather than divide by a zero weight total.
     #[test]
     fn a_region_map_with_no_regions_samples_as_zero() {
         let spec = RegionSpec::new(0x3333, 64, 8, ["base"]);
@@ -646,12 +762,18 @@ mod tests {
         assert_eq!(map.sample(CompiledOutput::RegionId, 12.5, 3.5), 0.0);
     }
 
+    // Column indices are resolved at plan time, but a `Blended` is public and a
+    // caller can ask for any index; the flattened value store is addressed
+    // arithmetically, so an unchecked index would read another region's row.
     #[test]
     fn a_column_that_is_not_in_the_table_reads_as_zero_rather_than_a_panic() {
         let map = map();
         assert_eq!(map.blended(120.0, 340.0).column(9), 0.0);
     }
 
+    // `sample` is the path a bake takes and `blended` the path a caller takes; the
+    // two have to agree, or a field would bake to something other than what the
+    // editor previewed.
     #[test]
     fn a_region_id_is_the_index_of_the_region_the_tile_is_in() {
         let map = map();
@@ -669,8 +791,11 @@ mod tests {
         }
     }
 
-    /// TODO(jb-doc): what these figures are for, which part of a blend the table removes
-    /// and which part it cannot. `cargo test --release -- --ignored --nocapture`.
+    // Not a pass/fail test: it prints the split between the two costs in a blend,
+    // the cell lookups the site table removes and the domain warp it cannot, so the
+    // shift a region column is worth baking at can be argued from figures rather
+    // than guessed. Ignored because it is a measurement.
+    // Run with `cargo test --release -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn the_cell_table_measures_what_it_takes_off_a_blend() {
@@ -716,6 +841,9 @@ mod tests {
         println!("262144 blends with no warp at all: {no_warp:?}");
     }
 
+    // A spec is what a saved document holds. The sample comparison is the part that
+    // matters: a field that survives serde but compiles differently would reload as
+    // a different tiling without any decode error.
     #[test]
     fn a_region_spec_survives_a_serde_round_trip() {
         let spec = spec();
@@ -734,6 +862,8 @@ mod tests {
         }
     }
 
+    // A spec written before the warp existed must still read, or adding the field
+    // invalidates every document already saved.
     #[test]
     fn a_spec_with_no_warp_reads_as_the_unwarped_lattice() {
         let decoded: RegionSpec = serde_json::from_str(

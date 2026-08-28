@@ -1,5 +1,13 @@
-// TODO(jb-doc): module docs — the rule the whole panel is built on: a choice is shape and
-// a number is a value, so choosing rebuilds and typing does not.
+//! The layer panel: the field's own properties, the brush, and one entry per layer of
+//! the stack.
+//!
+//! Everything here follows from one rule. **A choice is shape and a number is a
+//! value**: choosing a blend mode or an op changes which widgets exist, so the panel
+//! is thrown away and rebuilt; typing a number changes only what a widget holds, so
+//! the panel stands and the value is pushed into it. Getting a number into the shape
+//! would rebuild the panel under the keyboard on the frame it was typed into, and
+//! leaving a choice out of it would leave a menu showing what it used to say over a
+//! document that had already changed.
 
 use bevy::feathers::containers::{group, group_body, group_header};
 use bevy::feathers::controls::{
@@ -25,31 +33,35 @@ use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{ADDABLE, AddLayer, Expanded, PANEL_WIDTH, report};
 
-/// The panel's children are thrown away and rebuilt whenever the key changes. Everything a
-/// caption prints and everything that decides how many widgets there are is in it;
-/// nothing a number field holds is.
+/// What the panel was last built from, and which rebuild that was.
+///
+/// The key covers everything a caption prints and everything that decides how many
+/// widgets there are, and nothing a number field holds. The panel is rebuilt exactly
+/// when the key changes.
 #[derive(Resource, Default)]
 pub struct Shape {
     key: String,
     generation: u64,
 }
 
-/// Which rebuild a child belongs to.
+/// Which rebuild a child of the panel belongs to.
 ///
-/// A rebuild queues its children rather than spawning them, because a scene waits on the
-/// fonts it names. So a despawn cannot reach a spawn that has not happened yet: at startup
-/// the empty panel's contents landed *after* the first document had already replaced them,
-/// and the panel said "no document" over a document. Anything that arrives late carries an
-/// old number and is taken out again.
+/// A rebuild queues its children rather than spawning them, so a despawn cannot reach
+/// a spawn that has not happened yet and a child from an earlier rebuild can arrive
+/// after a later one has already replaced the panel. [`prune`] uses this to take such
+/// a child out again.
 #[derive(Component, Default, Clone)]
 pub struct StackEntry(u64);
 
+/// The panel's scroll container, whose children are the panel's contents.
 #[derive(Component, Default, Clone)]
 pub struct StackBody;
 
+/// The label that says whether what is on screen is the whole bake or a preview.
 #[derive(Component, Default, Clone)]
 pub struct PreviewTag;
 
+/// The panel's outer scene: a scrolling column, empty until [`rebuild`] fills it.
 pub fn panel() -> impl Scene {
     bsn! {
         Node {
@@ -66,8 +78,11 @@ pub fn panel() -> impl Scene {
     }
 }
 
-/// The stack of the field the toolbar has selected, which is what makes moisture and
-/// temperature editable by this panel with nothing about them written here.
+/// Rebuilds the panel when the shape changes, and does nothing otherwise.
+///
+/// Always for the field the toolbar has selected, whichever that is — nothing here
+/// names a field, so a document's own fields are editable by this panel without it
+/// knowing anything about them.
 pub fn rebuild(
     document: Res<Document>,
     brush: Res<BrushSettings>,
@@ -96,7 +111,8 @@ pub fn rebuild(
         .queue_spawn_related_scenes::<Children>(entries);
 }
 
-/// Whatever a rebuild could not despawn because it had not been spawned yet.
+/// Removes children left over from an earlier rebuild — the ones a rebuild could not
+/// despawn because they had not been spawned yet. See [`StackEntry`].
 pub fn prune(
     shape: Res<Shape>,
     body: Single<&Children, With<StackBody>>,
@@ -113,8 +129,8 @@ pub fn prune(
     }
 }
 
-/// What the panel prints that is neither a choice nor a number: whether the bake on screen
-/// is the whole document, and whether the shift may be moved at all.
+/// Writes the one thing the panel says that is neither a choice nor a number: whether
+/// what is on screen is the whole bake or a preview of part of it.
 pub fn sync(document: Res<Document>, mut preview: Query<&mut Text, With<PreviewTag>>) {
     let previewing = document.baked() != Baked::Whole || document.is_dirty();
     for mut text in preview.iter_mut() {
@@ -122,13 +138,6 @@ pub fn sync(document: Res<Document>, mut preview: Query<&mut Text, With<PreviewT
     }
 }
 
-/// Whether the shift is one the panel refuses to move: the water solve reads its height
-/// field one texel per cell, so a coarse one is a document that can never solve.
-///
-/// Only while the field is *already* right, so a document that arrived at a coarse height
-/// some other way can be put back rather than being locked out of the panel that would
-/// repair it. The guard proper is [`Edit::Set`] refusing — this is what stops a person
-/// reaching for it in the first place.
 fn shift_is_pinned(document: &Document) -> bool {
     document
         .terrain()
@@ -251,8 +260,6 @@ fn contents(
     children
 }
 
-/// A shift is the one edit that discards the bake rather than patching it, since it
-/// changes the raster the field is written onto.
 fn properties(active: &str, field: &watershed::Field, pinned: bool) -> impl Scene {
     let active = active.to_owned();
     let role = field.role;
@@ -298,10 +305,6 @@ fn properties(active: &str, field: &watershed::Field, pinned: bool) -> impl Scen
     ])
 }
 
-/// The brush, and where a drag over the world would land.
-///
-/// TODO(jb-doc): why the target is shown even though nothing here can choose it, and what a
-/// panel that only offered the numbers would leave a person guessing about.
 fn brush_section(document: &Document, brush: &BrushSettings, expanded: &Expanded) -> impl Scene {
     let active = document.active().to_owned();
     let target = target_of(document);
@@ -493,8 +496,6 @@ fn blend_row(active: &str, index: usize, layer: &Layer) -> impl Scene {
     widgets::captioned("blend", one(widgets::menu(blend_name(layer.blend), items)))
 }
 
-/// A painted mask is not offered: there is nothing here that paints one, and a shape that
-/// cannot be filled in is worse than one that cannot be chosen.
 fn mask_editor(index: usize, mask: &Mask, names: &[String]) -> impl Scene {
     let current = mask_kind(mask);
     let first = first_field(names);
@@ -617,7 +618,6 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String]) -> impl Scene {
                 "seed",
                 NumberBinding::NoiseSeed(index),
             )));
-            // A scale is a reciprocal wavelength, so the useful range spans three decades.
             rows.push(one(widgets::number_row(
                 "scale",
                 NumberBinding::NoiseScale(index),
@@ -707,8 +707,6 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String]) -> impl Scene {
 
         LayerOp::Regions { spec, output } => {
             let current = region_output_name(output);
-            // The two categorical outputs sit under the columns because they are read
-            // differently rather than because they are a different kind of thing to choose.
             let output_items: Vec<Box<dyn SceneList>> = spec
                 .columns
                 .iter()
@@ -826,8 +824,6 @@ fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
     ])
 }
 
-/// A collapsible block: a chevron and a caption, and a body that is only built when it is
-/// open. Closed sections cost nothing because the shape they are part of says they are shut.
 fn section(
     caption: impl Into<String>,
     open: bool,
@@ -909,9 +905,6 @@ fn with_layer<R>(
     field.layers.get_mut(index).map(write)
 }
 
-/// What the add button makes, which has to be something that bakes on its own — a field
-/// reference to nothing would put the document in an error state on the frame it was
-/// added, and the panel would look like it had refused.
 fn default_op(kind: &str, names: &[String]) -> LayerOp {
     match kind {
         "constant" => LayerOp::Constant(0.5),
@@ -921,8 +914,6 @@ fn default_op(kind: &str, names: &[String]) -> LayerOp {
             sample_tiles: 4.0,
             mode: SlopeMode::default(),
         },
-        // Empty, and sized by the first stroke — see `edit::parse_op`, which is the same
-        // decision reached from the other end.
         "paint" => LayerOp::Paint(Raster::default()),
         _ => LayerOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
     }
@@ -961,9 +952,9 @@ mod tests {
         )
     }
 
-    /// The rule the panel is built on, from the side that would break it quietly: a choice
-    /// that did not change the shape would leave the menu showing the option it used to be
-    /// on, with the document already changed underneath it.
+    // The rule the panel is built on, from the side that would break it quietly: a
+    // choice that did not change the shape would leave the menu showing the option it
+    // used to be on, with the document already changed underneath it.
     #[test]
     fn a_choice_changes_the_shape_the_panel_is_built_from() {
         let mut document = document_with(vec![LayerOp::Constant(0.5)]);
@@ -988,8 +979,8 @@ mod tests {
         assert_ne!(key(&document), before, "so is being switched off");
     }
 
-    /// And from the other side: a number in the shape would rebuild the panel on the frame
-    /// it was typed into, which throws away the field the keyboard is in.
+    // And from the other side: a number in the shape would rebuild the panel on the
+    // frame it was typed into, which throws away the field the keyboard is in.
     #[test]
     fn a_number_does_not_change_the_shape() {
         let mut document = document_with(vec![LayerOp::Noise(NoiseSpec::new(
@@ -1012,8 +1003,8 @@ mod tests {
         assert_eq!(key(&document), before);
     }
 
-    /// A layer added or taken away changes how many widgets there are, which is the one
-    /// thing a standing panel cannot absorb.
+    // A layer added or taken away changes how many widgets there are, which is the one
+    // thing a standing panel cannot absorb.
     #[test]
     fn the_number_of_layers_is_part_of_the_shape() {
         let one = document_with(vec![LayerOp::Constant(0.5)]);
@@ -1021,8 +1012,10 @@ mod tests {
         assert_ne!(key(&one), key(&two));
     }
 
-    /// The shift is a number field or a plain label depending on this, so it decides how
-    /// many widgets there are and belongs in the shape however numeric it looks.
+    // The shift is a number field or a plain label depending on this, so it decides how
+    // many widgets there are and belongs in the shape however numeric it looks. It is
+    // pinned only while the height field is already at shift 0, so a document that
+    // arrived coarse some other way can still be repaired from the panel.
     #[test]
     fn whether_the_shift_is_pinned_is_part_of_the_shape() {
         let mut document = document_with(vec![LayerOp::Constant(0.5)]);
@@ -1048,8 +1041,8 @@ mod tests {
         assert_ne!(key(&document), pinned);
     }
 
-    /// An open section holds widgets a shut one does not, so which sections are open is
-    /// shape rather than decoration.
+    // An open section holds widgets a shut one does not, so which sections are open is
+    // shape rather than decoration.
     #[test]
     fn opening_a_section_changes_the_shape() {
         let document = document_with(vec![LayerOp::Constant(0.5)]);

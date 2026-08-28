@@ -1,13 +1,15 @@
-// TODO(jb-doc): module docs — that the wheel belongs to whatever is under the pointer, and
-// why that is one rule rather than a list of which panels take it.
+//! Routing the mouse wheel: one rule, applied everywhere.
+//!
+//! The wheel belongs to whatever is under the pointer, and to whatever encloses that
+//! if it will not take the turn. Nothing here names a panel, so a new scrollable
+//! region works without being added to a list and no two regions can disagree about
+//! who owns a turn.
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::ui::{OverflowAxis, ScrollPosition};
 
-/// Points one line of wheel moves a panel. A line is not a length, so it has to be given
-/// one somewhere, and a row of the layer stack is about this tall.
 const LINE_HEIGHT: f32 = 21.0;
 
 /// A wheel turn offered to a node. It bubbles, so the widget the pointer is actually over
@@ -20,6 +22,11 @@ pub struct Scroll {
     delta: Vec2,
 }
 
+/// Turns each wheel message into a [`Scroll`] on every hovered entity. Sends nothing
+/// when the pointer is over nothing.
+///
+/// A line-unit turn is converted to points at roughly one row of the layer stack per
+/// line, since a line is not a length and the platform does not supply one.
 pub fn send(mut wheel: MessageReader<MouseWheel>, hover: Res<HoverMap>, mut commands: Commands) {
     for message in wheel.read() {
         let mut delta = -Vec2::new(message.x, message.y);

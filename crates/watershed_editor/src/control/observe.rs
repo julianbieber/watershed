@@ -1,8 +1,13 @@
-//! What a scenario can ask the editor about itself.
+//! What a caller can ask the running editor about itself.
 //!
-//! Adding a topic is a Rust change here; adding a *scenario* is a data file. That
-//! asymmetry is the point — it is what keeps a scenario per feature cheap enough to
-//! bother with.
+//! Every answer is what the editor *acted on*, not something the caller could work out
+//! for itself: the fitted colour range, the rectangle a live re-bake covers, the layer
+//! a stroke would land in. A second derivation on the caller's side would part company
+//! with the editor the moment the camera moved.
+//!
+//! Adding a topic is a change here; asking a new question of an existing one is not.
+//! That asymmetry is the point — it is what keeps a scenario per feature cheap enough
+//! to bother with.
 
 use bevy::prelude::*;
 use serde_json::{Value, json};
@@ -17,17 +22,28 @@ use crate::view::{
     view_centre_cell,
 };
 
+/// What an `observe` command is asking about.
 pub(super) enum Topic {
+    /// The document's state: what is running, what failed, how much is baked.
     Document,
+    /// A summary of the active field's baked values.
     Field,
+    /// Every field's whole stack, not just the active one's — an edit names a field,
+    /// so a caller has to be able to see the stack it is about to address without
+    /// switching the view to it first.
     Layers,
+    /// The brush's settings and where a stroke would land.
     Brush,
+    /// The solved water, counted.
     Water,
+    /// Where the camera is and what the ramp is fitted to.
     View,
+    /// Warnings and errors since the last time this was asked. Draining.
     Log,
 }
 
 impl Topic {
+    /// The topic of that exact name, or a message naming what was asked for.
     pub(super) fn parse(word: &str) -> Result<Self, String> {
         match word {
             "document" => Ok(Self::Document),
@@ -42,6 +58,9 @@ impl Topic {
     }
 }
 
+/// Answers the topic. Every answer carries `available`, or is a shape whose fields
+/// are always there — a topic asked of a document that has none says so rather than
+/// failing.
 pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
     match topic {
         Topic::Document => document(world),
@@ -61,8 +80,6 @@ fn document(world: &World) -> Value {
         "settled": document.is_settled(),
         "job": document.job().map(|kind| kind.name()),
         "error": document.error(),
-        // How much of the bake matches the layers, which after an edit is the visible
-        // rectangle rather than the document — and is what a solve is refused against.
         "baked": document.baked().name(),
         "baked_rect": match document.baked() {
             Baked::Rect(rect) => json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
@@ -80,8 +97,6 @@ fn document(world: &World) -> Value {
     })
 }
 
-/// TODO(jb-doc): why the summary is quantiles rather than a mean — that a field is judged
-/// by whether it *varies*, and a mean says nothing about that.
 fn field(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(terrain) = document.terrain() else {
@@ -119,12 +134,6 @@ fn field(world: &World) -> Value {
     })
 }
 
-/// Every field's whole stack, not just the active one's — an edit names a field, so a
-/// scenario has to be able to see the stack it is about to address without switching the
-/// view to it first.
-///
-/// TODO(jb-doc): why the summary is the same string the panel puts on a layer's header,
-/// and what a second phrasing here would let drift.
 fn layers(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(terrain) = document.terrain() else {
@@ -155,8 +164,6 @@ fn layers(world: &World) -> Value {
                 "field": field.id.to_string(),
                 "shift": field.shift,
                 "range": [field.range.0, field.range.1],
-                // Whether this field's bake is read at its nearest texel rather than
-                // between them, which follows an op parameter rather than being set.
                 "categorical": field.is_categorical(),
                 "layers": layers,
             })
@@ -166,8 +173,6 @@ fn layers(world: &World) -> Value {
     json!({ "available": true, "active": document.active(), "fields": fields })
 }
 
-/// The brush's numbers, and where a stroke would land — reported together because a stroke
-/// that is refused is refused for the second reason far more often than for the first.
 fn brush(world: &World) -> Value {
     let settings = world.resource::<BrushSettings>();
     let document = world.resource::<Document>();
@@ -192,8 +197,6 @@ fn brush(world: &World) -> Value {
     value
 }
 
-/// The channel threshold is the view's, not a second one: a scenario asserting on channels
-/// has to be asking about the ones it can see.
 fn water(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(state) = document.terrain().and_then(|terrain| terrain.water()) else {
@@ -239,9 +242,6 @@ fn counts(state: &WaterState) -> (u64, u64, u64) {
     (water, channel, sinks)
 }
 
-/// TODO(jb-doc): why the fitted range is reported here rather than derived by the caller —
-/// that it is what the screen is actually showing, and a second derivation would part
-/// company with it the moment the camera moved.
 fn view(world: &mut World) -> Value {
     let size = world.resource::<Document>().size;
     let range = *world.resource::<ViewRange>();
@@ -258,12 +258,8 @@ fn view(world: &mut World) -> Value {
         "available": true,
         "centre": [centre.x, centre.y],
         "cells_across": cells_across(projection),
-        // How much of the window the panels have left the world, which is what a fit aims
-        // at. Reported rather than derived because a panel's width is the layout's to decide.
         "free_size": [free.size.x, free.size.y],
         "free_centre": [free.centre.x, free.centre.y],
-        // The rectangle a live re-bake covers, reported here rather than derived by the
-        // caller for the reason the fitted range is: it is what the editor acted on.
         "cells": [visible.min.x, visible.min.y, visible.max.x, visible.max.y],
         "range": [range.low, range.high],
         "diverging": range.diverging,

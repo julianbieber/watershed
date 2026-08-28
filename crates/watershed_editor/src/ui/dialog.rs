@@ -1,5 +1,8 @@
-// TODO(jb-doc): module docs — why a modal is a node that is switched off rather than a
-// window that is closed, and what that costs the first frame after Create.
+//! The modal for starting a new terrain.
+//!
+//! The dialog is built once and switched between shown and hidden rather than
+//! spawned and despawned, so what a person typed into it is still there the next time
+//! it is opened and nothing has to be rebuilt to show it.
 
 use bevy::feathers::controls::{ButtonVariant, FeathersButton};
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor, ThemedText};
@@ -14,15 +17,21 @@ use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{NewDialog, report};
 
+/// The dialog and the sheet that dims what is behind it. [`sync`] shows and hides the
+/// dialog through this.
 #[derive(Component, Default, Clone)]
 pub struct DialogRoot;
 
+/// The menu button's caption, which names the chosen preset.
 #[derive(Component, Default, Clone)]
 pub struct PresetCaption;
 
+/// The button that starts the build, disabled while a job is running.
 #[derive(Component, Default, Clone)]
 pub struct CreateButton;
 
+/// The dialog's scene, built hidden. Its controls read and write
+/// [`NewDialog`], so the values outlive each opening.
 pub fn dialog() -> impl Scene {
     let presets: Vec<Box<dyn SceneList>> = Preset::ALL
         .into_iter()
@@ -47,8 +56,6 @@ pub fn dialog() -> impl Scene {
             align_items: AlignItems::Center,
             justify_content: JustifyContent::Center,
         }
-        // Over the panels, and under a menu popup — which sits at 100, and one of which is
-        // inside this dialog.
         GlobalZIndex(50)
         DialogRoot
         Children [
@@ -148,6 +155,8 @@ pub fn dialog() -> impl Scene {
     }
 }
 
+/// Shows or hides the dialog, names the chosen preset on its menu button, and
+/// disables Create while a job is running.
 pub fn sync(
     dialog: Res<NewDialog>,
     document: Res<Document>,

@@ -1,7 +1,14 @@
+// Colouring one field of a watershed document, with the solved water over it.
+//
+// The Rust half of this file is `material.rs`: the uniform below is declared there
+// as `FieldSettings` and the two ramps are written out there as well, because the
+// legend has to draw the same colours and cannot run a shader. A change here is a
+// change there.
+
 #import bevy_sprite::mesh2d_vertex_output::VertexOutput
 
-// The Rust side of this is `FieldSettings` in `material.rs`. Field order is the binding
-// layout: vectors before scalars, so the padding agrees on both sides.
+// Field order is the binding layout: vectors before scalars, so the padding agrees
+// with `FieldSettings`.
 struct FieldUniform {
     field_resolution: vec2<f32>,
     document_size: vec2<f32>,
@@ -14,13 +21,9 @@ struct FieldUniform {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var field_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var water_map: texture_2d<f32>;
 
-// TODO(jb-comment): why the ends are these two colours specifically, and what a ramp that
-// was not monotone in lightness would make the eye invent.
 const SEQUENTIAL_LIGHT: vec3<f32> = vec3<f32>(0.933, 0.949, 0.961);
 const SEQUENTIAL_DARK: vec3<f32> = vec3<f32>(0.063, 0.157, 0.227);
 
-// TODO(jb-comment): where this pair was validated and against what floors — the same
-// measurement wusel's inspection overlay carries.
 const DIVERGING_COOL: vec3<f32> = vec3<f32>(0.051, 0.212, 0.420);
 const DIVERGING_NEUTRAL: vec3<f32> = vec3<f32>(0.949, 0.937, 0.914);
 const DIVERGING_WARM: vec3<f32> = vec3<f32>(0.439, 0.075, 0.071);
@@ -28,12 +31,15 @@ const DIVERGING_WARM: vec3<f32> = vec3<f32>(0.439, 0.075, 0.071);
 const WATER_TINT: vec3<f32> = vec3<f32>(0.114, 0.353, 0.541);
 const CHANNEL_TINT: vec3<f32> = vec3<f32>(0.365, 0.749, 0.867);
 
+// `t` is on 0..1, clamped. Monotone in lightness, so a larger value always reads as
+// darker.
 fn sequential(t: f32) -> vec3<f32> {
     return mix(SEQUENTIAL_LIGHT, SEQUENTIAL_DARK, clamp(t, 0.0, 1.0));
 }
 
-// `t` is on -1..1, and the arms are kept equal about the neutral so a view wholly on one
-// side of the midpoint draws wholly in that side's hue.
+// `t` is on -1..1 with the neutral at zero, clamped. The arms reach equally far from
+// the neutral, so a view wholly on one side of the midpoint draws wholly in that
+// side's hue.
 fn diverging(t: f32) -> vec3<f32> {
     let s = clamp(t, -1.0, 1.0);
     if s < 0.0 {
@@ -42,10 +48,10 @@ fn diverging(t: f32) -> vec3<f32> {
     return mix(DIVERGING_NEUTRAL, DIVERGING_WARM, s);
 }
 
+// The quad's v runs down from the top while row zero of a raster is the bottom, so
+// both textures are read with v flipped and the Rust side uploads them unaltered.
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
-    // The quad's v runs down from the top while row zero of a raster is the bottom, so
-    // the flip is here rather than in every read on the Rust side.
     let uv = vec2<f32>(mesh.uv.x, 1.0 - mesh.uv.y);
 
     let field_size = max(settings.field_resolution, vec2<f32>(1.0, 1.0));
@@ -62,8 +68,6 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
 
     var colour: vec3<f32>;
     if settings.diverging > 0.5 {
-        // The midpoint is zero and the arms are the wider of the two, so the neutral band
-        // sits where the field actually changes sign.
         let reach = max(max(abs(low), abs(high)), 1e-6);
         colour = diverging(value / reach);
     } else {
@@ -79,8 +83,6 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         ));
         let water = textureLoad(water_map, water_texel, 0);
 
-        // Level first, then flow: a channel drawn under a lake would vanish into it, and
-        // the channel is the thing a scenario is asking about.
         colour = mix(colour, WATER_TINT, water.r * 0.78);
         colour = mix(colour, CHANNEL_TINT, water.g * 0.85);
     }

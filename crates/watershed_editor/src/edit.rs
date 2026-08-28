@@ -1,6 +1,11 @@
-// TODO(jb-doc): module docs — that this owns the whole vocabulary for naming and
-// addressing a layer, and why the panel and the ctl are obliged to share it rather than
-// each spelling a blend mode its own way.
+//! The editor's whole vocabulary for naming and changing a document: the paths that
+//! address a field, a layer and a property, the words every enum is spelled with, and
+//! the edits themselves.
+//!
+//! The panel and the control client both go through here rather than each writing
+//! their own. Two spellings of "multiply" would be two things to keep in step, and a
+//! path that worked from one and not the other would make the two disagree about what
+//! a document even contains.
 
 use serde_json::{Value, json};
 use watershed::brush::{Brush, BrushMode};
@@ -10,37 +15,69 @@ use watershed::raster::Raster;
 use watershed::regions::RegionOutput;
 use watershed::{Field, FieldRole, TerrainSpec};
 
-/// TODO(jb-doc): why a structural change is a value applied to a terrain rather than a
-/// method on the document — that the same four verbs reach it from a button and from a
-/// socket, and neither may take a shortcut the other cannot.
+/// A structural change to a document, as a value rather than a method.
+///
+/// Being a value is the point: a button builds one and a socket parses one, and both
+/// then take the identical path through [`Edit::apply`]. Neither side can acquire a
+/// shortcut the other lacks, and neither can change a document in a way the other
+/// could not have.
 pub enum Edit {
+    /// Appends a layer to the top of a field's stack.
     Add {
+        /// Field to add to. Must exist.
         field: String,
+        /// The op the new layer carries, at full amplitude, added and unmasked.
         op: LayerOp,
     },
+    /// Takes a layer out, renumbering every layer above it.
     Remove {
+        /// Field to remove from. Must exist.
         field: String,
+        /// Position in the stack. Must be in bounds.
         index: usize,
     },
-    /// TODO(jb-comment): why the destination is an index in the list *after* the layer has
-    /// been lifted out of it.
+    /// Moves a layer to another position in its stack.
     Move {
+        /// Field to move within. Must exist.
         field: String,
+        /// Position to move from. Must be in bounds.
         index: usize,
+        /// Position to move to, counted in the stack *after* the layer has been lifted
+        /// out of it — so moving layer 0 to 2 in a stack of three puts it on top.
+        /// Clamped to the end rather than refused.
         to: usize,
     },
+    /// Enables or disables a layer, which changes both what the bake evaluates and
+    /// what the field depends on.
     Toggle {
+        /// Field to toggle within. Must exist.
         field: String,
+        /// Position in the stack. Must be in bounds.
         index: usize,
+        /// The state to set, or `None` to flip whatever it is.
         enabled: Option<bool>,
     },
+    /// Writes one property, named by a dotted path. See the module's grammar.
     Set {
+        /// `field.property`, or `field.index.property`, or `field.index.op.property`.
         path: String,
+        /// The value, as words. Most properties take one; a mask or a warp takes
+        /// several.
         words: Vec<String>,
     },
 }
 
 impl Edit {
+    /// Applies the edit and describes what it did, as the reply the control client
+    /// sends back.
+    ///
+    /// Refused, with a message fit to show, if the edit names a field or a layer the
+    /// document does not have or a value it cannot read. A refusal leaves the document
+    /// exactly as it was.
+    ///
+    /// Nothing here notices that the bake is now stale — that is
+    /// [`Document::apply`](crate::document::Document::apply)'s job, and why edits go
+    /// through the document rather than through the terrain directly.
     pub fn apply(&self, terrain: &mut TerrainSpec) -> Result<Value, String> {
         match self {
             Self::Add { field, op } => {
@@ -67,8 +104,6 @@ impl Edit {
             Self::Move { field, index, to } => {
                 let field = field_mut(terrain, field)?;
                 bounds(&field.layers, *index)?;
-                // Clamped rather than refused: a scenario saying "to the top" writes a
-                // number past the end, and the last position is what it meant.
                 let to = (*to).min(field.layers.len().saturating_sub(1));
                 let layer = field.layers.remove(*index);
                 field.layers.insert(to, layer);
@@ -109,16 +144,10 @@ fn bounds(layers: &[Layer], index: usize) -> Result<(), String> {
     }
 }
 
-/// TODO(jb-doc): the grammar — that a path names a *place* and the words that follow are
-/// the value, and why a mask is addressed as one place taking several words rather than as
-/// a place per shape it can take.
 fn set(terrain: &mut TerrainSpec, path: &str, words: &[String]) -> Result<Value, String> {
     let parts: Vec<&str> = path.split('.').collect();
     let name = *parts.first().ok_or("a path needs a field name")?;
 
-    // A second segment that is a number is a layer index; anything else is a property of
-    // the field itself, which is what keeps `height.shift` and `height.1.blend` in one
-    // grammar without a marker segment between them.
     let Some(index) = parts.get(1) else {
         return Err(format!("`{path}` names a field and nothing on it"));
     };
@@ -171,16 +200,8 @@ fn set_field(
     words: &[String],
 ) -> Result<Value, String> {
     match parts.first().copied() {
-        // A shift changes the field's resolution, and the bake is discarded rather than
-        // resampled — so this is the one edit after which even the visible rectangle is
-        // rebuilt from nothing rather than patched.
         Some("shift") => {
             let shift: u8 = number(first(words)?)?;
-            // Refused here rather than discovered at the solve: `solve_water` reads the
-            // height one texel per cell and will not resample, so a coarse one leaves a
-            // document that can never solve — and the error it raises names the shift
-            // rather than the edit that set it. Zero is always allowed, or the field could
-            // not be put back.
             if shift != 0 && is_solve_height(terrain, name) {
                 return Err(format!(
                     "`{name}` is the water spec's height field and has to stay at shift 0"
@@ -195,8 +216,6 @@ fn set_field(
     }
 }
 
-/// TODO(jb-doc): why taking a role takes it from whichever field held it rather than
-/// refusing, and why the water is the one thing a role change cannot be allowed to strand.
 fn set_field_role(
     terrain: &mut TerrainSpec,
     name: &str,
@@ -211,8 +230,6 @@ fn set_field_role(
     if previous == role {
         return Ok(json!({ "role": role.as_str() }));
     }
-    // Refused here on the same terms the shift control refuses a coarse height: the solve
-    // reads its height one texel per cell and will not resample one.
     if role == FieldRole::Height && field.shift != 0 {
         return Err(format!(
             "`{name}` is at shift {} and a height field has to stay at shift 0",
@@ -236,8 +253,6 @@ fn set_field_role(
 
     field_mut(terrain, name)?.role = role;
 
-    // Resetting the water is how a terrain stops having a height field; an edit that took
-    // the last one away would leave a document that can never solve.
     if terrain.water_spec.is_some() && terrain.field_with_role(FieldRole::Height).is_none() {
         field_mut(terrain, name)?.role = previous;
         for id in &displaced {
@@ -251,8 +266,10 @@ fn set_field_role(
     Ok(json!({ "role": role.as_str(), "displaced": displaced }))
 }
 
-/// Whether the water solve would read this field as its height, which is the one thing
-/// that pins a field's resolution.
+/// Whether the water solve would read this field as its height.
+///
+/// The one thing that pins a field's resolution: such a field is refused a non-zero
+/// shift, because the solve reads its height one texel per cell and will not resample.
 pub fn is_solve_height(terrain: &TerrainSpec, name: &str) -> bool {
     terrain
         .field_with_role(FieldRole::Height)
@@ -278,8 +295,6 @@ fn set_other_field_property(
     }
 }
 
-/// TODO(jb-doc): why an op's parameters are reachable one at a time as well as wholesale,
-/// and what editing `op.scale` preserves that rewriting the op would throw away.
 fn set_op(op: &mut LayerOp, property: &str, words: &[String]) -> Result<(), String> {
     match (op, property) {
         (LayerOp::Constant(value), "value") => *value = number(first(words)?)?,
@@ -344,14 +359,12 @@ pub fn parse_op(words: &[String]) -> Result<LayerOp, String> {
                 None => SlopeMode::default(),
             },
         }),
-        // Sized by the first stroke rather than here, which is what lets it be written
-        // without a document to measure against — and what makes an unpainted one inert,
-        // since an empty raster reads as zero everywhere.
         "paint" => Ok(LayerOp::Paint(Raster::default())),
         other => Err(format!("no layer op called `{other}`")),
     }
 }
 
+/// Every brush mode, in the order the panel offers them.
 pub const BRUSH_MODES: [BrushMode; 4] = [
     BrushMode::Add,
     BrushMode::Subtract,
@@ -359,6 +372,7 @@ pub const BRUSH_MODES: [BrushMode; 4] = [
     BrushMode::Smooth,
 ];
 
+/// The word this brush mode is named by, in the panel and on the command line.
 pub fn brush_mode_name(mode: BrushMode) -> &'static str {
     match mode {
         BrushMode::Add => "add",
@@ -375,18 +389,26 @@ fn parse_brush_mode(word: &str) -> Result<BrushMode, String> {
         .ok_or_else(|| format!("no brush mode called `{word}`"))
 }
 
-/// One of the brush's numbers, named and read the way a layer's properties are — so the
-/// panel's controls and the ctl's words cannot come to mean different things.
+/// A change to one of the brush's settings, named and read the way a layer's
+/// properties are — so the panel's controls and the control client's words cannot come
+/// to mean different things.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BrushChange {
+    /// Reach in document cells. Floored at zero on apply.
     Radius(f32),
+    /// Fraction of the radius the weight falls off over. Clamped to `0.0..=1.0`.
     Falloff(f32),
+    /// How hard the stroke pushes. Not clamped — what it means depends on the mode.
     Strength(f32),
+    /// What `set` moves towards. Not clamped.
     Value(f32),
+    /// What the stroke does to what it covers.
     Mode(BrushMode),
 }
 
 impl BrushChange {
+    /// Reads `name` as one of the brush's settings and `word` as its value. Refused,
+    /// with a message fit to show, for an unknown name or an unreadable value.
     pub fn parse(name: &str, word: &str) -> Result<Self, String> {
         match name {
             "radius" => Ok(Self::Radius(number(word)?)),
@@ -398,6 +420,8 @@ impl BrushChange {
         }
     }
 
+    /// Writes the change into `brush`, clamping where the setting has a range. Cannot
+    /// fail.
     pub fn apply(self, brush: &mut Brush) {
         match self {
             Self::Radius(radius) => brush.radius_cells = radius.max(0.0),
@@ -409,6 +433,8 @@ impl BrushChange {
     }
 }
 
+/// The brush as the control client reports it, keyed by the same names
+/// [`BrushChange::parse`] takes.
 pub fn brush_summary(brush: &Brush) -> Value {
     json!({
         "mode": brush_mode_name(brush.mode),
@@ -455,6 +481,7 @@ fn parse_warp(words: &[String]) -> Result<Option<WarpSpec>, String> {
     }))
 }
 
+/// Every blend mode, in the order the panel offers them.
 pub const BLENDS: [Blend; 5] = [
     Blend::Add,
     Blend::Mul,
@@ -463,6 +490,7 @@ pub const BLENDS: [Blend; 5] = [
     Blend::Min,
 ];
 
+/// The word this blend mode is named by, in the panel and on the command line.
 pub fn blend_name(blend: Blend) -> &'static str {
     match blend {
         Blend::Add => "add",
@@ -480,8 +508,10 @@ fn parse_blend(word: &str) -> Result<Blend, String> {
         .ok_or_else(|| format!("no blend mode called `{word}`"))
 }
 
+/// Every noise kind, in the order the panel offers them.
 pub const NOISE_KINDS: [NoiseKind; 3] = [NoiseKind::Fbm, NoiseKind::Signed, NoiseKind::Ridged];
 
+/// The word this noise kind is named by, in the panel and on the command line.
 pub fn noise_kind_name(kind: NoiseKind) -> &'static str {
     match kind {
         NoiseKind::Fbm => "fbm",
@@ -497,8 +527,8 @@ fn parse_noise_kind(word: &str) -> Result<NoiseKind, String> {
         .ok_or_else(|| format!("no noise kind called `{word}`"))
 }
 
-/// A bare word is a column name, so the two categorical outputs take names no column
-/// would: an unknown column is caught by the bake, which is where the table is known.
+/// The slope mode of that exact name. The error names both spellings, since there are
+/// only two and a caller that got it wrong wants to see them.
 pub fn parse_slope_mode(word: &str) -> Result<SlopeMode, String> {
     match word {
         "gradient" => Ok(SlopeMode::Gradient),
@@ -509,6 +539,8 @@ pub fn parse_slope_mode(word: &str) -> Result<SlopeMode, String> {
     }
 }
 
+/// The word this slope mode is named by, and the only spelling
+/// [`parse_slope_mode`] accepts.
 pub fn slope_mode_name(mode: SlopeMode) -> &'static str {
     match mode {
         SlopeMode::Gradient => "gradient",
@@ -516,8 +548,12 @@ pub fn slope_mode_name(mode: SlopeMode) -> &'static str {
     }
 }
 
+/// Every slope mode, in the order the panel offers them.
 pub const SLOPE_MODES: [SlopeMode; 2] = [SlopeMode::Gradient, SlopeMode::SteepestAxis];
 
+/// Reads a region output. Cannot fail: a bare word is taken as a column name, so the
+/// two categorical outputs take names no column would, and a column the table does not
+/// carry is caught at plan time where the table is known.
 pub fn parse_region_output(word: &str) -> RegionOutput {
     match word {
         "region_id" => RegionOutput::RegionId,
@@ -526,6 +562,8 @@ pub fn parse_region_output(word: &str) -> RegionOutput {
     }
 }
 
+/// The word this region output is named by, and the spelling
+/// [`parse_region_output`] reads back.
 pub fn region_output_name(output: &RegionOutput) -> String {
     match output {
         RegionOutput::Blended(column) => column.clone(),
@@ -534,6 +572,8 @@ pub fn region_output_name(output: &RegionOutput) -> String {
     }
 }
 
+/// The word this op is named by, and the spelling `parse_op` takes — except
+/// `regions` and `external`, which nothing builds from words.
 pub fn op_name(op: &LayerOp) -> &'static str {
     match op {
         LayerOp::Constant(_) => "constant",
@@ -546,6 +586,8 @@ pub fn op_name(op: &LayerOp) -> &'static str {
     }
 }
 
+/// One line describing an op and its parameters, for the layer panel's collapsed row
+/// and the control client's listing. Not a path, and nothing reads it back.
 pub fn op_summary(op: &LayerOp) -> String {
     match op {
         LayerOp::Constant(value) => format!("constant {value}"),
@@ -570,6 +612,7 @@ pub fn op_summary(op: &LayerOp) -> String {
     }
 }
 
+/// One line describing a mask, on the same terms as [`op_summary`].
 pub fn mask_summary(mask: &Mask) -> String {
     match mask {
         Mask::Constant(value) => format!("constant {value}"),
@@ -634,6 +677,9 @@ mod tests {
         .apply(terrain)
     }
 
+    // The four structural verbs against one stack, in sequence, because each one
+    // renumbers the layers the next is addressed by — a reply that reported the wrong
+    // index would send the panel's next edit to a different layer.
     #[test]
     fn a_layer_can_be_added_removed_reordered_and_switched_off() {
         let mut terrain = document();
@@ -676,8 +722,8 @@ mod tests {
         assert_eq!(terrain.field("height").unwrap().layers.len(), 2);
     }
 
-    /// The assertion the scenario exists for, made where it can be made numerically: the
-    /// editor's whole claim is that editing the stack changes the field it bakes.
+    // The assertion the scenario exists for, made where it can be made numerically: the
+    // editor's whole claim is that editing the stack changes the field it bakes.
     #[test]
     fn a_layer_added_to_a_stack_moves_the_bake_it_produces() {
         let mut terrain = document();
@@ -694,8 +740,6 @@ mod tests {
         let after = terrain.field("height").unwrap().baked().data().to_vec();
 
         assert_ne!(before, after);
-        // The added layer adds a constant, so no texel may come out lower than it was —
-        // a difference in the other direction would mean the stack was reordered.
         assert!(
             before
                 .iter()
@@ -704,8 +748,6 @@ mod tests {
             "a texel fell after a layer was added"
         );
 
-        // And switching it off puts every one of them back, which is what makes `enabled`
-        // data rather than the caller keeping a copy of the stack.
         Edit::Toggle {
             field: "height".to_owned(),
             index: 2,
@@ -717,6 +759,9 @@ mod tests {
         assert_eq!(terrain.field("height").unwrap().baked().data(), &before[..]);
     }
 
+    // "Move to the top" reaches this as a number past the end, from the panel's button
+    // and from a script alike; refusing it would make the commonest move the one that
+    // fails.
     #[test]
     fn a_move_past_the_end_lands_on_the_end_rather_than_being_refused() {
         let mut terrain = document();
@@ -733,6 +778,9 @@ mod tests {
         ));
     }
 
+    // Every one of these arrives from a caller working against a document that has
+    // changed under it, so each has to be a message rather than a panic or a silent
+    // no-op that looks like the edit was applied.
     #[test]
     fn an_edit_naming_something_the_document_does_not_have_is_refused() {
         let mut terrain = document();
@@ -757,6 +805,8 @@ mod tests {
         assert!(set_line(&mut terrain, "height").is_err());
     }
 
+    // The path grammar is the whole surface the control client edits through, so a
+    // property nothing can address is a control the panel has and a script cannot use.
     #[test]
     fn every_layer_property_is_reachable_by_its_path() {
         let mut terrain = document();
@@ -776,6 +826,10 @@ mod tests {
         );
     }
 
+    // The reason op parameters are addressable one at a time: the seed here comes from
+    // the document rather than from any of the three edits, where rewriting the op
+    // wholesale would have to restate every parameter and would silently reset the ones
+    // it forgot.
     #[test]
     fn an_op_parameter_can_be_moved_without_rewriting_the_op_around_it() {
         let mut terrain = document();
@@ -789,11 +843,12 @@ mod tests {
         assert_eq!(spec.scale, 0.004);
         assert_eq!(spec.octaves, 6);
         assert_eq!(spec.kind, NoiseKind::Ridged);
-        // The seed came from the document rather than from any of the three edits, which
-        // is the whole difference between this and writing the op again.
         assert_eq!(spec.seed, 1);
     }
 
+    // `height.shift` and `height.1.blend` are one grammar with no marker segment
+    // between them, so the only thing separating a field property from a layer index is
+    // whether the segment parses as a number.
     #[test]
     fn a_field_property_is_told_apart_from_a_layer_index_by_being_unreadable_as_a_number() {
         let mut terrain = document();
@@ -804,10 +859,12 @@ mod tests {
         assert_eq!(field.range, (-1.0, 1.0));
     }
 
-    /// The defect this guards was reachable from the panel in one drag: `solve_water`
-    /// reads its height one texel per cell and refuses to resample, so a coarse height
-    /// field is a document that can never solve — and the refusal names the shift rather
-    /// than the edit that set it.
+    // The defect this guards was reachable from the panel in one drag: `solve_water`
+    // reads its height one texel per cell and refuses to resample, so a coarse height
+    // field is a document that can never solve — and the refusal names the shift rather
+    // than the edit that set it. The moisture field is checked too, in the other
+    // direction: the solve samples it rather than indexing it, so it is free to be
+    // coarse, which is what every preset does with it.
     #[test]
     fn the_water_specs_height_field_cannot_be_made_coarse() {
         let mut terrain = document();
@@ -817,16 +874,16 @@ mod tests {
         assert!(refused.contains("shift 0"), "{refused}");
         assert_eq!(terrain.field("height").unwrap().shift, 0);
 
-        // The field the spec reads as *moisture* is sampled rather than indexed, so it is
-        // free to be coarse — which is what every preset does with it.
         set_line(&mut terrain, "base.shift 4").unwrap();
         assert_eq!(terrain.field("base").unwrap().shift, 4);
     }
 
-    /// The defect this guards was reported from the running editor as "solve water does
-    /// nothing; it only works on a fresh document". An edit invalidates the *state* the
-    /// solve produced; it must not take away the *spec* the solve is run from, or the
-    /// first edit after the first solve makes the document permanently unsolvable.
+    // The defect this guards was reported from the running editor as "solve water does
+    // nothing; it only works on a fresh document". An edit invalidates the *state* the
+    // solve produced; it must not take away the *spec* the solve is run from, or the
+    // first edit after the first solve makes the document permanently unsolvable. The
+    // edit and the invalidation in the body are what `Document::note_edit` does to a
+    // terrain, spelled out because a test has no app to do it through.
     #[test]
     fn an_edit_after_a_solve_leaves_the_document_solvable() {
         let mut terrain = document();
@@ -835,7 +892,6 @@ mod tests {
         let spec = terrain.water_spec.clone().unwrap();
         terrain.solve_water(&spec).unwrap();
 
-        // What `Document::note_edit` does to the terrain, made here without an app.
         Edit::Set {
             path: "height.1.op.scale".to_owned(),
             words: vec!["0.05".to_owned()],
@@ -851,8 +907,8 @@ mod tests {
         );
     }
 
-    /// Zero has to stay reachable, or a document that arrived at a coarse height some other
-    /// way — a file written before the guard existed — could never be put back.
+    // Zero has to stay reachable, or a document that arrived at a coarse height some other
+    // way — a file written before the guard existed — could never be put back.
     #[test]
     fn a_height_field_can_always_be_returned_to_one_texel_per_cell() {
         let mut terrain = document();
@@ -863,8 +919,8 @@ mod tests {
         assert_eq!(terrain.field("height").unwrap().shift, 0);
     }
 
-    /// A role is what the bake reads, so the panel cannot be allowed to leave two fields
-    /// claiming one: taking it takes it from whoever held it.
+    // A role is what the bake reads, so the panel cannot be allowed to leave two fields
+    // claiming one: taking it takes it from whoever held it.
     #[test]
     fn taking_a_role_takes_it_from_the_field_that_held_it() {
         let mut terrain = document();
@@ -874,8 +930,8 @@ mod tests {
         assert_eq!(terrain.field("height").unwrap().role, FieldRole::Custom);
     }
 
-    /// The same rule the shift control carries, arrived at from the other side: a coarse
-    /// field cannot become the height field either.
+    // The same rule the shift control carries, arrived at from the other side: a coarse
+    // field cannot become the height field either.
     #[test]
     fn a_coarse_field_cannot_take_the_height_role() {
         let mut terrain = document();
@@ -886,8 +942,8 @@ mod tests {
         assert_eq!(terrain.field("base").unwrap().role, FieldRole::Custom);
     }
 
-    /// Resetting the water is how a terrain stops having a height field. An edit that took
-    /// the last one away would leave a document that can never solve.
+    // Resetting the water is how a terrain stops having a height field. An edit that took
+    // the last one away would leave a document that can never solve.
     #[test]
     fn a_terrain_that_declares_water_cannot_be_left_without_a_height_field() {
         let mut terrain = document();
@@ -898,8 +954,8 @@ mod tests {
         assert_eq!(terrain.field("height").unwrap().role, FieldRole::Height);
     }
 
-    /// The refusal has to put back everything it moved, or a rejected edit leaves the
-    /// document holding a role the panel never showed being taken.
+    // The refusal has to put back everything it moved, or a rejected edit leaves the
+    // document holding a role the panel never showed being taken.
     #[test]
     fn a_refused_role_change_leaves_every_other_field_as_it_was() {
         let mut terrain = document();
@@ -912,6 +968,9 @@ mod tests {
         assert_eq!(terrain.field("base").unwrap().role, FieldRole::Moisture);
     }
 
+    // Roles are spelled the same way everywhere, so an unknown word has to be refused
+    // rather than fall back to `custom` — which would silently take a document's height
+    // away.
     #[test]
     fn a_role_the_vocabulary_does_not_have_is_refused() {
         let mut terrain = document();
@@ -919,6 +978,9 @@ mod tests {
         assert!(refused.contains("elevation"), "{refused}");
     }
 
+    // The add button and the control client build ops from the same words, so a
+    // spelling that parsed to the wrong op would give the two different documents from
+    // the same instruction.
     #[test]
     fn every_op_a_command_line_can_write_parses_to_the_op_it_names() {
         for (line, name) in [
@@ -936,6 +998,9 @@ mod tests {
         assert!(parse_op(&words("noise fbm")).is_err());
     }
 
+    // Naming and parsing are written out separately for each enum, so nothing but this
+    // forces them to agree; a name that does not parse back makes a value the panel can
+    // display and no script can set.
     #[test]
     fn every_blend_mode_and_noise_kind_parses_back_from_the_name_it_prints() {
         for blend in BLENDS {
@@ -947,8 +1012,8 @@ mod tests {
         assert!(parse_blend("sideways").is_err());
     }
 
-    /// The two categorical outputs have to be unreachable as column names, or a table with
-    /// a column called `region_id` would make one of them unsayable.
+    // The two categorical outputs have to be unreachable as column names, or a table with
+    // a column called `region_id` would make one of them unsayable.
     #[test]
     fn a_region_output_parses_back_from_the_name_it_prints() {
         for output in [

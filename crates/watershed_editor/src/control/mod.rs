@@ -1,20 +1,18 @@
-//! Drive the running editor from outside the process.
+//! Driving the running editor from outside the process.
 //!
-//! Transplanted from wusel's `control/`, and for the same reason: a change that only shows
-//! up on screen cannot otherwise be verified without a person holding the keys. The editor
-//! keeps its real window and its real swapchain — this adds a way to talk to it, not a
-//! second way to run it.
+//! The editor keeps its real window and its real swapchain; this is a way to talk to
+//! it, not a second way to run it. Present only when `WATERSHED_CONTROL` is set in
+//! the environment.
 //!
-//! **A command is synchronous from the client's side.** The reply is held until the effect
-//! has actually happened — `solve-water` answers when the water is solved, `capture` when
-//! the PNG is on disk — so a caller never sleeps and hopes. What blocks is the *client*;
-//! the editor runs on undisturbed.
-//!
-//! Activation is the `WATERSHED_CONTROL` environment variable rather than a cargo feature:
-//! CI builds `--all-features`, so a feature would need care in every recipe to buy nothing.
+//! **A command is synchronous from the client's side.** The reply is held until the
+//! effect has actually happened — `solve-water` answers when the water is solved,
+//! `capture` when the PNG is on disk — so a caller never sleeps and hopes. What
+//! blocks is the *client*; the editor runs on undisturbed.
 
 use bevy::{log::BoxedLayer, prelude::*};
 
+/// Installs the control server, if `WATERSHED_CONTROL` names a socket to listen on.
+/// Without it the plugin is inert and the editor behaves as though it were absent.
 pub struct ControlPlugin;
 
 /// The extra tracing layer that keeps the run's warnings and errors where `observe log`

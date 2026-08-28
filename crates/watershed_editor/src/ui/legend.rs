@@ -1,5 +1,10 @@
-// TODO(jb-doc): why the legend prints the live ends rather than the field's declared
-// range, and what a sub-3:1 ramp needs from it besides the colour.
+//! The key to what the viewport is showing: which field, which colour ramp, and what
+//! its two ends are worth.
+//!
+//! The numbers are the ends the ramp is *currently* fitted to, not the range the
+//! field declares. The viewport refits to what is on screen as the camera moves, so
+//! a declared range would say nothing about the colours actually in front of the
+//! reader.
 
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor};
 use bevy::feathers::tokens;
@@ -11,32 +16,36 @@ use crate::material;
 use crate::ui::widgets::{self, set_text};
 use crate::view::ViewRange;
 
-/// Steps the ramp is drawn with. The strip is a gradient rather than a row of rectangles,
-/// so this is only how finely the ramp's own curve is sampled.
 const STEPS: usize = 64;
 
-/// Points the strip is drawn across, which is what the numbers under it have to line up
-/// with.
 const RAMP_WIDTH: f32 = 200.0;
 
+/// The legend as a whole. [`sync`] shows and hides the legend through this.
 #[derive(Component, Default, Clone)]
 pub struct LegendRoot;
 
+/// The line naming the field on show.
 #[derive(Component, Default, Clone)]
 pub struct LegendTitle;
 
+/// The colour strip. Its gradient is replaced when the ramp's polarity changes.
 #[derive(Component, Default, Clone)]
 pub struct LegendRamp;
 
+/// The number under the left end of the strip.
 #[derive(Component, Default, Clone)]
 pub struct LegendLow;
 
+/// The number under the right end of the strip.
 #[derive(Component, Default, Clone)]
 pub struct LegendHigh;
 
+/// The line saying how the ends were arrived at.
 #[derive(Component, Default, Clone)]
 pub struct LegendCaption;
 
+/// The legend's scene, built hidden and with every text empty — [`sync`] fills it in
+/// and shows it once a document is loaded.
 pub fn legend() -> impl Scene {
     bsn! {
         Node {
@@ -59,8 +68,6 @@ pub fn legend() -> impl Scene {
                     height: px(14),
                     border: px(1),
                 }
-                // A hairline ring, because the ramp's dark end is under 2:1 against the
-                // panel and without it the strip has no visible edge.
                 BorderColor::all(Color::srgb(0.35, 0.35, 0.35))
                 LegendRamp
             ),
@@ -80,6 +87,12 @@ pub fn legend() -> impl Scene {
     }
 }
 
+/// Brings the legend up to date with the document and the fitted view range, and
+/// hides it entirely while no terrain is loaded.
+///
+/// Texts are written only where they changed. The colour strip is rebuilt only when
+/// the ramp's polarity changes: the numbers move with the camera every frame, and the
+/// colours do not.
 pub fn sync(
     document: Res<Document>,
     range: Res<ViewRange>,
@@ -124,8 +137,6 @@ pub fn sync(
         },
     );
 
-    // The ramp only has to be rebuilt when its polarity changes: the numbers move with the
-    // camera, and the colours the strip is made of do not.
     if *drawn != Some(range.diverging) {
         *drawn = Some(range.diverging);
         commands

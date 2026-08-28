@@ -21,93 +21,152 @@ use crate::edit::{BrushChange, Edit, brush_summary, parse_op};
 use crate::preset::Preset;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
 
-/// Ten minutes at 60 Hz. Long enough for a 4096-square solve on a slow machine, short
-/// enough that a stuck scenario reports rather than hangs.
 const DEFAULT_WAIT_FRAMES: u32 = 36_000;
 
+/// How far along a command is, as of this frame.
 pub(super) enum Poll {
+    /// Not finished. Ask again next frame.
     Running,
+    /// Finished, with the fields to send back.
     Done(Value),
+    /// Finished badly. The message is sent instead of the fields.
     Failed(String),
 }
 
+/// One thing a client can ask the editor for.
+///
+/// A verb that starts a job also waits for it — there is no separate "did that
+/// finish". That is the whole protocol: the reply is held until the effect has
+/// actually happened, so a caller never sleeps and hopes, and a job that failed
+/// reports the error rather than a success the caller would have to notice was empty.
+///
+/// Several variants carry state of their own, because a command is polled once a frame
+/// and has to remember whether it has already started what it is waiting for.
 pub(super) enum Command {
+    /// Answers immediately. Proves the socket.
     Ping,
+    /// Lets that many frames pass.
     Step(u32),
+    /// Waits for a condition, or fails when the timeout runs out.
     Wait {
+        /// What is being waited for.
         condition: Condition,
+        /// Frames to wait before giving up.
         timeout: u32,
     },
-    /// TODO(jb-doc): why starting a job and waiting for it are one verb rather than two —
-    /// that the reply is held until the effect has happened, which is the whole protocol.
+    /// Builds a preset and waits for its bake.
     New {
+        /// Extent of the terrain to build.
         size: UVec2,
+        /// Seed the preset is built from.
         seed: u32,
+        /// Which preset.
         preset: Preset,
+        /// Whether the job has been asked for yet.
         started: bool,
     },
+    /// Puts a field on screen.
     Field(String),
-    /// An edit and the re-bake that answers it, held together for the reason every other
-    /// job-starting verb is: the reply says the effect has happened, and for an edit the
-    /// effect is the bake rather than the changed number.
+    /// An edit and the re-bake that answers it, held together: the reply says the
+    /// effect has happened, and for an edit the effect is the bake rather than the
+    /// changed number. A stack that no longer bakes — a cycle a toggle uncovered —
+    /// reports that error here rather than answering with a success nothing followed.
     Edit {
+        /// The change to make.
         edit: Edit,
+        /// The reply from the edit itself, once it has been applied.
         applied: Option<Value>,
     },
-    /// TODO(jb-doc): why several of the brush's numbers are set by one command rather than
-    /// one each, where a layer's are one each.
+    /// Several of the brush's settings at once, where a layer's are set one at a time:
+    /// a brush is one tool with a handful of knobs, and a caller usually means to state
+    /// a whole configuration rather than nudge a number.
     Brush(Vec<BrushChange>),
-    /// A stroke and the re-bake that answers it, held together for the reason [`Command::Edit`]
-    /// is — except that what it waits for is a rectangle rather than the view.
+    /// A stroke and the re-bake that answers it, on the same terms as
+    /// [`Command::Edit`] — except that what it waits for is the rectangle the stroke
+    /// made stale rather than the whole view.
     Stroke {
+        /// The polyline, in document cells.
         points: Vec<Vec2>,
+        /// The reply from the stroke itself, once it has been applied.
         applied: Option<Value>,
     },
+    /// Bakes the whole document and waits for it.
     Bake {
+        /// Whether the job has been asked for yet.
         started: bool,
     },
+    /// Solves the water and waits for it, baking the document first if it is not whole
+    /// — the same call the button makes, so the verb proves the button rather than a
+    /// narrower thing beside it.
     SolveWater {
+        /// Whether the job has been asked for yet.
         started: bool,
     },
+    /// Drops the water and its spec. Synchronous.
     ResetWater,
+    /// Writes the document and waits for it.
     Save {
+        /// Where to write.
         path: PathBuf,
+        /// What to put in the file.
         options: SaveOptions,
+        /// Whether the job has been asked for yet.
         started: bool,
     },
+    /// Reads a document and waits for it.
     Load {
+        /// Where to read from.
         path: PathBuf,
+        /// Whether the job has been asked for yet.
         started: bool,
     },
+    /// Moves the camera by a number of cells.
     Pan(Vec2),
+    /// Changes the zoom.
     Zoom(ZoomTo),
+    /// Writes a PNG of the window and waits until it is on disk.
     Capture {
+        /// Where to write the PNG.
         path: PathBuf,
-        /// The screenshot entity, once spawned. Its *absence from the world* is what says
-        /// the PNG is on disk — see the poll arm.
+        /// The screenshot entity, once spawned. Its *absence from the world* is what
+        /// says the PNG is on disk, so the reply never races a half-written file.
         entity: Option<Entity>,
     },
+    /// Answers a question about the editor's state. See [`Topic`].
     Observe(Topic),
+    /// Pins the frame delta, so a run is reproducible.
     FixedDelta(Duration),
+    /// Undoes [`Command::FixedDelta`].
     Realtime,
+    /// Ends the process.
     Quit,
 }
 
+/// What a `zoom` is aiming at.
 pub(super) enum ZoomTo {
+    /// The whole document, in the space the panels have left.
     Fit,
+    /// That many document cells across the view.
     CellsAcross(f32),
 }
 
+/// What a `wait` is waiting for.
+///
+/// All three require the document to be *settled* rather than merely idle: an edit is
+/// answered by a bake that a system opens on a later frame, so a document between the
+/// two has nothing in flight and is not finished either.
 pub(super) enum Condition {
-    /// The document is idle and carries a baked terrain.
+    /// Every field carries a baked raster.
     Bake,
-    /// The document is idle and carries a solved water state.
+    /// The document carries a solved water state.
     Water,
-    /// Nothing is in flight, whatever that job was.
+    /// Nothing more than settled.
     Idle,
 }
 
 impl Command {
+    /// The word this command was parsed from, for the reply. Every structural layer
+    /// edit answers `"layer"`, whatever it did.
     pub(super) fn verb(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -136,6 +195,8 @@ impl Command {
         }
     }
 
+    /// Reads one line as a command. Refused, with a message naming what was wrong,
+    /// for an unknown verb, a missing argument or an unreadable value.
     pub(super) fn parse(line: &str) -> Result<Self, String> {
         let mut words = line.split_whitespace();
         let verb = words.next().ok_or("empty command")?;
@@ -251,6 +312,11 @@ impl Command {
         }
     }
 
+    /// Advances the command by one frame and says how far along it is.
+    ///
+    /// Called once a frame with the frames since the command arrived, until it answers
+    /// something other than [`Poll::Running`]. May act on the world — a job-starting
+    /// command starts its job on the first call and waits on the rest.
     pub(super) fn poll(&mut self, world: &mut World, elapsed: u32) -> Poll {
         match self {
             Self::Ping => Poll::Done(json!({})),
@@ -312,10 +378,6 @@ impl Command {
                     }
                     return Poll::Running;
                 }
-                // Held until the re-bake the edit provoked has landed, so a scenario that
-                // observes the field on the next line is reading the world the edit made.
-                // A stack that no longer bakes — a cycle a toggle uncovered — reports the
-                // error here rather than answering with a success nothing followed.
                 let document = world.resource::<Document>();
                 if !document.is_settled() {
                     return Poll::Running;
@@ -344,8 +406,6 @@ impl Command {
                     }
                     return Poll::Running;
                 }
-                // Held until the rectangle the stroke made stale has been baked, so a
-                // scenario reading the field on the next line is reading the painted world.
                 let document = world.resource::<Document>();
                 if !document.is_settled() {
                     return Poll::Running;
@@ -375,9 +435,6 @@ impl Command {
                 if !*started {
                     *started = true;
                     let mut document = world.resource_mut::<Document>();
-                    // The same call the button makes, so the verb proves the button rather
-                    // than a narrower thing beside it: a solve needs the whole document
-                    // baked, and this bakes it when it is not.
                     if let Err(error) = document.solve_with_bake() {
                         return Poll::Failed(error);
                     }
@@ -457,8 +514,6 @@ impl Command {
             }
 
             Self::Zoom(to) => {
-                // The fit needs the terrain and the projection at once, so the size is
-                // read out before the camera is borrowed.
                 let terrain_size = world
                     .resource::<Document>()
                     .terrain()
@@ -503,10 +558,6 @@ impl Command {
                     );
                     Poll::Running
                 }
-                // `clear_screenshots` despawns the entity in `First`, which runs strictly
-                // after the `ScreenshotCaptured` observer has written the file. So the
-                // entity being gone is the signal that the PNG is on disk — no polling the
-                // filesystem, and no racing a half-written file.
                 Some(id) => {
                     if world.entities().contains(*id) {
                         Poll::Running
@@ -536,8 +587,6 @@ impl Command {
     }
 }
 
-/// A job's reply is held until the document goes idle, and a job that failed reports the
-/// error rather than a success the caller would have to notice was empty.
 fn finished(world: &mut World, fields: impl FnOnce(&Document) -> Value) -> Poll {
     let document = world.resource::<Document>();
     if document.is_busy() {
@@ -559,8 +608,6 @@ impl Condition {
         }
     }
 
-    /// Settled rather than merely idle: an edit is answered by a bake a system opens, so a
-    /// document between the two has nothing in flight and is not finished either.
     fn met(&self, world: &World) -> bool {
         let document = world.resource::<Document>();
         if !document.is_settled() {
@@ -578,8 +625,6 @@ impl Condition {
     }
 }
 
-/// TODO(jb-doc): why the four structural edits are one verb with a sub-word rather than
-/// four verbs, where `set` is a verb of its own.
 fn layer_edit(rest: &[&str]) -> Result<Edit, String> {
     let what = *rest.first().ok_or("layer needs add, rm, move or toggle")?;
     let field = (*rest.get(1).ok_or("layer needs a field name")?).to_owned();
@@ -600,8 +645,6 @@ fn layer_edit(rest: &[&str]) -> Result<Edit, String> {
         "toggle" => Ok(Edit::Toggle {
             field,
             index: number(rest.get(2).ok_or("layer toggle needs an index")?)?,
-            // No word at all flips it, which is what a keyboard-less caller wants; a word
-            // states it, which is what a scenario wants so a re-run cannot drift.
             enabled: match rest.get(3) {
                 None => None,
                 Some(&"on") => Some(true),
@@ -621,7 +664,6 @@ fn number<T: std::str::FromStr>(word: &str) -> Result<T, String> {
     word.parse().map_err(|_| format!("not a number: {word}"))
 }
 
-/// A cell, written as one word so a stroke's points cannot be miscounted into pairs.
 fn point(word: &str) -> Result<Vec2, String> {
     let (x, y) = word
         .split_once(',')
@@ -636,8 +678,6 @@ fn optional_number<T: std::str::FromStr>(word: Option<&&str>, fallback: T) -> Re
     }
 }
 
-/// Accepts `1/60` as well as `0.016`, because a frame budget is the thing a scenario
-/// actually means and writing it as a fraction is how it is written everywhere else.
 fn delta(word: &str) -> Result<Duration, String> {
     let seconds = match word.split_once('/') {
         Some((numerator, denominator)) => {
@@ -660,6 +700,9 @@ fn delta(word: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
 
+    // A frame budget is written as a fraction everywhere else, so `1/60` has to be
+    // accepted as well as `0.016`. The two refusals are the ones a fraction opens up: a
+    // division by zero, and a negative that `Duration::from_secs_f32` would panic on.
     #[test]
     fn a_delta_is_read_as_a_fraction_or_a_decimal() {
         assert_eq!(delta("1/60").unwrap(), Duration::from_secs_f32(1.0 / 60.0));
@@ -668,9 +711,9 @@ mod tests {
         assert!(delta("-1").is_err());
     }
 
-    /// TODO(jb-comment): why every verb is parsed here rather than only the awkward ones —
-    /// that a verb the ctl cannot parse is a feature nothing can reach, which is exactly
-    /// the drift the standing rule exists to catch.
+    // Every verb, not just the awkward ones: a verb the control client cannot parse is
+    // a feature nothing outside the window can reach, which is exactly the drift the
+    // standing rule about the two surfaces exists to catch.
     #[test]
     fn every_verb_parses_to_the_verb_it_names() {
         let lines = [
@@ -722,6 +765,8 @@ mod tests {
         }
     }
 
+    // A caller writes these by hand, so a mistyped word or a missing argument has to
+    // come back as a message rather than as a command that half happened.
     #[test]
     fn a_command_that_is_not_a_verb_is_refused() {
         assert!(Command::parse("wander about").is_err());
@@ -746,6 +791,9 @@ mod tests {
         assert!(Command::parse("stroke 10,20 sideways").is_err());
     }
 
+    // Points are written `x,y` so a stroke's arguments cannot be miscounted into pairs:
+    // a flat list with a number dropped would still parse and would paint a different
+    // line. Also pins that a coordinate keeps its fraction.
     #[test]
     fn a_stroke_reads_its_points_as_cells_rather_than_as_a_flat_list_of_numbers() {
         let Ok(Command::Stroke { points, .. }) = Command::parse("stroke 10,20 30.5,40") else {

@@ -1,5 +1,21 @@
-// TODO(jb-doc): crate-level docs — what a terrain is here (size, named fields, layer
-// stacks, a derived water state), and which of those the caller owns.
+//! Authoring, baking and reading a terrain.
+//!
+//! A terrain is an extent in cells and a set of named fields over it. Each field is
+//! a stack of layers — noise, paint, a slope of another field, a region tiling —
+//! evaluated onto a grid of its own resolution, and optionally a solved water state
+//! derived from whichever field holds the height.
+//!
+//! Two types carry that, and which one a caller holds says what it is doing:
+//!
+//! - [`TerrainSpec`] is the authored document. It holds the layers, it is what is
+//!   saved and loaded, and it is what an editor mutates.
+//! - [`Terrain`] is the result of baking one. It holds the values and nothing that
+//!   produced them, so a consuming application can read a document it could not
+//!   author.
+//!
+//! Everything derived is the caller's to ask for: a loaded document arrives unbaked
+//! and every field samples as `0.0` until [`TerrainSpec::bake`] or the staged
+//! [`TerrainSpec::begin_bake`] has run over it.
 
 pub mod bake;
 pub mod brush;
