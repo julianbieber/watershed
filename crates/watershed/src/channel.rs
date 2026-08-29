@@ -33,7 +33,7 @@ pub enum ChannelError {
         /// High end as it was read.
         high: f32,
     },
-    /// The endpoints are the wrong way round. A [`Field`](crate::field::Field) is
+    /// The endpoints are the wrong way round. A field is
     /// allowed to declare its range in either order and is sorted on the way in,
     /// so this can only come from a file.
     #[error("channel range ({low}, {high}) is not ordered")]
@@ -91,7 +91,7 @@ pub enum ChannelEncoding {
 /// A channel's interval and how the bytes in it are read.
 ///
 /// The interval is the *quantisation* range, which is not the same number as the
-/// range a [`Field`](crate::field::Field) declares: a field's range is the clamp
+/// range a field declares: a field's range is the clamp
 /// its bake applies, and this is what the byte then spreads over. They coincide
 /// for an ordinary field and deliberately do not for water.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

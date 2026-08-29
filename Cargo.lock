@@ -5199,10 +5199,8 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "png",
- "rayon",
  "ron",
  "serde",
- "serde_json",
  "thiserror 2.0.20",
 ]
 
@@ -5211,8 +5209,15 @@ name = "watershed_editor"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "glam",
  "log",
+ "naga",
+ "png",
+ "rayon",
+ "ron",
+ "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tracing",
  "watershed",
 ]

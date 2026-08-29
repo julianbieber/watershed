@@ -9,14 +9,15 @@
 //! That asymmetry is the point — it is what keeps a scenario per feature cheap enough
 //! to bother with.
 
+use crate::terrain::WaterState;
 use bevy::prelude::*;
 use serde_json::{Value, json};
-use watershed::WaterState;
 
 use super::log::LogBuffer;
 use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
 use crate::edit::{blend_name, brush_summary, mask_summary, op_name, op_summary};
+use crate::gpu::{STOCK, ShaderLibrary};
 use crate::view::{
     CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
     view_centre_cell,
@@ -40,6 +41,9 @@ pub(super) enum Topic {
     View,
     /// Warnings and errors since the last time this was asked. Draining.
     Log,
+    /// The shaders the document carries, what each declares, and why one did not
+    /// parse.
+    Shaders,
 }
 
 impl Topic {
@@ -53,6 +57,7 @@ impl Topic {
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
+            "shaders" => Ok(Self::Shaders),
             other => Err(format!("nothing to observe called {other}")),
         }
     }
@@ -70,6 +75,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Water => water(world),
         Topic::View => view(world),
         Topic::Log => log(world),
+        Topic::Shaders => shaders(world),
     }
 }
 
@@ -271,4 +277,38 @@ fn log(world: &World) -> Value {
         Some(buffer) => buffer.drain(),
         None => json!({ "available": false }),
     }
+}
+
+/// Every shader the document's directory holds, in name order: what it declares, and
+/// why it did not parse.
+///
+/// The parameters are named rather than counted, because a caller setting one has to
+/// know what it is called.
+fn shaders(world: &mut World) -> Value {
+    let library = world.resource::<ShaderLibrary>();
+    let files: Vec<Value> = library
+        .files()
+        .map(|file| {
+            let entry = library.entry(file).expect("a listed file has an entry");
+            json!({
+                "file": file,
+                "params": entry
+                    .layout
+                    .fields
+                    .iter()
+                    .map(|param| json!({
+                        "name": param.name,
+                        "type": param.ty.as_str(),
+                        "group": param.group,
+                    }))
+                    .collect::<Vec<_>>(),
+                "error": entry.error,
+            })
+        })
+        .collect();
+    json!({
+        "root": library.root().to_string_lossy(),
+        "shaders": files,
+        "stock": STOCK.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+    })
 }

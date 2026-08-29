@@ -1,5 +1,5 @@
-//! What `terrain.ron` says: the whole of a terrain except the numbers, which are in
-//! the images it names.
+//! What `terrain.ron` says: the whole of a terrain's values except the numbers,
+//! which are in the images it names.
 //!
 //! Everything here is the serialized form and nothing more — it is what a person
 //! editing a terrain by hand reads, so it holds names and indices rather than data,
@@ -8,16 +8,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::channel::ChannelMeta;
-use crate::field::FieldId;
-use crate::layer::Layer;
 use crate::terrain::FieldInfo;
-use crate::water::WaterSpec;
 
 /// The format this build writes, and the only one it reads.
 ///
 /// A terrain carrying any other version is refused outright; there is no migration
 /// path, exactly as there was none for the format this replaced.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// One image in a terrain: what it is called, how big it is, and how to read the
 /// channels in it.
@@ -41,59 +38,15 @@ pub struct LayerMeta {
     pub channels: Vec<ChannelMeta>,
 }
 
-/// Which raster of a layer stack a painted image stands for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PaintSlot {
-    /// The layer's own raster — a [`LayerOp::Paint`](crate::layer::LayerOp::Paint)
-    /// or [`LayerOp::External`](crate::layer::LayerOp::External).
-    Op,
-    /// The layer's [`Mask::Painted`](crate::layer::Mask::Painted).
-    Mask,
-}
-
-/// A painted raster's home, stated rather than implied by position.
-///
-/// The old format re-attached paint by walking the stacks in the same order twice.
-/// This file is hand-editable, so an order both halves have to agree on without
-/// saying so is the one thing left that a reader would have to derive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaintRef {
-    /// Position in the field's stack.
-    pub stack_index: u32,
-    /// Which of that layer's two rasters this is.
-    pub slot: PaintSlot,
-    /// The image holding it.
-    pub layer: u8,
-}
-
-/// The recipe for one field: everything needed to bake it again.
-///
-/// Absent from a terrain saved without its recipe, which is readable but can no
-/// longer be edited.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FieldStack {
-    /// The field this stack belongs to.
-    pub field: FieldId,
-    /// The interval a bake clamps into. Not the same number as the range of the
-    /// channel the field is stored in, which is what the byte spreads over.
-    pub range: (f32, f32),
-    /// Carried through and never read by this crate.
-    pub export: bool,
-    /// The layers, in evaluation order, with every raster in them emptied out.
-    pub stack: Vec<Layer>,
-    /// Where each emptied raster went.
-    pub paint: Vec<PaintRef>,
-}
-
 /// A solved water, as a terrain carries it.
 ///
 /// All of it is one image at the document's extent, in a fixed channel order:
 /// depth, the two components of the flow direction, then accumulation. One image
 /// rather than three, and one index to check rather than five.
 ///
-/// A solved [`WaterState`](crate::water::WaterState) cannot be rebuilt from this —
-/// lake ids do not survive quantisation and the direction codes became a vector —
-/// so the solver's own output stays with the document that produced it.
+/// The solver's own output cannot be rebuilt from this — lake ids do not survive
+/// quantisation and the direction codes became a vector — so it stays with the
+/// document that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaterInfo {
     /// How many lakes the solve found. The ids themselves are not carried.
@@ -114,6 +67,10 @@ impl WaterInfo {
 }
 
 /// `terrain.ron` itself.
+///
+/// The values and nothing that produced them. A recipe, where a terrain carries
+/// one, is a second file beside this one and is never named from here — so a
+/// reader of values need not know what a layer stack is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerrainMeta {
     /// [`VERSION`]. Checked before anything else is read.
@@ -128,9 +85,4 @@ pub struct TerrainMeta {
     pub fields: Vec<FieldInfo>,
     /// The solved water, if the terrain carries one.
     pub water: Option<WaterInfo>,
-    /// The spec the water was solved from, kept so a document that carries no
-    /// solved water can still be re-solved rather than losing it.
-    pub water_spec: Option<WaterSpec>,
-    /// The recipe, one entry per field. Empty in a terrain saved without one.
-    pub stacks: Vec<FieldStack>,
 }

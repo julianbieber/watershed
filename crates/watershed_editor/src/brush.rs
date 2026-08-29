@@ -11,13 +11,13 @@
 //! refused — started over a panel, or aimed at a field with nowhere to paint — is
 //! refused once, not once a frame while the button is down.
 
+use crate::terrain::Field;
+use crate::terrain::brush::Brush;
+use crate::terrain::layer::LayerOp;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use serde_json::{Value, json};
-use watershed::Field;
-use watershed::brush::Brush;
-use watershed::layer::LayerOp;
 use watershed::raster::{Raster, resolution};
 
 use crate::document::{Document, EditorSystems};
@@ -217,8 +217,8 @@ fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use watershed::TerrainSpec;
-    use watershed::layer::Layer;
+    use crate::terrain::TerrainSpec;
+    use crate::terrain::layer::Layer;
     use watershed::raster::CellRect;
 
     fn field_with(ops: Vec<LayerOp>) -> Field {

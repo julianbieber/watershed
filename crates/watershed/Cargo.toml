@@ -1,6 +1,6 @@
 [package]
 name = "watershed"
-description = "Terrain field stacks, a whole-grid water solver, and a terrain file format."
+description = "Reading a terrain: named fields over an extent, and the directory they live in."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,12 +12,6 @@ png.workspace = true
 ron.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rayon.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

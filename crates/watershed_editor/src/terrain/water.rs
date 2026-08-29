@@ -9,9 +9,9 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::bake::TerrainSpec;
-use crate::field::FieldId;
-use crate::raster::Raster;
+use crate::terrain::bake::TerrainSpec;
+use watershed::field::FieldId;
+use watershed::raster::Raster;
 
 /// Why a document could not be solved. Every variant is about the document's state
 /// rather than the solve, which cannot itself fail: on a readable height field the
@@ -616,8 +616,8 @@ impl PartialOrd for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::Field;
-    use crate::layer::{Layer, LayerOp};
+    use crate::terrain::field::Field;
+    use crate::terrain::layer::{Layer, LayerOp};
 
     fn raster_from(size: UVec2, cell: impl Fn(u32, u32) -> f32) -> Raster<f32> {
         let mut raster = Raster::new(size, 0.0f32);

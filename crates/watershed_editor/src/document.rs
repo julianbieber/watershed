@@ -12,10 +12,11 @@
 
 use std::path::PathBuf;
 
+use crate::terrain::{SaveOptions, TerrainSpec};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use serde_json::Value;
-use watershed::{CellRect, SaveOptions, TerrainSpec};
+use watershed::CellRect;
 
 use crate::edit::Edit;
 use crate::preset::Preset;

@@ -5,11 +5,12 @@
 //! anyone is meant to ship. The set stays small for that reason — it is chosen to
 //! cover the ways a stack can be put together, not to be a library of landscapes.
 
+use crate::terrain::layer::{Blend, Layer, LayerOp, Mask, Remap};
+use crate::terrain::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
+use crate::terrain::regions::{Region, RegionOutput, RegionSpec};
+use crate::terrain::{Field, TerrainSpec, WaterSpec};
 use bevy::prelude::*;
-use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap};
-use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
-use watershed::regions::{Region, RegionOutput, RegionSpec};
-use watershed::{Field, FieldRole, TerrainSpec, WaterSpec};
+use watershed::FieldRole;
 
 /// Which starting document to build.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

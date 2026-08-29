@@ -6,11 +6,11 @@
 //! place, so they live side by side — a binding that read one number and wrote
 //! another would look like a field that will not take an edit.
 
+use crate::terrain::brush::Brush;
+use crate::terrain::layer::{Layer, LayerOp, Mask};
 use bevy::feathers::controls::{NumberFormat, NumberInputValue, UpdateNumberInput};
 use bevy::prelude::*;
 use bevy::ui_widgets::ValueChange;
-use watershed::brush::Brush;
-use watershed::layer::{Layer, LayerOp, Mask};
 
 use crate::brush::BrushSettings;
 use crate::document::Document;
@@ -57,6 +57,14 @@ pub enum NumberBinding {
     RegionBlendTiles(usize),
     RegionWeight(usize, usize),
     RegionValue(usize, usize, usize),
+    /// One component of one parameter of a shader layer: the layer, the parameter's
+    /// position in the layer's own key order, and which component of it.
+    ///
+    /// Positional because a binding has to be `Copy`, and safe to be positional
+    /// because the panel is rebuilt whenever the shader's parameters change — a
+    /// binding left over from before answers "not there" rather than writing into
+    /// whatever moved into that position.
+    ShaderParam(usize, usize, usize),
     DialogWidth,
     DialogHeight,
     DialogSeed,
@@ -179,6 +187,12 @@ impl NumberBinding {
                 .get(region)?
                 .values
                 .get(column)?,
+            Self::ShaderParam(index, param, component) => {
+                let LayerOp::Shader(shader) = &layer(document, index)?.op else {
+                    return None;
+                };
+                *shader.params.values().nth(param)?.get(component)?
+            }
         };
         Some(if self.is_integer() {
             NumberInputValue::I32(value as i32)
@@ -291,6 +305,20 @@ impl NumberBinding {
                 LayerOp::Constant(held) => *held = value,
                 _ => return false,
             },
+            Self::ShaderParam(_, param, component) => {
+                let LayerOp::Shader(shader) = &mut layer.op else {
+                    return false;
+                };
+                let Some(slot) = shader
+                    .params
+                    .values_mut()
+                    .nth(param)
+                    .and_then(|value| value.get_mut(component))
+                else {
+                    return false;
+                };
+                *slot = value;
+            }
             Self::NoiseSeed(_)
             | Self::NoiseScale(_)
             | Self::NoiseOctaves(_)
@@ -385,13 +413,14 @@ impl NumberBinding {
             | Self::RegionCellTiles(index)
             | Self::RegionBlendTiles(index)
             | Self::RegionWeight(index, _)
-            | Self::RegionValue(index, _, _) => Some(index),
+            | Self::RegionValue(index, _, _)
+            | Self::ShaderParam(index, _, _) => Some(index),
             _ => None,
         }
     }
 }
 
-fn field(document: &Document) -> Option<&watershed::Field> {
+fn field(document: &Document) -> Option<&crate::terrain::Field> {
     document.terrain()?.field(document.active())
 }
 
@@ -399,21 +428,21 @@ fn layer(document: &Document, index: usize) -> Option<&Layer> {
     field(document)?.layers.get(index)
 }
 
-fn remap(document: &Document, index: usize) -> Option<&watershed::layer::Remap> {
+fn remap(document: &Document, index: usize) -> Option<&crate::terrain::layer::Remap> {
     match &layer(document, index)?.mask {
         Mask::Field(_, remap) => Some(remap),
         _ => None,
     }
 }
 
-fn noise(document: &Document, index: usize) -> Option<&watershed::noise::NoiseSpec> {
+fn noise(document: &Document, index: usize) -> Option<&crate::terrain::noise::NoiseSpec> {
     match &layer(document, index)?.op {
         LayerOp::Noise(spec) => Some(spec),
         _ => None,
     }
 }
 
-fn regions(document: &Document, index: usize) -> Option<&watershed::regions::RegionSpec> {
+fn regions(document: &Document, index: usize) -> Option<&crate::terrain::regions::RegionSpec> {
     match &layer(document, index)?.op {
         LayerOp::Regions { spec, .. } => Some(spec),
         _ => None,
