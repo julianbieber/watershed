@@ -15,8 +15,10 @@ mod brush;
 mod control;
 mod document;
 mod edit;
+mod gpu;
 mod material;
 mod preset;
+mod terrain;
 mod ui;
 mod view;
 
@@ -32,6 +34,7 @@ fn main() {
             document::DocumentPlugin,
             brush::BrushPlugin,
             view::ViewPlugin,
+            gpu::ShaderPlugin,
             ui::UiPlugin,
             control::ControlPlugin,
         ))

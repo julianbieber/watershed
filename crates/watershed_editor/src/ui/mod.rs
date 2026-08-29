@@ -147,13 +147,26 @@ impl Expanded {
 
 const PANEL_WIDTH: f32 = 320.0;
 
-/// The ops the layer panel's add button offers, spelled as
-/// [`crate::edit::parse_op`] spells them so the button and the control client's verb
-/// name the same things.
+/// What the layer panel's add button offers.
+///
+/// An op is spelled as [`crate::edit::parse_op`] spells it, so the button and the
+/// control client's verb name the same thing. A `shader:` entry is not an op word: it
+/// names the stock shader to copy into the document, and the layer it makes is a
+/// `shader` op over the copy.
 ///
 /// A regions op is deliberately absent: a region table is not something a single
 /// button or a command line can write.
-pub const ADDABLE: [&str; 5] = ["noise", "constant", "fieldref", "slope", "paint"];
+pub const ADDABLE: [&str; 9] = [
+    "noise",
+    "constant",
+    "fieldref",
+    "slope",
+    "paint",
+    "shader:ridged",
+    "shader:warped",
+    "shader:terrace",
+    "shader:blank",
+];
 
 #[derive(Component, Default, Clone)]
 struct WorldViewport;

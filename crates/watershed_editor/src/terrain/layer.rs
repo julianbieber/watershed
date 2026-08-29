@@ -3,10 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::field::FieldId;
-use crate::noise::NoiseSpec;
-use crate::raster::Raster;
-use crate::regions::{RegionOutput, RegionSpec};
+use watershed::field::FieldId;
+
+use crate::terrain::noise::NoiseSpec;
+use crate::terrain::regions::{RegionOutput, RegionSpec};
+use crate::terrain::shader::ShaderLayer;
+use watershed::raster::Raster;
 
 /// How a layer's value meets the accumulated value under it.
 ///
@@ -202,6 +204,18 @@ pub enum LayerOp {
     /// the host application. Evaluated exactly like [`LayerOp::Paint`]; the
     /// distinction is that a brush stroke will not write into it.
     External(Raster<f32>),
+    /// A raster a WGSL shader produced, at the field's own resolution.
+    ///
+    /// The shader is a function of the position, its own parameters and the extent
+    /// it is dispatched over — it reads no field — so this op contributes no
+    /// dependency and widens no re-bake. What the shader wrote is read here exactly
+    /// as a field reads its own bake, and the scaling, the mask and the blend are
+    /// the layer's as they are for every other op.
+    ///
+    /// The values are not serialized. A loaded document reads the layer as `0.0`
+    /// until it has been dispatched again, in the way a loaded field reads as `0.0`
+    /// until it has been baked.
+    Shader(ShaderLayer),
 }
 
 impl LayerOp {
@@ -276,7 +290,7 @@ impl Layer {
     }
 
     /// The fields this layer reads, op before mask. Reports them whether or not the
-    /// layer is enabled — [`Field::dependencies`](crate::field::Field::dependencies)
+    /// layer is enabled — [`Field::dependencies`](crate::terrain::field::Field::dependencies)
     /// is what filters on that.
     pub fn dependencies(&self) -> impl Iterator<Item = &FieldId> {
         self.op

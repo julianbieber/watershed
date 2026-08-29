@@ -7,6 +7,7 @@
 //! part that does depend on the document, the field menu, is rebuilt when the list of
 //! fields changes and not otherwise.
 
+use crate::terrain::SaveOptions;
 use bevy::feathers::controls::{
     ButtonVariant, FeathersButton, FeathersMenu, FeathersMenuButton, FeathersMenuPopup,
     FeathersTextInput, FeathersTextInputContainer,
@@ -17,7 +18,6 @@ use bevy::prelude::*;
 use bevy::text::{EditableText, TextEdit, TextEditChange};
 use bevy::ui::InteractionDisabled;
 use bevy::ui_widgets::Activate;
-use watershed::SaveOptions;
 
 use crate::document::{Baked, Document};
 use crate::ui::widgets::{self, one, set_text};

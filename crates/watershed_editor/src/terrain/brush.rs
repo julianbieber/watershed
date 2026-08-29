@@ -8,7 +8,7 @@
 use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::raster::{CellRect, Raster};
+use watershed::raster::{CellRect, Raster};
 
 /// What a stroke does to the value already under it.
 ///

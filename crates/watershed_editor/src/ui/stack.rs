@@ -9,6 +9,9 @@
 //! leaving a choice out of it would leave a menu showing what it used to say over a
 //! document that had already changed.
 
+use crate::terrain::layer::{Layer, LayerOp, Mask, Remap, SlopeMode};
+use crate::terrain::noise::{NoiseKind, NoiseSpec};
+use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
 use bevy::feathers::containers::{group, group_body, group_header};
 use bevy::feathers::controls::{
     ButtonVariant, FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersToolButton,
@@ -18,8 +21,6 @@ use bevy::feathers::tokens;
 use bevy::prelude::*;
 use bevy::ui::{Checked, InteractionDisabled};
 use bevy::ui_widgets::{Activate, ValueChange};
-use watershed::layer::{Layer, LayerOp, Mask, Remap, SlopeMode};
-use watershed::noise::{NoiseKind, NoiseSpec};
 use watershed::raster::Raster;
 use watershed::{FieldId, FieldRole};
 
@@ -29,6 +30,7 @@ use crate::edit::{
     BLENDS, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, blend_name, brush_mode_name,
     noise_kind_name, op_name, op_summary, parse_region_output, region_output_name, slope_mode_name,
 };
+use crate::gpu::{STOCK, ShaderLibrary};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{ADDABLE, AddLayer, Expanded, PANEL_WIDTH, report};
@@ -88,11 +90,12 @@ pub fn rebuild(
     brush: Res<BrushSettings>,
     expanded: Res<Expanded>,
     add: Res<AddLayer>,
+    library: Res<ShaderLibrary>,
     mut shape: ResMut<Shape>,
     body: Single<Entity, With<StackBody>>,
     mut commands: Commands,
 ) {
-    let key = fingerprint(&document, &brush, &expanded, &add);
+    let key = fingerprint(&document, &brush, &expanded, &add, &library);
     if shape.key == key {
         return;
     }
@@ -100,7 +103,7 @@ pub fn rebuild(
     shape.generation += 1;
     let generation = shape.generation;
 
-    let entries: Vec<Box<dyn SceneList>> = contents(&document, &brush, &expanded, &add)
+    let entries: Vec<Box<dyn SceneList>> = contents(&document, &brush, &expanded, &add, &library)
         .into_iter()
         .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
         .collect();
@@ -147,7 +150,7 @@ fn shift_is_pinned(document: &Document) -> bool {
         })
 }
 
-fn field_of(document: &Document) -> Option<&watershed::Field> {
+fn field_of(document: &Document) -> Option<&crate::terrain::Field> {
     document.terrain()?.field(document.active())
 }
 
@@ -156,6 +159,7 @@ fn fingerprint(
     brush: &BrushSettings,
     expanded: &Expanded,
     add: &AddLayer,
+    library: &ShaderLibrary,
 ) -> String {
     let mut key = String::new();
     key.push_str(document.active());
@@ -202,6 +206,25 @@ fn fingerprint(
                 key.push_str(&format!("{of}:{}", slope_mode_name(*mode)));
             }
             LayerOp::FieldRef(id) => key.push_str(id.as_ref()),
+            LayerOp::Shader(shader) => {
+                key.push_str(&shader.file);
+                match library.entry(&shader.file) {
+                    Some(entry) => {
+                        for param in &entry.layout.fields {
+                            key.push(':');
+                            key.push_str(&param.group);
+                            key.push('/');
+                            key.push_str(&param.label);
+                        }
+                        key.push_str(if entry.error.is_some() {
+                            ":broken"
+                        } else {
+                            ":good"
+                        });
+                    }
+                    None => key.push_str(":missing"),
+                }
+            }
             LayerOp::Regions { spec, output } => {
                 key.push_str(&region_output_name(output));
                 key.push_str(&spec.columns.join(","));
@@ -229,6 +252,7 @@ fn contents(
     brush: &BrushSettings,
     expanded: &Expanded,
     add: &AddLayer,
+    library: &ShaderLibrary,
 ) -> Vec<Box<dyn Scene>> {
     let active = document.active().to_owned();
     let names = document.field_names();
@@ -253,6 +277,7 @@ fn contents(
             layer,
             &names,
             expanded.has(index),
+            library,
         )));
     }
 
@@ -260,7 +285,7 @@ fn contents(
     children
 }
 
-fn properties(active: &str, field: &watershed::Field, pinned: bool) -> impl Scene {
+fn properties(active: &str, field: &crate::terrain::Field, pinned: bool) -> impl Scene {
     let active = active.to_owned();
     let role = field.role;
     let role_items: Vec<Box<dyn SceneList>> = FieldRole::ALL
@@ -373,6 +398,7 @@ fn layer_entry(
     layer: &Layer,
     names: &[String],
     open: bool,
+    library: &ShaderLibrary,
 ) -> impl Scene {
     let active = active.to_owned();
     let title = format!("{index}  {}", op_name(&layer.op));
@@ -397,7 +423,7 @@ fn layer_entry(
             NumberBinding::Amplitude(index),
         )),
         one(mask_editor(index, &layer.mask, names)),
-        one(op_editor(index, &layer.op, names)),
+        one(op_editor(index, &layer.op, names, library)),
     ];
 
     widgets::column(vec![
@@ -577,7 +603,7 @@ fn mask_editor(index: usize, mask: &Mask, names: &[String]) -> impl Scene {
     widgets::column(rows)
 }
 
-fn op_editor(index: usize, op: &LayerOp, names: &[String]) -> impl Scene {
+fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibrary) -> impl Scene {
     let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::small(op_name(op)))];
 
     match op {
@@ -784,9 +810,64 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String]) -> impl Scene {
                 raster.height()
             ))));
         }
+
+        LayerOp::Shader(shader) => {
+            rows.push(one(widgets::small(shader.file.clone())));
+            match library.entry(&shader.file) {
+                None => rows.push(one(widgets::small("no such shader in this document"))),
+                Some(entry) => {
+                    if let Some(error) = &entry.error {
+                        rows.push(one(widgets::small(error.clone())));
+                    }
+                    rows.extend(param_rows(index, shader, &entry.layout));
+                }
+            }
+        }
     }
 
     widgets::column(rows)
+}
+
+/// One row per parameter the shader declares, in declaration order, with a heading
+/// wherever the `@group` changes.
+///
+/// A parameter is addressed by its position in the layer's own key order rather than
+/// by name, which is what lets a binding stay `Copy`; the two orders are put back
+/// together here, where the layout is in hand.
+fn param_rows(
+    index: usize,
+    shader: &ShaderLayer,
+    layout: &ParamsLayout,
+) -> Vec<Box<dyn SceneList>> {
+    let mut rows: Vec<Box<dyn SceneList>> = Vec::new();
+    let mut group = String::new();
+    for field in &layout.fields {
+        if matches!(field.widget, Widget::Hidden) {
+            continue;
+        }
+        if field.group != group {
+            group = field.group.clone();
+            if !group.is_empty() {
+                rows.push(one(widgets::small(group.clone())));
+            }
+        }
+        let Some(param) = shader.params.keys().position(|name| *name == field.name) else {
+            continue;
+        };
+        let components = field.ty.components();
+        for component in 0..components {
+            let caption = if components == 1 {
+                field.label.clone()
+            } else {
+                format!("{} {}", field.label, "xyzw".as_bytes()[component] as char)
+            };
+            rows.push(one(widgets::number_row(
+                caption,
+                NumberBinding::ShaderParam(index, param, component),
+            )));
+        }
+    }
+    rows
 }
 
 fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
@@ -811,11 +892,21 @@ fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
             @FeathersButton {
                 @caption: bsn! { Text("Add layer") ThemedText },
             }
-            on(move |_: On<Activate>, mut document: ResMut<Document>| {
+            on(move |_: On<Activate>, mut document: ResMut<Document>, mut library: ResMut<ShaderLibrary>| {
+                let op = match stock_of(&chosen) {
+                    Some(stock) => match library.adopt(stock) {
+                        Ok(file) => LayerOp::Shader(ShaderLayer::new(file)),
+                        Err(error) => {
+                            report(&mut document, Err(error));
+                            return;
+                        }
+                    },
+                    None => default_op(&chosen, &names),
+                };
                 let result = document
                     .apply(&Edit::Add {
                         field: active.clone(),
-                        op: default_op(&chosen, &names),
+                        op,
                     })
                     .map(|_| ());
                 report(&mut document, result);
@@ -905,6 +996,21 @@ fn with_layer<R>(
     field.layers.get_mut(index).map(write)
 }
 
+/// The stock shader a `shader:` entry of [`ADDABLE`] names, or `None` for an entry
+/// that is an op word rather than a shader.
+fn stock_of(chosen: &str) -> Option<&'static str> {
+    let name = chosen.strip_prefix("shader:")?;
+    let file = if name == "blank" {
+        "_template.wgsl".to_owned()
+    } else {
+        format!("{name}.wgsl")
+    };
+    STOCK
+        .iter()
+        .find(|(stock, _)| *stock == file)
+        .map(|(stock, _)| *stock)
+}
+
 fn default_op(kind: &str, names: &[String]) -> LayerOp {
     match kind {
         "constant" => LayerOp::Constant(0.5),
@@ -929,14 +1035,14 @@ fn first_field(names: &[String]) -> FieldId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use watershed::TerrainSpec;
-    use watershed::layer::Blend;
+    use crate::terrain::TerrainSpec;
+    use crate::terrain::layer::Blend;
 
     fn document_with(ops: Vec<LayerOp>) -> Document {
         let mut document = Document::default();
         let field = ops
             .into_iter()
-            .fold(watershed::Field::new("height"), |field, op| {
+            .fold(crate::terrain::Field::new("height"), |field, op| {
                 field.with_layer(Layer::new(op))
             });
         document.adopt(TerrainSpec::new(UVec2::splat(64)).with_field(field));
@@ -949,6 +1055,7 @@ mod tests {
             &BrushSettings::default(),
             &Expanded::default(),
             &AddLayer::default(),
+            &ShaderLibrary::default(),
         )
     }
 
@@ -1055,6 +1162,7 @@ mod tests {
                 layers: vec![0],
             },
             &AddLayer::default(),
+            &ShaderLibrary::default(),
         );
         assert_ne!(shut, open);
     }

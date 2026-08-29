@@ -9,7 +9,7 @@
 use glam::{IVec2, UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::noise::{Warp, WarpSpec, hash2};
+use crate::terrain::noise::{Warp, WarpSpec, hash2};
 
 /// The fraction of its cell a region's site may wander over.
 ///
@@ -124,7 +124,7 @@ impl RegionSpec {
 /// The last two answer with a region index rather than a quantity. Every field in
 /// this crate is `f32`, so the index is carried as one — which is exactly why a
 /// field reading either of them is
-/// [categorical](crate::field::Field::is_categorical) and must never be
+/// [categorical](crate::terrain::field::Field::is_categorical) and must never be
 /// interpolated: halfway between region 2 and region 4 is not region 3.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegionOutput {

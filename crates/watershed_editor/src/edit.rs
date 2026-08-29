@@ -7,13 +7,15 @@
 //! path that worked from one and not the other would make the two disagree about what
 //! a document even contains.
 
+use crate::terrain::brush::{Brush, BrushMode};
+use crate::terrain::layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
+use crate::terrain::noise::{NoiseKind, NoiseSpec, WarpSpec};
+use crate::terrain::regions::RegionOutput;
+use crate::terrain::shader::ShaderLayer;
+use crate::terrain::{Field, TerrainSpec};
 use serde_json::{Value, json};
-use watershed::brush::{Brush, BrushMode};
-use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
-use watershed::noise::{NoiseKind, NoiseSpec, WarpSpec};
+use watershed::FieldRole;
 use watershed::raster::Raster;
-use watershed::regions::RegionOutput;
-use watershed::{Field, FieldRole, TerrainSpec};
 
 /// A structural change to a document, as a value rather than a method.
 ///
@@ -360,6 +362,7 @@ pub fn parse_op(words: &[String]) -> Result<LayerOp, String> {
             },
         }),
         "paint" => Ok(LayerOp::Paint(Raster::default())),
+        "shader" => Ok(LayerOp::Shader(ShaderLayer::new(first(rest)?.as_str()))),
         other => Err(format!("no layer op called `{other}`")),
     }
 }
@@ -583,6 +586,7 @@ pub fn op_name(op: &LayerOp) -> &'static str {
         LayerOp::FieldRef(_) => "fieldref",
         LayerOp::Regions { .. } => "regions",
         LayerOp::External(_) => "external",
+        LayerOp::Shader(_) => "shader",
     }
 }
 
@@ -609,6 +613,7 @@ pub fn op_summary(op: &LayerOp) -> String {
         LayerOp::FieldRef(id) => format!("fieldref {id}"),
         LayerOp::Regions { output, .. } => format!("regions {}", region_output_name(output)),
         LayerOp::External(raster) => format!("external {}x{}", raster.width(), raster.height()),
+        LayerOp::Shader(shader) => format!("shader {}", shader.file),
     }
 }
 
@@ -643,8 +648,9 @@ fn boolean(word: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::WaterSpec;
     use bevy::math::UVec2;
-    use watershed::{FieldId, WaterSpec};
+    use watershed::FieldId;
 
     fn document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(64, 64))

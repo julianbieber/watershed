@@ -6,13 +6,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::terrain::SaveOptions;
 use bevy::{
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
     time::TimeUpdateStrategy,
 };
 use serde_json::{Value, json};
-use watershed::SaveOptions;
 
 use super::observe::{self, Topic};
 use crate::brush::{BrushSettings, apply_stroke};
@@ -104,6 +104,9 @@ pub(super) enum Command {
     },
     /// Drops the water and its spec. Synchronous.
     ResetWater,
+    /// Copies a stock shader into the document's shader directory. Synchronous, and
+    /// answers the name the copy was given — which is what a `layer add` names.
+    AdoptShader(String),
     /// Writes the document and waits for it.
     Save {
         /// Where to write.
@@ -183,6 +186,7 @@ impl Command {
             Self::Bake { .. } => "bake",
             Self::SolveWater { .. } => "solve-water",
             Self::ResetWater => "reset-water",
+            Self::AdoptShader(_) => "shader",
             Self::Save { .. } => "save",
             Self::Load { .. } => "load",
             Self::Pan(_) => "pan",
@@ -271,6 +275,12 @@ impl Command {
             "bake" => Ok(Self::Bake { started: false }),
             "solve-water" => Ok(Self::SolveWater { started: false }),
             "reset-water" => Ok(Self::ResetWater),
+            "shader" => match rest.first() {
+                Some(&"adopt") => Ok(Self::AdoptShader(
+                    (*rest.get(1).ok_or("shader adopt needs a stock name")?).to_owned(),
+                )),
+                _ => Err("shader needs adopt".to_owned()),
+            },
             "save" => Ok(Self::Save {
                 path: PathBuf::from(rest.first().ok_or("save needs a path")?),
                 options: match rest.get(1) {
@@ -452,6 +462,14 @@ impl Command {
                 let mut document = world.resource_mut::<Document>();
                 match document.reset_water() {
                     Ok(()) => Poll::Done(json!({})),
+                    Err(error) => Poll::Failed(error),
+                }
+            }
+
+            Self::AdoptShader(stock) => {
+                let mut library = world.resource_mut::<crate::gpu::ShaderLibrary>();
+                match library.adopt(stock) {
+                    Ok(file) => Poll::Done(json!({ "file": file })),
                     Err(error) => Poll::Failed(error),
                 }
             }

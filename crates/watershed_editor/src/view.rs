@@ -6,6 +6,7 @@
 //! in the space one cell would take at the default zoom, and everything that talks
 //! about the view talks in cells rather than in pixels.
 
+use crate::terrain::WaterState;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::CameraUpdateSystems;
 use bevy::image::{ImageSampler, TextureFormatPixelInfo};
@@ -16,7 +17,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
 use bevy::text::EditableText;
-use watershed::{CellRect, WaterState};
+use watershed::CellRect;
 
 use crate::document::{Document, EditorSystems};
 use crate::material::{FieldMaterial, FieldMaterialPlugin, FieldSettings};

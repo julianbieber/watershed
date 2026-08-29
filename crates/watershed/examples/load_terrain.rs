@@ -5,9 +5,9 @@
 //! project reads them straight out of it — which is the whole reason the format
 //! stores images beside its metadata rather than a recipe to re-derive them from.
 
-use watershed::{Error, FieldRole, FieldView, Terrain};
+use watershed::{FieldRole, FieldView, IoError, Terrain};
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), IoError> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "terrain".to_owned());

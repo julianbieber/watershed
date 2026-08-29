@@ -2,41 +2,135 @@
 
 | crate | what it is |
 |---|---|
-| `watershed` | library: named terrain fields built from layer stacks, a whole-grid water solver, a terrain file format |
-| `watershed_editor` | bevy editor: 2D false-colour view, noise layers, painting, water solve, save/load |
+| `watershed` | library: reading a terrain — named fields over an extent, and a solved water state |
+| `watershed_editor` | bevy editor: authoring a terrain, baking it, and writing it out |
+
+## The two halves
+
+**A terrain is read from a directory and authored in the editor, and nothing does both.**
+
+`watershed` is the read side. It holds `Terrain` — the values and nothing that made
+them — its channels and metadata, and the loader that opens a terrain directory. It
+bakes nothing, solves nothing and evaluates nothing: everything a consuming project
+reads was settled when the directory was written, so `Terrain::load_from_dir` is the
+only way to obtain one. It needs no GPU and no thread pool, and builds for the web.
+
+`watershed_editor` is the author side, and it carries the whole model a document is
+made of: the fields and their layer stacks, the noise, the region tiling, the brush,
+the water solve, the bake, and the shaders. A project that wants a terrain ships the
+directory the editor wrote; it does not build one at run time.
 
 ## The terrain model
 
-A terrain is an extent in cells and a set of named fields over it. A field is a stack of
-layers — noise, painted rasters, the slope of another field, a region tiling — each scaled,
-confined by a mask and blended onto what is under it, then clamped to the field's declared
-range. Layers may reference other fields, so baking is ordered: every field after the ones
-it reads.
+A terrain is an extent in cells and a set of named fields over it. A field is a stack
+of layers — noise, a compute shader, painted rasters, the slope of another field, a
+region tiling — each scaled, confined by a mask and blended onto what is under it,
+then clamped to the field's declared range. Layers may reference other fields, so
+baking is ordered: every field after the ones it reads.
 
-A field is evaluated onto a raster of its own resolution, chosen as a *shift*: one texel per
-cell at 0, one per `2^shift` cells above that. A coarse field still answers at every cell of
-the document, interpolated between its texels — unless its values name a class rather than
-measure a quantity, in which case it is read to the nearest texel instead.
+A field is evaluated onto a raster of its own resolution, chosen as a *shift*: one
+texel per cell at 0, one per `2^shift` cells above that. A coarse field still answers
+at every cell of the document, interpolated between its texels — unless its values
+name a class rather than measure a quantity, in which case it is read to the nearest
+texel instead.
 
-Two types carry all of this, and which one you hold says what you are doing. `TerrainSpec`
-is the authored document: it holds the layers, it is what is saved and loaded, and it is
-what an editor mutates. `Terrain` is what baking one produces: the values and nothing that
-made them, for an application that reads a document it could not author.
+Two types carry all of this. `TerrainSpec` is the authored document: it holds the
+layers, it is what an editor mutates, and it lives in the editor. `Terrain` is what
+baking one produces, and it is what a consuming project holds.
 
-Nothing derived is stored in a file. A loaded document arrives unbaked and every field
-samples as `0.0` until it is baked; the recipe is what the format carries, not the result.
+## Shader layers
+
+A layer's values may come from a WGSL compute shader instead of from an op the editor
+has a name for. This is how a new way of making a field is added without touching
+Rust: write the file, and the editor reads what it declares and draws the panel for
+it.
+
+A shader lives in the document's own `shaders` directory, so a terrain stays portable,
+and it is hot-reloaded — save the file and the field re-bakes. Adding a shader layer
+copies one of the shipped shaders in under a fresh name, which is then yours to edit.
+
+```wgsl
+// @shader Ridged
+
+struct Params {
+    // @group Shape
+    scale: f32,     // @ui 0.02 [0.001, 0.2]
+    octaves: u32,   // @ui 5 [1, 8] step 1
+    // @group Crest
+    sharpness: f32, // @ui "Sharpness" 1.0 [0.2, 4.0]
+}
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn value(p: vec2<f32>) -> f32 {
+    return pow(ridged_fbm(p * params.scale, params.octaves, 0.5, 2.0), params.sharpness);
+}
+```
+
+`p` is a position in **document cells**, not a normalised coordinate, so a scale means
+the same thing at every shift and a rectangle re-bake produces what a whole bake
+would. The entry point is appended by the editor; the bindings, the noise and
+`cell_position` come from `assets/shaders/field_lib.wgsl`, whose noise is the same
+algorithm the CPU noise layers use so one name does not mean two functions inside one
+stack.
+
+A shader reads only its position, its parameters and the extent it is dispatched over.
+It names no field, so it adds no bake-order dependency and widens no re-bake. It
+composes with the rest of the stack through the layer's own amplitude, mask and blend,
+exactly as every other op does — the shader is resolved to a raster first, and the
+stack is then walked on the CPU as it always was.
+
+### `@ui` annotations
+
+One per field of the `Params` struct. A field without one is a parse error, reported in
+the status bar; the layer keeps the values it had, because a shader is edited in place
+and is expected to be broken for as long as it takes to type the next line.
+
+| Form | Field types | Widget |
+|---|---|---|
+| `@ui <default> [<min>, <max>]` | `f32`, `i32`, `u32` | number |
+| `@ui <default> [<min>, <max>] step <s>` | `f32`, `i32`, `u32` | number, stepped |
+| `@ui (<x>, <y>) [<min>, <max>]` | `vec2<f32>` | one per component |
+| `@ui color srgb(<r>, <g>, <b>)` | `vec3<f32>`, `vec4<f32>` | colour, stored linear |
+| `@ui toggle <true\|false>` | `u32`, `i32` | toggle |
+| `@ui hidden` | any | none; the default is used |
+| `@ui "Label" ...` | any | overrides the displayed name |
+| `// @group <Name>` on its own line | — | starts a section |
+
+A parameter the document carries that the file no longer declares is dropped when the
+file is re-read; one the file declares that the document lacks takes the file's
+default. A file whose name begins with `_` is a template and is not offered as a layer.
 
 ## The water solve
 
-Water is a whole-grid answer over one field — the one holding the `Height` role, at shift 0.
-Depressions are flooded to their outlets, every cell is given a downhill neighbour on the
-filled surface, and the weight each cell contributes (`1.0`, or a moisture field's value) is
-accumulated downstream. What comes back is a depth, a flow direction, an accumulation and a
-lake id per cell.
+Water is a whole-grid answer over one field — the one holding the `Height` role, at
+shift 0. Depressions are flooded to their outlets, every cell is given a downhill
+neighbour on the filled surface, and the weight each cell contributes (`1.0`, or a
+moisture field's value) is accumulated downstream. What comes back is a depth, a flow
+direction, an accumulation and a lake id per cell.
 
-It is all or nothing: water leaves the document only at its border, so a rectangle cannot be
-re-solved on its own. An edit to the height therefore invalidates the whole answer — but not
-the spec that produced it, which is what a document carries so it can be solved again.
+It is all or nothing: water leaves the document only at its border, so a rectangle
+cannot be re-solved on its own. An edit to the height therefore invalidates the whole
+answer — but not the document that produced it, which is what can be solved again.
+
+## The file format
+
+A terrain is a directory.
+
+| file | what it is | who reads it |
+|---|---|---|
+| `terrain.ron` | the extent, the fields, the images, the water | both |
+| `layer_<n>.png` | the values, eight bits to a channel | both |
+| `recipe.ron` | the layer stacks and the water spec | the editor |
+| `paint_<n>.png` | the painted rasters the stacks name | the editor |
+| `shaders/*.wgsl` | the shaders the stacks name | the editor |
+
+The values are always written; the recipe only when the editor saves a *document*. An
+export writes the values alone, and removes a recipe already in the directory — one
+left behind would claim to describe values it no longer produced.
+
+The split is what makes the boundary real: a reader of values never parses a layer
+stack, so it never needs the types a layer stack is made of. A directory whose recipe
+has been deleted is still a terrain.
 
 ## Commands
 

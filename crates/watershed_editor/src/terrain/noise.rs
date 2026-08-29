@@ -519,7 +519,7 @@ pub enum NoiseKind {
 /// and nothing about what is done with the result.
 ///
 /// Scaling the value, deciding where it applies and combining it with anything else
-/// belong to the [`Layer`](crate::layer::Layer) holding the spec, so the same spec
+/// belong to the [`Layer`](crate::terrain::layer::Layer) holding the spec, so the same spec
 /// means the same field wherever it is used.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NoiseSpec {

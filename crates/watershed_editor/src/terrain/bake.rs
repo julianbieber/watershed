@@ -8,15 +8,17 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
-use crate::field::{Field, FieldId, FieldRole};
-use crate::layer::{Blend, LayerOp, Mask, Remap, SlopeMode};
-use crate::meta::WaterInfo;
-use crate::noise::Noise;
-use crate::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
-use crate::regions::{CompiledOutput, RegionMap, RegionOutput};
-use crate::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
-use crate::water::{WaterError, WaterSpec, WaterState};
+use watershed::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
+use watershed::field::{FieldId, FieldRole};
+
+use crate::terrain::field::Field;
+use crate::terrain::layer::{Blend, LayerOp, Mask, Remap, SlopeMode};
+use crate::terrain::noise::Noise;
+use crate::terrain::regions::{CompiledOutput, RegionMap, RegionOutput};
+use crate::terrain::water::{WaterError, WaterSpec, WaterState};
+use watershed::meta::WaterInfo;
+use watershed::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
+use watershed::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 
 /// Everything structurally wrong with a document, all of it detectable without
 /// evaluating a single texel.
@@ -569,6 +571,7 @@ enum CompiledOp<'a> {
     Constant(f32),
     Noise(Noise),
     Raster(&'a Raster<f32>),
+    Shaded(&'a Raster<f32>, u8),
     Slope {
         of: usize,
         sample_tiles: f32,
@@ -602,6 +605,7 @@ fn compile_layers<'a>(
             LayerOp::Constant(value) => CompiledOp::Constant(*value),
             LayerOp::Noise(spec) => CompiledOp::Noise(Noise::new(spec)),
             LayerOp::Paint(raster) | LayerOp::External(raster) => CompiledOp::Raster(raster),
+            LayerOp::Shader(shader) => CompiledOp::Shaded(shader.values(), field.shift),
             LayerOp::Slope {
                 of,
                 sample_tiles,
@@ -696,6 +700,10 @@ impl Evaluator<'_> {
             CompiledOp::Constant(value) => *value,
             CompiledOp::Noise(noise) => noise.sample(position.x, position.y),
             CompiledOp::Raster(raster) => raster.sample_over(self.size, position.x, position.y),
+            CompiledOp::Shaded(raster, shift) => raster.sample_bilinear(
+                raster_coord(position.x, *shift),
+                raster_coord(position.y, *shift),
+            ),
             CompiledOp::Slope {
                 of,
                 sample_tiles,
@@ -1006,12 +1014,12 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
             }
         });
 
-    Ok(Terrain {
-        size: spec.size,
+    Ok(Terrain::new(
+        spec.size,
         fields,
-        layers: layers.into_iter().map(LayerBuild::finish).collect(),
+        layers.into_iter().map(LayerBuild::finish).collect(),
         water,
-    })
+    ))
 }
 
 fn value_range(values: &[f32]) -> ChannelMeta {
@@ -1215,8 +1223,8 @@ impl TerrainSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::Layer;
-    use crate::noise::{NoiseKind, NoiseSpec};
+    use crate::terrain::layer::Layer;
+    use crate::terrain::noise::{NoiseKind, NoiseSpec};
 
     fn noise_layer(seed: u32) -> Layer {
         Layer::new(LayerOp::Noise(NoiseSpec::new(seed, NoiseKind::Fbm, 0.05)))
@@ -1761,9 +1769,9 @@ mod tests {
         }
     }
 
-    fn region_spec() -> crate::regions::RegionSpec {
-        use crate::noise::WarpSpec;
-        use crate::regions::{Region, RegionSpec};
+    fn region_spec() -> crate::terrain::regions::RegionSpec {
+        use crate::terrain::noise::WarpSpec;
+        use crate::terrain::regions::{Region, RegionSpec};
         RegionSpec::new(0x5eed_0036, 128, 16, ["base", "ridge"])
             .with_region(Region::new(6, [0.20, 0.0]))
             .with_region(Region::new(4, [0.52, 0.0]))
@@ -2106,11 +2114,11 @@ mod tests {
             .map(|field| field.baked().data().to_vec())
             .collect();
 
-        let brush = crate::brush::Brush {
+        let brush = crate::terrain::brush::Brush {
             radius_cells: 14.0,
             falloff: 0.5,
             strength: 0.8,
-            ..crate::brush::Brush::default()
+            ..crate::terrain::brush::Brush::default()
         };
         let size = terrain.size;
         let LayerOp::Paint(raster) = &mut terrain.field_mut("moisture").unwrap().layers[1].op

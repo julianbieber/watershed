@@ -173,9 +173,7 @@ pub struct FieldInfo {
 /// [`Terrain::fields`] names is readable at every cell inside the extent.
 ///
 /// Values are held as the images carry them, eight bits to a channel, and are
-/// decoded as they are read. A terrain that came from [`bake`](crate::bake) is
-/// quantised exactly as one read off disk is, so the two are the same thing at the
-/// same fidelity rather than one being a sharper version of the other.
+/// decoded as they are read.
 #[derive(Clone, Debug, Default)]
 pub struct Terrain {
     pub(crate) size: UVec2,
@@ -185,6 +183,28 @@ pub struct Terrain {
 }
 
 impl Terrain {
+    /// A terrain from the parts a writer already holds: the extent, the fields in
+    /// the order they are to be read back, the images they sit in, and the water.
+    ///
+    /// Nothing is checked. Every [`FieldInfo`] must name a layer that is there, a
+    /// channel that layer has, and the shift that layer stands at, and a
+    /// [`WaterInfo`] must name a four-channel layer at the extent — the same
+    /// conditions [`Terrain::load_from_dir`] refuses a directory for. A terrain
+    /// built outside them reads wrong values or none.
+    pub fn new(
+        size: UVec2,
+        fields: Vec<FieldInfo>,
+        layers: Vec<TerrainLayer>,
+        water: Option<WaterInfo>,
+    ) -> Self {
+        Self {
+            size,
+            fields,
+            layers,
+            water,
+        }
+    }
+
     /// Cells on the x axis.
     pub fn width(&self) -> u32 {
         self.size.x
@@ -580,7 +600,7 @@ impl<'a> FieldView<'a> {
 /// The solved water of a loaded terrain.
 ///
 /// Everything is decoded from the one image the water occupies. What a solved
-/// [`WaterState`](crate::water::WaterState) has and this does not: lake ids, which
+/// the solver's own output has and this does not: lake ids, which
 /// are identities and do not survive quantisation, and the raw direction codes,
 /// which became a vector.
 #[derive(Clone, Copy, Debug)]
@@ -637,33 +657,68 @@ impl WaterView<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::bake::TerrainSpec;
-    use crate::field::{Field, FieldRole};
-    use crate::layer::{Blend, Layer, LayerOp};
-
     use super::*;
+    use crate::raster::resolution;
+
+    // One image of `constants.len()` channels, each holding one value everywhere. A
+    // degenerate channel range reads back exactly, so a fixture states the value it
+    // means rather than the nearest of 256 steps.
+    fn layer_of(size: UVec2, shift: u8, constants: &[f32]) -> TerrainLayer {
+        let channels: Vec<ChannelMeta> = constants
+            .iter()
+            .map(|value| ChannelMeta::linear(*value, *value))
+            .collect();
+        let texels = resolution(size, shift);
+        let mut bytes = Vec::with_capacity((texels.x * texels.y) as usize * channels.len());
+        for _ in 0..texels.x * texels.y {
+            for (channel, value) in channels.iter().zip(constants) {
+                bytes.push(channel.encode(*value));
+            }
+        }
+        let texels = LayerTexels::from_bytes(texels, channels.len(), bytes).unwrap();
+        TerrainLayer::new(Some(shift), channels, texels)
+    }
+
+    fn info(name: &str, role: FieldRole, shift: u8, layer: u8, channel: u8) -> FieldInfo {
+        FieldInfo {
+            name: name.to_owned(),
+            role,
+            shift,
+            categorical: false,
+            layer,
+            channel,
+        }
+    }
 
     fn baked() -> Terrain {
-        TerrainSpec::new(UVec2::new(64, 32))
-            .with_field(
-                Field::new("height")
-                    .with_role(FieldRole::Height)
-                    .with_layer(Layer::new(LayerOp::Constant(0.25)).with_blend(Blend::Replace)),
-            )
-            .with_field(
-                Field::new("moisture")
-                    .with_role(FieldRole::Moisture)
-                    .with_shift(4)
-                    .with_layer(Layer::new(LayerOp::Constant(0.5)).with_blend(Blend::Replace)),
-            )
-            .bake()
-            .unwrap()
+        let size = UVec2::new(64, 32);
+        Terrain {
+            size,
+            fields: vec![
+                info("height", FieldRole::Height, 0, 0, 0),
+                info("moisture", FieldRole::Moisture, 4, 1, 0),
+            ],
+            layers: vec![layer_of(size, 0, &[0.25]), layer_of(size, 4, &[0.5])],
+            water: None,
+        }
+    }
+
+    fn shared_image(size: UVec2) -> Terrain {
+        Terrain {
+            size,
+            fields: vec![
+                info("a", FieldRole::Custom, 0, 0, 0),
+                info("b", FieldRole::Custom, 0, 0, 1),
+            ],
+            layers: vec![layer_of(size, 0, &[0.25, 0.75])],
+            water: None,
+        }
     }
 
     // The extent is what every cell read is bounds-checked against, and it is the one
     // thing a coarse field must not be able to change.
     #[test]
-    fn a_baked_terrain_answers_the_extent_the_spec_declared() {
+    fn a_terrain_answers_the_extent_it_was_written_with() {
         let terrain = baked();
         assert_eq!((terrain.width(), terrain.height()), (64, 32));
     }
@@ -671,7 +726,7 @@ mod tests {
     // The order is what a consuming project reads its fields back in, so it is part
     // of the contract rather than an artefact of how they were packed into images.
     #[test]
-    fn fields_come_back_in_the_order_the_spec_declared_them() {
+    fn fields_come_back_in_the_order_the_metadata_declared_them() {
         let terrain = baked();
         let names: Vec<_> = terrain
             .fields()
@@ -740,8 +795,8 @@ mod tests {
         assert!(baked().field("elevation").is_none());
     }
 
-    // A view carries the metadata the bake settled, so a project reading through one
-    // never needs the spec that produced the terrain.
+    // A view carries the metadata the write settled, so a project reading through one
+    // never needs the document that produced the terrain.
     #[test]
     fn a_view_reports_the_shift_and_role_its_field_declared() {
         let terrain = baked();
@@ -750,35 +805,11 @@ mod tests {
         assert_eq!(moisture.role(), FieldRole::Moisture);
     }
 
-    // A constant field spends no range at all, and that is exactly where quantising
-    // over the values rather than the declared interval pays: the value is exact
-    // rather than the nearest of 256 steps of `0..1`.
-    #[test]
-    fn a_field_that_never_varies_reads_back_exactly() {
-        let terrain = baked();
-        assert_eq!(
-            terrain.field("height").unwrap().value_at(10, 10),
-            Some(0.25)
-        );
-        assert_eq!(terrain.field("height").unwrap().range_low(), 0.25);
-        assert_eq!(terrain.field("height").unwrap().range_high(), 0.25);
-    }
-
     // Two fields at one shift are packed into one image, so a field read has to pick
     // its own channel out of an interleaved texel rather than assume it is alone.
     #[test]
     fn two_fields_sharing_an_image_read_their_own_channel() {
-        let terrain = TerrainSpec::new(UVec2::new(16, 16))
-            .with_field(
-                Field::new("a")
-                    .with_layer(Layer::new(LayerOp::Constant(0.25)).with_blend(Blend::Replace)),
-            )
-            .with_field(
-                Field::new("b")
-                    .with_layer(Layer::new(LayerOp::Constant(0.75)).with_blend(Blend::Replace)),
-            )
-            .bake()
-            .unwrap();
+        let terrain = shared_image(UVec2::new(16, 16));
 
         assert_eq!(terrain.layer_count(), 1);
         assert_eq!(terrain.layer(0).unwrap().channels(), 2);
@@ -793,17 +824,7 @@ mod tests {
     // channel count rather than a caller's guess at it.
     #[test]
     fn a_layer_reads_as_the_vector_its_channel_count_implies() {
-        let terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(
-                Field::new("a")
-                    .with_layer(Layer::new(LayerOp::Constant(0.25)).with_blend(Blend::Replace)),
-            )
-            .with_field(
-                Field::new("b")
-                    .with_layer(Layer::new(LayerOp::Constant(0.75)).with_blend(Blend::Replace)),
-            )
-            .bake()
-            .unwrap();
+        let terrain = shared_image(UVec2::new(8, 8));
 
         let layer = terrain.layer(0).unwrap();
         assert_eq!(layer.vec2_at(1, 1), Some(Vec2::new(0.25, 0.75)));
