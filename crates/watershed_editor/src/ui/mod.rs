@@ -6,20 +6,20 @@
 //! window can do can be driven from outside the process. The rule runs that way round:
 //! a new action is written where both can reach it, and then given a button.
 
+use bevy::feathers::theme::ThemeBackgroundColor;
+use bevy::feathers::tokens;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::picking::Pickable;
 use bevy::picking::hover::HoverMap;
-use bevy::feathers::theme::ThemeBackgroundColor;
-use bevy::feathers::tokens;
 use bevy::prelude::*;
 use bevy::ui::UiSystems;
 use bevy::window::PrimaryWindow;
 
+use crate::canvas::{CanvasFrame, CanvasViewport};
 use crate::document::Document;
 use crate::preset::Preset;
-use crate::view::FreeView;
-use crate::canvas::{CanvasFrame, CanvasViewport};
 use crate::terrain::graph::NodeId;
+use crate::view::FreeView;
 
 mod bind;
 mod dialog;
@@ -294,7 +294,9 @@ fn measure_canvas_frame(
     if target.x < 1.0 || target.y < 1.0 {
         return;
     }
-    let low = (centre - size * 0.5).max(Vec2::ZERO).min(target - Vec2::ONE);
+    let low = (centre - size * 0.5)
+        .max(Vec2::ZERO)
+        .min(target - Vec2::ONE);
     frame.position = low;
     frame.size = size.min(target - low).max(Vec2::ONE);
 }

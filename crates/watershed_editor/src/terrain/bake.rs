@@ -228,7 +228,11 @@ impl TerrainSpec {
     pub fn preview_node(&self, field: &str, node: NodeId) -> Option<Raster<f32>> {
         self.field(field)?.graph.node(node)?;
         let mut scratch = self.clone();
-        scratch.field_mut(field)?.graph.set_output(Some(node)).ok()?;
+        scratch
+            .field_mut(field)?
+            .graph
+            .set_output(Some(node))
+            .ok()?;
         scratch.bake_field(field).ok()?;
         Some(scratch.field(field)?.baked().clone())
     }
@@ -535,11 +539,8 @@ impl TerrainSpec {
 fn slope_reach_to(field: &Field, referenced: &FieldId) -> f32 {
     let order = field.graph.evaluation_order().unwrap_or_default();
     let mut reach = vec![0.0f32; order.len()];
-    let position: HashMap<NodeId, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(at, &id)| (id, at))
-        .collect();
+    let position: HashMap<NodeId, usize> =
+        order.iter().enumerate().map(|(at, &id)| (id, at)).collect();
     for at in (0..order.len()).rev() {
         let Some(node) = field.graph.node(order[at]) else {
             continue;
@@ -674,25 +675,25 @@ fn compile_graph<'a>(
     index_of: &HashMap<String, usize>,
     size: UVec2,
 ) -> Result<CompiledGraph<'a>, PlanError> {
-    let order = field.graph.evaluation_order().map_err(|error| match error {
-        GraphError::WouldCycle { from, .. } => PlanError::NodeCycle {
-            field: field.id.to_string(),
-            node: from.0,
-        },
-        GraphError::UnknownNode(NodeId(node)) => PlanError::UnknownNode {
-            field: field.id.to_string(),
-            node,
-        },
-        _ => PlanError::UnknownNode {
-            field: field.id.to_string(),
-            node: 0,
-        },
-    })?;
-    let position: HashMap<NodeId, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(at, &id)| (id, at))
-        .collect();
+    let order = field
+        .graph
+        .evaluation_order()
+        .map_err(|error| match error {
+            GraphError::WouldCycle { from, .. } => PlanError::NodeCycle {
+                field: field.id.to_string(),
+                node: from.0,
+            },
+            GraphError::UnknownNode(NodeId(node)) => PlanError::UnknownNode {
+                field: field.id.to_string(),
+                node,
+            },
+            _ => PlanError::UnknownNode {
+                field: field.id.to_string(),
+                node: 0,
+            },
+        })?;
+    let position: HashMap<NodeId, usize> =
+        order.iter().enumerate().map(|(at, &id)| (id, at)).collect();
     let mut nodes = Vec::with_capacity(order.len());
     for &id in &order {
         let node = field.graph.node(id).ok_or(PlanError::UnknownNode {
@@ -797,17 +798,53 @@ impl Evaluator<'_> {
         let reach = sample_tiles.abs().max(f32::EPSILON);
         match mode {
             SlopeMode::Gradient => {
-                let east = self.eval(graph, source, position + Vec2::new(reach, 0.0), scratch, level);
-                let west = self.eval(graph, source, position - Vec2::new(reach, 0.0), scratch, level);
-                let north = self.eval(graph, source, position + Vec2::new(0.0, reach), scratch, level);
-                let south = self.eval(graph, source, position - Vec2::new(0.0, reach), scratch, level);
+                let east = self.eval(
+                    graph,
+                    source,
+                    position + Vec2::new(reach, 0.0),
+                    scratch,
+                    level,
+                );
+                let west = self.eval(
+                    graph,
+                    source,
+                    position - Vec2::new(reach, 0.0),
+                    scratch,
+                    level,
+                );
+                let north = self.eval(
+                    graph,
+                    source,
+                    position + Vec2::new(0.0, reach),
+                    scratch,
+                    level,
+                );
+                let south = self.eval(
+                    graph,
+                    source,
+                    position - Vec2::new(0.0, reach),
+                    scratch,
+                    level,
+                );
                 let scale = 2.0 * reach;
                 (((east - west) / scale).powi(2) + ((north - south) / scale).powi(2)).sqrt()
             }
             SlopeMode::SteepestAxis => {
                 let here = self.eval(graph, source, position, scratch, level);
-                let east = self.eval(graph, source, position + Vec2::new(reach, 0.0), scratch, level);
-                let north = self.eval(graph, source, position + Vec2::new(0.0, reach), scratch, level);
+                let east = self.eval(
+                    graph,
+                    source,
+                    position + Vec2::new(reach, 0.0),
+                    scratch,
+                    level,
+                );
+                let north = self.eval(
+                    graph,
+                    source,
+                    position + Vec2::new(0.0, reach),
+                    scratch,
+                    level,
+                );
                 (east - here).abs().max((north - here).abs()) / reach
             }
         }
@@ -868,9 +905,7 @@ impl Evaluator<'_> {
                         raster_coord(position.y, *shift),
                     ),
                     CompiledOp::FieldRef(index) => self.field(*index, position),
-                    CompiledOp::Regions(map, output) => {
-                        map.sample(*output, position.x, position.y)
-                    }
+                    CompiledOp::Regions(map, output) => map.sample(*output, position.x, position.y),
                     CompiledOp::Binary(binary) => binary.apply(a, b),
                     CompiledOp::Lerp => a + (b - a) * c.clamp(0.0, 1.0),
                     CompiledOp::Scale(factor) => a * factor,
@@ -1427,11 +1462,11 @@ mod tests {
     fn two_field_document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(96, 80))
             .with_field(Field::new("moisture").with_shift(3).with_op(noise_op(7)))
-            .with_field(
-                Field::new("height")
-                    .with_shift(0)
-                    .with_graph(weighted(noise_op(11), "moisture", (0.3, 0.7))),
-            )
+            .with_field(Field::new("height").with_shift(0).with_graph(weighted(
+                noise_op(11),
+                "moisture",
+                (0.3, 0.7),
+            )))
     }
 
     // The whole point of the staged bake: a caller that walks the order one field at a
@@ -1651,9 +1686,7 @@ mod tests {
         )
         .unwrap();
         let mut terrain = TerrainSpec::new(size)
-            .with_field(
-                Field::new("height").with_op(NodeOp::External(ramp)),
-            )
+            .with_field(Field::new("height").with_op(NodeOp::External(ramp)))
             .with_field(
                 Field::new("soil")
                     .with_range((0.0, 10.0))
@@ -1673,15 +1706,13 @@ mod tests {
     #[test]
     fn a_field_is_baked_before_the_field_that_reads_it() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(
-                Field::new("derived").with_range((0.0, 10.0)).with_graph({
-                    let mut graph = FieldGraph::new();
-                    let read = graph.node_with(NodeOp::FieldRef(FieldId::from("source")), &[]);
-                    let scaled = graph.node_with(NodeOp::Scale(2.0), &[read]);
-                    graph.set_output(Some(scaled)).unwrap();
-                    graph
-                }),
-            )
+            .with_field(Field::new("derived").with_range((0.0, 10.0)).with_graph({
+                let mut graph = FieldGraph::new();
+                let read = graph.node_with(NodeOp::FieldRef(FieldId::from("source")), &[]);
+                let scaled = graph.node_with(NodeOp::Scale(2.0), &[read]);
+                graph.set_output(Some(scaled)).unwrap();
+                graph
+            }))
             .with_field(
                 Field::new("source")
                     .with_range((0.0, 10.0))
@@ -1697,12 +1728,8 @@ mod tests {
     #[test]
     fn a_dependency_cycle_is_an_error_rather_than_a_hang() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(
-                Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("b"))),
-            )
-            .with_field(
-                Field::new("b").with_op(NodeOp::FieldRef(FieldId::from("a"))),
-            );
+            .with_field(Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("b"))))
+            .with_field(Field::new("b").with_op(NodeOp::FieldRef(FieldId::from("a"))));
         let error = terrain.bake_in_place().unwrap_err();
         assert!(matches!(error, PlanError::Cycle(_)), "{error}");
     }
@@ -1728,9 +1755,8 @@ mod tests {
     // reader, so an error naming only the missing field would not say where to look.
     #[test]
     fn a_reference_to_a_field_that_is_not_there_is_an_error() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("gone"))),
-        );
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
+            .with_field(Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("gone"))));
         let error = terrain.bake_in_place().unwrap_err();
         assert!(
             matches!(&error, PlanError::UnknownField { referenced, reader }
@@ -1839,17 +1865,15 @@ mod tests {
     fn a_painted_weight_lets_a_value_through_where_it_is_white() {
         let mask = Raster::from_vec(UVec2::new(2, 1), vec![0u8, 255]).unwrap();
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height")
-                .with_range((-10.0, 10.0))
-                .with_graph({
-                    let mut graph = FieldGraph::new();
-                    let under = graph.node_with(NodeOp::Constant(1.0), &[]);
-                    let value = graph.node_with(NodeOp::Constant(5.0), &[]);
-                    let weight = graph.node_with(NodeOp::Paint(mask), &[]);
-                    let lerp = graph.node_with(NodeOp::Lerp, &[under, value, weight]);
-                    graph.set_output(Some(lerp)).unwrap();
-                    graph
-                }),
+            Field::new("height").with_range((-10.0, 10.0)).with_graph({
+                let mut graph = FieldGraph::new();
+                let under = graph.node_with(NodeOp::Constant(1.0), &[]);
+                let value = graph.node_with(NodeOp::Constant(5.0), &[]);
+                let weight = graph.node_with(NodeOp::Paint(mask), &[]);
+                let lerp = graph.node_with(NodeOp::Lerp, &[under, value, weight]);
+                graph.set_output(Some(lerp)).unwrap();
+                graph
+            }),
         );
         terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 0.5, 4.5).unwrap(), 1.0);
@@ -1873,10 +1897,8 @@ mod tests {
                     NodeOp::Noise(NoiseSpec::new(5, NoiseKind::Fbm, 0.0015)),
                     &[],
                 );
-                let detail = graph.node_with(
-                    NodeOp::Noise(NoiseSpec::new(7, NoiseKind::Fbm, 0.04)),
-                    &[],
-                );
+                let detail =
+                    graph.node_with(NodeOp::Noise(NoiseSpec::new(7, NoiseKind::Fbm, 0.04)), &[]);
                 let smaller = graph.node_with(NodeOp::Scale(0.25), &[detail]);
                 let sum = graph.node_with(NodeOp::Binary(Binary::Add), &[base, smaller]);
                 let ridged = graph.node_with(
@@ -1885,24 +1907,20 @@ mod tests {
                 );
                 let scaled = graph.node_with(NodeOp::Scale(0.3), &[ridged]);
                 let source = graph.node_with(NodeOp::FieldRef(FieldId::from("moisture")), &[]);
-                let weight = graph.node_with(
-                    NodeOp::Remap(Remap::new((0.4, 0.7), (0.0, 1.0))),
-                    &[source],
-                );
+                let weight =
+                    graph.node_with(NodeOp::Remap(Remap::new((0.4, 0.7), (0.0, 1.0))), &[source]);
                 let total = graph.node_with(NodeOp::Binary(Binary::Add), &[sum, scaled]);
                 let masked = graph.node_with(NodeOp::Lerp, &[sum, total, weight]);
                 graph.set_output(Some(masked)).unwrap();
                 graph
             }))
-            .with_field(
-                Field::new("soil").with_graph({
-                    let mut graph = slope_of("height", 2.0, SlopeMode::default());
-                    let slope = graph.output.unwrap();
-                    let scaled = graph.node_with(NodeOp::Scale(20.0), &[slope]);
-                    graph.set_output(Some(scaled)).unwrap();
-                    graph
-                }),
-            );
+            .with_field(Field::new("soil").with_graph({
+                let mut graph = slope_of("height", 2.0, SlopeMode::default());
+                let slope = graph.output.unwrap();
+                let scaled = graph.node_with(NodeOp::Scale(20.0), &[slope]);
+                graph.set_output(Some(scaled)).unwrap();
+                graph
+            }));
 
         let started = std::time::Instant::now();
         terrain.bake_in_place().unwrap();
@@ -1949,33 +1967,30 @@ mod tests {
                 spec: region_spec(),
                 output: RegionOutput::Blended("ridge".to_owned()),
             }))
-            .with_field(
-                Field::new("height").with_graph({
-                    let mut graph = FieldGraph::new();
-                    let base = graph.node_with(
-                        NodeOp::Regions {
-                            spec: region_spec(),
-                            output: RegionOutput::Blended("base".to_owned()),
-                        },
-                        &[],
-                    );
-                    let ridged = graph.node_with(
-                        NodeOp::Noise(NoiseSpec::new(11, NoiseKind::Ridged, 0.01)),
-                        &[],
-                    );
-                    let scaled = graph.node_with(NodeOp::Scale(0.4), &[ridged]);
-                    let source =
-                        graph.node_with(NodeOp::FieldRef(FieldId::from("ridge_weight")), &[]);
-                    let weight = graph.node_with(
-                        NodeOp::Remap(Remap::new((0.0, 0.34), (0.0, 1.0))),
-                        &[source],
-                    );
-                    let total = graph.node_with(NodeOp::Binary(Binary::Add), &[base, scaled]);
-                    let masked = graph.node_with(NodeOp::Lerp, &[base, total, weight]);
-                    graph.set_output(Some(masked)).unwrap();
-                    graph
-                }),
-            )
+            .with_field(Field::new("height").with_graph({
+                let mut graph = FieldGraph::new();
+                let base = graph.node_with(
+                    NodeOp::Regions {
+                        spec: region_spec(),
+                        output: RegionOutput::Blended("base".to_owned()),
+                    },
+                    &[],
+                );
+                let ridged = graph.node_with(
+                    NodeOp::Noise(NoiseSpec::new(11, NoiseKind::Ridged, 0.01)),
+                    &[],
+                );
+                let scaled = graph.node_with(NodeOp::Scale(0.4), &[ridged]);
+                let source = graph.node_with(NodeOp::FieldRef(FieldId::from("ridge_weight")), &[]);
+                let weight = graph.node_with(
+                    NodeOp::Remap(Remap::new((0.0, 0.34), (0.0, 1.0))),
+                    &[source],
+                );
+                let total = graph.node_with(NodeOp::Binary(Binary::Add), &[base, scaled]);
+                let masked = graph.node_with(NodeOp::Lerp, &[base, total, weight]);
+                graph.set_output(Some(masked)).unwrap();
+                graph
+            }))
     }
 
     // A regions node is the one op with no input at all, so this is where it is
@@ -2219,18 +2234,17 @@ mod tests {
     fn the_two_slope_modes_differ_by_the_hypotenuse_on_a_tilted_plane() {
         let rise = 0.001_f32;
         let plane = |mode| {
-            let mut terrain =
-                TerrainSpec::new(UVec2::splat(64))
-                    .with_field(
-                        Field::new("ground")
-                            .with_range((-10.0, 10.0))
-                            .with_op(NodeOp::Constant(0.0)),
-                    )
-                    .with_field(
-                        Field::new("tilt")
-                            .with_range((-10.0, 10.0))
-                            .with_graph(slope_of("ground", 4.0, mode)),
-                    );
+            let mut terrain = TerrainSpec::new(UVec2::splat(64))
+                .with_field(
+                    Field::new("ground")
+                        .with_range((-10.0, 10.0))
+                        .with_op(NodeOp::Constant(0.0)),
+                )
+                .with_field(
+                    Field::new("tilt")
+                        .with_range((-10.0, 10.0))
+                        .with_graph(slope_of("ground", 4.0, mode)),
+                );
             let size = terrain.size;
             let mut raster = Raster::new(size, 0.0);
             for y in 0..size.y {
@@ -2264,7 +2278,9 @@ mod tests {
     // fields the paint never touched.
     #[test]
     fn the_rectangle_a_stroke_reaches_covers_every_cell_a_full_bake_would_move() {
-        let mut terrain = two_field_document().with_field(Field::new("relief").with_graph(slope_of("height", 6.0, SlopeMode::default())));
+        let mut terrain = two_field_document().with_field(
+            Field::new("relief").with_graph(slope_of("height", 6.0, SlopeMode::default())),
+        );
         let paint = Raster::new(
             terrain.field("moisture").unwrap().resolution(terrain.size),
             0u8,
@@ -2493,10 +2509,8 @@ mod tests {
     // so a water spec it carried names a height field the plan can no longer find.
     #[test]
     fn a_document_that_carries_no_roles_refuses_to_plan_its_water() {
-        let mut spec = TerrainSpec::new(UVec2::new(32, 32)).with_field(
-            Field::new("height")
-                .with_op(NodeOp::Constant(0.5)),
-        );
+        let mut spec = TerrainSpec::new(UVec2::new(32, 32))
+            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
         spec.water_spec = Some(WaterSpec::new("height"));
 
         assert!(matches!(

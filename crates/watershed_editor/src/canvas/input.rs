@@ -72,7 +72,8 @@ pub fn canvas_camera(
     }
 
     if let Grab::Pan { anchor } = *grab {
-        let world = transform.translation.truncate() + cursor * Vec2::new(ortho.scale, -ortho.scale);
+        let world =
+            transform.translation.truncate() + cursor * Vec2::new(ortho.scale, -ortho.scale);
         transform.translation += (anchor - world).extend(0.0);
     }
 }
@@ -111,15 +112,12 @@ pub fn canvas_drag(
     else {
         return;
     };
-    let world =
-        camera_at.translation.truncate() + cursor * Vec2::new(ortho.scale, -ortho.scale);
+    let world = camera_at.translation.truncate() + cursor * Vec2::new(ortho.scale, -ortho.scale);
 
     if mouse.just_pressed(MouseButton::Left) && !pointer_over_ui(&hover, &ui) {
         let on_pin = pins
             .iter()
-            .find(|(_, at)| {
-                at.translation().truncate().distance(world) <= super::PIN_RADIUS * 2.0
-            })
+            .find(|(_, at)| at.translation().truncate().distance(world) <= super::PIN_RADIUS * 2.0)
             .map(|(pin, _)| *pin);
         let on_card = cards
             .iter()

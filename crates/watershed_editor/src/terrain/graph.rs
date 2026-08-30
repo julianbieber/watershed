@@ -416,10 +416,7 @@ impl FieldGraph {
         };
         for row in 0..64 {
             for column in 0..8 {
-                let at = [
-                    column as f32 * NODE_STEP[0],
-                    -(row as f32) * NODE_STEP[1],
-                ];
+                let at = [column as f32 * NODE_STEP[0], -(row as f32) * NODE_STEP[1]];
                 if clear(at) {
                     return at;
                 }
@@ -537,13 +534,17 @@ impl FieldGraph {
 
     /// Sets whether a node is bypassed.
     pub fn set_bypassed(&mut self, id: NodeId, bypassed: bool) -> Result<(), GraphError> {
-        self.node_mut(id).ok_or(GraphError::UnknownNode(id))?.bypassed = bypassed;
+        self.node_mut(id)
+            .ok_or(GraphError::UnknownNode(id))?
+            .bypassed = bypassed;
         Ok(())
     }
 
     /// Writes a node's canvas position and nothing else.
     pub fn place(&mut self, id: NodeId, position: [f32; 2]) -> Result<(), GraphError> {
-        self.node_mut(id).ok_or(GraphError::UnknownNode(id))?.position = position;
+        self.node_mut(id)
+            .ok_or(GraphError::UnknownNode(id))?
+            .position = position;
         Ok(())
     }
 
@@ -612,7 +613,11 @@ impl FieldGraph {
             return Vec::new();
         };
         if node.bypassed {
-            node.inputs.first().and_then(|pin| *pin).into_iter().collect()
+            node.inputs
+                .first()
+                .and_then(|pin| *pin)
+                .into_iter()
+                .collect()
         } else {
             node.sources().collect()
         }
@@ -956,11 +961,13 @@ mod tests {
     // is derived from that.
     #[test]
     fn slope_is_the_only_op_that_widens_a_rebake() {
-        assert!(NodeOp::Slope {
-            sample_tiles: 1.0,
-            mode: SlopeMode::default(),
-        }
-        .widens());
+        assert!(
+            NodeOp::Slope {
+                sample_tiles: 1.0,
+                mode: SlopeMode::default(),
+            }
+            .widens()
+        );
         assert!(!NodeOp::Scale(2.0).widens());
         assert!(!NodeOp::Constant(1.0).widens());
     }

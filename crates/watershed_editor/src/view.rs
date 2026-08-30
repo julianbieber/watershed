@@ -14,10 +14,10 @@ use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input_focus::InputFocus;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
-use bevy::ui::IsDefaultUiCamera;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
 use bevy::text::EditableText;
+use bevy::ui::IsDefaultUiCamera;
 use watershed::CellRect;
 
 use crate::document::{Document, EditorSystems};

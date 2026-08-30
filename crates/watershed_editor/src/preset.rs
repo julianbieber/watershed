@@ -5,8 +5,8 @@
 //! anyone is meant to ship. The set stays small for that reason — it is chosen to
 //! cover the ways a stack can be put together, not to be a library of landscapes.
 
-use crate::terrain::graph::{Binary, FieldGraph, NodeId, NodeOp};
 use crate::terrain::graph::Remap;
+use crate::terrain::graph::{Binary, FieldGraph, NodeId, NodeOp};
 use crate::terrain::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
 use crate::terrain::regions::{Region, RegionOutput, RegionSpec};
 use crate::terrain::{Field, TerrainSpec, WaterSpec};
@@ -100,9 +100,14 @@ fn noise(seed: u32, kind: NoiseKind, scale: f32, octaves: u32) -> NodeOp {
 }
 
 fn moisture(seed: u32) -> Field {
-    Field::new("moisture").with_shift(4).with_graph(built(|graph| {
-        graph.add_node(noise(sub_seed(seed, 11), NoiseKind::Fbm, 0.004, 4), at(0, 0))
-    }))
+    Field::new("moisture")
+        .with_shift(4)
+        .with_graph(built(|graph| {
+            graph.add_node(
+                noise(sub_seed(seed, 11), NoiseKind::Fbm, 0.004, 4),
+                at(0, 0),
+            )
+        }))
 }
 
 const CONTINENT_SCALE: f32 = 0.0015;

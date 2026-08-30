@@ -751,7 +751,14 @@ mod tests {
         assert_eq!(document.baked, Baked::Whole, "a move invalidated the bake");
         assert!(!document.dirty, "a move made the document dirty");
         assert_eq!(
-            document.terrain().unwrap().field("height").unwrap().graph.nodes[0].position,
+            document
+                .terrain()
+                .unwrap()
+                .field("height")
+                .unwrap()
+                .graph
+                .nodes[0]
+                .position,
             [40.0, -20.0]
         );
     }

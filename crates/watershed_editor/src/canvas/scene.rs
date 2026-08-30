@@ -9,7 +9,7 @@ use bevy::text::FontSize;
 
 use super::{
     CANVAS_LAYER, CARD, CanvasLabel, CanvasShape, DETAIL_SIZE, Grab, NodeCard, NodeEdge, NodePin,
-    PIN_RADIUS, Selection, TITLE_BAR, TITLE_SIZE, THUMB, open_graph,
+    PIN_RADIUS, Selection, THUMB, TITLE_BAR, TITLE_SIZE, open_graph,
 };
 use crate::document::Document;
 use crate::edit::{op_name, op_summary};
@@ -406,11 +406,7 @@ mod tests {
     }
 
     fn at(world: &World, card: Entity) -> Vec2 {
-        world
-            .get::<Transform>(card)
-            .unwrap()
-            .translation
-            .truncate()
+        world.get::<Transform>(card).unwrap().translation.truncate()
     }
 
     // The defect this guards was the whole of "I drag a node and it jumps back": the

@@ -103,9 +103,10 @@ impl Field {
             let id = self.graph.node_with(op, &[]);
             under = Some(match under {
                 None => id,
-                Some(under) => self
-                    .graph
-                    .node_with(NodeOp::Binary(crate::terrain::graph::Binary::Add), &[under, id]),
+                Some(under) => self.graph.node_with(
+                    NodeOp::Binary(crate::terrain::graph::Binary::Add),
+                    &[under, id],
+                ),
             });
         }
         if let Some(output) = under {

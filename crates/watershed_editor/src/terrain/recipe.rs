@@ -453,7 +453,11 @@ impl TerrainSpec {
             spec.fields.push(field);
         }
 
-        if spec.fields.iter().any(|field| !field.graph.nodes.is_empty()) {
+        if spec
+            .fields
+            .iter()
+            .any(|field| !field.graph.nodes.is_empty())
+        {
             spec.bake_in_place()?;
             if let Some(water) = spec.water_spec.clone() {
                 spec.solve_water(&water)?;
@@ -614,11 +618,10 @@ mod tests {
                         let weight = graph.node_with(NodeOp::Paint(byte_mask()), &[]);
                         let over = graph.node_with(NodeOp::Lerp, &[painted, imported, weight]);
                         let detail = graph.node_with(noise_op(9), &[]);
-                        let read = graph.node_with(NodeOp::FieldRef(FieldId::from("moisture")), &[]);
-                        let band = graph.node_with(
-                            NodeOp::Remap(Remap::new((0.3, 0.7), (0.0, 1.0))),
-                            &[read],
-                        );
+                        let read =
+                            graph.node_with(NodeOp::FieldRef(FieldId::from("moisture")), &[]);
+                        let band = graph
+                            .node_with(NodeOp::Remap(Remap::new((0.3, 0.7), (0.0, 1.0))), &[read]);
                         let total = graph.node_with(NodeOp::Lerp, &[over, detail, band]);
                         graph.set_output(Some(total)).unwrap();
                         graph
@@ -682,7 +685,12 @@ mod tests {
         assert!(Terrain::load_from_dir(&root).is_ok());
         let loaded = TerrainSpec::load_from_dir(&root).unwrap();
         assert_eq!(loaded.fields.len(), 2);
-        assert!(loaded.fields.iter().all(|field| field.graph.nodes.is_empty()));
+        assert!(
+            loaded
+                .fields
+                .iter()
+                .all(|field| field.graph.nodes.is_empty())
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -740,8 +748,8 @@ mod tests {
     #[test]
     fn a_painted_image_carries_its_own_extent_and_no_shift() {
         let odd = Raster::from_vec(UVec2::new(7, 5), vec![128u8; 35]).unwrap();
-        let spec = TerrainSpec::new(SIZE)
-            .with_field(Field::new("height").with_op(NodeOp::Paint(odd)));
+        let spec =
+            TerrainSpec::new(SIZE).with_field(Field::new("height").with_op(NodeOp::Paint(odd)));
         let root = saved(&spec, SaveOptions::document(), "odd-paint");
 
         let text = std::fs::read_to_string(root.join(RECIPE_FILE)).unwrap();

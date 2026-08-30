@@ -70,10 +70,7 @@ impl Plugin for CanvasPlugin {
                     .chain()
                     .before(EditorSystems::Document),
             )
-            .add_systems(
-                PostUpdate,
-                size_canvas_viewport.after(UiSystems::Layout),
-            );
+            .add_systems(PostUpdate, size_canvas_viewport.after(UiSystems::Layout));
     }
 }
 
@@ -299,7 +296,11 @@ fn size_canvas_viewport(
     let mut camera = camera.into_inner();
     // A viewport that leaves the render target is a validation error the renderer
     // quits on, so it is clamped here rather than trusted from the layout.
-    let position = frame.position.max(Vec2::ZERO).as_uvec2().min(target - UVec2::ONE);
+    let position = frame
+        .position
+        .max(Vec2::ZERO)
+        .as_uvec2()
+        .min(target - UVec2::ONE);
     let size = frame
         .size
         .max(Vec2::ONE)
@@ -557,11 +558,17 @@ mod tests {
         let mut graph = FieldGraph::new();
         let under = graph.node_with(NodeOp::Constant(0.25), &[]);
         let over = graph.node_with(NodeOp::Constant(0.75), &[]);
-        let sum = graph.node_with(NodeOp::Binary(crate::terrain::graph::Binary::Add), &[under, over]);
+        let sum = graph.node_with(
+            NodeOp::Binary(crate::terrain::graph::Binary::Add),
+            &[under, over],
+        );
         graph.set_output(Some(sum)).unwrap();
 
-        let mut terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(Field::new("height").with_range((0.0, 4.0)).with_graph(graph));
+        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(
+            Field::new("height")
+                .with_range((0.0, 4.0))
+                .with_graph(graph),
+        );
         terrain.bake_in_place().unwrap();
         let before = terrain.clone();
 

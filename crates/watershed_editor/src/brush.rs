@@ -144,7 +144,9 @@ pub fn apply_stroke(
     };
 
     if painted.is_empty() {
-        return Ok(json!({ "field": name, "node": crate::edit::node_path(id), "cells": Value::Null }));
+        return Ok(
+            json!({ "field": name, "node": crate::edit::node_path(id), "cells": Value::Null }),
+        );
     }
     let painted = painted.expand(bleed);
 
@@ -337,10 +339,8 @@ mod tests {
     fn a_stroke_lands_in_the_node_and_leaves_the_bake_where_it_was() {
         let mut document = Document::default();
         let terrain = TerrainSpec::new(UVec2::splat(64)).with_field(
-            Field::new("height").with_sum([
-                NodeOp::Constant(0.25),
-                NodeOp::Paint(Raster::default()),
-            ]),
+            Field::new("height")
+                .with_sum([NodeOp::Constant(0.25), NodeOp::Paint(Raster::default())]),
         );
         document.adopt(terrain);
 

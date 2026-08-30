@@ -25,14 +25,14 @@ use watershed::raster::Raster;
 use watershed::{FieldId, FieldRole};
 
 use crate::brush::{BrushSettings, target_of};
+use crate::canvas::Selection;
 use crate::document::{Baked, Document};
 use crate::edit::{
     BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, binary_name, brush_mode_name,
     noise_kind_name, op_name, op_summary, parse_region_output, region_output_name, slope_mode_name,
 };
-use crate::canvas::Selection;
-use crate::terrain::graph::{Binary, Curve, GraphNode, NodeId, NodeOp};
 use crate::gpu::{STOCK, ShaderLibrary};
+use crate::terrain::graph::{Binary, Curve, GraphNode, NodeId, NodeOp};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{ADDABLE, AddLayer, Expanded, PANEL_WIDTH, report};
@@ -109,8 +109,8 @@ pub fn rebuild(
     let entries: Vec<Box<dyn SceneList>> =
         contents(&document, &brush, &expanded, &add, &library, &selection)
             .into_iter()
-        .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
-        .collect();
+            .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
+            .collect();
 
     commands
         .entity(*body)
@@ -201,7 +201,10 @@ fn fingerprint(
     key.push_str(field.role.as_str());
     key.push_str(&format!(
         "|out:{}",
-        field.graph.output.map_or_else(|| "none".to_owned(), |id| id.to_string())
+        field
+            .graph
+            .output
+            .map_or_else(|| "none".to_owned(), |id| id.to_string())
     ));
     for node in &field.graph.nodes {
         key.push_str(&format!(
@@ -264,7 +267,9 @@ fn contents(
     let Some(field) = field_of(document) else {
         return vec![widgets::boxed(widgets::text("no document"))];
     };
-    let selected = selection.node.filter(|node| field.graph.node(*node).is_some());
+    let selected = selection
+        .node
+        .filter(|node| field.graph.node(*node).is_some());
 
     let mut children: Vec<Box<dyn Scene>> = vec![
         widgets::boxed(widgets::row(vec![
@@ -799,11 +804,7 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
 /// A parameter is addressed by its position in the layer's own key order rather than
 /// by name, which is what lets a binding stay `Copy`; the two orders are put back
 /// together here, where the layout is in hand.
-fn param_rows(
-    id: NodeId,
-    shader: &ShaderLayer,
-    layout: &ParamsLayout,
-) -> Vec<Box<dyn SceneList>> {
+fn param_rows(id: NodeId, shader: &ShaderLayer, layout: &ParamsLayout) -> Vec<Box<dyn SceneList>> {
     let mut rows: Vec<Box<dyn SceneList>> = Vec::new();
     let mut group = String::new();
     for field in &layout.fields {
@@ -1073,11 +1074,8 @@ mod tests {
     // frame it was typed into, which throws away the field the keyboard is in.
     #[test]
     fn a_number_does_not_change_the_shape() {
-        let mut document = document_with(vec![NodeOp::Noise(NoiseSpec::new(
-            1,
-            NoiseKind::Fbm,
-            0.02,
-        ))]);
+        let mut document =
+            document_with(vec![NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02))]);
         let before = key(&document);
 
         {

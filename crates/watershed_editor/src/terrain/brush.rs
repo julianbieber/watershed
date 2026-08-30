@@ -422,7 +422,10 @@ mod tests {
         for (index, (up, down)) in raised.data().iter().zip(lowered.data()).enumerate() {
             let up = Texel::to_f32(*up) - MIDDLE;
             let down = Texel::to_f32(*down) - MIDDLE;
-            assert!((up + down).abs() < 1.0 / 255.0, "texel {index}: {up} against {down}");
+            assert!(
+                (up + down).abs() < 1.0 / 255.0,
+                "texel {index}: {up} against {down}"
+            );
         }
     }
 
@@ -444,7 +447,10 @@ mod tests {
         assert!((at(&raster, 16, 16) - 0.75).abs() < 1.0 / 255.0);
         for value in raster.data() {
             let value = Texel::to_f32(*value);
-            assert!((0.0..=0.75 + 1.0 / 255.0).contains(&value), "{value} left the band");
+            assert!(
+                (0.0..=0.75 + 1.0 / 255.0).contains(&value),
+                "{value} left the band"
+            );
         }
     }
 

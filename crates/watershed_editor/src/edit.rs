@@ -460,7 +460,10 @@ fn set_op(op: &mut NodeOp, property: &str, words: &[String]) -> Result<(), Strin
         (NodeOp::Curve(curve), "points") => *curve = parse_curve(words)?,
 
         (op, other) => {
-            return Err(format!("a {} node has nothing called `{other}`", op_name(op)));
+            return Err(format!(
+                "a {} node has nothing called `{other}`",
+                op_name(op)
+            ));
         }
     }
     Ok(())
@@ -784,14 +787,10 @@ mod tests {
     fn document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(64, 64))
             .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
-            .with_field(
-                Field::new("height")
-                    .with_role(FieldRole::Height)
-                    .with_sum([
-                        NodeOp::FieldRef(FieldId::from("base")),
-                        NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
-                    ]),
-            )
+            .with_field(Field::new("height").with_role(FieldRole::Height).with_sum([
+                NodeOp::FieldRef(FieldId::from("base")),
+                NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
+            ]))
     }
 
     fn words(line: &str) -> Vec<String> {
@@ -836,7 +835,13 @@ mod tests {
         .apply(&mut terrain)
         .unwrap();
         assert_eq!(
-            terrain.field("height").unwrap().graph.node(added).unwrap().inputs,
+            terrain
+                .field("height")
+                .unwrap()
+                .graph
+                .node(added)
+                .unwrap()
+                .inputs,
             vec![Some(output)]
         );
 
@@ -847,7 +852,15 @@ mod tests {
         }
         .apply(&mut terrain)
         .unwrap();
-        assert!(terrain.field("height").unwrap().graph.node(added).unwrap().bypassed);
+        assert!(
+            terrain
+                .field("height")
+                .unwrap()
+                .graph
+                .node(added)
+                .unwrap()
+                .bypassed
+        );
 
         Edit::RemoveNode {
             field: "height".to_owned(),
@@ -1030,7 +1043,13 @@ mod tests {
         set_line(&mut terrain, &format!("height.{noise}.op.octaves 6")).unwrap();
         set_line(&mut terrain, &format!("height.{noise}.op.kind ridged")).unwrap();
 
-        let NodeOp::Noise(spec) = &terrain.field("height").unwrap().graph.node(noise).unwrap().op
+        let NodeOp::Noise(spec) = &terrain
+            .field("height")
+            .unwrap()
+            .graph
+            .node(noise)
+            .unwrap()
+            .op
         else {
             panic!("the op stopped being noise");
         };
