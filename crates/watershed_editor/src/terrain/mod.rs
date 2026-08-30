@@ -3,7 +3,7 @@
 //!
 //! Nothing outside the editor holds any of this. A consuming project reads a
 //! terrain directory, and a directory was settled when it was written — so the
-//! layer stacks, the noise, the region tiling, the water solve and the bake are
+//! field graphs, the noise, the region tiling, the water solve and the bake are
 //! all authoring-time machinery and live here rather than in the library.
 
 #![allow(dead_code)]
@@ -11,7 +11,7 @@
 pub mod bake;
 pub mod brush;
 pub mod field;
-pub mod layer;
+pub mod graph;
 pub mod noise;
 pub mod recipe;
 pub mod regions;

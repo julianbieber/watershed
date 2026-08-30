@@ -7,7 +7,7 @@
 //! another would look like a field that will not take an edit.
 
 use crate::terrain::brush::Brush;
-use crate::terrain::layer::{Layer, LayerOp, Mask};
+use crate::terrain::graph::{NodeId, NodeOp};
 use bevy::feathers::controls::{NumberFormat, NumberInputValue, UpdateNumberInput};
 use bevy::prelude::*;
 use bevy::ui_widgets::ValueChange;
@@ -19,10 +19,10 @@ use crate::ui::{NewDialog, report};
 
 /// Which number a number field stands for.
 ///
-/// Layer-indexed variants carry the index within the *active* field's stack, so a
-/// binding is only meaningful against the document the panel was built from; both
-/// directions answer "not there" rather than guessing when the stack has since
-/// changed under it.
+/// Node-keyed variants carry a [`NodeId`] of the *active* field's graph. An id names
+/// its node for the life of the document, so a binding stays pointed at what it was
+/// built for across every edit that does not delete that node — and answers "not
+/// there" rather than guessing when one does.
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub enum NumberBinding {
     /// A field naming nothing. Never built by the panel — it is what the scene system
@@ -36,35 +36,34 @@ pub enum NumberBinding {
     BrushFalloff,
     BrushStrength,
     BrushValue,
-    Amplitude(usize),
-    MaskConstant(usize),
-    MaskFromLow(usize),
-    MaskFromHigh(usize),
-    MaskToLow(usize),
-    MaskToHigh(usize),
-    Constant(usize),
-    NoiseSeed(usize),
-    NoiseScale(usize),
-    NoiseOctaves(usize),
-    NoiseStrike(usize),
-    NoiseAspect(usize),
-    WarpAmplitude(usize),
-    WarpScale(usize),
-    WarpOctaves(usize),
-    SlopeSampleTiles(usize),
-    RegionSeed(usize),
-    RegionCellTiles(usize),
-    RegionBlendTiles(usize),
-    RegionWeight(usize, usize),
-    RegionValue(usize, usize, usize),
-    /// One component of one parameter of a shader layer: the layer, the parameter's
-    /// position in the layer's own key order, and which component of it.
+    ScaleFactor(NodeId),
+    RemapFromLow(NodeId),
+    RemapFromHigh(NodeId),
+    RemapToLow(NodeId),
+    RemapToHigh(NodeId),
+    Constant(NodeId),
+    NoiseSeed(NodeId),
+    NoiseScale(NodeId),
+    NoiseOctaves(NodeId),
+    NoiseStrike(NodeId),
+    NoiseAspect(NodeId),
+    WarpAmplitude(NodeId),
+    WarpScale(NodeId),
+    WarpOctaves(NodeId),
+    SlopeSampleTiles(NodeId),
+    RegionSeed(NodeId),
+    RegionCellTiles(NodeId),
+    RegionBlendTiles(NodeId),
+    RegionWeight(NodeId, usize),
+    RegionValue(NodeId, usize, usize),
+    /// One component of one parameter of a shader node: the node, the parameter's
+    /// position in the node's own key order, and which component of it.
     ///
-    /// Positional because a binding has to be `Copy`, and safe to be positional
-    /// because the panel is rebuilt whenever the shader's parameters change — a
-    /// binding left over from before answers "not there" rather than writing into
+    /// The parameter is positional because a binding has to be `Copy`, and safe to be
+    /// positional because the panel is rebuilt whenever the shader's parameters change
+    /// — a binding left over from before answers "not there" rather than writing into
     /// whatever moved into that position.
-    ShaderParam(usize, usize, usize),
+    ShaderParam(NodeId, usize, usize),
     DialogWidth,
     DialogHeight,
     DialogSeed,
@@ -103,7 +102,6 @@ impl NumberBinding {
             Self::Shift => Some((0.0, 8.0)),
             Self::BrushRadius => Some((0.0, 512.0)),
             Self::BrushFalloff => Some((0.0, 1.0)),
-            Self::MaskConstant(_) => Some((0.0, 1.0)),
             Self::NoiseScale(_) | Self::WarpScale(_) => Some((0.0, 1.0)),
             Self::NoiseOctaves(_) => Some((1.0, 10.0)),
             Self::WarpOctaves(_) => Some((1.0, 6.0)),
@@ -131,7 +129,7 @@ impl NumberBinding {
     /// What the field should be showing.
     ///
     /// `None` where the binding names something the document no longer has — a stack
-    /// that shrank under a panel waiting to be rebuilt, or a layer whose op has
+    /// that shrank under a panel waiting to be rebuilt, or a node whose op has
     /// changed to one with no such number.
     pub fn read(
         self,
@@ -151,44 +149,43 @@ impl NumberBinding {
             Self::DialogWidth => dialog.width as f32,
             Self::DialogHeight => dialog.height as f32,
             Self::DialogSeed => dialog.seed as f32,
-            Self::Amplitude(index) => layer(document, index)?.amplitude,
-            Self::MaskConstant(index) => match layer(document, index)?.mask {
-                Mask::Constant(value) => value,
+            Self::ScaleFactor(id) => match op(document, id)? {
+                NodeOp::Scale(factor) => *factor,
                 _ => return None,
             },
-            Self::MaskFromLow(index) => remap(document, index)?.from.0,
-            Self::MaskFromHigh(index) => remap(document, index)?.from.1,
-            Self::MaskToLow(index) => remap(document, index)?.to.0,
-            Self::MaskToHigh(index) => remap(document, index)?.to.1,
-            Self::Constant(index) => match &layer(document, index)?.op {
-                LayerOp::Constant(value) => *value,
+            Self::RemapFromLow(id) => remap(document, id)?.from.0,
+            Self::RemapFromHigh(id) => remap(document, id)?.from.1,
+            Self::RemapToLow(id) => remap(document, id)?.to.0,
+            Self::RemapToHigh(id) => remap(document, id)?.to.1,
+            Self::Constant(id) => match op(document, id)? {
+                NodeOp::Constant(value) => *value,
                 _ => return None,
             },
-            Self::NoiseSeed(index) => noise(document, index)?.seed as f32,
-            Self::NoiseScale(index) => noise(document, index)?.scale,
-            Self::NoiseOctaves(index) => noise(document, index)?.octaves as f32,
-            Self::NoiseStrike(index) => noise(document, index)?.transform.strike_degrees,
-            Self::NoiseAspect(index) => noise(document, index)?.transform.aspect,
-            Self::WarpAmplitude(index) => noise(document, index)?.warp.as_ref()?.amplitude,
-            Self::WarpScale(index) => noise(document, index)?.warp.as_ref()?.scale,
-            Self::WarpOctaves(index) => noise(document, index)?.warp.as_ref()?.octaves as f32,
-            Self::SlopeSampleTiles(index) => match &layer(document, index)?.op {
-                LayerOp::Slope { sample_tiles, .. } => *sample_tiles,
+            Self::NoiseSeed(id) => noise(document, id)?.seed as f32,
+            Self::NoiseScale(id) => noise(document, id)?.scale,
+            Self::NoiseOctaves(id) => noise(document, id)?.octaves as f32,
+            Self::NoiseStrike(id) => noise(document, id)?.transform.strike_degrees,
+            Self::NoiseAspect(id) => noise(document, id)?.transform.aspect,
+            Self::WarpAmplitude(id) => noise(document, id)?.warp.as_ref()?.amplitude,
+            Self::WarpScale(id) => noise(document, id)?.warp.as_ref()?.scale,
+            Self::WarpOctaves(id) => noise(document, id)?.warp.as_ref()?.octaves as f32,
+            Self::SlopeSampleTiles(id) => match op(document, id)? {
+                NodeOp::Slope { sample_tiles, .. } => *sample_tiles,
                 _ => return None,
             },
-            Self::RegionSeed(index) => regions(document, index)?.seed as f32,
-            Self::RegionCellTiles(index) => regions(document, index)?.cell_tiles as f32,
-            Self::RegionBlendTiles(index) => regions(document, index)?.blend_tiles as f32,
-            Self::RegionWeight(index, region) => {
-                regions(document, index)?.regions.get(region)?.weight as f32
+            Self::RegionSeed(id) => regions(document, id)?.seed as f32,
+            Self::RegionCellTiles(id) => regions(document, id)?.cell_tiles as f32,
+            Self::RegionBlendTiles(id) => regions(document, id)?.blend_tiles as f32,
+            Self::RegionWeight(id, region) => {
+                regions(document, id)?.regions.get(region)?.weight as f32
             }
-            Self::RegionValue(index, region, column) => *regions(document, index)?
+            Self::RegionValue(id, region, column) => *regions(document, id)?
                 .regions
                 .get(region)?
                 .values
                 .get(column)?,
-            Self::ShaderParam(index, param, component) => {
-                let LayerOp::Shader(shader) = &layer(document, index)?.op else {
+            Self::ShaderParam(id, param, component) => {
+                let NodeOp::Shader(shader) = op(document, id)? else {
                     return None;
                 };
                 *shader.params.values().nth(param)?.get(component)?
@@ -267,46 +264,44 @@ impl NumberBinding {
             Self::RangeLow => field.range.0 = value,
             Self::RangeHigh => field.range.1 = value,
             _ => {
-                let index = match self.layer_index() {
-                    Some(index) => index,
-                    None => return false,
-                };
-                let Some(layer) = field.layers.get_mut(index) else {
+                let Some(id) = self.node() else {
                     return false;
                 };
-                return self.write_layer(value, layer);
+                let Some(node) = field.graph.node_mut(id) else {
+                    return false;
+                };
+                return self.write_op(value, &mut node.op);
             }
         }
         true
     }
 
-    fn write_layer(self, value: f32, layer: &mut Layer) -> bool {
+    fn write_op(self, value: f32, op: &mut NodeOp) -> bool {
         match self {
-            Self::Amplitude(_) => layer.amplitude = value,
-            Self::MaskConstant(_) => match &mut layer.mask {
-                Mask::Constant(held) => *held = value,
+            Self::ScaleFactor(_) => match op {
+                NodeOp::Scale(held) => *held = value,
                 _ => return false,
             },
-            Self::MaskFromLow(_)
-            | Self::MaskFromHigh(_)
-            | Self::MaskToLow(_)
-            | Self::MaskToHigh(_) => {
-                let Mask::Field(_, remap) = &mut layer.mask else {
+            Self::RemapFromLow(_)
+            | Self::RemapFromHigh(_)
+            | Self::RemapToLow(_)
+            | Self::RemapToHigh(_) => {
+                let NodeOp::Remap(remap) = op else {
                     return false;
                 };
                 match self {
-                    Self::MaskFromLow(_) => remap.from.0 = value,
-                    Self::MaskFromHigh(_) => remap.from.1 = value,
-                    Self::MaskToLow(_) => remap.to.0 = value,
+                    Self::RemapFromLow(_) => remap.from.0 = value,
+                    Self::RemapFromHigh(_) => remap.from.1 = value,
+                    Self::RemapToLow(_) => remap.to.0 = value,
                     _ => remap.to.1 = value,
                 }
             }
-            Self::Constant(_) => match &mut layer.op {
-                LayerOp::Constant(held) => *held = value,
+            Self::Constant(_) => match op {
+                NodeOp::Constant(held) => *held = value,
                 _ => return false,
             },
             Self::ShaderParam(_, param, component) => {
-                let LayerOp::Shader(shader) = &mut layer.op else {
+                let NodeOp::Shader(shader) = op else {
                     return false;
                 };
                 let Some(slot) = shader
@@ -327,7 +322,7 @@ impl NumberBinding {
             | Self::WarpAmplitude(_)
             | Self::WarpScale(_)
             | Self::WarpOctaves(_) => {
-                let LayerOp::Noise(spec) = &mut layer.op else {
+                let NodeOp::Noise(spec) = op else {
                     return false;
                 };
                 match self {
@@ -349,7 +344,7 @@ impl NumberBinding {
                 }
             }
             Self::SlopeSampleTiles(_) => {
-                let LayerOp::Slope { sample_tiles, .. } = &mut layer.op else {
+                let NodeOp::Slope { sample_tiles, .. } = op else {
                     return false;
                 };
                 *sample_tiles = value;
@@ -359,7 +354,7 @@ impl NumberBinding {
             | Self::RegionBlendTiles(_)
             | Self::RegionWeight(..)
             | Self::RegionValue(..) => {
-                let LayerOp::Regions { spec, .. } = &mut layer.op else {
+                let NodeOp::Regions { spec, .. } = op else {
                     return false;
                 };
                 match self {
@@ -391,30 +386,29 @@ impl NumberBinding {
         true
     }
 
-    fn layer_index(self) -> Option<usize> {
+    fn node(self) -> Option<NodeId> {
         match self {
-            Self::Amplitude(index)
-            | Self::MaskConstant(index)
-            | Self::MaskFromLow(index)
-            | Self::MaskFromHigh(index)
-            | Self::MaskToLow(index)
-            | Self::MaskToHigh(index)
-            | Self::Constant(index)
-            | Self::NoiseSeed(index)
-            | Self::NoiseScale(index)
-            | Self::NoiseOctaves(index)
-            | Self::NoiseStrike(index)
-            | Self::NoiseAspect(index)
-            | Self::WarpAmplitude(index)
-            | Self::WarpScale(index)
-            | Self::WarpOctaves(index)
-            | Self::SlopeSampleTiles(index)
-            | Self::RegionSeed(index)
-            | Self::RegionCellTiles(index)
-            | Self::RegionBlendTiles(index)
-            | Self::RegionWeight(index, _)
-            | Self::RegionValue(index, _, _)
-            | Self::ShaderParam(index, _, _) => Some(index),
+            Self::ScaleFactor(id)
+            | Self::RemapFromLow(id)
+            | Self::RemapFromHigh(id)
+            | Self::RemapToLow(id)
+            | Self::RemapToHigh(id)
+            | Self::Constant(id)
+            | Self::NoiseSeed(id)
+            | Self::NoiseScale(id)
+            | Self::NoiseOctaves(id)
+            | Self::NoiseStrike(id)
+            | Self::NoiseAspect(id)
+            | Self::WarpAmplitude(id)
+            | Self::WarpScale(id)
+            | Self::WarpOctaves(id)
+            | Self::SlopeSampleTiles(id)
+            | Self::RegionSeed(id)
+            | Self::RegionCellTiles(id)
+            | Self::RegionBlendTiles(id)
+            | Self::RegionWeight(id, _)
+            | Self::RegionValue(id, _, _)
+            | Self::ShaderParam(id, _, _) => Some(id),
             _ => None,
         }
     }
@@ -424,27 +418,27 @@ fn field(document: &Document) -> Option<&crate::terrain::Field> {
     document.terrain()?.field(document.active())
 }
 
-fn layer(document: &Document, index: usize) -> Option<&Layer> {
-    field(document)?.layers.get(index)
+fn op(document: &Document, id: NodeId) -> Option<&NodeOp> {
+    field(document)?.graph.node(id).map(|node| &node.op)
 }
 
-fn remap(document: &Document, index: usize) -> Option<&crate::terrain::layer::Remap> {
-    match &layer(document, index)?.mask {
-        Mask::Field(_, remap) => Some(remap),
+fn remap(document: &Document, id: NodeId) -> Option<&crate::terrain::graph::Remap> {
+    match op(document, id)? {
+        NodeOp::Remap(remap) => Some(remap),
         _ => None,
     }
 }
 
-fn noise(document: &Document, index: usize) -> Option<&crate::terrain::noise::NoiseSpec> {
-    match &layer(document, index)?.op {
-        LayerOp::Noise(spec) => Some(spec),
+fn noise(document: &Document, id: NodeId) -> Option<&crate::terrain::noise::NoiseSpec> {
+    match op(document, id)? {
+        NodeOp::Noise(spec) => Some(spec),
         _ => None,
     }
 }
 
-fn regions(document: &Document, index: usize) -> Option<&crate::terrain::regions::RegionSpec> {
-    match &layer(document, index)?.op {
-        LayerOp::Regions { spec, .. } => Some(spec),
+fn regions(document: &Document, id: NodeId) -> Option<&crate::terrain::regions::RegionSpec> {
+    match op(document, id)? {
+        NodeOp::Regions { spec, .. } => Some(spec),
         _ => None,
     }
 }

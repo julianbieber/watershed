@@ -16,18 +16,23 @@ new 256 256 7 continents
 wait bake
 zoom fit
 
-# The brush paints into the topmost enabled paint layer of the field on screen, so there has
-# to be one before there is anywhere for a stroke to go. Adding it changes nothing on its
-# own: a paint layer starts with an empty raster, and an empty raster reads as zero
-# everywhere, so the field below is the preset's untouched.
-layer add height paint
-observe layers
+# The brush paints into the one paint node of the field on screen, so there has to be one
+# before there is anywhere for a stroke to go — and exactly one, since nothing about a
+# graph makes one of two the obvious target. Adding it alone changes nothing twice over: a
+# paint node starts with an empty raster, and a node the output cannot reach is evaluated
+# never. Wiring it onto the output is what makes a stroke visible.
+node add height paint
+node add height binary add
+node connect height n3 n5 0
+node connect height n4 n5 1
+node output height n5
+observe nodes
 observe brush
 
 brush mode add radius 10 falloff 0.4 strength 0.9 value 1
 observe brush
 
-# The baseline, taken after the layer is added rather than before it: adding a layer is a
+# The baseline, taken after the node is wired rather than before it: wiring a node is a
 # structural edit, and an edit invalidates the water it was solved against. Solving first
 # would only mean solving twice.
 solve-water
@@ -63,7 +68,7 @@ solve-water
 observe water
 capture /tmp/watershed-scenario/cut-ridge.png
 
-# Moisture has no paint layer, so `observe brush` has to report no target at all. Inventing
+# Moisture has no paint node, so `observe brush` has to report no target at all. Inventing
 # one would put a layer in the document that nobody asked for, and would do it on the first
 # frame of a drag that was aimed at the wrong field.
 field moisture

@@ -1,15 +1,15 @@
-//! The layer panel: the field's own properties, the brush, and one entry per layer of
-//! the stack.
+//! The panel beside the map: the field's own properties, the brush, and the node the
+//! canvas has selected.
 //!
 //! Everything here follows from one rule. **A choice is shape and a number is a
-//! value**: choosing a blend mode or an op changes which widgets exist, so the panel
+//! value**: choosing an op or a mode changes which widgets exist, so the panel
 //! is thrown away and rebuilt; typing a number changes only what a widget holds, so
 //! the panel stands and the value is pushed into it. Getting a number into the shape
 //! would rebuild the panel under the keyboard on the frame it was typed into, and
 //! leaving a choice out of it would leave a menu showing what it used to say over a
 //! document that had already changed.
 
-use crate::terrain::layer::{Layer, LayerOp, Mask, Remap, SlopeMode};
+use crate::terrain::graph::{Remap, SlopeMode};
 use crate::terrain::noise::{NoiseKind, NoiseSpec};
 use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
 use bevy::feathers::containers::{group, group_body, group_header};
@@ -25,12 +25,14 @@ use watershed::raster::Raster;
 use watershed::{FieldId, FieldRole};
 
 use crate::brush::{BrushSettings, target_of};
+use crate::canvas::Selection;
 use crate::document::{Baked, Document};
 use crate::edit::{
-    BLENDS, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, blend_name, brush_mode_name,
+    BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, binary_name, brush_mode_name,
     noise_kind_name, op_name, op_summary, parse_region_output, region_output_name, slope_mode_name,
 };
 use crate::gpu::{STOCK, ShaderLibrary};
+use crate::terrain::graph::{Binary, Curve, GraphNode, NodeId, NodeOp};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{ADDABLE, AddLayer, Expanded, PANEL_WIDTH, report};
@@ -91,11 +93,12 @@ pub fn rebuild(
     expanded: Res<Expanded>,
     add: Res<AddLayer>,
     library: Res<ShaderLibrary>,
+    selection: Res<Selection>,
     mut shape: ResMut<Shape>,
     body: Single<Entity, With<StackBody>>,
     mut commands: Commands,
 ) {
-    let key = fingerprint(&document, &brush, &expanded, &add, &library);
+    let key = fingerprint(&document, &brush, &expanded, &add, &library, &selection);
     if shape.key == key {
         return;
     }
@@ -103,10 +106,11 @@ pub fn rebuild(
     shape.generation += 1;
     let generation = shape.generation;
 
-    let entries: Vec<Box<dyn SceneList>> = contents(&document, &brush, &expanded, &add, &library)
-        .into_iter()
-        .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
-        .collect();
+    let entries: Vec<Box<dyn SceneList>> =
+        contents(&document, &brush, &expanded, &add, &library, &selection)
+            .into_iter()
+            .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
+            .collect();
 
     commands
         .entity(*body)
@@ -160,9 +164,16 @@ fn fingerprint(
     expanded: &Expanded,
     add: &AddLayer,
     library: &ShaderLibrary,
+    selection: &Selection,
 ) -> String {
     let mut key = String::new();
     key.push_str(document.active());
+    key.push('|');
+    key.push_str(
+        &selection
+            .node
+            .map_or_else(|| "none".to_owned(), |node| node.to_string()),
+    );
     key.push('|');
     key.push_str(&document.field_names().join(","));
     key.push('|');
@@ -188,25 +199,32 @@ fn fingerprint(
         return key + "empty";
     };
     key.push_str(field.role.as_str());
-    for (index, layer) in field.layers.iter().enumerate() {
+    key.push_str(&format!(
+        "|out:{}",
+        field
+            .graph
+            .output
+            .map_or_else(|| "none".to_owned(), |id| id.to_string())
+    ));
+    for node in &field.graph.nodes {
         key.push_str(&format!(
-            "|{index}:{}:{}:{}:{}:{}",
-            op_name(&layer.op),
-            blend_name(layer.blend),
-            layer.enabled,
-            mask_kind(&layer.mask),
-            expanded.has(index),
+            "|{}:{}:{}:{}:{:?}",
+            node.id,
+            op_name(&node.op),
+            node.bypassed,
+            expanded.has(node.id),
+            node.inputs,
         ));
-        match &layer.op {
-            LayerOp::Noise(spec) => {
+        match &node.op {
+            NodeOp::Noise(spec) => {
                 key.push_str(noise_kind_name(spec.kind));
                 key.push_str(if spec.warp.is_some() { ":warp" } else { "" });
             }
-            LayerOp::Slope { of, mode, .. } => {
-                key.push_str(&format!("{of}:{}", slope_mode_name(*mode)));
-            }
-            LayerOp::FieldRef(id) => key.push_str(id.as_ref()),
-            LayerOp::Shader(shader) => {
+            NodeOp::Slope { mode, .. } => key.push_str(slope_mode_name(*mode)),
+            NodeOp::FieldRef(id) => key.push_str(id.as_ref()),
+            NodeOp::Binary(binary) => key.push_str(binary_name(*binary)),
+            NodeOp::Curve(curve) => key.push_str(&format!("{}", curve.points.len())),
+            NodeOp::Shader(shader) => {
                 key.push_str(&shader.file);
                 match library.entry(&shader.file) {
                     Some(entry) => {
@@ -225,26 +243,15 @@ fn fingerprint(
                     None => key.push_str(":missing"),
                 }
             }
-            LayerOp::Regions { spec, output } => {
+            NodeOp::Regions { spec, output } => {
                 key.push_str(&region_output_name(output));
                 key.push_str(&spec.columns.join(","));
                 key.push_str(&format!(":{}", spec.regions.len()));
             }
             _ => {}
         }
-        if let Mask::Field(id, _) = &layer.mask {
-            key.push_str(&format!(":mask{id}"));
-        }
     }
     key
-}
-
-fn mask_kind(mask: &Mask) -> &'static str {
-    match mask {
-        Mask::Constant(_) => "constant",
-        Mask::Painted(_) => "painted",
-        Mask::Field(..) => "field",
-    }
 }
 
 fn contents(
@@ -253,12 +260,16 @@ fn contents(
     expanded: &Expanded,
     add: &AddLayer,
     library: &ShaderLibrary,
+    selection: &Selection,
 ) -> Vec<Box<dyn Scene>> {
     let active = document.active().to_owned();
     let names = document.field_names();
     let Some(field) = field_of(document) else {
         return vec![widgets::boxed(widgets::text("no document"))];
     };
+    let selected = selection
+        .node
+        .filter(|node| field.graph.node(*node).is_some());
 
     let mut children: Vec<Box<dyn Scene>> = vec![
         widgets::boxed(widgets::row(vec![
@@ -266,19 +277,31 @@ fn contents(
             one(bsn! { widgets::small("") PreviewTag }),
         ])),
         widgets::boxed(brush_section(document, brush, expanded)),
-        widgets::boxed(properties(&active, field, shift_is_pinned(document))),
     ];
 
-    for (index, layer) in field.layers.iter().enumerate() {
-        children.push(widgets::boxed(layer_entry(
+    // The field's own properties belong with the node its value is read from: that is
+    // where a person looks for what the field is, and with nothing selected there is
+    // nothing else the panel could be about.
+    if selected.is_none_or(|node| field.graph.output == Some(node)) {
+        children.push(widgets::boxed(properties(
             &active,
-            index,
-            field.layers.len(),
-            layer,
-            &names,
-            expanded.has(index),
-            library,
+            field,
+            shift_is_pinned(document),
         )));
+    }
+
+    match selected.and_then(|node| field.graph.node(node)) {
+        Some(node) => children.push(widgets::boxed(node_entry(
+            &active,
+            node,
+            field.graph.output == Some(node.id),
+            &names,
+            expanded.has(node.id),
+            library,
+        ))),
+        None => children.push(widgets::boxed(widgets::small(
+            "select a node on the canvas",
+        ))),
     }
 
     children.push(widgets::boxed(add_row(&active, &names, add)));
@@ -370,14 +393,15 @@ fn brush_section(document: &Document, brush: &BrushSettings, expanded: &Expanded
             body.push(one(widgets::small(format!("{active} has no paint layer"))));
             body.push(one(bsn! {
                 @FeathersButton {
-                    @caption: bsn! { Text("Add paint layer") ThemedText },
+                    @caption: bsn! { Text("Add paint node") ThemedText },
                 }
                 on(move |_: On<Activate>, mut document: ResMut<Document>| {
                     let active = document.active().to_owned();
                     let result = document
-                        .apply(&Edit::Add {
+                        .apply(&Edit::AddNode {
                             field: active,
-                            op: LayerOp::Paint(Raster::default()),
+                            op: NodeOp::Paint(Raster::default()),
+                            position: None,
                         })
                         .map(|_| ());
                     report(&mut document, result);
@@ -391,63 +415,70 @@ fn brush_section(document: &Document, brush: &BrushSettings, expanded: &Expanded
     })
 }
 
-fn layer_entry(
+fn node_entry(
     active: &str,
-    index: usize,
-    count: usize,
-    layer: &Layer,
+    node: &GraphNode,
+    is_output: bool,
     names: &[String],
     open: bool,
     library: &ShaderLibrary,
 ) -> impl Scene {
     let active = active.to_owned();
-    let title = format!("{index}  {}", op_name(&layer.op));
+    let id = node.id;
+    let title = match &node.name {
+        Some(name) => format!("{id}  {name}"),
+        None => format!("{id}  {}", op_name(&node.op)),
+    };
 
     let header = widgets::row(vec![
-        one(enabled_checkbox(&active, index, layer.enabled)),
-        one(move_button(&active, index, index.checked_sub(1), "^")),
-        one(move_button(
-            &active,
-            index,
-            (index + 1 < count).then_some(index + 1),
-            "v",
-        )),
-        one(remove_button(&active, index)),
+        one(bypass_checkbox(&active, id, node.bypassed)),
+        one(output_button(&active, id, is_output)),
+        one(remove_button(&active, id)),
         one(widgets::text(title)),
     ]);
 
-    let body: Vec<Box<dyn SceneList>> = vec![
-        one(blend_row(&active, index, layer)),
-        one(widgets::number_row(
-            "amplitude",
-            NumberBinding::Amplitude(index),
-        )),
-        one(mask_editor(index, &layer.mask, names)),
-        one(op_editor(index, &layer.op, names, library)),
-    ];
+    let mut body: Vec<Box<dyn SceneList>> = Vec::new();
+    if !node.inputs.is_empty() {
+        body.push(one(widgets::small(inputs_caption(node))));
+    }
+    body.push(one(op_editor(id, &node.op, names, library)));
 
     widgets::column(vec![
         one(header),
         one(section(
-            op_summary(&layer.op),
+            op_summary(&node.op),
             open,
             body,
-            move |open, expanded: &mut Expanded| expanded.set(index, open),
+            move |open, expanded: &mut Expanded| expanded.set(id, open),
         )),
     ])
 }
 
-fn enabled_checkbox(active: &str, index: usize, enabled: bool) -> impl Scene {
+/// What is wired into a node, as one line. Read-only: an edge is drawn on the canvas
+/// or written by a control verb, not picked from a menu here.
+fn inputs_caption(node: &GraphNode) -> String {
+    let pins: Vec<String> = node
+        .inputs
+        .iter()
+        .map(|pin| match pin {
+            Some(source) => source.to_string(),
+            None => "-".to_owned(),
+        })
+        .collect();
+    format!("inputs {}", pins.join(" "))
+}
+
+fn bypass_checkbox(active: &str, id: NodeId, bypassed: bool) -> impl Scene {
     let active = active.to_owned();
     bsn! {
-        {widgets::when(enabled, Checked)}
+        {widgets::when(!bypassed, Checked)}
         @FeathersCheckbox
         on(move |change: On<ValueChange<bool>>, mut document: ResMut<Document>| {
             let result = document
-                .apply(&Edit::Toggle {
+                .apply(&Edit::Bypass {
                     field: active.clone(),
-                    index,
-                    enabled: Some(change.value),
+                    node: id.to_string(),
+                    bypassed: Some(!change.value),
                 })
                 .map(|_| ());
             report(&mut document, result);
@@ -455,23 +486,19 @@ fn enabled_checkbox(active: &str, index: usize, enabled: bool) -> impl Scene {
     }
 }
 
-fn move_button(active: &str, index: usize, to: Option<usize>, caption: &'static str) -> impl Scene {
+fn output_button(active: &str, id: NodeId, is_output: bool) -> impl Scene {
     let active = active.to_owned();
     bsn! {
         @FeathersToolButton {
-            @caption: bsn! { Text(caption) ThemedText },
+            @caption: bsn! { Text("=") ThemedText },
             @variant: ButtonVariant::Plain,
         }
-        {widgets::when(to.is_none(), InteractionDisabled)}
+        {widgets::when(is_output, InteractionDisabled)}
         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-            let Some(to) = to else {
-                return;
-            };
             let result = document
-                .apply(&Edit::Move {
+                .apply(&Edit::SetOutput {
                     field: active.clone(),
-                    index,
-                    to,
+                    node: Some(id.to_string()),
                 })
                 .map(|_| ());
             report(&mut document, result);
@@ -479,7 +506,7 @@ fn move_button(active: &str, index: usize, to: Option<usize>, caption: &'static 
     }
 }
 
-fn remove_button(active: &str, index: usize) -> impl Scene {
+fn remove_button(active: &str, id: NodeId) -> impl Scene {
     let active = active.to_owned();
     bsn! {
         @FeathersToolButton {
@@ -488,9 +515,9 @@ fn remove_button(active: &str, index: usize) -> impl Scene {
         }
         on(move |_: On<Activate>, mut document: ResMut<Document>| {
             let result = document
-                .apply(&Edit::Remove {
+                .apply(&Edit::RemoveNode {
                     field: active.clone(),
-                    index,
+                    node: id.to_string(),
                 })
                 .map(|_| ());
             report(&mut document, result);
@@ -498,131 +525,26 @@ fn remove_button(active: &str, index: usize) -> impl Scene {
     }
 }
 
-fn blend_row(active: &str, index: usize, layer: &Layer) -> impl Scene {
-    let active = active.to_owned();
-    let items: Vec<Box<dyn SceneList>> = BLENDS
-        .into_iter()
-        .map(|blend| {
-            let active = active.clone();
-            one(bsn! {
-                widgets::item_caption(blend_name(blend))
-                on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document
-                        .apply(&Edit::Set {
-                            path: format!("{active}.{index}.blend"),
-                            words: vec![blend_name(blend).to_owned()],
-                        })
-                        .map(|_| ());
-                    report(&mut document, result);
-                })
-            })
-        })
-        .collect();
-
-    widgets::captioned("blend", one(widgets::menu(blend_name(layer.blend), items)))
-}
-
-fn mask_editor(index: usize, mask: &Mask, names: &[String]) -> impl Scene {
-    let current = mask_kind(mask);
-    let first = first_field(names);
-
-    let items: Vec<Box<dyn SceneList>> = ["constant", "field"]
-        .into_iter()
-        .map(|kind| {
-            let first = first.clone();
-            one(bsn! {
-                widgets::item_caption(kind)
-                on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                    let replacement = if kind == "constant" {
-                        Mask::Constant(1.0)
-                    } else {
-                        Mask::Field(first.clone(), Remap::IDENTITY)
-                    };
-                    let changed = with_layer(&mut document, index, |layer| {
-                        if mask_kind(&layer.mask) == kind {
-                            return false;
-                        }
-                        layer.mask = replacement;
-                        true
-                    });
-                    if changed == Some(true) {
-                        document.note_edit();
-                    }
-                })
-            })
-        })
-        .collect();
-
-    let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::captioned(
-        "mask",
-        one(widgets::menu(current, items)),
-    ))];
-    match mask {
-        Mask::Constant(_) => {
-            rows.push(one(widgets::number_row(
-                "value",
-                NumberBinding::MaskConstant(index),
-            )));
-        }
-        Mask::Painted(raster) => {
-            rows.push(one(widgets::small(format!(
-                "{}x{} painted",
-                raster.width(),
-                raster.height()
-            ))));
-        }
-        Mask::Field(id, _) => {
-            rows.push(one(widgets::captioned(
-                "of",
-                one(field_menu(id, names, move |document, chosen| {
-                    with_layer(document, index, |layer| {
-                        let Mask::Field(id, _) = &mut layer.mask else {
-                            return false;
-                        };
-                        *id = chosen;
-                        true
-                    })
-                })),
-            )));
-            rows.push(one(widgets::captioned(
-                "from",
-                one(widgets::row(vec![
-                    one(widgets::number(NumberBinding::MaskFromLow(index))),
-                    one(widgets::number(NumberBinding::MaskFromHigh(index))),
-                ])),
-            )));
-            rows.push(one(widgets::captioned(
-                "to",
-                one(widgets::row(vec![
-                    one(widgets::number(NumberBinding::MaskToLow(index))),
-                    one(widgets::number(NumberBinding::MaskToHigh(index))),
-                ])),
-            )));
-        }
-    }
-    widgets::column(rows)
-}
-
-fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibrary) -> impl Scene {
+fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary) -> impl Scene {
     let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::small(op_name(op)))];
 
     match op {
-        LayerOp::Constant(_) => {
+        NodeOp::Constant(_) => {
             rows.push(one(widgets::number_row(
                 "value",
-                NumberBinding::Constant(index),
+                NumberBinding::Constant(id),
             )));
         }
 
-        LayerOp::Noise(spec) => {
+        NodeOp::Noise(spec) => {
             let kind_items: Vec<Box<dyn SceneList>> = NOISE_KINDS
                 .into_iter()
                 .map(|kind| {
                     one(bsn! {
                         widgets::item_caption(noise_kind_name(kind))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            let changed = with_layer(&mut document, index, |layer| {
-                                let LayerOp::Noise(spec) = &mut layer.op else {
+                            let changed = with_op(&mut document, id, |op| {
+                                let NodeOp::Noise(spec) = op else {
                                     return false;
                                 };
                                 spec.kind = kind;
@@ -642,52 +564,40 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
             )));
             rows.push(one(widgets::number_row(
                 "seed",
-                NumberBinding::NoiseSeed(index),
+                NumberBinding::NoiseSeed(id),
             )));
             rows.push(one(widgets::number_row(
                 "scale",
-                NumberBinding::NoiseScale(index),
+                NumberBinding::NoiseScale(id),
             )));
             rows.push(one(widgets::number_row(
                 "octaves",
-                NumberBinding::NoiseOctaves(index),
+                NumberBinding::NoiseOctaves(id),
             )));
             rows.push(one(widgets::number_row(
                 "strike",
-                NumberBinding::NoiseStrike(index),
+                NumberBinding::NoiseStrike(id),
             )));
             rows.push(one(widgets::number_row(
                 "aspect",
-                NumberBinding::NoiseAspect(index),
+                NumberBinding::NoiseAspect(id),
             )));
             if spec.warp.is_some() {
                 rows.push(one(widgets::captioned(
                     "warp",
                     one(widgets::row(vec![
-                        one(widgets::number(NumberBinding::WarpAmplitude(index))),
-                        one(widgets::number(NumberBinding::WarpScale(index))),
-                        one(widgets::number(NumberBinding::WarpOctaves(index))),
+                        one(widgets::number(NumberBinding::WarpAmplitude(id))),
+                        one(widgets::number(NumberBinding::WarpScale(id))),
+                        one(widgets::number(NumberBinding::WarpOctaves(id))),
                     ])),
                 )));
             }
         }
 
-        LayerOp::Slope { of, mode, .. } => {
-            rows.push(one(widgets::captioned(
-                "of",
-                one(field_menu(of, names, move |document, chosen| {
-                    with_layer(document, index, |layer| {
-                        let LayerOp::Slope { of, .. } = &mut layer.op else {
-                            return false;
-                        };
-                        *of = chosen;
-                        true
-                    })
-                })),
-            )));
+        NodeOp::Slope { mode, .. } => {
             rows.push(one(widgets::number_row(
                 "sample tiles",
-                NumberBinding::SlopeSampleTiles(index),
+                NumberBinding::SlopeSampleTiles(id),
             )));
 
             let mode_items: Vec<Box<dyn SceneList>> = SLOPE_MODES
@@ -696,8 +606,8 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
                     one(bsn! {
                         widgets::item_caption(slope_mode_name(candidate))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            let changed = with_layer(&mut document, index, |layer| {
-                                let LayerOp::Slope { mode, .. } = &mut layer.op else {
+                            let changed = with_op(&mut document, id, |op| {
+                                let NodeOp::Slope { mode, .. } = op else {
                                     return false;
                                 };
                                 *mode = candidate;
@@ -716,22 +626,22 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
             )));
         }
 
-        LayerOp::FieldRef(id) => {
+        NodeOp::FieldRef(read) => {
             rows.push(one(widgets::captioned(
                 "of",
-                one(field_menu(id, names, move |document, chosen| {
-                    with_layer(document, index, |layer| {
-                        let LayerOp::FieldRef(id) = &mut layer.op else {
+                one(field_menu(read, names, move |document, chosen| {
+                    with_op(document, id, |op| {
+                        let NodeOp::FieldRef(held) = op else {
                             return false;
                         };
-                        *id = chosen;
+                        *held = chosen;
                         true
                     })
                 })),
             )));
         }
 
-        LayerOp::Regions { spec, output } => {
+        NodeOp::Regions { spec, output } => {
             let current = region_output_name(output);
             let output_items: Vec<Box<dyn SceneList>> = spec
                 .columns
@@ -744,8 +654,8 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
                         widgets::item_caption(name)
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
                             let picked = parse_region_output(&chosen);
-                            let changed = with_layer(&mut document, index, |layer| {
-                                let LayerOp::Regions { output, .. } = &mut layer.op else {
+                            let changed = with_op(&mut document, id, |op| {
+                                let NodeOp::Regions { output, .. } = op else {
                                     return false;
                                 };
                                 *output = picked;
@@ -765,15 +675,15 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
             )));
             rows.push(one(widgets::number_row(
                 "seed",
-                NumberBinding::RegionSeed(index),
+                NumberBinding::RegionSeed(id),
             )));
             rows.push(one(widgets::number_row(
                 "cell tiles",
-                NumberBinding::RegionCellTiles(index),
+                NumberBinding::RegionCellTiles(id),
             )));
             rows.push(one(widgets::number_row(
                 "blend tiles",
-                NumberBinding::RegionBlendTiles(index),
+                NumberBinding::RegionBlendTiles(id),
             )));
 
             let mut heading: Vec<Box<dyn SceneList>> = vec![one(widgets::small("weight"))];
@@ -784,18 +694,78 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
 
             for (region, values) in spec.regions.iter().enumerate() {
                 let mut cells: Vec<Box<dyn SceneList>> = vec![one(widgets::number(
-                    NumberBinding::RegionWeight(index, region),
+                    NumberBinding::RegionWeight(id, region),
                 ))];
                 for column in 0..values.values.len() {
                     cells.push(one(widgets::number(NumberBinding::RegionValue(
-                        index, region, column,
+                        id, region, column,
                     ))));
                 }
                 rows.push(one(widgets::row(cells)));
             }
         }
 
-        LayerOp::Paint(raster) => {
+        NodeOp::Binary(binary) => {
+            let items: Vec<Box<dyn SceneList>> = BINARIES
+                .into_iter()
+                .map(|candidate| {
+                    one(bsn! {
+                        widgets::item_caption(binary_name(candidate))
+                        on(move |_: On<Activate>, mut document: ResMut<Document>| {
+                            let changed = with_op(&mut document, id, |op| {
+                                let NodeOp::Binary(held) = op else {
+                                    return false;
+                                };
+                                *held = candidate;
+                                true
+                            });
+                            if changed == Some(true) {
+                                document.note_edit();
+                            }
+                        })
+                    })
+                })
+                .collect();
+            rows.push(one(widgets::captioned(
+                "mode",
+                one(widgets::menu(binary_name(*binary), items)),
+            )));
+        }
+
+        NodeOp::Lerp => {}
+
+        NodeOp::Scale(_) => {
+            rows.push(one(widgets::number_row(
+                "factor",
+                NumberBinding::ScaleFactor(id),
+            )));
+        }
+
+        NodeOp::Remap(_) => {
+            rows.push(one(widgets::captioned(
+                "from",
+                one(widgets::row(vec![
+                    one(widgets::number(NumberBinding::RemapFromLow(id))),
+                    one(widgets::number(NumberBinding::RemapFromHigh(id))),
+                ])),
+            )));
+            rows.push(one(widgets::captioned(
+                "to",
+                one(widgets::row(vec![
+                    one(widgets::number(NumberBinding::RemapToLow(id))),
+                    one(widgets::number(NumberBinding::RemapToHigh(id))),
+                ])),
+            )));
+        }
+
+        NodeOp::Curve(curve) => {
+            rows.push(one(widgets::small(format!(
+                "{} points",
+                curve.points.len()
+            ))));
+        }
+
+        NodeOp::Paint(raster) => {
             rows.push(one(widgets::small(if raster.is_empty() {
                 "unpainted".to_owned()
             } else {
@@ -803,7 +773,7 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
             })));
         }
 
-        LayerOp::External(raster) => {
+        NodeOp::External(raster) => {
             rows.push(one(widgets::small(format!(
                 "{}x{} raster",
                 raster.width(),
@@ -811,7 +781,7 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
             ))));
         }
 
-        LayerOp::Shader(shader) => {
+        NodeOp::Shader(shader) => {
             rows.push(one(widgets::small(shader.file.clone())));
             match library.entry(&shader.file) {
                 None => rows.push(one(widgets::small("no such shader in this document"))),
@@ -819,7 +789,7 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
                     if let Some(error) = &entry.error {
                         rows.push(one(widgets::small(error.clone())));
                     }
-                    rows.extend(param_rows(index, shader, &entry.layout));
+                    rows.extend(param_rows(id, shader, &entry.layout));
                 }
             }
         }
@@ -834,11 +804,7 @@ fn op_editor(index: usize, op: &LayerOp, names: &[String], library: &ShaderLibra
 /// A parameter is addressed by its position in the layer's own key order rather than
 /// by name, which is what lets a binding stay `Copy`; the two orders are put back
 /// together here, where the layout is in hand.
-fn param_rows(
-    index: usize,
-    shader: &ShaderLayer,
-    layout: &ParamsLayout,
-) -> Vec<Box<dyn SceneList>> {
+fn param_rows(id: NodeId, shader: &ShaderLayer, layout: &ParamsLayout) -> Vec<Box<dyn SceneList>> {
     let mut rows: Vec<Box<dyn SceneList>> = Vec::new();
     let mut group = String::new();
     for field in &layout.fields {
@@ -863,7 +829,7 @@ fn param_rows(
             };
             rows.push(one(widgets::number_row(
                 caption,
-                NumberBinding::ShaderParam(index, param, component),
+                NumberBinding::ShaderParam(id, param, component),
             )));
         }
     }
@@ -890,12 +856,12 @@ fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
         one(widgets::menu(add.0.clone(), items)),
         one(bsn! {
             @FeathersButton {
-                @caption: bsn! { Text("Add layer") ThemedText },
+                @caption: bsn! { Text("Add node") ThemedText },
             }
             on(move |_: On<Activate>, mut document: ResMut<Document>, mut library: ResMut<ShaderLibrary>| {
                 let op = match stock_of(&chosen) {
                     Some(stock) => match library.adopt(stock) {
-                        Ok(file) => LayerOp::Shader(ShaderLayer::new(file)),
+                        Ok(file) => NodeOp::Shader(ShaderLayer::new(file)),
                         Err(error) => {
                             report(&mut document, Err(error));
                             return;
@@ -904,9 +870,10 @@ fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
                     None => default_op(&chosen, &names),
                 };
                 let result = document
-                    .apply(&Edit::Add {
+                    .apply(&Edit::AddNode {
                         field: active.clone(),
                         op,
+                        position: None,
                     })
                     .map(|_| ());
                 report(&mut document, result);
@@ -985,15 +952,15 @@ fn field_menu(
     widgets::menu(current, items)
 }
 
-fn with_layer<R>(
+fn with_op<R>(
     document: &mut Document,
-    index: usize,
-    write: impl FnOnce(&mut Layer) -> R,
+    id: NodeId,
+    write: impl FnOnce(&mut NodeOp) -> R,
 ) -> Option<R> {
     let active = document.active().to_owned();
     let terrain = document.terrain_mut()?;
     let field = terrain.field_mut(&active)?;
-    field.layers.get_mut(index).map(write)
+    field.graph.node_mut(id).map(|node| write(&mut node.op))
 }
 
 /// The stock shader a `shader:` entry of [`ADDABLE`] names, or `None` for an entry
@@ -1011,17 +978,21 @@ fn stock_of(chosen: &str) -> Option<&'static str> {
         .map(|(stock, _)| *stock)
 }
 
-fn default_op(kind: &str, names: &[String]) -> LayerOp {
+fn default_op(kind: &str, names: &[String]) -> NodeOp {
     match kind {
-        "constant" => LayerOp::Constant(0.5),
-        "fieldref" => LayerOp::FieldRef(first_field(names)),
-        "slope" => LayerOp::Slope {
-            of: first_field(names),
+        "constant" => NodeOp::Constant(0.5),
+        "fieldref" => NodeOp::FieldRef(first_field(names)),
+        "slope" => NodeOp::Slope {
             sample_tiles: 4.0,
             mode: SlopeMode::default(),
         },
-        "paint" => LayerOp::Paint(Raster::default()),
-        _ => LayerOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
+        "paint" => NodeOp::Paint(Raster::default()),
+        "binary" => NodeOp::Binary(Binary::default()),
+        "lerp" => NodeOp::Lerp,
+        "scale" => NodeOp::Scale(1.0),
+        "remap" => NodeOp::Remap(Remap::IDENTITY),
+        "curve" => NodeOp::Curve(Curve::default()),
+        _ => NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
     }
 }
 
@@ -1036,17 +1007,29 @@ fn first_field(names: &[String]) -> FieldId {
 mod tests {
     use super::*;
     use crate::terrain::TerrainSpec;
-    use crate::terrain::layer::Blend;
+    use crate::terrain::graph::Binary;
 
-    fn document_with(ops: Vec<LayerOp>) -> Document {
+    fn document_with(ops: Vec<NodeOp>) -> Document {
         let mut document = Document::default();
         let field = ops
             .into_iter()
             .fold(crate::terrain::Field::new("height"), |field, op| {
-                field.with_layer(Layer::new(op))
+                field.with_op(op)
             });
         document.adopt(TerrainSpec::new(UVec2::splat(64)).with_field(field));
         document
+    }
+
+    fn selecting(document: &Document) -> Selection {
+        let mut selection = Selection::default();
+        selection.select(
+            document
+                .terrain()
+                .and_then(|terrain| terrain.field("height"))
+                .and_then(|field| field.graph.nodes.first())
+                .map(|node| node.id),
+        );
+        selection
     }
 
     fn key(document: &Document) -> String {
@@ -1056,6 +1039,7 @@ mod tests {
             &Expanded::default(),
             &AddLayer::default(),
             &ShaderLibrary::default(),
+            &selecting(document),
         )
     }
 
@@ -1064,45 +1048,42 @@ mod tests {
     // used to be on, with the document already changed underneath it.
     #[test]
     fn a_choice_changes_the_shape_the_panel_is_built_from() {
-        let mut document = document_with(vec![LayerOp::Constant(0.5)]);
+        let mut document = document_with(vec![NodeOp::Constant(0.5)]);
         let before = key(&document);
 
-        document
-            .terrain_mut()
-            .unwrap()
-            .field_mut("height")
-            .unwrap()
-            .layers[0]
-            .blend = Blend::Mul;
-        assert_ne!(key(&document), before, "a blend is a choice");
+        let node = {
+            let field = document.terrain_mut().unwrap().field_mut("height").unwrap();
+            let node = field.graph.nodes[0].id;
+            field.graph.node_mut(node).unwrap().op = NodeOp::Binary(Binary::Mul);
+            node
+        };
+        assert_ne!(key(&document), before, "the op a node carries is a choice");
 
         document
             .terrain_mut()
             .unwrap()
             .field_mut("height")
             .unwrap()
-            .layers[0]
-            .enabled = false;
-        assert_ne!(key(&document), before, "so is being switched off");
+            .graph
+            .set_bypassed(node, true)
+            .unwrap();
+        assert_ne!(key(&document), before, "so is being bypassed");
     }
 
     // And from the other side: a number in the shape would rebuild the panel on the
     // frame it was typed into, which throws away the field the keyboard is in.
     #[test]
     fn a_number_does_not_change_the_shape() {
-        let mut document = document_with(vec![LayerOp::Noise(NoiseSpec::new(
-            1,
-            NoiseKind::Fbm,
-            0.02,
-        ))]);
+        let mut document =
+            document_with(vec![NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02))]);
         let before = key(&document);
 
         {
             let field = document.terrain_mut().unwrap().field_mut("height").unwrap();
-            field.layers[0].amplitude = 0.25;
             field.range = (-1.0, 2.0);
-            let LayerOp::Noise(spec) = &mut field.layers[0].op else {
-                panic!("the layer stopped being noise");
+            let node = field.graph.nodes[0].id;
+            let NodeOp::Noise(spec) = &mut field.graph.node_mut(node).unwrap().op else {
+                panic!("the node stopped being noise");
             };
             spec.seed = 99;
             spec.scale = 0.5;
@@ -1110,12 +1091,12 @@ mod tests {
         assert_eq!(key(&document), before);
     }
 
-    // A layer added or taken away changes how many widgets there are, which is the one
+    // A node added or taken away changes how many widgets there are, which is the one
     // thing a standing panel cannot absorb.
     #[test]
-    fn the_number_of_layers_is_part_of_the_shape() {
-        let one = document_with(vec![LayerOp::Constant(0.5)]);
-        let two = document_with(vec![LayerOp::Constant(0.5), LayerOp::Constant(0.25)]);
+    fn the_number_of_nodes_is_part_of_the_shape() {
+        let one = document_with(vec![NodeOp::Constant(0.5)]);
+        let two = document_with(vec![NodeOp::Constant(0.5), NodeOp::Constant(0.25)]);
         assert_ne!(key(&one), key(&two));
     }
 
@@ -1125,7 +1106,7 @@ mod tests {
     // arrived coarse some other way can still be repaired from the panel.
     #[test]
     fn whether_the_shift_is_pinned_is_part_of_the_shape() {
-        let mut document = document_with(vec![LayerOp::Constant(0.5)]);
+        let mut document = document_with(vec![NodeOp::Constant(0.5)]);
         document
             .terrain_mut()
             .unwrap()
@@ -1152,18 +1133,46 @@ mod tests {
     // shape rather than decoration.
     #[test]
     fn opening_a_section_changes_the_shape() {
-        let document = document_with(vec![LayerOp::Constant(0.5)]);
+        let document = document_with(vec![NodeOp::Constant(0.5)]);
+        let opened = document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes[0]
+            .id;
         let shut = key(&document);
         let open = fingerprint(
             &document,
             &BrushSettings::default(),
             &Expanded {
                 brush: false,
-                layers: vec![0],
+                nodes: vec![opened],
             },
             &AddLayer::default(),
             &ShaderLibrary::default(),
+            &selecting(&document),
         );
         assert_ne!(shut, open);
+    }
+
+    // The panel is an inspector for whatever the canvas has selected, so the selection
+    // decides which widgets exist and therefore belongs in the shape. Deselecting is
+    // the case that matters: the panel becomes the field's own properties, which is a
+    // different set of widgets rather than the same ones showing nothing.
+    #[test]
+    fn what_is_selected_is_part_of_the_shape() {
+        let document = document_with(vec![NodeOp::Constant(0.5)]);
+        let selected = key(&document);
+        let deselected = fingerprint(
+            &document,
+            &BrushSettings::default(),
+            &Expanded::default(),
+            &AddLayer::default(),
+            &ShaderLibrary::default(),
+            &Selection::default(),
+        );
+        assert_ne!(selected, deselected);
     }
 }

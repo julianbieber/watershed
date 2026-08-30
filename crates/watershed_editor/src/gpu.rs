@@ -4,7 +4,7 @@
 //! A shader is resolved to a whole raster *before* a field's stack is walked, because
 //! the walk is a per-texel CPU function and a dispatch cannot join it. What lands in
 //! the layer is then read exactly as a painted raster is, which is why every other
-//! part of a layer — its amplitude, its mask, its blend — needs no arm for this.
+//! node around it — the scale on it, the lerp it feeds — needs no arm for this.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use glam::UVec2;
 use watershed::raster::{Raster, resolution};
 
 use crate::document::Document;
-use crate::terrain::layer::LayerOp;
+use crate::terrain::graph::{NodeId, NodeOp};
 use crate::terrain::shader::{ParamsLayout, SHADER_DIR, parse_params};
 
 /// The source every shader layer is compiled against: the bindings a dispatch
@@ -270,7 +270,7 @@ impl Plugin for ShaderPlugin {
 /// What each shader layer was last resolved from, so a dispatch happens when
 /// something it depends on moved and not once a frame.
 #[derive(Resource, Default)]
-struct Resolved(BTreeMap<(String, usize), Stamp>);
+struct Resolved(BTreeMap<(String, NodeId), Stamp>);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -297,7 +297,7 @@ fn follow_document(document: Res<Document>, mut library: ResMut<ShaderLibrary>) 
 }
 
 /// Moves the shaders a document wrote before it had a directory into the one it has
-/// now, so a layer added to an unsaved document survives the first save.
+/// now, so a node added to an unsaved document survives the first save.
 ///
 /// A file the destination already holds is left alone: the document's own copy is the
 /// one its layers name.
@@ -397,8 +397,8 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
     };
     let mut touched = false;
     for field in &mut terrain.fields {
-        for layer in &mut field.layers {
-            let LayerOp::Shader(shader) = &mut layer.op else {
+        for node in &mut field.graph.nodes {
+            let NodeOp::Shader(shader) = &mut node.op else {
                 continue;
             };
             if !changed.contains(&shader.file) {
@@ -434,10 +434,10 @@ fn resolve(
         return;
     };
 
-    let mut work: Vec<(String, usize, Stamp, String, Vec<u8>, DispatchGlobals)> = Vec::new();
+    let mut work: Vec<(String, NodeId, Stamp, String, Vec<u8>, DispatchGlobals)> = Vec::new();
     for field in &terrain.fields {
-        for (index, layer) in field.layers.iter().enumerate() {
-            let LayerOp::Shader(shader) = &layer.op else {
+        for node in &field.graph.nodes {
+            let NodeOp::Shader(shader) = &node.op else {
                 continue;
             };
             let Some(entry) = library.entry(&shader.file) else {
@@ -453,13 +453,13 @@ fn resolve(
                 params: fingerprint(&params),
                 texels,
             };
-            let key = (field.id.as_str().to_owned(), index);
+            let key = (field.id.as_str().to_owned(), node.id);
             if resolved.0.get(&key) == Some(&stamp) && !shader.values().is_empty() {
                 continue;
             }
             work.push((
                 key.0,
-                index,
+                node.id,
                 stamp,
                 entry.source.clone(),
                 params,
@@ -477,12 +477,12 @@ fn resolve(
         return;
     }
 
-    let mut produced: Vec<((String, usize), Stamp, Raster<f32>)> = Vec::new();
+    let mut produced: Vec<((String, NodeId), Stamp, Raster<f32>)> = Vec::new();
     let mut failure = None;
-    for (name, index, stamp, source, params, globals) in work {
+    for (name, id, stamp, source, params, globals) in work {
         match dispatch(&device, &queue, &source, &params, globals) {
             Ok(values) => match Raster::from_vec(globals.texels, values) {
-                Some(raster) => produced.push(((name, index), stamp, raster)),
+                Some(raster) => produced.push(((name, id), stamp, raster)),
                 None => failure = Some("a dispatch produced the wrong number of texels".to_owned()),
             },
             Err(error) => failure = Some(error),
@@ -499,18 +499,18 @@ fn resolve(
     let Some(terrain) = document.terrain_mut() else {
         return;
     };
-    for ((name, index), stamp, raster) in produced {
+    for ((name, id), stamp, raster) in produced {
         let Some(field) = terrain.field_mut(&name) else {
             continue;
         };
-        let Some(layer) = field.layers.get_mut(index) else {
+        let Some(node) = field.graph.node_mut(id) else {
             continue;
         };
-        let LayerOp::Shader(shader) = &mut layer.op else {
+        let NodeOp::Shader(shader) = &mut node.op else {
             continue;
         };
         shader.put_values(raster);
-        resolved.0.insert((name, index), stamp);
+        resolved.0.insert((name, id), stamp);
     }
     document.note_edit();
     if let Some(error) = failure {

@@ -119,7 +119,7 @@ impl RegionSpec {
     }
 }
 
-/// Which question a layer asks of the tiling.
+/// Which question a node asks of the tiling.
 ///
 /// The last two answer with a region index rather than a quantity. Every field in
 /// this crate is `f32`, so the index is carried as one — which is exactly why a

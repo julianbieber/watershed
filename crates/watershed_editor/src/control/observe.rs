@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use super::log::LogBuffer;
 use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
-use crate::edit::{blend_name, brush_summary, mask_summary, op_name, op_summary};
+use crate::edit::{brush_summary, op_name, op_summary};
 use crate::gpu::{STOCK, ShaderLibrary};
 use crate::view::{
     CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
@@ -32,7 +32,7 @@ pub(super) enum Topic {
     /// Every field's whole stack, not just the active one's — an edit names a field,
     /// so a caller has to be able to see the stack it is about to address without
     /// switching the view to it first.
-    Layers,
+    Nodes,
     /// The brush's settings and where a stroke would land.
     Brush,
     /// The solved water, counted.
@@ -52,7 +52,7 @@ impl Topic {
         match word {
             "document" => Ok(Self::Document),
             "field" => Ok(Self::Field),
-            "layers" => Ok(Self::Layers),
+            "nodes" => Ok(Self::Nodes),
             "brush" => Ok(Self::Brush),
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
@@ -70,7 +70,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
     match topic {
         Topic::Document => document(world),
         Topic::Field => field(world),
-        Topic::Layers => layers(world),
+        Topic::Nodes => nodes(world),
         Topic::Brush => brush(world),
         Topic::Water => water(world),
         Topic::View => view(world),
@@ -140,7 +140,7 @@ fn field(world: &World) -> Value {
     })
 }
 
-fn layers(world: &World) -> Value {
+fn nodes(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(terrain) = document.terrain() else {
         return json!({ "available": false });
@@ -150,19 +150,26 @@ fn layers(world: &World) -> Value {
         .fields
         .iter()
         .map(|field| {
-            let layers: Vec<Value> = field
-                .layers
+            let nodes: Vec<Value> = field
+                .graph
+                .nodes
                 .iter()
-                .enumerate()
-                .map(|(index, layer)| {
+                .map(|node| {
                     json!({
-                        "index": index,
-                        "op": op_name(&layer.op),
-                        "summary": op_summary(&layer.op),
-                        "blend": blend_name(layer.blend),
-                        "amplitude": layer.amplitude,
-                        "mask": mask_summary(&layer.mask),
-                        "enabled": layer.enabled,
+                        "node": node.id.to_string(),
+                        "name": node.name,
+                        "op": op_name(&node.op),
+                        "summary": op_summary(&node.op),
+                        "bypassed": node.bypassed,
+                        "inputs": node
+                            .inputs
+                            .iter()
+                            .map(|pin| match pin {
+                                Some(source) => json!(source.to_string()),
+                                None => Value::Null,
+                            })
+                            .collect::<Vec<Value>>(),
+                        "position": node.position,
                     })
                 })
                 .collect();
@@ -171,7 +178,8 @@ fn layers(world: &World) -> Value {
                 "shift": field.shift,
                 "range": [field.range.0, field.range.1],
                 "categorical": field.is_categorical(),
-                "layers": layers,
+                "output": field.graph.output.map(|id| id.to_string()),
+                "nodes": nodes,
             })
         })
         .collect();
@@ -193,9 +201,9 @@ fn brush(world: &World) -> Value {
             },
         );
         object.insert(
-            "layer".to_owned(),
+            "node".to_owned(),
             match &target {
-                Some((_, index)) => json!(index),
+                Some((_, id)) => json!(id.to_string()),
                 None => Value::Null,
             },
         );

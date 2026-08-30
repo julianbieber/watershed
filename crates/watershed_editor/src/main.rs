@@ -12,6 +12,7 @@ use bevy::feathers::theme::UiTheme;
 use bevy::prelude::*;
 
 mod brush;
+mod canvas;
 mod control;
 mod document;
 mod edit;
@@ -34,6 +35,7 @@ fn main() {
             document::DocumentPlugin,
             brush::BrushPlugin,
             view::ViewPlugin,
+            canvas::CanvasPlugin,
             gpu::ShaderPlugin,
             ui::UiPlugin,
             control::ControlPlugin,

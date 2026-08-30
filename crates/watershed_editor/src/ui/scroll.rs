@@ -14,7 +14,7 @@ const LINE_HEIGHT: f32 = 21.0;
 
 /// A wheel turn offered to a node. It bubbles, so the widget the pointer is actually over
 /// gets first refusal and whatever encloses it takes what is left — which is what makes a
-/// number field inside the layer panel scroll the panel rather than nothing at all.
+/// number field inside the panel scroll the panel rather than nothing at all.
 #[derive(EntityEvent, Debug)]
 #[entity_event(propagate, auto_propagate)]
 pub struct Scroll {
@@ -25,7 +25,7 @@ pub struct Scroll {
 /// Turns each wheel message into a [`Scroll`] on every hovered entity. Sends nothing
 /// when the pointer is over nothing.
 ///
-/// A line-unit turn is converted to points at roughly one row of the layer stack per
+/// A line-unit turn is converted to points at roughly one row of the panel per
 /// line, since a line is not a length and the platform does not supply one.
 pub fn send(mut wheel: MessageReader<MouseWheel>, hover: Res<HoverMap>, mut commands: Commands) {
     for message in wheel.read() {

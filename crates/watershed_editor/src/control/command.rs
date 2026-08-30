@@ -77,7 +77,7 @@ pub(super) enum Command {
         /// The reply from the edit itself, once it has been applied.
         applied: Option<Value>,
     },
-    /// Several of the brush's settings at once, where a layer's are set one at a time:
+    /// Several of the brush's settings at once, where a node's are set one at a time:
     /// a brush is one tool with a handful of knobs, and a caller usually means to state
     /// a whole configuration rather than nudge a number.
     Brush(Vec<BrushChange>),
@@ -168,8 +168,8 @@ pub(super) enum Condition {
 }
 
 impl Command {
-    /// The word this command was parsed from, for the reply. Every structural layer
-    /// edit answers `"layer"`, whatever it did.
+    /// The word this command was parsed from, for the reply. Every structural graph
+    /// edit answers `"node"`, whatever it did.
     pub(super) fn verb(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -179,7 +179,7 @@ impl Command {
             Self::Field(_) => "field",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
-                _ => "layer",
+                _ => "node",
             },
             Self::Brush(_) => "brush",
             Self::Stroke { .. } => "stroke",
@@ -234,8 +234,8 @@ impl Command {
             "field" => Ok(Self::Field(
                 rest.first().ok_or("field needs a name")?.to_string(),
             )),
-            "layer" => Ok(Self::Edit {
-                edit: layer_edit(&rest)?,
+            "node" => Ok(Self::Edit {
+                edit: node_edit(&rest)?,
                 applied: None,
             }),
             "set" => {
@@ -653,34 +653,71 @@ impl Condition {
     }
 }
 
-fn layer_edit(rest: &[&str]) -> Result<Edit, String> {
-    let what = *rest.first().ok_or("layer needs add, rm, move or toggle")?;
-    let field = (*rest.get(1).ok_or("layer needs a field name")?).to_owned();
+fn node_edit(rest: &[&str]) -> Result<Edit, String> {
+    let what = *rest
+        .first()
+        .ok_or("node needs add, rm, connect, disconnect, bypass, place, name or output")?;
+    let field = (*rest.get(1).ok_or("node needs a field name")?).to_owned();
+    let named = |at: usize, what: &str| -> Result<String, String> {
+        rest.get(at)
+            .map(|word| (*word).to_owned())
+            .ok_or_else(|| format!("node {what} needs a node"))
+    };
     match what {
-        "add" => Ok(Edit::Add {
+        "add" => Ok(Edit::AddNode {
             field,
             op: parse_op(&owned(&rest[2..]))?,
+            position: None,
         }),
-        "rm" => Ok(Edit::Remove {
+        "rm" => Ok(Edit::RemoveNode {
             field,
-            index: number(rest.get(2).ok_or("layer rm needs an index")?)?,
+            node: named(2, "rm")?,
         }),
-        "move" => Ok(Edit::Move {
+        "connect" => Ok(Edit::Connect {
             field,
-            index: number(rest.get(2).ok_or("layer move needs an index")?)?,
-            to: number(rest.get(3).ok_or("layer move needs somewhere to go")?)?,
+            from: named(2, "connect")?,
+            to: named(3, "connect")?,
+            pin: number(rest.get(4).ok_or("node connect needs a pin")?)?,
         }),
-        "toggle" => Ok(Edit::Toggle {
+        "disconnect" => Ok(Edit::Disconnect {
             field,
-            index: number(rest.get(2).ok_or("layer toggle needs an index")?)?,
-            enabled: match rest.get(3) {
+            node: named(2, "disconnect")?,
+            pin: number(rest.get(3).ok_or("node disconnect needs a pin")?)?,
+        }),
+        "bypass" => Ok(Edit::Bypass {
+            field,
+            node: named(2, "bypass")?,
+            bypassed: match rest.get(3) {
                 None => None,
                 Some(&"on") => Some(true),
                 Some(&"off") => Some(false),
-                Some(word) => return Err(format!("a toggle is on or off, not `{word}`")),
+                Some(word) => return Err(format!("a bypass is on or off, not `{word}`")),
             },
         }),
-        other => Err(format!("no layer edit called `{other}`")),
+        "place" => Ok(Edit::PlaceNode {
+            field,
+            node: named(2, "place")?,
+            position: [
+                number(rest.get(3).ok_or("node place needs an x")?)?,
+                number(rest.get(4).ok_or("node place needs a y")?)?,
+            ],
+        }),
+        "name" => {
+            let name = named(3, "name")?;
+            Ok(Edit::RenameNode {
+                field,
+                node: named(2, "name")?,
+                name: (name != "none").then_some(name),
+            })
+        }
+        "output" => {
+            let node = named(2, "output")?;
+            Ok(Edit::SetOutput {
+                field,
+                node: (node != "none").then_some(node),
+            })
+        }
+        other => Err(format!("no node edit called `{other}`")),
     }
 }
 
@@ -751,19 +788,23 @@ mod tests {
             ("wait water 600", "wait"),
             ("new 256 256 7 ridges", "new"),
             ("field height", "field"),
-            ("layer add height noise fbm 0.01", "layer"),
-            ("layer add height constant 0.25", "layer"),
-            ("layer add height slope base 4", "layer"),
-            ("layer rm height 2", "layer"),
-            ("layer move height 2 0", "layer"),
-            ("layer toggle height 1", "layer"),
-            ("layer toggle height 1 off", "layer"),
+            ("node add height noise fbm 0.01", "node"),
+            ("node add height constant 0.25", "node"),
+            ("node add height slope 4", "node"),
+            ("node rm height n2", "node"),
+            ("node connect height n2 n0 0", "node"),
+            ("node disconnect height n0 0", "node"),
+            ("node bypass height n1", "node"),
+            ("node bypass height n1 off", "node"),
+            ("node place height n1 20 40", "node"),
+            ("node name height n1 ridge", "node"),
+            ("node output height n1", "node"),
             ("set height.1.amplitude 0.5", "set"),
             ("set height.1.blend mul", "set"),
             ("set height.1.mask field moisture 0.4 0.6 0 1", "set"),
             ("set height.1.op.scale 0.004", "set"),
             ("set height.shift 2", "set"),
-            ("layer add height paint", "layer"),
+            ("node add height paint", "node"),
             ("brush radius 24", "brush"),
             (
                 "brush mode smooth radius 8 falloff 0.2 strength 0.5 value 0.3",
@@ -803,11 +844,11 @@ mod tests {
         assert!(Command::parse("new 256 256 1 nothing-like-this").is_err());
         assert!(Command::parse("zoom").is_err());
         assert!(Command::parse("save /tmp/a-terrain sideways").is_err());
-        assert!(Command::parse("layer").is_err());
-        assert!(Command::parse("layer add height").is_err());
+        assert!(Command::parse("node").is_err());
+        assert!(Command::parse("node add height").is_err());
         assert!(Command::parse("layer sideways height 1").is_err());
-        assert!(Command::parse("layer toggle height 1 maybe").is_err());
-        assert!(Command::parse("layer rm height").is_err());
+        assert!(Command::parse("node bypass height n1 maybe").is_err());
+        assert!(Command::parse("node rm height").is_err());
         assert!(Command::parse("set").is_err());
         assert!(Command::parse("brush").is_err());
         assert!(Command::parse("brush radius").is_err());
