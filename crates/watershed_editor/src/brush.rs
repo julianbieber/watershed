@@ -1,7 +1,7 @@
 //! Painting into a document with the pointer.
 //!
 //! A stroke is an ordinary edit — it writes into a paint layer of a field, and
-//! nothing about the layer stack is special-cased for it. What is special is what it
+//! nothing about the field's graph is special-cased for it. What is special is what it
 //! tells the document afterwards: a rectangle rather than "this is stale", so a
 //! stroke provokes a re-bake of the ground it reached instead of the whole document.
 //!
@@ -13,7 +13,7 @@
 
 use crate::terrain::Field;
 use crate::terrain::brush::Brush;
-use crate::terrain::layer::LayerOp;
+use crate::terrain::graph::{NodeId, NodeOp};
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -64,28 +64,29 @@ impl Painting {
     }
 }
 
-/// The layer a stroke would land in: the topmost enabled paint layer of `field`, or
-/// `None` if it has none.
+/// The node a stroke would land in: the one `Paint` node of `field`, or `None` when
+/// it has none or has several.
 ///
-/// Derived from the stack every time rather than remembered, so reordering, disabling
-/// or deleting a layer moves the target with no separate selection to keep in step —
-/// and the panel and the control client cannot disagree about where a stroke goes.
-pub fn paint_layer(field: &Field) -> Option<usize> {
-    field
-        .layers
+/// Derived from the graph every time rather than remembered, so adding or deleting a
+/// node moves the target with no separate selection to keep in step. A field with two
+/// `Paint` nodes is ambiguous and answers `None` rather than guessing — nothing about
+/// a graph makes one of them the obvious target, where the top of a stack once did.
+pub fn paint_node(field: &Field) -> Option<NodeId> {
+    let mut painted = field
+        .graph
+        .nodes
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, layer)| layer.enabled && matches!(layer.op, LayerOp::Paint(_)))
-        .map(|(index, _)| index)
+        .filter(|node| matches!(node.op, NodeOp::Paint(_)));
+    let first = painted.next()?;
+    painted.next().is_none().then_some(first.id)
 }
 
 /// What the panel names and `observe brush` reports: the field the brush would paint into,
-/// and the layer of it, or nothing when the active field has none.
-pub fn target_of(document: &Document) -> Option<(String, usize)> {
+/// and the node of it, or nothing when the active field has none.
+pub fn target_of(document: &Document) -> Option<(String, NodeId)> {
     let terrain = document.terrain()?;
     let field = terrain.field(document.active())?;
-    paint_layer(field).map(|index| (field.id.to_string(), index))
+    paint_node(field).map(|id| (field.id.to_string(), id))
 }
 
 /// Applies a stroke and tells the document what it reached — the one path a brush
@@ -94,16 +95,16 @@ pub fn target_of(document: &Document) -> Option<(String, usize)> {
 ///
 /// `points` are in document cells. Refused, with a message fit to show, if there are
 /// no points, if a job is already running, if there is no document, or if the active
-/// field has no enabled paint layer.
+/// field has no single paint node.
 ///
-/// The target layer's raster is allocated on first use at the field's own resolution,
+/// The target node's raster is allocated on first use at the field's own resolution,
 /// so a texel of the field reads exactly one painted texel and a stroke is never finer
 /// than what the field can hold. One that arrived at some other resolution — from a
 /// file, or from a shift changed under it — is kept and stretched over the document
 /// instead, and the reported rectangle is widened to cover the cells either side of
 /// each painted texel.
 ///
-/// The reply names the field, the layer, the cells painted and the wider rectangle
+/// The reply names the field, the node, the cells painted and the wider rectangle
 /// the change reaches through the fields that read it.
 pub fn apply_stroke(
     document: &mut Document,
@@ -118,7 +119,7 @@ pub fn apply_stroke(
     }
     let name = document.active().to_owned();
 
-    let (index, painted, bleed) = {
+    let (id, painted, bleed) = {
         let terrain = document
             .terrain_mut()
             .ok_or("there is no document to paint on")?;
@@ -126,23 +127,24 @@ pub fn apply_stroke(
         let field = terrain
             .field_mut(&name)
             .ok_or_else(|| format!("no field named `{name}`"))?;
-        let index = paint_layer(field)
-            .ok_or_else(|| format!("`{name}` has no enabled paint layer to paint into"))?;
+        let id = paint_node(field)
+            .ok_or_else(|| format!("`{name}` has no single paint node to paint into"))?;
         let shift = field.shift;
-        let LayerOp::Paint(raster) = &mut field.layers[index].op else {
-            return Err("the brush's target stopped being a paint layer".to_owned());
+        let node = field.graph.node_mut(id).expect("resolved above");
+        let NodeOp::Paint(raster) = &mut node.op else {
+            return Err("the brush's target stopped being a paint node".to_owned());
         };
         if raster.is_empty() {
-            *raster = Raster::new(resolution(size, shift), 0.0);
+            *raster = Raster::new(resolution(size, shift), 0u8);
         }
         let bleed = (size.x.div_ceil(raster.width().max(1)))
             .max(size.y.div_ceil(raster.height().max(1)))
             + 1;
-        (index, brush.stroke(raster, size, points), bleed)
+        (id, brush.stroke(raster, size, points), bleed)
     };
 
     if painted.is_empty() {
-        return Ok(json!({ "field": name, "layer": index, "cells": Value::Null }));
+        return Ok(json!({ "field": name, "node": crate::edit::node_path(id), "cells": Value::Null }));
     }
     let painted = painted.expand(bleed);
 
@@ -154,7 +156,7 @@ pub fn apply_stroke(
 
     Ok(json!({
         "field": name,
-        "layer": index,
+        "node": crate::edit::node_path(id),
         "cells": [painted.min.x, painted.min.y, painted.max.x, painted.max.y],
         "reached": [reached.min.x, reached.min.y, reached.max.x, reached.max.y],
         "points": points.len(),
@@ -218,39 +220,45 @@ fn paint(
 mod tests {
     use super::*;
     use crate::terrain::TerrainSpec;
-    use crate::terrain::layer::Layer;
+    use crate::terrain::graph::NodeOp;
     use watershed::raster::CellRect;
 
-    fn field_with(ops: Vec<LayerOp>) -> Field {
-        ops.into_iter().fold(Field::new("height"), |field, op| {
-            field.with_layer(Layer::new(op))
-        })
+    fn field_with(ops: Vec<NodeOp>) -> Field {
+        ops.into_iter()
+            .fold(Field::new("height"), |field, op| field.with_op(op))
     }
 
-    // Topmost rather than first: a stroke has to land in the layer the person can see
-    // on top, and a stack with two paint layers is the only case that tells the two
-    // readings apart.
+    // The one paint node is the target wherever it sits in the graph, since a graph
+    // has no top for a stroke to land on.
     #[test]
-    fn the_brush_paints_into_the_topmost_paint_layer_of_the_field() {
+    fn the_brush_paints_into_the_one_paint_node_of_the_field() {
         let field = field_with(vec![
-            LayerOp::Constant(0.5),
-            LayerOp::Paint(Raster::default()),
-            LayerOp::Constant(0.1),
-            LayerOp::Paint(Raster::default()),
+            NodeOp::Constant(0.5),
+            NodeOp::Paint(Raster::default()),
+            NodeOp::Constant(0.1),
         ]);
-        assert_eq!(paint_layer(&field), Some(3));
+        let painted = field
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.op, NodeOp::Paint(_)))
+            .map(|node| node.id);
+        assert_eq!(paint_node(&field), painted);
     }
 
-    // Both are states the panel offers, and both have to resolve to no target rather
-    // than to some other layer — a stroke that fell through to the layer beneath a
-    // disabled one would paint somewhere the person cannot see.
+    // Nothing about a graph makes one of two paint nodes the obvious target, so an
+    // ambiguous field has to answer "no target" rather than guess and paint somewhere
+    // the person is not looking. A field with none answers the same way.
     #[test]
-    fn a_field_with_no_paint_layer_and_one_that_is_switched_off_are_both_no_target() {
-        assert_eq!(paint_layer(&field_with(vec![LayerOp::Constant(0.5)])), None);
-
-        let mut field = field_with(vec![LayerOp::Paint(Raster::default())]);
-        field.layers[0].enabled = false;
-        assert_eq!(paint_layer(&field), None);
+    fn a_field_with_no_paint_node_and_one_with_two_are_both_no_target() {
+        assert_eq!(paint_node(&field_with(vec![NodeOp::Constant(0.5)])), None);
+        assert_eq!(
+            paint_node(&field_with(vec![
+                NodeOp::Paint(Raster::default()),
+                NodeOp::Paint(Raster::default()),
+            ])),
+            None
+        );
     }
 
     // The defect this guards was found by driving the editor: a stroke's own re-bake is
@@ -326,12 +334,13 @@ mod tests {
     // The seam the whole module is written against: a stroke lands in the layer, and
     // what it reports to the document is a rectangle rather than "everything".
     #[test]
-    fn a_stroke_lands_in_the_layer_and_leaves_the_bake_where_it_was() {
+    fn a_stroke_lands_in_the_node_and_leaves_the_bake_where_it_was() {
         let mut document = Document::default();
         let terrain = TerrainSpec::new(UVec2::splat(64)).with_field(
-            Field::new("height")
-                .with_layer(Layer::new(LayerOp::Constant(0.25)))
-                .with_layer(Layer::new(LayerOp::Paint(Raster::default()))),
+            Field::new("height").with_sum([
+                NodeOp::Constant(0.25),
+                NodeOp::Paint(Raster::default()),
+            ]),
         );
         document.adopt(terrain);
 
@@ -341,17 +350,17 @@ mod tests {
             ..Brush::default()
         };
         let reply = apply_stroke(&mut document, &brush, &[Vec2::splat(32.0)]).unwrap();
-        assert_eq!(reply["layer"], 1);
         assert!(document.is_dirty());
 
-        let LayerOp::Paint(raster) =
-            &document.terrain().unwrap().field("height").unwrap().layers[1].op
-        else {
-            panic!("the target stopped being a paint layer");
+        let field = document.terrain().unwrap().field("height").unwrap();
+        let target = paint_node(field).expect("the fixture has one paint node");
+        assert_eq!(reply["node"], target.to_string());
+        let NodeOp::Paint(raster) = &field.graph.node(target).unwrap().op else {
+            panic!("the target stopped being a paint node");
         };
         assert_eq!(raster.size(), UVec2::splat(64));
-        assert!(*raster.get(32, 32).unwrap() > 0.0);
-        assert!(*raster.get(0, 0).unwrap() == 0.0);
+        assert!(raster.data().iter().any(|byte| *byte > 0));
+        assert_eq!(raster.data()[0], 0);
 
         let cells = &reply["cells"];
         assert!(

@@ -1,4 +1,4 @@
-//! A named stack of layers, and the raster the stack bakes onto.
+//! A named graph of nodes, and the raster the graph bakes onto.
 
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
@@ -6,20 +6,20 @@ use serde::{Deserialize, Serialize};
 use watershed::field::{FieldId, FieldRole};
 use watershed::raster::{Raster, raster_coord, resolution};
 
-use crate::terrain::layer::{Layer, LayerOp};
+use crate::terrain::graph::{FieldGraph, NodeOp};
 use crate::terrain::regions::RegionOutput;
 
-/// A named stack of layers together with everything needed to evaluate it onto its
+/// A named graph of nodes together with everything needed to evaluate it onto its
 /// own raster, plus that raster once it has been baked.
 ///
-/// The baked raster is not serialized: it is derived from the layers and is
+/// The baked raster is not serialized: it is derived from the graph and is
 /// re-obtained by baking, so a loaded document starts with every field empty and
 /// sampling as `0.0`. Equality does compare it, so two fields differing only in
 /// bake state are not equal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     /// The name this field is referenced by. Changing it does not rewrite the
-    /// layers of other fields that reference the old name.
+    /// graphs of other fields that reference the old name.
     pub id: FieldId,
     /// What the bake may do with the field. See [`FieldRole`] for the constraints
     /// a document carrying this has to satisfy.
@@ -35,15 +35,17 @@ pub struct Field {
     /// whatever consumes a baked terrain to decide what an exported field means.
     #[serde(default)]
     pub export: bool,
-    /// Evaluated in order, each blended onto the result of the ones before it.
-    pub layers: Vec<Layer>,
+    /// What the field's value is built out of. Evaluation order is derived from the
+    /// edges, not stored.
+    pub graph: FieldGraph,
     #[serde(skip)]
     baked: Raster<f32>,
 }
 
 impl Field {
-    /// A field named `id` with no layers: role `Custom`, shift 0, range `0.0..=1.0`,
-    /// not exported, and unbaked — so it samples as `0.0` until it is baked.
+    /// A field named `id` with an empty graph: role `Custom`, shift 0, range
+    /// `0.0..=1.0`, not exported, and unbaked — so it samples as `0.0` until it is
+    /// baked.
     pub fn new(id: impl Into<FieldId>) -> Self {
         Self {
             id: id.into(),
@@ -51,7 +53,7 @@ impl Field {
             shift: 0,
             range: (0.0, 1.0),
             export: false,
-            layers: Vec::new(),
+            graph: FieldGraph::new(),
             baked: Raster::default(),
         }
     }
@@ -82,9 +84,41 @@ impl Field {
         self
     }
 
-    /// Appends a layer on top of the ones already there. Order is evaluation order.
-    pub fn with_layer(mut self, layer: Layer) -> Self {
-        self.layers.push(layer);
+    /// Adds one node of `op` and reads the field from it.
+    ///
+    /// The one-node graph a field starts as, and what most of the test suite wants:
+    /// a field that is exactly one op.
+    pub fn with_op(mut self, op: NodeOp) -> Self {
+        self.graph.add_node(op, [0.0, 0.0]);
+        self
+    }
+
+    /// A field whose value is the sum of `ops`, in the order given.
+    ///
+    /// What a stack of layers blending onto zero came to, and so what most of the
+    /// suite wants: the ops are added left to right and the field reads the total.
+    pub fn with_sum(mut self, ops: impl IntoIterator<Item = NodeOp>) -> Self {
+        let mut under: Option<crate::terrain::graph::NodeId> = None;
+        for op in ops {
+            let id = self.graph.node_with(op, &[]);
+            under = Some(match under {
+                None => id,
+                Some(under) => self
+                    .graph
+                    .node_with(NodeOp::Binary(crate::terrain::graph::Binary::Add), &[under, id]),
+            });
+        }
+        if let Some(output) = under {
+            self.graph
+                .set_output(Some(output))
+                .expect("the node was just added to this graph");
+        }
+        self
+    }
+
+    /// Replaces the whole graph.
+    pub fn with_graph(mut self, graph: FieldGraph) -> Self {
+        self.graph = graph;
         self
     }
 
@@ -134,23 +168,24 @@ impl Field {
     /// Whether this field's values name a class rather than measure a quantity,
     /// which is what decides how [`Field::sample`] interpolates.
     ///
-    /// Derived from the layers, not declared: true when an *enabled* layer emits
-    /// region ids or cover classes. Disabling that layer makes the field
-    /// non-categorical again, so the answer can change without the shift or the
-    /// range changing.
+    /// Derived from the graph, not declared: true when the node the field's value
+    /// actually comes from emits region ids or cover classes.
+    ///
+    /// It is the *effective* output that decides — a bypassed node at the output is
+    /// followed to what it passes through — so a `Regions` node under an arithmetic
+    /// node no longer switches the whole field to nearest sampling, where a `Regions`
+    /// layer anywhere in a stack once did.
     pub fn is_categorical(&self) -> bool {
-        self.layers
-            .iter()
-            .filter(|layer| layer.enabled)
-            .any(|layer| {
-                matches!(
-                    &layer.op,
-                    LayerOp::Regions {
-                        output: RegionOutput::RegionId | RegionOutput::CoverClass,
-                        ..
-                    }
-                )
+        let Some(id) = self.graph.effective_output() else {
+            return false;
+        };
+        matches!(
+            self.graph.node(id).map(|node| &node.op),
+            Some(NodeOp::Regions {
+                output: RegionOutput::RegionId | RegionOutput::CoverClass,
+                ..
             })
+        )
     }
 
     /// The baked value at a position in document cells, where a cell centre is at
@@ -171,24 +206,21 @@ impl Field {
         }
     }
 
-    /// The fields this one reads, through the ops and masks of its *enabled* layers
-    /// only; disabling a layer removes its dependencies.
+    /// The fields this one reads, through the nodes reachable from its output only;
+    /// bypassing or unwiring a node removes its dependencies.
     ///
     /// This is what bake ordering and cycle detection run on, so a cycle that exists
-    /// only through a disabled layer is not a cycle and the document plans.
-    /// Duplicates are not removed and the order is the layer order.
+    /// only through an unreachable node is not a cycle and the document plans.
+    /// Duplicates are not removed and the order is evaluation order.
     pub fn dependencies(&self) -> impl Iterator<Item = &FieldId> {
-        self.layers
-            .iter()
-            .filter(|layer| layer.enabled)
-            .flat_map(|layer| layer.dependencies())
+        self.graph.dependencies().into_iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::layer::{Mask, Remap};
+    use crate::terrain::graph::{FieldGraph, NodeOp, Remap};
 
     // Shift 0 is what the `Height` field is pinned to, so a document's cell grid and
     // its height raster have to be the same grid.
@@ -217,19 +249,24 @@ mod tests {
         assert_eq!(field.bounds(), (-1.0, 1.0));
     }
 
-    // Pins both halves of what bake ordering is computed from: a mask contributes a
-    // dependency just as an op does, and a disabled layer contributes none.
+    // Pins both halves of what bake ordering is computed from: every reference the
+    // output reaches counts, and one it cannot reach counts for nothing.
     #[test]
-    fn a_field_reports_the_dependencies_of_every_enabled_layer_and_no_others() {
-        let field = Field::new("height")
-            .with_layer(Layer::new(LayerOp::Constant(0.5)))
-            .with_layer(
-                Layer::new(LayerOp::FieldRef(FieldId::from("relief")))
-                    .with_mask(Mask::Field(FieldId::from("ridge"), Remap::IDENTITY)),
-            )
-            .with_layer(Layer::new(LayerOp::FieldRef(FieldId::from("hidden"))).disabled());
+    fn a_field_reports_the_dependencies_its_output_reaches_and_no_others() {
+        let mut graph = FieldGraph::new();
+        let base = graph.node_with(NodeOp::Constant(0.5), &[]);
+        let relief = graph.node_with(NodeOp::FieldRef(FieldId::from("relief")), &[]);
+        let ridge = graph.node_with(NodeOp::FieldRef(FieldId::from("ridge")), &[]);
+        let weight = graph.node_with(NodeOp::Remap(Remap::IDENTITY), &[ridge]);
+        let mixed = graph.node_with(NodeOp::Lerp, &[base, relief, weight]);
+        graph.node_with(NodeOp::FieldRef(FieldId::from("hidden")), &[]);
+        graph.set_output(Some(mixed)).unwrap();
+
+        let field = Field::new("height").with_graph(graph);
         let deps: Vec<_> = field.dependencies().map(|id| id.as_str()).collect();
-        assert_eq!(deps, vec!["relief", "ridge"]);
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&"relief") && deps.contains(&"ridge"));
+        assert!(!deps.contains(&"hidden"));
     }
 
     // Every loaded document is in this state until it is baked, so sampling one has

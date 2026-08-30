@@ -1,4 +1,4 @@
-//! A layer op written as WGSL: the file a layer names, the parameters that file
+//! A node op written as WGSL: the file a node names, the parameters that file
 //! declares, and the values a document carries for them.
 //!
 //! Nothing here touches a GPU. This is the document's half of a shader layer — what
@@ -473,7 +473,7 @@ impl ShaderLayer {
         }
     }
 
-    /// The values from the last dispatch. Empty for a layer that has never been
+    /// The values from the last dispatch. Empty for a node that has never been
     /// resolved or that came from a loaded document, which reads as `0.0`.
     pub fn values(&self) -> &Raster<f32> {
         &self.values

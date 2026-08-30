@@ -88,7 +88,7 @@ impl JobKind {
 /// How much of the document's bake still matches the layers it was cut from.
 ///
 /// An edit to the stack drops this to [`Baked::Nothing`] rather than to the part it
-/// left alone: a layer applies to a whole field, and nothing here knows the reach of
+/// left alone: a node applies to a whole field, and nothing here knows the reach of
 /// the one that changed. A stroke is the exception — it names the ground it moved, so
 /// it leaves the extent where it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

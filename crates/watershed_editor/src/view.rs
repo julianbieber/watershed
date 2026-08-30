@@ -14,6 +14,7 @@ use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input_focus::InputFocus;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
+use bevy::ui::IsDefaultUiCamera;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite_render::MeshMaterial2d;
 use bevy::text::EditableText;
@@ -153,7 +154,7 @@ impl FreeView {
 
 #[derive(Component)]
 struct MapRevisions {
-    field: Option<u64>,
+    field: Option<(u64, u64)>,
     water: Option<u64>,
 }
 
@@ -199,6 +200,7 @@ fn spawn_view(
             scale: 1.0,
             ..OrthographicProjection::default_2d()
         }),
+        IsDefaultUiCamera,
         EditorCamera,
     ));
 
@@ -216,6 +218,7 @@ fn spawn_view(
 
 fn sync_maps(
     document: Res<Document>,
+    solo: Res<crate::canvas::Solo>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FieldMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -229,13 +232,15 @@ fn sync_maps(
         return;
     };
 
-    if revisions.field != Some(document.revision()) {
-        revisions.field = Some(document.revision());
+    if revisions.field != Some((document.revision(), solo.generation)) {
+        revisions.field = Some((document.revision(), solo.generation));
 
         let Some(field) = terrain.field(document.active()) else {
             return;
         };
-        let baked = field.baked();
+        // What the map shows is always named on the canvas: the soloed node when there
+        // is one, and the field's output otherwise.
+        let baked = solo.raster.as_ref().unwrap_or(field.baked());
 
         if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
             *mesh = Rectangle::new(terrain.size.x as f32, terrain.size.y as f32).into();
@@ -331,6 +336,8 @@ fn pan_zoom(
     nodes: Query<(), With<Node>>,
     mut wheel: MessageReader<MouseWheel>,
     time: Res<Time>,
+    frame: Res<crate::canvas::CanvasFrame>,
+    window: Option<Single<&Window, With<bevy::window::PrimaryWindow>>>,
     camera: Single<(&mut Transform, &mut Projection), With<EditorCamera>>,
 ) {
     let (mut transform, mut projection) = camera.into_inner();
@@ -370,7 +377,11 @@ fn pan_zoom(
             MouseScrollUnit::Pixel => message.y / 32.0,
         };
     }
-    if crate::ui::pointer_over_ui(&hover, &nodes) {
+    // The canvas zooms on its own camera, so a scroll over it is not the map's to take.
+    let over_canvas = window
+        .as_deref()
+        .is_some_and(|window| crate::canvas::pointer_over_canvas(window, &frame));
+    if over_canvas || crate::ui::pointer_over_ui(&hover, &nodes) {
         steps = 0.0;
     }
     if !typing {

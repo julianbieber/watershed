@@ -5,7 +5,8 @@
 //! anyone is meant to ship. The set stays small for that reason — it is chosen to
 //! cover the ways a stack can be put together, not to be a library of landscapes.
 
-use crate::terrain::layer::{Blend, Layer, LayerOp, Mask, Remap};
+use crate::terrain::graph::{Binary, FieldGraph, NodeId, NodeOp};
+use crate::terrain::graph::Remap;
 use crate::terrain::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
 use crate::terrain::regions::{Region, RegionOutput, RegionSpec};
 use crate::terrain::{Field, TerrainSpec, WaterSpec};
@@ -75,13 +76,33 @@ impl Preset {
     }
 }
 
+fn built(build: impl FnOnce(&mut FieldGraph) -> NodeId) -> FieldGraph {
+    let mut graph = FieldGraph::new();
+    let output = build(&mut graph);
+    graph
+        .set_output(Some(output))
+        .expect("the output node was just added to this graph");
+    graph
+}
+
+fn wire(graph: &mut FieldGraph, from: NodeId, to: NodeId, pin: usize) {
+    graph
+        .connect(from, to, pin)
+        .expect("a preset graph is acyclic and wires only pins its ops carry");
+}
+
+fn at(column: i32, row: i32) -> [f32; 2] {
+    [column as f32 * 260.0, row as f32 * 150.0]
+}
+
+fn noise(seed: u32, kind: NoiseKind, scale: f32, octaves: u32) -> NodeOp {
+    NodeOp::Noise(NoiseSpec::new(seed, kind, scale).with_octaves(octaves))
+}
+
 fn moisture(seed: u32) -> Field {
-    Field::new("moisture").with_shift(4).with_layer(
-        Layer::new(LayerOp::Noise(
-            NoiseSpec::new(sub_seed(seed, 11), NoiseKind::Fbm, 0.004).with_octaves(4),
-        ))
-        .with_blend(Blend::Replace),
-    )
+    Field::new("moisture").with_shift(4).with_graph(built(|graph| {
+        graph.add_node(noise(sub_seed(seed, 11), NoiseKind::Fbm, 0.004, 4), at(0, 0))
+    }))
 }
 
 const CONTINENT_SCALE: f32 = 0.0015;
@@ -90,61 +111,65 @@ const RELIEF_SCALE: f32 = 0.04;
 fn continents(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
         .with_field(moisture(seed))
-        .with_field(
-            Field::new("height")
-                .with_layer(
-                    Layer::new(LayerOp::Noise(
-                        NoiseSpec::new(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE)
-                            .with_octaves(4),
-                    ))
-                    .with_blend(Blend::Replace),
-                )
-                .with_layer(
-                    Layer::new(LayerOp::Noise(
-                        NoiseSpec::new(sub_seed(seed, 2), NoiseKind::Fbm, RELIEF_SCALE)
-                            .with_octaves(4),
-                    ))
-                    .with_blend(Blend::Add)
-                    .with_amplitude(0.18),
-                ),
-        )
+        .with_field(Field::new("height").with_graph(built(|graph| {
+            let base = graph.add_node(
+                noise(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE, 4),
+                at(0, 0),
+            );
+            let detail = graph.add_node(
+                noise(sub_seed(seed, 2), NoiseKind::Fbm, RELIEF_SCALE, 4),
+                at(0, 1),
+            );
+            let scaled = graph.add_node(NodeOp::Scale(0.18), at(1, 1));
+            let sum = graph.add_node(NodeOp::Binary(Binary::Add), at(2, 0));
+            wire(graph, detail, scaled, 0);
+            wire(graph, base, sum, 0);
+            wire(graph, scaled, sum, 1);
+            sum
+        })))
 }
 
 fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
         .with_field(moisture(seed))
-        .with_field(
-            Field::new("base").with_layer(
-                Layer::new(LayerOp::Noise(
-                    NoiseSpec::new(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE)
-                        .with_octaves(4),
-                ))
-                .with_blend(Blend::Replace),
-            ),
-        )
-        .with_field(
-            Field::new("height")
-                .with_layer(Layer::new(LayerOp::FieldRef("base".into())).with_blend(Blend::Replace))
-                .with_layer(
-                    Layer::new(LayerOp::Noise(
-                        NoiseSpec::new(sub_seed(seed, 3), NoiseKind::Ridged, 0.006).with_octaves(5),
-                    ))
-                    .with_blend(Blend::Add)
-                    .with_amplitude(0.55)
-                    .with_mask(Mask::Field(
-                        "base".into(),
-                        Remap::new((0.45, 0.75), (0.0, 1.0)),
-                    )),
-                )
-                .with_layer(
-                    Layer::new(LayerOp::Noise(
-                        NoiseSpec::new(sub_seed(seed, 4), NoiseKind::Fbm, RELIEF_SCALE)
-                            .with_octaves(3),
-                    ))
-                    .with_blend(Blend::Add)
-                    .with_amplitude(0.08),
-                ),
-        )
+        .with_field(Field::new("base").with_graph(built(|graph| {
+            graph.add_node(
+                noise(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE, 4),
+                at(0, 0),
+            )
+        })))
+        .with_field(Field::new("height").with_graph(built(|graph| {
+            let under = graph.add_node(NodeOp::FieldRef("base".into()), at(0, 0));
+            let ridged = graph.add_node(
+                noise(sub_seed(seed, 3), NoiseKind::Ridged, 0.006, 5),
+                at(0, 1),
+            );
+            let scaled = graph.add_node(NodeOp::Scale(0.55), at(1, 1));
+            let sum = graph.add_node(NodeOp::Binary(Binary::Add), at(2, 1));
+            let weight_of = graph.add_node(NodeOp::FieldRef("base".into()), at(0, 2));
+            let weight = graph.add_node(
+                NodeOp::Remap(Remap::new((0.45, 0.75), (0.0, 1.0))),
+                at(1, 2),
+            );
+            let masked = graph.add_node(NodeOp::Lerp, at(3, 1));
+            let relief = graph.add_node(
+                noise(sub_seed(seed, 4), NoiseKind::Fbm, RELIEF_SCALE, 3),
+                at(0, 3),
+            );
+            let smaller = graph.add_node(NodeOp::Scale(0.08), at(1, 3));
+            let total = graph.add_node(NodeOp::Binary(Binary::Add), at(4, 2));
+            wire(graph, ridged, scaled, 0);
+            wire(graph, under, sum, 0);
+            wire(graph, scaled, sum, 1);
+            wire(graph, weight_of, weight, 0);
+            wire(graph, under, masked, 0);
+            wire(graph, sum, masked, 1);
+            wire(graph, weight, masked, 2);
+            wire(graph, relief, smaller, 0);
+            wire(graph, masked, total, 0);
+            wire(graph, smaller, total, 1);
+            total
+        })))
 }
 
 const REGION_CELL_TILES: u32 = 384;
@@ -170,39 +195,47 @@ fn regions(size: UVec2, seed: u32) -> TerrainSpec {
     .with_region(Region::new(2, [0.74, 0.42]))
     .with_region(Region::new(2, [0.48, 0.06]));
 
+    let column = |spec: RegionSpec, name: &str| {
+        let name = name.to_owned();
+        built(move |graph| {
+            graph.add_node(
+                NodeOp::Regions {
+                    spec,
+                    output: RegionOutput::Blended(name),
+                },
+                at(0, 0),
+            )
+        })
+    };
+
     TerrainSpec::new(size)
         .with_field(moisture(seed))
         .with_field(
-            Field::new("base").with_shift(2).with_layer(
-                Layer::new(LayerOp::Regions {
-                    spec: spec.clone(),
-                    output: RegionOutput::Blended("base".to_owned()),
-                })
-                .with_blend(Blend::Replace),
-            ),
+            Field::new("base")
+                .with_shift(2)
+                .with_graph(column(spec.clone(), "base")),
         )
         .with_field(
-            Field::new("relief").with_shift(2).with_layer(
-                Layer::new(LayerOp::Regions {
-                    spec,
-                    output: RegionOutput::Blended("relief".to_owned()),
-                })
-                .with_blend(Blend::Replace),
-            ),
+            Field::new("relief")
+                .with_shift(2)
+                .with_graph(column(spec, "relief")),
         )
-        .with_field(
-            Field::new("height")
-                .with_layer(Layer::new(LayerOp::FieldRef("base".into())).with_blend(Blend::Replace))
-                .with_layer(
-                    Layer::new(LayerOp::Noise(
-                        NoiseSpec::new(sub_seed(seed, 9), NoiseKind::Fbm, RELIEF_SCALE)
-                            .with_octaves(4),
-                    ))
-                    .with_blend(Blend::Add)
-                    .with_amplitude(1.0)
-                    .with_mask(Mask::Field("relief".into(), Remap::IDENTITY)),
-                ),
-        )
+        .with_field(Field::new("height").with_graph(built(|graph| {
+            let under = graph.add_node(NodeOp::FieldRef("base".into()), at(0, 0));
+            let detail = graph.add_node(
+                noise(sub_seed(seed, 9), NoiseKind::Fbm, RELIEF_SCALE, 4),
+                at(0, 1),
+            );
+            let sum = graph.add_node(NodeOp::Binary(Binary::Add), at(1, 0));
+            let weight = graph.add_node(NodeOp::FieldRef("relief".into()), at(0, 2));
+            let masked = graph.add_node(NodeOp::Lerp, at(2, 1));
+            wire(graph, under, sum, 0);
+            wire(graph, detail, sum, 1);
+            wire(graph, under, masked, 0);
+            wire(graph, sum, masked, 1);
+            wire(graph, weight, masked, 2);
+            masked
+        })))
 }
 
 #[cfg(test)]

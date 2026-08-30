@@ -2,7 +2,7 @@
 //! names, beside the values a `watershed::Terrain` was written from.
 //!
 //! The values and the recipe are two files because they are two audiences. A
-//! consuming project reads `terrain.ron` and never learns what a layer stack is; the
+//! consuming project reads `terrain.ron` and never learns what a field graph is; the
 //! editor reads both, and only the editor can. Nothing here is needed to read a
 //! terrain, and a directory with this half deleted is still a terrain.
 //!
@@ -19,18 +19,29 @@ use thiserror::Error;
 use watershed::channel::ChannelMeta;
 use watershed::field::FieldId;
 use watershed::io::IoError;
-use watershed::meta::{LayerMeta, VERSION};
+use watershed::meta::LayerMeta;
 use watershed::raster::Raster;
 use watershed::terrain::Terrain;
 
 use crate::terrain::bake::{BakeError, PlanError, TerrainSpec};
 use crate::terrain::field::Field;
-use crate::terrain::layer::{Layer, LayerOp, Mask};
+use crate::terrain::graph::{FieldGraph, NodeId, NodeOp};
 use crate::terrain::water::{WaterError, WaterSpec};
 
 /// The recipe file a terrain directory carries when it was saved as a document, and
 /// the only name this reader knows without being told it.
 pub const RECIPE_FILE: &str = "recipe.ron";
+
+/// The recipe format this build writes, and the only one it reads.
+///
+/// Separate from [`watershed::meta::VERSION`], which versions the `terrain.ron` a
+/// consuming project reads: the two files have two audiences and change for
+/// different reasons, and a recipe that gains a field must not invalidate every
+/// terrain already exported.
+///
+/// A recipe carrying any other version is refused outright; there is no migration
+/// path.
+pub const RECIPE_VERSION: u32 = 3;
 
 /// The largest `recipe.ron` this build will read, checked before the file is read.
 pub const MAX_RECIPE_BYTES: u64 = 64 * 1024 * 1024;
@@ -54,7 +65,7 @@ pub enum RecipeError {
     #[error("{RECIPE_FILE} is {0} bytes, over the {MAX_RECIPE_BYTES} byte limit")]
     TooLarge(u64),
     /// A recipe this build cannot read. There is no migration path.
-    #[error("recipe version {0} is not supported; this build reads {VERSION}")]
+    #[error("recipe version {0} is not supported; this build reads {RECIPE_VERSION}")]
     UnsupportedVersion(u32),
     /// A file the recipe names is not a plain name inside the directory.
     #[error("`{0}` is not a file name inside the terrain")]
@@ -117,25 +128,14 @@ impl SaveOptions {
     }
 }
 
-/// Which raster of a layer stack a painted image stands for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PaintSlot {
-    /// The layer's own raster — a [`LayerOp::Paint`] or [`LayerOp::External`].
-    Op,
-    /// The layer's [`Mask::Painted`].
-    Mask,
-}
-
 /// A painted raster's home, stated rather than implied by position.
 ///
 /// The recipe is hand-editable, so an order both halves would have to agree on
 /// without saying so is the one thing left that a reader would have to derive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaintRef {
-    /// Position in the field's stack.
-    pub stack_index: u32,
-    /// Which of that layer's two rasters this is.
-    pub slot: PaintSlot,
+    /// The node holding it, by [`NodeId`].
+    pub node: u32,
     /// The image holding it, as an index into [`RecipeMeta::images`].
     pub image: u32,
 }
@@ -143,7 +143,7 @@ pub struct PaintRef {
 /// The recipe for one field: everything needed to bake it again.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldStack {
-    /// The field this stack belongs to.
+    /// The field this graph belongs to.
     pub field: FieldId,
     /// The interval a bake clamps into. Not the same number as the range of the
     /// channel the field's values are stored in, which is what the byte spreads
@@ -151,8 +151,8 @@ pub struct FieldStack {
     pub range: (f32, f32),
     /// Carried through and never read by the bake.
     pub export: bool,
-    /// The layers, in evaluation order, with every raster in them emptied out.
-    pub stack: Vec<Layer>,
+    /// The graph, with every raster in it emptied out.
+    pub graph: FieldGraph,
     /// Where each emptied raster went.
     pub paint: Vec<PaintRef>,
 }
@@ -160,15 +160,15 @@ pub struct FieldStack {
 /// `recipe.ron` itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecipeMeta {
-    /// The format version, which is the terrain format's own. Checked before
-    /// anything else is read.
+    /// The recipe format version, [`RECIPE_VERSION`] — not the version of the
+    /// `terrain.ron` beside it. Checked before anything else is read.
     pub version: u32,
     /// Every painted image, in the order [`PaintRef::image`] indexes them.
     pub images: Vec<LayerMeta>,
     /// The spec the water was solved from, kept so a document that carries no
     /// solved water can still be re-solved rather than losing it.
     pub water_spec: Option<WaterSpec>,
-    /// One entry per field that has a stack.
+    /// One entry per field that has a graph.
     pub stacks: Vec<FieldStack>,
 }
 
@@ -250,22 +250,15 @@ fn decode_gray(file: &str, bytes: &[u8], size: UVec2) -> Result<Vec<u8>, RecipeE
     Ok(out)
 }
 
-fn stripped_op(op: &LayerOp) -> LayerOp {
+fn stripped_op(op: &NodeOp) -> NodeOp {
     match op {
-        LayerOp::Paint(_) => LayerOp::Paint(Raster::default()),
-        LayerOp::External(_) => LayerOp::External(Raster::default()),
-        LayerOp::Shader(shader) => {
+        NodeOp::Paint(_) => NodeOp::Paint(Raster::default()),
+        NodeOp::External(_) => NodeOp::External(Raster::default()),
+        NodeOp::Shader(shader) => {
             let mut shader = shader.clone();
             shader.clear();
-            LayerOp::Shader(shader)
+            NodeOp::Shader(shader)
         }
-        other => other.clone(),
-    }
-}
-
-fn stripped_mask(mask: &Mask) -> Mask {
-    match mask {
-        Mask::Painted(_) => Mask::Painted(Raster::default()),
         other => other.clone(),
     }
 }
@@ -275,7 +268,7 @@ struct PaintedImage {
     bytes: Vec<u8>,
 }
 
-fn paint_image(index: usize, raster: &Raster<f32>) -> PaintedImage {
+fn external_image(index: usize, raster: &Raster<f32>) -> PaintedImage {
     let finite: Vec<f32> = raster
         .data()
         .iter()
@@ -306,7 +299,7 @@ fn paint_image(index: usize, raster: &Raster<f32>) -> PaintedImage {
     }
 }
 
-fn mask_image(index: usize, raster: &Raster<u8>) -> PaintedImage {
+fn painted_image(index: usize, raster: &Raster<u8>) -> PaintedImage {
     PaintedImage {
         meta: LayerMeta {
             file: paint_file(index),
@@ -326,39 +319,36 @@ fn recipe_of(spec: &TerrainSpec) -> (RecipeMeta, Vec<PaintedImage>) {
     let mut stacks = Vec::with_capacity(spec.fields.len());
     for field in &spec.fields {
         let mut paint = Vec::new();
-        let mut stack = Vec::with_capacity(field.layers.len());
-        for (index, layer) in field.layers.iter().enumerate() {
-            if let LayerOp::Paint(raster) | LayerOp::External(raster) = &layer.op {
-                images.push(paint_image(images.len(), raster));
-                paint.push(PaintRef {
-                    stack_index: index as u32,
-                    slot: PaintSlot::Op,
-                    image: images.len() as u32 - 1,
-                });
+        let mut graph = field.graph.clone();
+        for node in &mut graph.nodes {
+            match &node.op {
+                NodeOp::Paint(raster) if !raster.is_empty() => {
+                    images.push(painted_image(images.len(), raster));
+                }
+                NodeOp::External(raster) if !raster.is_empty() => {
+                    images.push(external_image(images.len(), raster));
+                }
+                _ => {
+                    node.op = stripped_op(&node.op);
+                    continue;
+                }
             }
-            if let Mask::Painted(raster) = &layer.mask {
-                images.push(mask_image(images.len(), raster));
-                paint.push(PaintRef {
-                    stack_index: index as u32,
-                    slot: PaintSlot::Mask,
-                    image: images.len() as u32 - 1,
-                });
-            }
-            let mut stripped = layer.clone();
-            stripped.op = stripped_op(&layer.op);
-            stripped.mask = stripped_mask(&layer.mask);
-            stack.push(stripped);
+            paint.push(PaintRef {
+                node: node.id.0,
+                image: images.len() as u32 - 1,
+            });
+            node.op = stripped_op(&node.op);
         }
         stacks.push(FieldStack {
             field: field.id.clone(),
             range: field.range,
             export: field.export,
-            stack,
+            graph,
             paint,
         });
     }
     let meta = RecipeMeta {
-        version: VERSION,
+        version: RECIPE_VERSION,
         images: images.iter().map(|image| image.meta.clone()).collect(),
         water_spec: spec.water_spec.clone(),
         stacks,
@@ -457,13 +447,13 @@ impl TerrainSpec {
                 let meta = recipe.as_ref().expect("a stack came from a recipe");
                 field.range = stack.range;
                 field.export = stack.export;
-                field.layers = stack.stack.clone();
+                field.graph = stack.graph.clone();
                 attach_paint(&root, meta, stack, &mut field)?;
             }
             spec.fields.push(field);
         }
 
-        if spec.fields.iter().any(|field| !field.layers.is_empty()) {
+        if spec.fields.iter().any(|field| !field.graph.nodes.is_empty()) {
             spec.bake_in_place()?;
             if let Some(water) = spec.water_spec.clone() {
                 spec.solve_water(&water)?;
@@ -485,7 +475,7 @@ fn read_recipe(root: &Path) -> Result<Option<RecipeMeta>, RecipeError> {
     let text = std::fs::read_to_string(&path)?;
     let meta: RecipeMeta =
         ron::from_str(&text).map_err(|error| RecipeError::Meta(error.to_string()))?;
-    if meta.version != VERSION {
+    if meta.version != RECIPE_VERSION {
         return Err(RecipeError::UnsupportedVersion(meta.version));
     }
     if meta.images.len() > MAX_PAINT_IMAGES {
@@ -516,14 +506,12 @@ fn attach_paint(
             ))
         })?;
         let target = field
-            .layers
-            .get_mut(reference.stack_index as usize)
+            .graph
+            .node_mut(NodeId(reference.node))
             .ok_or_else(|| {
                 RecipeError::Inconsistent(format!(
-                    "`{}` names stack position {}, of {}",
-                    field.id,
-                    reference.stack_index,
-                    stack.stack.len()
+                    "`{}` names node n{}, which its graph does not have",
+                    field.id, reference.node
                 ))
             })?;
         let size = UVec2::new(declared.width, declared.height);
@@ -533,32 +521,20 @@ fn attach_paint(
             RecipeError::Inconsistent(format!("`{}` declares no channel", declared.file))
         })?;
         let short = || RecipeError::Inconsistent(format!("`{}` is short", declared.file));
-        match reference.slot {
-            PaintSlot::Op => {
+        match &mut target.op {
+            NodeOp::Paint(slot) => {
+                *slot = Raster::from_vec(size, pixels).ok_or_else(short)?;
+            }
+            NodeOp::External(slot) => {
                 let table = channel.table();
                 let data: Vec<f32> = pixels.iter().map(|byte| table.get(*byte)).collect();
-                let raster = Raster::from_vec(size, data).ok_or_else(short)?;
-                match &mut target.op {
-                    LayerOp::Paint(slot) | LayerOp::External(slot) => *slot = raster,
-                    _ => {
-                        return Err(RecipeError::Inconsistent(format!(
-                            "`{}` position {} does not take paint",
-                            field.id, reference.stack_index
-                        )));
-                    }
-                }
+                *slot = Raster::from_vec(size, data).ok_or_else(short)?;
             }
-            PaintSlot::Mask => {
-                let raster = Raster::from_vec(size, pixels).ok_or_else(short)?;
-                match &mut target.mask {
-                    Mask::Painted(slot) => *slot = raster,
-                    _ => {
-                        return Err(RecipeError::Inconsistent(format!(
-                            "`{}` position {} does not take a mask",
-                            field.id, reference.stack_index
-                        )));
-                    }
-                }
+            _ => {
+                return Err(RecipeError::Inconsistent(format!(
+                    "`{}` node n{} does not take paint",
+                    field.id, reference.node
+                )));
             }
         }
     }
@@ -573,7 +549,7 @@ mod tests {
     use watershed::field::{FieldId, FieldRole};
     use watershed::meta::TerrainMeta;
 
-    use crate::terrain::layer::{Blend, Remap};
+    use crate::terrain::graph::Remap;
     use crate::terrain::noise::{NoiseKind, NoiseSpec};
     use crate::terrain::shader::ShaderLayer;
 
@@ -598,51 +574,65 @@ mod tests {
         Raster::from_vec(SIZE, data).unwrap()
     }
 
+    /// The same awkward extent as [`awkward_ramp`], as the bytes a paint node keeps.
+    fn awkward_bytes() -> Raster<u8> {
+        let size = UVec2::new(SIZE.x + 3, SIZE.y - 1);
+        let count = (size.x * size.y) as usize;
+        let data = (0..count).map(|i| (i % 251) as u8).collect();
+        Raster::from_vec(size, data).unwrap()
+    }
+
+    /// The same ramp as [`ramp`], as the bytes a paint node keeps.
+    fn byte_ramp() -> Raster<u8> {
+        let data = (0..cells())
+            .map(|i| ((i % SIZE.x as usize) as f32 / SIZE.x as f32 * 255.0) as u8)
+            .collect();
+        Raster::from_vec(SIZE, data).unwrap()
+    }
+
     fn byte_mask() -> Raster<u8> {
         let data = (0..cells()).map(|i| (i % 251) as u8).collect();
         Raster::from_vec(SIZE, data).unwrap()
     }
 
-    fn noise_layer(seed: u32) -> Layer {
-        Layer::new(LayerOp::Noise(NoiseSpec::new(seed, NoiseKind::Fbm, 0.05)))
-            .with_blend(Blend::Replace)
+    fn noise_op(seed: u32) -> NodeOp {
+        NodeOp::Noise(NoiseSpec::new(seed, NoiseKind::Fbm, 0.05))
     }
 
+    /// A graph carrying every kind of raster the recipe has to lift out and put back:
+    /// a painted one, an imported one, and a painted weight.
     fn painted_document() -> TerrainSpec {
         TerrainSpec::new(SIZE)
-            .with_field(
-                Field::new("moisture")
-                    .with_shift(2)
-                    .with_layer(noise_layer(3)),
-            )
+            .with_field(Field::new("moisture").with_shift(2).with_op(noise_op(3)))
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
-                    .with_layer(
-                        Layer::new(LayerOp::Paint(awkward_ramp())).with_blend(Blend::Replace),
-                    )
-                    .with_layer(
-                        Layer::new(LayerOp::External(ramp())).with_mask(Mask::Painted(byte_mask())),
-                    )
-                    .with_layer(noise_layer(9).with_mask(Mask::Field(
-                        FieldId::from("moisture"),
-                        Remap::new((0.3, 0.7), (0.0, 1.0)),
-                    ))),
+                    .with_graph({
+                        let mut graph = FieldGraph::new();
+                        let painted = graph.node_with(NodeOp::Paint(awkward_bytes()), &[]);
+                        let imported = graph.node_with(NodeOp::External(ramp()), &[]);
+                        let weight = graph.node_with(NodeOp::Paint(byte_mask()), &[]);
+                        let over = graph.node_with(NodeOp::Lerp, &[painted, imported, weight]);
+                        let detail = graph.node_with(noise_op(9), &[]);
+                        let read = graph.node_with(NodeOp::FieldRef(FieldId::from("moisture")), &[]);
+                        let band = graph.node_with(
+                            NodeOp::Remap(Remap::new((0.3, 0.7), (0.0, 1.0))),
+                            &[read],
+                        );
+                        let total = graph.node_with(NodeOp::Lerp, &[over, detail, band]);
+                        graph.set_output(Some(total)).unwrap();
+                        graph
+                    }),
             )
     }
 
     fn baked_document() -> TerrainSpec {
         let mut terrain = TerrainSpec::new(SIZE)
-            .with_field(
-                Field::new("moisture")
-                    .with_shift(2)
-                    .with_layer(noise_layer(3)),
-            )
+            .with_field(Field::new("moisture").with_shift(2).with_op(noise_op(3)))
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
-                    .with_layer(Layer::new(LayerOp::Paint(ramp())).with_blend(Blend::Replace))
-                    .with_layer(noise_layer(9)),
+                    .with_sum([NodeOp::Paint(byte_ramp()), noise_op(9)]),
             );
         terrain.bake_in_place().unwrap();
         terrain
@@ -652,7 +642,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "watershed-recipe-{}-{}-{name}",
             std::process::id(),
-            VERSION
+            RECIPE_VERSION
         ));
         let _ = std::fs::remove_dir_all(&root);
         root
@@ -692,7 +682,7 @@ mod tests {
         assert!(Terrain::load_from_dir(&root).is_ok());
         let loaded = TerrainSpec::load_from_dir(&root).unwrap();
         assert_eq!(loaded.fields.len(), 2);
-        assert!(loaded.fields.iter().all(|field| field.layers.is_empty()));
+        assert!(loaded.fields.iter().all(|field| field.graph.nodes.is_empty()));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -749,11 +739,9 @@ mod tests {
     // paint layer unloadable.
     #[test]
     fn a_painted_image_carries_its_own_extent_and_no_shift() {
-        let odd = Raster::from_vec(UVec2::new(7, 5), vec![0.5f32; 35]).unwrap();
-        let spec = TerrainSpec::new(SIZE).with_field(
-            Field::new("height")
-                .with_layer(Layer::new(LayerOp::Paint(odd)).with_blend(Blend::Replace)),
-        );
+        let odd = Raster::from_vec(UVec2::new(7, 5), vec![128u8; 35]).unwrap();
+        let spec = TerrainSpec::new(SIZE)
+            .with_field(Field::new("height").with_op(NodeOp::Paint(odd)));
         let root = saved(&spec, SaveOptions::document(), "odd-paint");
 
         let text = std::fs::read_to_string(root.join(RECIPE_FILE)).unwrap();
@@ -762,8 +750,8 @@ mod tests {
         assert_eq!(recipe.images[0].shift, None);
 
         let loaded = TerrainSpec::load_from_dir(&root).unwrap();
-        match &loaded.fields[0].layers[0].op {
-            LayerOp::Paint(raster) => assert_eq!(raster.size(), UVec2::new(7, 5)),
+        match &loaded.fields[0].graph.nodes[0].op {
+            NodeOp::Paint(raster) => assert_eq!(raster.size(), UVec2::new(7, 5)),
             other => panic!("{other:?}"),
         }
         std::fs::remove_dir_all(&root).unwrap();
@@ -779,12 +767,12 @@ mod tests {
         let mask = loaded
             .fields
             .iter()
-            .flat_map(|field| &field.layers)
-            .find_map(|layer| match &layer.mask {
-                Mask::Painted(raster) => Some(raster),
+            .flat_map(|field| &field.graph.nodes)
+            .find_map(|node| match &node.op {
+                NodeOp::Paint(raster) if raster == &byte_mask() => Some(raster),
                 _ => None,
             })
-            .unwrap();
+            .expect("the painted weight came back");
         assert_eq!(mask, &byte_mask());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -860,13 +848,13 @@ mod tests {
         let spec = TerrainSpec::new(SIZE).with_field(
             Field::new("height")
                 .with_role(FieldRole::Height)
-                .with_layer(Layer::new(LayerOp::Shader(shader)).with_blend(Blend::Replace)),
+                .with_op(NodeOp::Shader(shader)),
         );
         let root = saved(&spec, SaveOptions::document(), "shader");
 
         let loaded = TerrainSpec::load_from_dir(&root).unwrap();
-        match &loaded.fields[0].layers[0].op {
-            LayerOp::Shader(shader) => {
+        match &loaded.fields[0].graph.nodes[0].op {
+            NodeOp::Shader(shader) => {
                 assert_eq!(shader.file, "ridged.wgsl");
                 assert_eq!(shader.params.get("scale"), Some(&vec![0.03]));
                 assert!(shader.values().is_empty(), "the values were serialized");

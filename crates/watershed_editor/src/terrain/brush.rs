@@ -8,7 +8,7 @@
 use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 
-use watershed::raster::{CellRect, Raster};
+use watershed::raster::{CellRect, Raster, Texel};
 
 /// What a stroke does to the value already under it.
 ///
@@ -105,7 +105,7 @@ impl Brush {
     /// outwards: every cell whose value changed is inside it, and it may name cells
     /// that did not change. Empty when the stroke touched nothing — no points, no
     /// radius, or entirely off the document.
-    pub fn stroke(&self, raster: &mut Raster<f32>, size: UVec2, points: &[Vec2]) -> CellRect {
+    pub fn stroke(&self, raster: &mut Raster<u8>, size: UVec2, points: &[Vec2]) -> CellRect {
         let Some(texels) = self.touched_texels(raster.size(), size, points) else {
             return CellRect::EMPTY;
         };
@@ -123,7 +123,7 @@ impl Brush {
                 if weight <= 0.0 {
                     continue;
                 }
-                let Some(current) = raster.get(i, j).copied() else {
+                let Some(current) = raster.get(i, j).copied().map(Texel::to_f32) else {
                     continue;
                 };
                 let rate = (self.strength * weight).clamp(0.0, 1.0);
@@ -133,7 +133,7 @@ impl Brush {
                     BrushMode::Set => current + (self.value - current) * rate,
                     BrushMode::Smooth => current + (window.mean_around(i, j) - current) * rate,
                 };
-                raster.set(i, j, value);
+                raster.set(i, j, to_byte(value));
             }
         }
 
@@ -211,13 +211,17 @@ fn distance_to_segment(from: Vec2, to: Vec2, position: Vec2) -> f32 {
     (from + along * t).distance(position)
 }
 
+fn to_byte(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 struct Window {
     rect: CellRect,
     values: Vec<f32>,
 }
 
 impl Window {
-    fn of(raster: &Raster<f32>, texels: CellRect, wanted: bool) -> Self {
+    fn of(raster: &Raster<u8>, texels: CellRect, wanted: bool) -> Self {
         if !wanted {
             return Self {
                 rect: CellRect::EMPTY,
@@ -230,7 +234,7 @@ impl Window {
         let mut values = Vec::with_capacity((rect.width() * rect.height()) as usize);
         for y in rect.min.y..rect.max.y {
             for x in rect.min.x..rect.max.x {
-                values.push(raster.get(x, y).copied().unwrap_or(0.0));
+                values.push(raster.get(x, y).copied().map_or(0.0, Texel::to_f32));
             }
         }
         Self { rect, values }
@@ -263,8 +267,22 @@ impl Window {
 mod tests {
     use super::*;
 
-    fn raster(size: u32) -> Raster<f32> {
-        Raster::new(UVec2::splat(size), 0.0)
+    fn raster(size: u32) -> Raster<u8> {
+        Raster::new(UVec2::splat(size), 0u8)
+    }
+
+    /// Half of the band a stroke is kept in, as the byte holding it.
+    const MIDDLE: f32 = 128.0 / 255.0;
+
+    /// A raster a stroke can move in either direction from, which zero is not: a byte
+    /// clamps at the bottom of the band, so a subtract from zero is a no-op.
+    fn middling(size: u32) -> Raster<u8> {
+        Raster::new(UVec2::splat(size), 128u8)
+    }
+
+    /// A texel as the float everything downstream reads it as.
+    fn at(raster: &Raster<u8>, x: u32, y: u32) -> f32 {
+        raster.get(x, y).copied().map_or(0.0, Texel::to_f32)
     }
 
     fn document(size: u32) -> UVec2 {
@@ -317,9 +335,9 @@ mod tests {
         };
         let touched = brush.stroke(&mut raster, document(64), &[Vec2::new(32.0, 32.0)]);
 
-        assert!(*raster.get(32, 32).unwrap() > 0.0);
-        assert_eq!(*raster.get(0, 0).unwrap(), 0.0);
-        assert_eq!(*raster.get(63, 63).unwrap(), 0.0);
+        assert!(at(&raster, 32, 32) > 0.0);
+        assert_eq!(at(&raster, 0, 0), 0.0);
+        assert_eq!(at(&raster, 63, 63), 0.0);
         assert!(touched.contains(32, 32));
         assert!(!touched.contains(0, 0));
     }
@@ -342,7 +360,7 @@ mod tests {
 
         for y in 0..64 {
             for x in 0..64 {
-                if *raster.get(x, y).unwrap() != 0.0 {
+                if at(&raster, x, y) != 0.0 {
                     assert!(
                         touched.contains(x, y),
                         "{x},{y} moved outside the rectangle"
@@ -377,7 +395,7 @@ mod tests {
         brush.stroke(&mut fine, document(64), &subdivided);
 
         for (a, b) in coarse.data().iter().zip(fine.data()) {
-            assert!((a - b).abs() < 1e-5, "{a} against {b}");
+            assert_eq!(a, b, "{a} against {b}");
         }
     }
 
@@ -385,8 +403,8 @@ mod tests {
     // two modes are exact mirrors, including through the falloff.
     #[test]
     fn subtracting_is_adding_in_the_other_direction() {
-        let mut raised = raster(32);
-        let mut lowered = raster(32);
+        let mut raised = middling(32);
+        let mut lowered = middling(32);
         let brush = Brush {
             radius_cells: 6.0,
             strength: 0.4,
@@ -401,8 +419,10 @@ mod tests {
         }
         .stroke(&mut lowered, document(32), &points);
 
-        for (up, down) in raised.data().iter().zip(lowered.data()) {
-            assert!((up + down).abs() < 1e-6);
+        for (index, (up, down)) in raised.data().iter().zip(lowered.data()).enumerate() {
+            let up = Texel::to_f32(*up) - MIDDLE;
+            let down = Texel::to_f32(*down) - MIDDLE;
+            assert!((up + down).abs() < 1.0 / 255.0, "texel {index}: {up} against {down}");
         }
     }
 
@@ -421,9 +441,10 @@ mod tests {
         };
         brush.stroke(&mut raster, document(32), &[Vec2::new(16.0, 16.0)]);
 
-        assert!((*raster.get(16, 16).unwrap() - 0.75).abs() < 1e-6);
+        assert!((at(&raster, 16, 16) - 0.75).abs() < 1.0 / 255.0);
         for value in raster.data() {
-            assert!((0.0..=0.75).contains(value), "{value} left the band");
+            let value = Texel::to_f32(*value);
+            assert!((0.0..=0.75 + 1.0 / 255.0).contains(&value), "{value} left the band");
         }
     }
 
@@ -433,7 +454,7 @@ mod tests {
     #[test]
     fn smoothing_pulls_a_spike_down_without_moving_the_ground_around_it() {
         let mut raster = raster(32);
-        raster.set(16, 16, 1.0);
+        raster.set(16, 16, 255u8);
         let before = raster.data().to_vec();
 
         Brush {
@@ -445,9 +466,9 @@ mod tests {
         }
         .stroke(&mut raster, document(32), &[Vec2::new(16.5, 16.5)]);
 
-        assert!(*raster.get(16, 16).unwrap() < 0.5);
-        assert!(*raster.get(15, 16).unwrap() > 0.0);
-        assert_eq!(*raster.get(0, 0).unwrap(), before[0]);
+        assert!(at(&raster, 16, 16) < 0.5);
+        assert!(at(&raster, 15, 16) > 0.0);
+        assert_eq!(raster.data()[0], before[0]);
     }
 
     // A coarse layer is stretched over the document rather than matching it, so a
@@ -462,15 +483,15 @@ mod tests {
             strength: 1.0,
             ..Brush::default()
         };
-        let mut fine = Raster::new(UVec2::splat(64), 0.0);
-        let mut coarse = Raster::new(UVec2::splat(16), 0.0);
+        let mut fine = Raster::new(UVec2::splat(64), 0u8);
+        let mut coarse = Raster::new(UVec2::splat(16), 0u8);
         let points = [Vec2::new(16.0, 16.0)];
         brush.stroke(&mut fine, document(64), &points);
         brush.stroke(&mut coarse, document(64), &points);
 
-        assert!(*fine.get(16, 16).unwrap() > 0.5);
-        assert!(*coarse.get(4, 4).unwrap() > 0.5);
-        assert_eq!(*coarse.get(15, 15).unwrap(), 0.0);
+        assert!(at(&fine, 16, 16) > 0.5);
+        assert!(at(&coarse, 4, 4) > 0.5);
+        assert_eq!(at(&coarse, 15, 15), 0.0);
     }
 
     // The texel rectangle is computed in floats and cast to unsigned; without the
@@ -486,7 +507,7 @@ mod tests {
         };
         let touched = brush.stroke(&mut raster, document(32), &[Vec2::new(-100.0, -100.0)]);
         assert!(touched.is_empty());
-        assert!(raster.data().iter().all(|value| *value == 0.0));
+        assert!(raster.data().iter().all(|byte| *byte == 0));
     }
 
     // Both are states the editor passes through on the way to a real stroke — a
@@ -508,6 +529,6 @@ mod tests {
             .stroke(&mut raster, document(32), &[Vec2::splat(16.0)])
             .is_empty()
         );
-        assert!(raster.data().iter().all(|value| *value == 0.0));
+        assert!(raster.data().iter().all(|byte| *byte == 0));
     }
 }

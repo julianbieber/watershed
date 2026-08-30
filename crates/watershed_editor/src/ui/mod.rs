@@ -9,6 +9,8 @@
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::picking::Pickable;
 use bevy::picking::hover::HoverMap;
+use bevy::feathers::theme::ThemeBackgroundColor;
+use bevy::feathers::tokens;
 use bevy::prelude::*;
 use bevy::ui::UiSystems;
 use bevy::window::PrimaryWindow;
@@ -16,6 +18,8 @@ use bevy::window::PrimaryWindow;
 use crate::document::Document;
 use crate::preset::Preset;
 use crate::view::FreeView;
+use crate::canvas::{CanvasFrame, CanvasViewport};
+use crate::terrain::graph::NodeId;
 
 mod bind;
 mod dialog;
@@ -55,7 +59,10 @@ impl Plugin for UiPlugin {
             .add_observer(scroll::apply)
             .add_systems(
                 PostUpdate,
-                (bind::push, measure_free_view.after(UiSystems::Layout)),
+                (
+                    bind::push,
+                    (measure_free_view, measure_canvas_frame).after(UiSystems::Layout),
+                ),
             );
     }
 }
@@ -102,7 +109,7 @@ impl Default for FilePath {
     }
 }
 
-/// Which op the layer panel's add button will make, as one of [`ADDABLE`].
+/// Which op the panel's add button will make, as one of [`ADDABLE`].
 ///
 /// Held across frames because choosing from the menu and pressing the button are two
 /// separate acts, and the choice has to stand between them.
@@ -115,10 +122,10 @@ impl Default for AddLayer {
     }
 }
 
-/// Which of the layer panel's collapsible sections are open.
+/// Which of the panel's collapsible sections are open.
 ///
 /// Kept here rather than in the toggles themselves because the panel is rebuilt
-/// whenever the stack changes shape — adding a layer despawns every toggle in it, and
+/// whenever the graph changes shape — adding a node despawns every toggle in it, and
 /// state left in one would be lost with it, closing every section on each edit.
 ///
 /// Layers are held by index, so reordering a stack moves which layer is open.
@@ -126,42 +133,47 @@ impl Default for AddLayer {
 pub struct Expanded {
     /// Whether the brush section is open.
     pub brush: bool,
-    /// Indices of the open layers, in no particular order.
-    pub layers: Vec<usize>,
+    /// The open nodes, in no particular order.
+    pub nodes: Vec<NodeId>,
 }
 
 impl Expanded {
-    /// Whether the layer at that index is open.
-    pub fn has(&self, index: usize) -> bool {
-        self.layers.contains(&index)
+    /// Whether that node's section is open.
+    pub fn has(&self, id: NodeId) -> bool {
+        self.nodes.contains(&id)
     }
 
-    /// Opens or closes the layer at that index. Any number may be open at once.
-    pub fn set(&mut self, index: usize, open: bool) {
-        self.layers.retain(|held| *held != index);
+    /// Opens or closes that node's section. Any number may be open at once.
+    pub fn set(&mut self, id: NodeId, open: bool) {
+        self.nodes.retain(|held| *held != id);
         if open {
-            self.layers.push(index);
+            self.nodes.push(id);
         }
     }
 }
 
 const PANEL_WIDTH: f32 = 320.0;
 
-/// What the layer panel's add button offers.
+/// What the panel's add button offers.
 ///
 /// An op is spelled as [`crate::edit::parse_op`] spells it, so the button and the
 /// control client's verb name the same thing. A `shader:` entry is not an op word: it
-/// names the stock shader to copy into the document, and the layer it makes is a
+/// names the stock shader to copy into the document, and the node it makes is a
 /// `shader` op over the copy.
 ///
 /// A regions op is deliberately absent: a region table is not something a single
 /// button or a command line can write.
-pub const ADDABLE: [&str; 9] = [
+pub const ADDABLE: [&str; 14] = [
     "noise",
     "constant",
     "fieldref",
     "slope",
     "paint",
+    "binary",
+    "lerp",
+    "scale",
+    "remap",
+    "curve",
     "shader:ridged",
     "shader:warped",
     "shader:terrace",
@@ -173,6 +185,23 @@ struct WorldViewport;
 
 fn shell() -> impl SceneList {
     bsn_list![chrome(), dialog::dialog()]
+}
+
+/// The line between the map and the canvas.
+///
+/// The two are separate views on separate cameras that happen to share a window, and
+/// without a seam a person reads them as one picture — and then cannot tell which of
+/// them a scroll is about to act on.
+fn canvas_divider() -> impl Scene {
+    bsn! {
+        Node {
+            height: px(2),
+            min_height: px(2),
+            flex_shrink: 0.0,
+        }
+        Pickable { should_block_lower: false, is_hoverable: false }
+        ThemeBackgroundColor(tokens::GROUP_HEADER_BORDER)
+    }
 }
 
 fn chrome() -> impl Scene {
@@ -203,19 +232,71 @@ fn chrome() -> impl Scene {
                             flex_grow: 1.0,
                             display: Display::Flex,
                             flex_direction: FlexDirection::Column,
-                            justify_content: JustifyContent::End,
-                            align_items: AlignItems::Start,
-                            padding: px(12),
+                            align_items: AlignItems::Stretch,
+                            min_width: px(0),
                         }
                         Pickable { should_block_lower: false, is_hoverable: false }
-                        WorldViewport
-                        Children [ legend::legend() ]
+                        Children [
+                            (
+                                Node {
+                                    flex_grow: 1.0,
+                                    display: Display::Flex,
+                                    flex_direction: FlexDirection::Column,
+                                    justify_content: JustifyContent::End,
+                                    align_items: AlignItems::Start,
+                                    padding: px(12),
+                                    min_height: px(0),
+                                }
+                                Pickable { should_block_lower: false, is_hoverable: false }
+                                WorldViewport
+                                Children [ legend::legend() ]
+                            ),
+                            canvas_divider(),
+                            (
+                                Node {
+                                    flex_grow: 0.72,
+                                    min_height: px(0),
+                                }
+                                Pickable { should_block_lower: false, is_hoverable: false }
+                                CanvasViewport
+                            ),
+                        ]
                     ),
                     stack::panel(),
                 ]
             )
         ]
     }
+}
+
+/// Publishes the rectangle the layout gave the canvas, in physical pixels.
+///
+/// Measured from the node the layout actually placed rather than from a fraction
+/// computed a second time, so the camera's viewport and the space reserved for it
+/// cannot drift apart.
+fn measure_canvas_frame(
+    mut frame: ResMut<CanvasFrame>,
+    window: Option<Single<&Window, With<PrimaryWindow>>>,
+    viewport: Option<Single<(&ComputedNode, &UiGlobalTransform), With<CanvasViewport>>>,
+) {
+    let (Some(window), Some(viewport)) = (window, viewport) else {
+        return;
+    };
+    let (node, transform) = viewport.into_inner();
+    // A computed node is already measured in physical pixels, as the window is — a
+    // second conversion by the scale factor is what put the viewport off the target.
+    let size = node.size();
+    let centre = Vec2::new(transform.translation.x, transform.translation.y);
+    let target = Vec2::new(
+        window.physical_width() as f32,
+        window.physical_height() as f32,
+    );
+    if target.x < 1.0 || target.y < 1.0 {
+        return;
+    }
+    let low = (centre - size * 0.5).max(Vec2::ZERO).min(target - Vec2::ONE);
+    frame.position = low;
+    frame.size = size.min(target - low).max(Vec2::ONE);
 }
 
 fn measure_free_view(
