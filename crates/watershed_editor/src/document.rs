@@ -174,6 +174,11 @@ pub struct Document {
     /// What a stroke has made stale since the last bake was opened. A rectangle rather than
     /// a flag because that is the whole of what a stroke costs — see [`Document::note_stroke`].
     stroke_rect: CellRect,
+    /// Edits made while a job held the terrain, waiting for it to come back.
+    ///
+    /// Only edits no bake reads ever land here, so draining them cannot invalidate the
+    /// bake that was running while they were made.
+    deferred: Vec<Edit>,
     pub size: UVec2,
     pub seed: u32,
     pub preset: Preset,
@@ -183,6 +188,7 @@ pub struct Document {
 impl Default for Document {
     fn default() -> Self {
         Self {
+            deferred: Vec::new(),
             terrain: None,
             job: Job::Idle,
             active: "height".to_owned(),
@@ -326,18 +332,29 @@ impl Document {
     /// Refused while a job is running or with no document open. On a refusal from the
     /// edit itself the document is untouched.
     pub fn apply(&mut self, edit: &Edit) -> Result<Value, String> {
+        // An edit no bake reads is held until the terrain comes back rather than
+        // refused: a job takes the terrain with it, and a card dropped while one was
+        // running would otherwise spring back to where it was picked up.
         if self.is_busy() {
-            return Err(format!(
-                "a {} is running",
-                self.job().map(JobKind::name).unwrap_or("job")
-            ));
+            if edit.reaches_the_bake() {
+                return Err(format!(
+                    "a {} is running",
+                    self.job().map(JobKind::name).unwrap_or("job")
+                ));
+            }
+            self.deferred.push(edit.clone());
+            return Ok(Value::Bool(true));
         }
         let terrain = self
             .terrain
             .as_mut()
             .ok_or("there is no document to edit")?;
         let reply = edit.apply(terrain)?;
-        self.note_edit();
+        if edit.reaches_the_bake() {
+            self.note_edit();
+        } else {
+            self.revision += 1;
+        }
         Ok(reply)
     }
 
@@ -592,6 +609,17 @@ fn finish_job(mut document: ResMut<Document>) {
         document.size = terrain.size;
         document.terrain = Some(terrain);
     }
+    // The edits held while the terrain was away, now that it is back. None of them
+    // reaches the bake, so applying them here cannot make the bake that just landed
+    // stale.
+    let held = std::mem::take(&mut document.deferred);
+    if let Some(terrain) = document.terrain.as_mut() {
+        for edit in &held {
+            if let Err(error) = edit.apply(terrain) {
+                warn!("a held edit was refused: {error}");
+            }
+        }
+    }
     document.revision += 1;
     document.water_revision += 1;
 
@@ -677,6 +705,124 @@ mod tests {
 
     fn rect(min: u32, max: u32) -> CellRect {
         CellRect::new(UVec2::splat(min), UVec2::splat(max))
+    }
+
+    fn one_node_document() -> Document {
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::{Field, TerrainSpec};
+        let mut document = Document::default();
+        let mut terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+        terrain.bake_in_place().unwrap();
+        document.adopt(terrain);
+        document.dirty = false;
+        document.baked = Baked::Whole;
+        document
+    }
+
+    fn only_node(document: &Document) -> String {
+        document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes[0]
+            .id
+            .to_string()
+    }
+
+    // Dragging a card writes the document but reaches no bake, so it must not throw the
+    // bake away — and `note_edit` also invalidates solved water, which would make moving
+    // a node cost a re-solve of the whole document.
+    #[test]
+    fn moving_a_node_does_not_make_the_bake_stale() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+
+        document
+            .apply(&Edit::PlaceNode {
+                field: "height".to_owned(),
+                node: node.clone(),
+                position: [40.0, -20.0],
+            })
+            .unwrap();
+
+        assert_eq!(document.baked, Baked::Whole, "a move invalidated the bake");
+        assert!(!document.dirty, "a move made the document dirty");
+        assert_eq!(
+            document.terrain().unwrap().field("height").unwrap().graph.nodes[0].position,
+            [40.0, -20.0]
+        );
+    }
+
+    // Naming a node is the same kind of edit and has to answer the same way.
+    #[test]
+    fn naming_a_node_does_not_make_the_bake_stale() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+
+        document
+            .apply(&Edit::RenameNode {
+                field: "height".to_owned(),
+                node,
+                name: Some("ground".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(document.baked, Baked::Whole);
+        assert!(!document.dirty);
+    }
+
+    // Changing what a node computes is the other half of the rule: that one does reach
+    // the bake, so it has to make it stale.
+    #[test]
+    fn changing_what_a_node_computes_does_make_the_bake_stale() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+
+        document
+            .apply(&Edit::Set {
+                path: format!("height.{node}.value"),
+                words: vec!["0.75".to_owned()],
+            })
+            .unwrap();
+
+        assert_eq!(document.baked, Baked::Nothing);
+        assert!(document.dirty);
+    }
+
+    // A job takes the terrain with it, so an edit made while one runs has nothing to
+    // write to. One that reaches no bake is held rather than refused, because a card
+    // dropped mid-bake would otherwise spring back to where it was picked up.
+    #[test]
+    fn a_move_made_while_a_job_holds_the_terrain_is_kept_rather_than_refused() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        // A real job, because the point of the test is that the terrain is genuinely
+        // gone while one runs; it is never polled, so nothing here waits on it.
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake(None).unwrap();
+        assert!(document.is_busy());
+        assert!(document.terrain().is_none(), "a job holds the terrain");
+
+        document
+            .apply(&Edit::PlaceNode {
+                field: "height".to_owned(),
+                node: node.clone(),
+                position: [12.0, 34.0],
+            })
+            .expect("a move is held, not refused");
+
+        // An edit that does reach the bake still has nowhere to go and is refused.
+        assert!(
+            document
+                .apply(&Edit::Set {
+                    path: format!("height.{node}.value"),
+                    words: vec!["0.75".to_owned()],
+                })
+                .is_err()
+        );
     }
 
     // `covers` is what decides whether a frame starts a job, so it has to be exact at

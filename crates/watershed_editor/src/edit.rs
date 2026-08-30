@@ -24,6 +24,7 @@ use watershed::raster::Raster;
 /// then take the identical path through [`Edit::apply`]. Neither side can acquire a
 /// shortcut the other lacks, and neither can change a document in a way the other
 /// could not have.
+#[derive(Clone)]
 pub enum Edit {
     /// Adds an unconnected node to a field's graph.
     AddNode {
@@ -109,6 +110,16 @@ pub enum Edit {
 }
 
 impl Edit {
+    /// Whether what this edit changes is read by a bake.
+    ///
+    /// A node's position and its name are authoring data: they are written to the
+    /// document and saved with it, but nothing that evaluates a texel reads either. An
+    /// edit that touches only those must not make the bake stale, or dragging a card
+    /// would throw away the whole field — and the solved water with it.
+    pub fn reaches_the_bake(&self) -> bool {
+        !matches!(self, Self::PlaceNode { .. } | Self::RenameNode { .. })
+    }
+
     /// Applies the edit and describes what it did, as the reply the control client
     /// sends back.
     ///
