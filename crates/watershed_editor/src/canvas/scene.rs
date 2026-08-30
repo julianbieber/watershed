@@ -132,9 +132,14 @@ pub fn rebuild_canvas(
 /// Position and name reach the document but not the bake, so they must not reach a
 /// rebuild either: dragging a card would otherwise despawn every card on the canvas
 /// the moment the button came up.
+///
+/// The card a drag is holding is left alone. While it is held the drag owns where it
+/// sits, and writing the document's position over it would put the card back under the
+/// cursor's own hand — and on the frame the button came up, back where it started.
 pub fn sync_canvas(
     document: Res<Document>,
     selection: Res<Selection>,
+    grab: Res<Grab>,
     mut cards: Query<(&NodeCard, &mut Transform)>,
     mut bars: Query<(&CardTitleBar, &mut Sprite)>,
     mut titles: Query<(&CardTitle, &mut Text2d)>,
@@ -143,10 +148,17 @@ pub fn sync_canvas(
     let Some(graph) = open_graph(&document) else {
         return;
     };
+    let held = match *grab {
+        Grab::Card { node, .. } => Some(node),
+        _ => None,
+    };
     for (card, mut transform) in &mut cards {
         let Some(node) = graph.node(card.node) else {
             continue;
         };
+        if held == Some(card.node) {
+            continue;
+        }
         transform.translation.x = node.position[0];
         transform.translation.y = node.position[1];
     }
@@ -340,4 +352,85 @@ fn fingerprint(document: &Document) -> String {
         }
     }
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::system::RunSystemOnce;
+
+    use super::*;
+    use crate::terrain::graph::NodeOp;
+    use crate::terrain::{Field, TerrainSpec};
+
+    /// A world holding one field of one node, with that node's card on the canvas at
+    /// `dragged_to`, and a drag holding that card when `held`.
+    fn world_with(held: bool, dragged_to: Vec2) -> (World, Entity) {
+        let mut document = Document::default();
+        document.adopt(
+            TerrainSpec::new(UVec2::splat(16))
+                .with_field(Field::new("height").with_op(NodeOp::Constant(0.5))),
+        );
+        let node = document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes[0]
+            .id;
+
+        let mut world = World::new();
+        world.insert_resource(document);
+        world.insert_resource(Selection::default());
+        let card = world
+            .spawn((
+                NodeCard {
+                    node,
+                    size: CARD,
+                    inputs: 0,
+                },
+                Transform::from_translation(dragged_to.extend(0.0)),
+            ))
+            .id();
+        world.insert_resource(if held {
+            Grab::Card {
+                entity: card,
+                node,
+                offset: Vec2::ZERO,
+                at: dragged_to,
+            }
+        } else {
+            Grab::Idle
+        });
+        (world, card)
+    }
+
+    fn at(world: &World, card: Entity) -> Vec2 {
+        world
+            .get::<Transform>(card)
+            .unwrap()
+            .translation
+            .truncate()
+    }
+
+    // The defect this guards was the whole of "I drag a node and it jumps back": the
+    // sync runs before the drag, so on the frame the button comes up it would write the
+    // document's position over the card the drag had just placed — putting it back
+    // where it was picked up, and taking the release's answer with it.
+    #[test]
+    fn the_card_a_drag_is_holding_is_left_where_the_drag_put_it() {
+        let dragged_to = Vec2::new(120.0, -80.0);
+        let (mut world, card) = world_with(true, dragged_to);
+        world.run_system_once(sync_canvas).unwrap();
+        assert_eq!(at(&world, card), dragged_to);
+    }
+
+    // And the other half: a card nothing is holding follows the document, which is what
+    // makes a position written by a control verb show up on the canvas at all.
+    #[test]
+    fn a_card_nothing_is_holding_follows_the_document() {
+        let (mut world, card) = world_with(false, Vec2::new(120.0, -80.0));
+        world.run_system_once(sync_canvas).unwrap();
+        assert_eq!(at(&world, card), Vec2::ZERO);
+    }
 }

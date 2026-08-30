@@ -169,6 +169,10 @@ pub enum Grab {
     #[default]
     Idle,
     /// A card is being moved. The offset keeps the point under the cursor under it.
+    ///
+    /// While this is held the drag owns the card's position, not the document: `at` is
+    /// where the card has been pulled to, and it is what the release writes. Reading it
+    /// back off the transform instead would read whatever ran last that frame.
     Card {
         /// The card entity.
         entity: Entity,
@@ -176,6 +180,8 @@ pub enum Grab {
         node: NodeId,
         /// Where the card sat relative to the cursor when it was taken.
         offset: Vec2,
+        /// Where the card has been dragged to.
+        at: Vec2,
     },
     /// A wire is being dragged from a pin.
     Wire {

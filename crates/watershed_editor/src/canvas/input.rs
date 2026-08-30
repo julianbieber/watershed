@@ -14,8 +14,13 @@ use crate::edit::Edit;
 use crate::terrain::graph::NodeId;
 use crate::ui::{pointer_over_ui, report};
 
-/// How far, in canvas units, a press may move and still count as a click.
-const CLICK_SLOP: f32 = 3.0;
+/// How far the pointer may travel, in the viewport's own pixels, and still count as a
+/// click rather than a drag.
+///
+/// Measured against where the press landed rather than against the frame before, so a
+/// slow drag is still a drag; and in viewport pixels rather than canvas units, so
+/// panning the camera under the pointer does not read as pointer movement.
+const CLICK_SLOP: f32 = 4.0;
 
 /// What the canvas holds between the frame a drag is finished on and the frame the
 /// edit it makes is applied.
@@ -91,7 +96,7 @@ pub fn canvas_drag(
     mut grab: ResMut<Grab>,
     mut selection: ResMut<Selection>,
     mut finished: ResMut<Finished>,
-    mut moved: Local<bool>,
+    mut pressed_at: Local<Option<Vec2>>,
 ) {
     let (Some(window), Some(camera)) = (window, camera) else {
         return;
@@ -110,7 +115,6 @@ pub fn canvas_drag(
         camera_at.translation.truncate() + cursor * Vec2::new(ortho.scale, -ortho.scale);
 
     if mouse.just_pressed(MouseButton::Left) && !pointer_over_ui(&hover, &ui) {
-        *moved = false;
         let on_pin = pins
             .iter()
             .find(|(_, at)| {
@@ -124,6 +128,7 @@ pub fn canvas_drag(
             })
             .map(|(entity, card, at)| (entity, card.node, at.translation.truncate()));
 
+        *pressed_at = Some(cursor);
         *grab = match (on_pin, on_card) {
             (Some(pin), _) => {
                 selection.select(Some(pin.node));
@@ -138,6 +143,7 @@ pub fn canvas_drag(
                     entity,
                     node,
                     offset: at - world,
+                    at,
                 }
             }
             (None, None) => Grab::Pan { anchor: world },
@@ -145,27 +151,46 @@ pub fn canvas_drag(
     }
 
     if mouse.pressed(MouseButton::Left)
-        && let Grab::Card { entity, offset, .. } = *grab
-        && let Ok((_, _, mut at)) = cards.get_mut(entity)
+        && let Grab::Card {
+            entity,
+            node,
+            offset,
+            ..
+        } = *grab
     {
         let target = world + offset;
-        if at.translation.truncate().distance(target) > CLICK_SLOP {
-            *moved = true;
+        *grab = Grab::Card {
+            entity,
+            node,
+            offset,
+            at: target,
+        };
+        if let Ok((_, _, mut held)) = cards.get_mut(entity) {
+            held.translation.x = target.x;
+            held.translation.y = target.y;
         }
-        at.translation.x = target.x;
-        at.translation.y = target.y;
     }
 
     if mouse.just_released(MouseButton::Left) {
         let held = std::mem::take(&mut *grab);
+        let dragged = pressed_at
+            .take()
+            .is_some_and(|from| from.distance(cursor) > CLICK_SLOP);
         let active = document.active().to_owned();
         match held {
-            Grab::Card { node, entity, .. } => {
-                if *moved && let Ok((_, _, at)) = cards.get(entity) {
+            Grab::Card { node, at, .. } => {
+                // Written from where the drag pulled the card to, and only when that is
+                // not where the document already has it — so a click on a card is not
+                // an edit, and a move of any size is.
+                let recorded = open_graph(&document)
+                    .and_then(|graph| graph.node(node))
+                    .map(|node| node.position);
+                let placed = [at.x, at.y];
+                if recorded != Some(placed) {
                     finished.0 = Some(Edit::PlaceNode {
                         field: active,
                         node: node.to_string(),
-                        position: [at.translation.x, at.translation.y],
+                        position: placed,
                     });
                 }
             }
@@ -185,13 +210,12 @@ pub fn canvas_drag(
                 }
             }
             Grab::Pan { .. } => {
-                if !*moved {
+                if !dragged {
                     selection.select(None);
                 }
             }
             Grab::Idle => {}
         }
-        *moved = false;
     }
 }
 
