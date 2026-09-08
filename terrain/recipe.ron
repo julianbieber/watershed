@@ -1,0 +1,208 @@
+(
+    version: 3,
+    images: [],
+    water_spec: Some((
+        height: ("height"),
+        moisture: Some(("moisture")),
+        lake_min_cells: 64,
+    )),
+    stacks: [
+        (
+            field: ("moisture"),
+            range: (0.0, 1.0),
+            export: false,
+            graph: (
+                nodes: [
+                    (
+                        id: (0),
+                        name: None,
+                        op: Noise((
+                            seed: 2387451637,
+                            kind: Fbm,
+                            scale: 0.004,
+                            octaves: 4,
+                            salt: 0,
+                            transform: (
+                                strike_degrees: 0.0,
+                                aspect: 1.0,
+                            ),
+                            warp: None,
+                        )),
+                        inputs: [],
+                        bypassed: false,
+                        position: (0.0, 0.0),
+                    ),
+                    (
+                        id: (1),
+                        name: None,
+                        op: Shader((
+                            file: "terrace_2.wgsl",
+                            params: {
+                                "hardness": [
+                                    0.7,
+                                ],
+                                "octaves": [
+                                    4.0,
+                                ],
+                                "scale": [
+                                    0.02,
+                                ],
+                                "steps": [
+                                    8.0,
+                                ],
+                            },
+                        )),
+                        inputs: [],
+                        bypassed: false,
+                        position: (260.0, -0.0),
+                    ),
+                    (
+                        id: (2),
+                        name: None,
+                        op: Binary(Add),
+                        inputs: [
+                            Some((1)),
+                            Some((0)),
+                        ],
+                        bypassed: false,
+                        position: (520.0, -0.0),
+                    ),
+                ],
+                output: Some((0)),
+                next_id: 3,
+            ),
+            paint: [],
+        ),
+        (
+            field: ("height"),
+            range: (0.0, 1.0),
+            export: false,
+            graph: (
+                nodes: [
+                    (
+                        id: (0),
+                        name: None,
+                        op: Noise((
+                            seed: 399228561,
+                            kind: Fbm,
+                            scale: 0.0015,
+                            octaves: 4,
+                            salt: 0,
+                            transform: (
+                                strike_degrees: 0.0,
+                                aspect: 1.0,
+                            ),
+                            warp: None,
+                        )),
+                        inputs: [],
+                        bypassed: false,
+                        position: (0.0, 0.0),
+                    ),
+                    (
+                        id: (1),
+                        name: None,
+                        op: Noise((
+                            seed: 1645750120,
+                            kind: Fbm,
+                            scale: 0.04,
+                            octaves: 4,
+                            salt: 0,
+                            transform: (
+                                strike_degrees: 0.0,
+                                aspect: 1.0,
+                            ),
+                            warp: None,
+                        )),
+                        inputs: [],
+                        bypassed: false,
+                        position: (0.0, 150.0),
+                    ),
+                    (
+                        id: (2),
+                        name: None,
+                        op: Scale(0.18),
+                        inputs: [
+                            Some((1)),
+                        ],
+                        bypassed: false,
+                        position: (260.0, 150.0),
+                    ),
+                    (
+                        id: (3),
+                        name: None,
+                        op: Binary(Add),
+                        inputs: [
+                            Some((0)),
+                            Some((2)),
+                        ],
+                        bypassed: false,
+                        position: (520.0, 0.0),
+                    ),
+                    (
+                        id: (4),
+                        name: None,
+                        op: Shader((
+                            file: "ridged.wgsl",
+                            params: {
+                                "lift": [
+                                    0.0,
+                                ],
+                                "octaves": [
+                                    5.0,
+                                ],
+                                "scale": [
+                                    0.02,
+                                ],
+                                "sharpness": [
+                                    1.0,
+                                ],
+                            },
+                        )),
+                        inputs: [],
+                        bypassed: false,
+                        position: (260.0, -0.0),
+                    ),
+                    (
+                        id: (5),
+                        name: None,
+                        op: Lerp,
+                        inputs: [
+                            Some((3)),
+                            Some((4)),
+                            Some((6)),
+                        ],
+                        bypassed: false,
+                        position: (780.0, -0.0),
+                    ),
+                    (
+                        id: (6),
+                        name: None,
+                        op: Shader((
+                            file: "terrace.wgsl",
+                            params: {
+                                "hardness": [
+                                    0.7,
+                                ],
+                                "octaves": [
+                                    10.0,
+                                ],
+                                "scale": [
+                                    0.02,
+                                ],
+                                "steps": [
+                                    10.0,
+                                ],
+                            },
+                        )),
+                        inputs: [],
+                        bypassed: false,
+                        position: (1040.0, -0.0),
+                    ),
+                ],
+                output: Some((3)),
+                next_id: 7,
+            ),
+            paint: [],
+        ),
+    ],
+)

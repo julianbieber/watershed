@@ -1,0 +1,83 @@
+(
+    version: 2,
+    size_x: 1024,
+    size_y: 1024,
+    layers: [
+        (
+            file: "layer_000.png",
+            width: 64,
+            height: 64,
+            shift: Some(4),
+            channels: [
+                (
+                    low: 0.017763048,
+                    high: 0.96858084,
+                    encoding: Linear,
+                ),
+            ],
+        ),
+        (
+            file: "layer_001.png",
+            width: 1024,
+            height: 1024,
+            shift: Some(0),
+            channels: [
+                (
+                    low: 0.17292419,
+                    high: 1.0,
+                    encoding: Linear,
+                ),
+            ],
+        ),
+        (
+            file: "layer_002.png",
+            width: 1024,
+            height: 1024,
+            shift: Some(0),
+            channels: [
+                (
+                    low: 0.0,
+                    high: 0.29957584,
+                    encoding: Log,
+                ),
+                (
+                    low: -1.0,
+                    high: 1.0,
+                    encoding: Unit,
+                ),
+                (
+                    low: -1.0,
+                    high: 1.0,
+                    encoding: Unit,
+                ),
+                (
+                    low: 0.0,
+                    high: 216896.45,
+                    encoding: Log,
+                ),
+            ],
+        ),
+    ],
+    fields: [
+        (
+            name: "moisture",
+            role: Moisture,
+            shift: 4,
+            categorical: false,
+            layer: 0,
+            channel: 0,
+        ),
+        (
+            name: "height",
+            role: Height,
+            shift: 0,
+            categorical: false,
+            layer: 1,
+            channel: 0,
+        ),
+    ],
+    water: Some((
+        lakes: 575,
+        layer: 2,
+    )),
+)
