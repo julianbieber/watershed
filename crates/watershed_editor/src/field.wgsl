@@ -15,6 +15,8 @@ struct FieldUniform {
     range: vec2<f32>,
     diverging: f32,
     water_overlay: f32,
+    hillshade: f32,
+    light_azimuth: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> settings: FieldUniform;
@@ -30,6 +32,10 @@ const DIVERGING_WARM: vec3<f32> = vec3<f32>(0.439, 0.075, 0.071);
 
 const WATER_TINT: vec3<f32> = vec3<f32>(0.114, 0.353, 0.541);
 const CHANNEL_TINT: vec3<f32> = vec3<f32>(0.365, 0.749, 0.867);
+
+const LIGHT_ALTITUDE: f32 = 45.0;
+const HILLSHADE_GAIN: f32 = 8.0;
+const HILLSHADE_DEPTH: f32 = 0.7;
 
 // `t` is on 0..1, clamped. Monotone in lightness, so a larger value always reads as
 // darker.
@@ -48,18 +54,56 @@ fn diverging(t: f32) -> vec3<f32> {
     return mix(DIVERGING_NEUTRAL, DIVERGING_WARM, s);
 }
 
+// `texel` is clamped into the raster rather than wrapped, so the outermost row shades
+// against itself instead of against the far edge.
+fn field_at(texel: vec2<f32>, size: vec2<f32>) -> f32 {
+    let clamped = clamp(texel, vec2<f32>(0.0, 0.0), size - vec2<f32>(1.0, 1.0));
+    return textureLoad(field_map, vec2<i32>(clamped), 0).r;
+}
+
+// The multiplier the ramp is lit by: `1.0` on ground that is flat, more where the
+// surface turns towards the light and less where it turns away.
+//
+// The slope is measured in fitted `span`s per texel, so the relief reads the same
+// whatever units the field is in, and flat ground lands on exactly the unlit ramp
+// colour — which is what the legend beside it still stands for. `azimuth` is a compass
+// bearing in degrees.
+fn relief(texel: vec2<f32>, size: vec2<f32>, span: f32, azimuth: f32) -> f32 {
+    let east = field_at(texel + vec2<f32>(1.0, 0.0), size);
+    let west = field_at(texel + vec2<f32>(-1.0, 0.0), size);
+    let north = field_at(texel + vec2<f32>(0.0, 1.0), size);
+    let south = field_at(texel + vec2<f32>(0.0, -1.0), size);
+
+    let gradient = vec2<f32>(east - west, north - south) * 0.5 * HILLSHADE_GAIN / span;
+    let normal = normalize(vec3<f32>(-gradient.x, -gradient.y, 1.0));
+
+    let bearing = radians(azimuth);
+    let altitude = radians(LIGHT_ALTITUDE);
+    let light = vec3<f32>(
+        sin(bearing) * cos(altitude),
+        cos(bearing) * cos(altitude),
+        sin(altitude),
+    );
+    let flat = max(sin(altitude), 1e-6);
+    let lit = max(dot(normal, light), 0.0) / flat;
+    return mix(1.0, lit, HILLSHADE_DEPTH);
+}
+
 // The quad's v runs down from the top while row zero of a raster is the bottom, so
 // both textures are read with v flipped and the Rust side uploads them unaltered.
+//
+// The overlays run after the ramp, each taking the colour the one before it left.
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let uv = vec2<f32>(mesh.uv.x, 1.0 - mesh.uv.y);
 
     let field_size = max(settings.field_resolution, vec2<f32>(1.0, 1.0));
-    let field_texel = vec2<i32>(clamp(
+    let texel = clamp(
         floor(uv * field_size),
         vec2<f32>(0.0, 0.0),
         field_size - vec2<f32>(1.0, 1.0),
-    ));
+    );
+    let field_texel = vec2<i32>(texel);
     let value = textureLoad(field_map, field_texel, 0).r;
 
     let low = settings.range.x;
@@ -72,6 +116,11 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         colour = diverging(value / reach);
     } else {
         colour = sequential((value - low) / span);
+    }
+
+    if settings.hillshade > 0.5 {
+        let lit = relief(texel, field_size, span, settings.light_azimuth);
+        colour = clamp(colour * lit, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
     if settings.water_overlay > 0.5 {

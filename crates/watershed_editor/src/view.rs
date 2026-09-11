@@ -232,6 +232,11 @@ fn sync_maps(
         return;
     };
 
+    if let Some(field) = terrain.field(document.active()) {
+        material.settings.hillshade = if field.hillshade { 1.0 } else { 0.0 };
+        material.settings.light_azimuth = field.light_azimuth;
+    }
+
     if revisions.field != Some((document.revision(), solo.generation)) {
         revisions.field = Some((document.revision(), solo.generation));
 

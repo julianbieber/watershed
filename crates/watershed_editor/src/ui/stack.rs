@@ -199,6 +199,7 @@ fn fingerprint(
         return key + "empty";
     };
     key.push_str(field.role.as_str());
+    key.push_str(&format!("|hillshade:{}", field.hillshade));
     key.push_str(&format!(
         "|out:{}",
         field
@@ -350,6 +351,15 @@ fn properties(active: &str, field: &crate::terrain::Field, pinned: bool) -> impl
                 one(widgets::number(NumberBinding::RangeHigh)),
             ])),
         )),
+        one(toggle_row(
+            &active,
+            "hillshade",
+            field.hillshade,
+            vec![
+                one(widgets::small("azimuth")),
+                one(widgets::number(NumberBinding::LightAzimuth)),
+            ],
+        )),
     ])
 }
 
@@ -486,6 +496,33 @@ fn bypass_checkbox(active: &str, id: NodeId, bypassed: bool) -> impl Scene {
             report(&mut document, result);
         })
     }
+}
+
+fn toggle_row(
+    active: &str,
+    property: &'static str,
+    checked: bool,
+    beside: Vec<Box<dyn SceneList>>,
+) -> impl Scene {
+    let active = active.to_owned();
+    let mut children: Vec<Box<dyn SceneList>> = vec![
+        one(bsn! {
+            {widgets::when(checked, Checked)}
+            @FeathersCheckbox
+            on(move |change: On<ValueChange<bool>>, mut document: ResMut<Document>| {
+                let result = document
+                    .apply(&Edit::Set {
+                        path: format!("{active}.{property}"),
+                        words: vec![if change.value { "on" } else { "off" }.to_owned()],
+                    })
+                    .map(|_| ());
+                report(&mut document, result);
+            })
+        }),
+        one(widgets::small(property)),
+    ];
+    children.extend(beside);
+    widgets::row(children)
 }
 
 fn output_button(active: &str, id: NodeId, is_output: bool) -> impl Scene {

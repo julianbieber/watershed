@@ -116,8 +116,17 @@ impl Edit {
     /// document and saved with it, but nothing that evaluates a texel reads either. An
     /// edit that touches only those must not make the bake stale, or dragging a card
     /// would throw away the whole field — and the solved water with it.
+    ///
+    /// A field's display properties are the same kind of thing: they say how the map
+    /// draws the field, not what the field holds, so a `Set` on one of them is exempt
+    /// too. An overlay added later adds its properties to that list rather than
+    /// replacing it.
     pub fn reaches_the_bake(&self) -> bool {
-        !matches!(self, Self::PlaceNode { .. } | Self::RenameNode { .. })
+        match self {
+            Self::PlaceNode { .. } | Self::RenameNode { .. } => false,
+            Self::Set { path, .. } => !is_display_property(path),
+            _ => true,
+        }
     }
 
     /// Applies the edit and describes what it did, as the reply the control client
@@ -408,6 +417,16 @@ fn set_other_field_property(
             let high: f32 = number(words.get(1).ok_or("a range needs two numbers")?)?;
             field.range = (low, high);
             Ok(json!({ "range": [low, high] }))
+        }
+        Some("hillshade") => {
+            let on = boolean(first(words)?)?;
+            field.hillshade = on;
+            Ok(json!({ "hillshade": on }))
+        }
+        Some("light_azimuth") => {
+            let degrees: f32 = number(first(words)?)?;
+            field.light_azimuth = degrees;
+            Ok(json!({ "light_azimuth": degrees }))
         }
         Some(other) => Err(format!("a field has nothing called `{other}`")),
         None => Err("a path needs something after the field name".to_owned()),
@@ -772,6 +791,13 @@ pub fn op_summary(op: &NodeOp) -> String {
         NodeOp::Shader(shader) => format!("shader {}", shader.file),
         _ => format!("{} {}", op_name(op), op_params(op)),
     }
+}
+
+const DISPLAY_PROPERTIES: [&str; 2] = ["hillshade", "light_azimuth"];
+
+fn is_display_property(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('.').collect();
+    parts.len() == 2 && DISPLAY_PROPERTIES.contains(&parts[1])
 }
 
 fn first(words: &[String]) -> Result<&String, String> {
@@ -1311,6 +1337,42 @@ mod tests {
         assert!(parse_op(&words("binary sideways")).is_err());
         assert!(parse_op(&words("remap 0 1")).is_err());
         assert!(parse_op(&words("curve 0 0 1")).is_err());
+    }
+
+    // The two display properties are the only field properties the panel writes that a
+    // bake never reads, so both the write and its reply are pinned here.
+    #[test]
+    fn the_display_properties_are_written_and_reported_back() {
+        let mut terrain = document();
+
+        let reply = set_line(&mut terrain, "height.hillshade on").unwrap();
+        assert_eq!(reply, json!({ "hillshade": true }));
+        assert!(terrain.field("height").unwrap().hillshade);
+
+        let reply = set_line(&mut terrain, "height.light_azimuth 135").unwrap();
+        assert_eq!(reply, json!({ "light_azimuth": 135.0 }));
+        assert_eq!(terrain.field("height").unwrap().light_azimuth, 135.0);
+
+        assert!(set_line(&mut terrain, "height.hillshade sideways").is_err());
+    }
+
+    // How the map draws a field is not what the field holds, so toggling an overlay must
+    // not throw the bake away; the length guard is what keeps a node property spelled the
+    // same from claiming the exemption.
+    #[test]
+    fn a_display_property_is_the_only_set_that_does_not_reach_the_bake() {
+        let exempt = |path: &str| {
+            Edit::Set {
+                path: path.to_owned(),
+                words: vec!["on".to_owned()],
+            }
+            .reaches_the_bake()
+        };
+
+        assert!(!exempt("height.hillshade"));
+        assert!(!exempt("height.light_azimuth"));
+        assert!(exempt("height.range"));
+        assert!(exempt("height.n3.hillshade"));
     }
 
     // Naming and parsing are written out separately for each enum, so nothing but this

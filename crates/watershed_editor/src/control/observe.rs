@@ -179,6 +179,8 @@ fn nodes(world: &World) -> Value {
                 "field": field.id.to_string(),
                 "shift": field.shift,
                 "range": [field.range.0, field.range.1],
+                "hillshade": field.hillshade,
+                "light_azimuth": field.light_azimuth,
                 "categorical": field.is_categorical(),
                 "output": field.graph.output.map(|id| id.to_string()),
                 "nodes": nodes,

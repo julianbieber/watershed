@@ -32,6 +32,7 @@ pub enum NumberBinding {
     Shift,
     RangeLow,
     RangeHigh,
+    LightAzimuth,
     BrushRadius,
     BrushFalloff,
     BrushStrength,
@@ -100,6 +101,7 @@ impl NumberBinding {
     fn range(self) -> Option<(f32, f32)> {
         match self {
             Self::Shift => Some((0.0, 8.0)),
+            Self::LightAzimuth => Some((0.0, 360.0)),
             Self::BrushRadius => Some((0.0, 512.0)),
             Self::BrushFalloff => Some((0.0, 1.0)),
             Self::NoiseScale(_) | Self::WarpScale(_) => Some((0.0, 1.0)),
@@ -142,6 +144,7 @@ impl NumberBinding {
             Self::Shift => field(document)?.shift as f32,
             Self::RangeLow => field(document)?.range.0,
             Self::RangeHigh => field(document)?.range.1,
+            Self::LightAzimuth => field(document)?.light_azimuth,
             Self::BrushRadius => brush.radius_cells,
             Self::BrushFalloff => brush.falloff,
             Self::BrushStrength => brush.strength,
@@ -213,6 +216,15 @@ impl NumberBinding {
                     .apply(&Edit::Set {
                         path: format!("{active}.shift"),
                         words: vec![(value as u8).to_string()],
+                    })
+                    .map(|_| ())
+            }
+            Self::LightAzimuth => {
+                let active = document.active().to_owned();
+                document
+                    .apply(&Edit::Set {
+                        path: format!("{active}.light_azimuth"),
+                        words: vec![value.to_string()],
                     })
                     .map(|_| ())
             }
