@@ -83,14 +83,6 @@ pub const STOCK: [(&str, &str); 4] = [
 ///
 /// This is literally the text a copied layer carries, so a panel rendering it and a
 /// reader scrolling that file cannot be told two different things.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the reference panel that renders this is its own task; the accessor \
-                  ships with the header it reads"
-    )
-)]
 pub fn shader_reference() -> &'static str {
     static REFERENCE: LazyLock<String> = LazyLock::new(|| strip_header(TEMPLATE_SOURCE));
     &REFERENCE

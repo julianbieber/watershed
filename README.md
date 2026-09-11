@@ -76,7 +76,8 @@ functions inside one stack.
 
 A copied shader arrives with all of this in its own header: every library function,
 the bindings, the coordinate convention and the annotations below, so the file need
-not be left to write the first line.
+not be left to write the first line. The same text is in the editor, under
+**Reference** on a shader node's panel.
 
 A shader may also declare input textures, one pin on its node per declaration, and
 read the upstream raster at any texel:

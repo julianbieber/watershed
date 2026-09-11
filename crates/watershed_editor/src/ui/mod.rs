@@ -140,6 +140,8 @@ impl Default for AddLayer {
 pub struct Expanded {
     /// Whether the brush section is open.
     pub brush: bool,
+    /// Whether the shader reference is open.
+    pub reference: bool,
     /// The open nodes, in no particular order.
     pub nodes: Vec<NodeId>,
 }
