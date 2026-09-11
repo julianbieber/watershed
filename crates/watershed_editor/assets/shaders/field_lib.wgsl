@@ -118,6 +118,19 @@ fn cell_position(id: vec2<u32>) -> vec2<f32> {
     return (vec2<f32>(texel) + vec2<f32>(0.5, 0.5)) * step;
 }
 
+// The document's extent, in cells.
+fn document_extent() -> vec2<f32> {
+    return vec2<f32>(globals.document);
+}
+
+// A document position as a 0..1 coordinate across the document, which is the reading a
+// shader written against a normalised space wants. Not square: a document wider than it
+// is tall stretches, because the coordinate runs 0..1 on both axes whatever the extent
+// is.
+fn uv(p: vec2<f32>) -> vec2<f32> {
+    return p / document_extent();
+}
+
 // The texel of this field's own raster a document position falls in — the inverse of
 // `cell_position`, and how a shader turns a neighbour's position into an index into
 // an input.

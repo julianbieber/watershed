@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
 use bevy::prelude::*;
@@ -42,6 +42,8 @@ use crate::terrain::shader::{
 /// point uses.
 const FIELD_LIB: &str = include_str!("../assets/shaders/field_lib.wgsl");
 
+const TEMPLATE_SOURCE: &str = include_str!("../assets/shaders/stock/_template.wgsl");
+
 /// The entry point, appended after the shader's own source because WGSL has no
 /// forward declaration and an entry point that came first could not call a `value`
 /// declared after it.
@@ -60,10 +62,7 @@ fn generate(@builtin(global_invocation_id) id: vec3<u32>) {
 /// A name beginning with `_` is a template: it is copied like any other but is not
 /// offered as something to add.
 pub const STOCK: [(&str, &str); 4] = [
-    (
-        "_template.wgsl",
-        include_str!("../assets/shaders/stock/_template.wgsl"),
-    ),
+    ("_template.wgsl", TEMPLATE_SOURCE),
     (
         "ridged.wgsl",
         include_str!("../assets/shaders/stock/ridged.wgsl"),
@@ -77,6 +76,45 @@ pub const STOCK: [(&str, &str); 4] = [
         include_str!("../assets/shaders/stock/terrace.wgsl"),
     ),
 ];
+
+/// Everything a shader may call and everything a shader file may declare, as prose:
+/// the header of the template a new layer is copied from, with its comment markers
+/// taken off and the `@shader` line naming the node left out.
+///
+/// This is literally the text a copied layer carries, so a panel rendering it and a
+/// reader scrolling that file cannot be told two different things.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the reference panel that renders this is its own task; the accessor \
+                  ships with the header it reads"
+    )
+)]
+pub fn shader_reference() -> &'static str {
+    static REFERENCE: LazyLock<String> = LazyLock::new(|| strip_header(TEMPLATE_SOURCE));
+    &REFERENCE
+}
+
+fn strip_header(source: &str) -> String {
+    let mut prose = String::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(text) = trimmed.strip_prefix("//") else {
+            if trimmed.is_empty() {
+                continue;
+            }
+            break;
+        };
+        let text = text.strip_prefix(' ').unwrap_or(text);
+        if text.trim_start().starts_with("@shader ") {
+            continue;
+        }
+        prose.push_str(text);
+        prose.push('\n');
+    }
+    prose.trim_matches('\n').to_owned()
+}
 
 /// The assembled source a shader is compiled from: the library, the file's own
 /// source, then the entry point — in that order, because WGSL has no forward
@@ -949,6 +987,62 @@ mod tests {
         if let Err(error) = validate(source) {
             panic!("a blur over a declared input does not compile: {error}");
         }
+    }
+
+    // The acceptance is that the header alone is enough to write a shader, so what the
+    // panel renders has to be prose rather than a commented file, and it has to reach
+    // every grammar a file may use.
+    #[test]
+    fn the_reference_reads_as_prose_and_covers_every_annotation() {
+        let reference = shader_reference();
+        assert!(
+            !reference
+                .lines()
+                .any(|line| line.trim_start().starts_with("//")),
+            "the reference still carries comment markers"
+        );
+        for needle in ["uv(", "document_extent(", "@ui", "@in", "@reach", "@group"] {
+            assert!(
+                reference.contains(needle),
+                "the reference never names `{needle}`"
+            );
+        }
+    }
+
+    // A helper added to the library with no line in the header would be invisible to
+    // anyone who only reads the header, which is the one thing the acceptance asks for.
+    #[test]
+    fn every_library_function_is_named_in_the_reference() {
+        let reference = shader_reference();
+        let internal = ["hash2", "gradient", "fade"];
+        for line in FIELD_LIB.lines() {
+            let Some(rest) = line.strip_prefix("fn ") else {
+                continue;
+            };
+            let name = rest.split('(').next().expect("a declaration with no name");
+            if internal.contains(&name) {
+                continue;
+            }
+            assert!(
+                reference.contains(&format!("{name}(")),
+                "`{name}` is in the library but not in the reference"
+            );
+        }
+    }
+
+    // The worked example the header gives, compiled: the acceptance observation short
+    // of a GPU. The header's own examples are shown indented so that none of them is
+    // read as this file's declaration — a `@reach` line at the start of a line would
+    // narrow the template's re-bake, and an input example would grow it a pin.
+    #[test]
+    fn the_headers_worked_example_compiles_and_its_examples_declare_nothing() {
+        let source =
+            "fn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(uv(p) * 4.0, 4u, 0.5, 2.0);\n}\n";
+        if let Err(error) = validate(source) {
+            panic!("the header's worked example does not compile: {error}");
+        }
+        assert_eq!(parse_reach(TEMPLATE_SOURCE).unwrap(), None);
+        assert!(parse_inputs(TEMPLATE_SOURCE).unwrap().is_empty());
     }
 
     // The reason a shader is validated before the device sees it: wgpu reports a
