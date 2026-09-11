@@ -6,7 +6,8 @@
 //! window can do can be driven from outside the process. The rule runs that way round:
 //! a new action is written where both can reach it, and then given a button.
 
-use bevy::feathers::theme::ThemeBackgroundColor;
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
 use bevy::input_focus::InputFocus;
 use bevy::input_focus::tab_navigation::TabGroup;
@@ -15,9 +16,10 @@ use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::text::EditableText;
 use bevy::ui::UiSystems;
+use bevy::ui_widgets::Activate;
 use bevy::window::PrimaryWindow;
 
-use crate::canvas::{CanvasFrame, CanvasViewport};
+use crate::canvas::{CanvasCameraTag, CanvasFrame, CanvasViewport, frame_whole_graph};
 use crate::document::Document;
 use crate::preset::Preset;
 use crate::terrain::graph::NodeId;
@@ -206,6 +208,47 @@ fn canvas_divider() -> impl Scene {
     }
 }
 
+/// The strip along the top of the canvas, and what it offers.
+///
+/// Above the canvas rather than over it: the canvas is a second camera that clears the
+/// rectangle the layout gives it, and it draws after the camera the interface is on, so
+/// anything drawn inside that rectangle would be painted over.
+fn canvas_bar() -> impl Scene {
+    bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(6),
+            padding: px(4),
+            flex_shrink: 0.0,
+        }
+        ThemeBackgroundColor(tokens::WINDOW_BG)
+        Children [
+            (
+                @FeathersButton {
+                    @caption: bsn! { Text("Fit") ThemedText },
+                    @variant: ButtonVariant::Plain,
+                }
+                on(|_: On<Activate>,
+                    document: Res<Document>,
+                    frame: Res<CanvasFrame>,
+                    window: Single<&Window, With<PrimaryWindow>>,
+                    camera: Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>| {
+                    let (mut transform, mut projection) = camera.into_inner();
+                    frame_whole_graph(
+                        &document,
+                        &frame,
+                        *window,
+                        &mut transform,
+                        &mut projection,
+                    );
+                })
+            ),
+        ]
+    }
+}
+
 fn chrome() -> impl Scene {
     bsn! {
         Node {
@@ -254,6 +297,7 @@ fn chrome() -> impl Scene {
                                 Children [ legend::legend() ]
                             ),
                             canvas_divider(),
+                            canvas_bar(),
                             (
                                 Node {
                                     flex_grow: 0.72,

@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::ui::UiSystems;
 
 use crate::document::{Document, EditorSystems};
-use crate::terrain::graph::NodeId;
+use crate::terrain::graph::{FieldGraph, NodeId};
 
 /// The width and height of a card, in canvas units.
 ///
@@ -69,6 +69,7 @@ impl Plugin for CanvasPlugin {
                     scene::sync_canvas,
                     thumb::sync_thumbnails,
                     input::canvas_camera,
+                    input::fit_key,
                     input::canvas_solo,
                     input::canvas_drag,
                     input::canvas_commit,
@@ -360,7 +361,9 @@ fn solo_preview(
 /// Puts the whole of the open field's graph in view, once per field.
 ///
 /// Once, because after that the pan and the zoom are the person's: a frame on every
-/// edit would drag the view out from under someone adding a node at the far edge.
+/// edit would drag the view out from under someone adding a node at the far edge. The
+/// on-demand path is [`frame_whole_graph`], which the canvas's Fit button and the key F
+/// both take.
 fn frame_graph(
     document: Res<Document>,
     frame: Res<CanvasFrame>,
@@ -375,16 +378,66 @@ fn frame_graph(
     let (Some(camera), Some(window)) = (camera, window) else {
         return;
     };
-    let scale_factor = window.scale_factor();
-    if !scale_factor.is_finite() || scale_factor <= 0.0 {
-        return;
-    }
     let Some(graph) = open_graph(&document) else {
         return;
     };
     if graph.nodes.is_empty() {
         shape.framed = Some(active);
         return;
+    }
+    let (mut transform, mut projection) = camera.into_inner();
+    if frame_whole_graph(
+        &document,
+        &frame,
+        window.into_inner(),
+        &mut transform,
+        &mut projection,
+    ) {
+        shape.framed = Some(active);
+    }
+}
+
+/// Puts the whole of the open field's graph in view on the canvas camera.
+///
+/// What the canvas's Fit button and the key F both do. Answers whether the camera was
+/// moved: `false` when the document carries no graph for the open field, when that
+/// graph has no nodes, and when the canvas has not been measured yet.
+pub fn frame_whole_graph(
+    document: &Document,
+    frame: &CanvasFrame,
+    window: &Window,
+    transform: &mut Transform,
+    projection: &mut Projection,
+) -> bool {
+    let scale_factor = window.scale_factor();
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return false;
+    }
+    let Some(graph) = open_graph(document) else {
+        return false;
+    };
+    let Projection::Orthographic(ortho) = projection else {
+        return false;
+    };
+    let Some((centre, scale)) = graph_fit(graph, frame.size / scale_factor) else {
+        return false;
+    };
+    ortho.scale = scale;
+    transform.translation.x = centre.x;
+    transform.translation.y = centre.y;
+    true
+}
+
+/// Where the canvas camera has to sit, and at what scale, for every one of a graph's
+/// cards to be inside a viewport that many logical pixels across.
+///
+/// The scale is already clamped to what the canvas allows, so a graph too large to fit
+/// is framed as closely as the zoom permits rather than not at all. `None` when the
+/// graph has no nodes or the viewport has no area — there is nothing to frame in either
+/// case.
+fn graph_fit(graph: &FieldGraph, viewport: Vec2) -> Option<(Vec2, f32)> {
+    if graph.nodes.is_empty() || viewport.x <= 1.0 || viewport.y <= 1.0 {
+        return None;
     }
     let mut low = Vec2::splat(f32::INFINITY);
     let mut high = Vec2::splat(f32::NEG_INFINITY);
@@ -393,21 +446,12 @@ fn frame_graph(
         low = low.min(at - CARD * 0.5);
         high = high.max(at + CARD * 0.5);
     }
-    if !low.is_finite() || !high.is_finite() || frame.size.x <= 1.0 || frame.size.y <= 1.0 {
-        return;
+    if !low.is_finite() || !high.is_finite() {
+        return None;
     }
-    shape.framed = Some(active);
-
     let span = (high - low).max(Vec2::splat(1.0)) + Vec2::splat(CARD.x * 0.4);
-    let (mut transform, mut projection) = camera.into_inner();
-    let Projection::Orthographic(ortho) = &mut *projection else {
-        return;
-    };
-    let wanted = (span / (frame.size / scale_factor)).max_element();
-    ortho.scale = wanted.clamp(MIN_SCALE, MAX_SCALE);
-    let centre = (low + high) * 0.5;
-    transform.translation.x = centre.x;
-    transform.translation.y = centre.y;
+    let scale = (span / viewport).max_element().clamp(MIN_SCALE, MAX_SCALE);
+    Some(((low + high) * 0.5, scale))
 }
 
 /// Rasterises each label at the size it is about to be shown at.
@@ -557,6 +601,39 @@ mod tests {
             assert!(at.y.abs() <= CARD.y * 0.5, "pin {index} left the card");
         }
         assert!(input_offset(&card, 0).y > input_offset(&card, 2).y);
+    }
+
+    // The acceptance, pinned at the arithmetic: whatever a fit answers has to put every
+    // card of a graph spread wider than the viewport inside the framed rectangle.
+    #[test]
+    fn a_fit_puts_every_card_of_a_spread_out_graph_in_view() {
+        let mut graph = FieldGraph::new();
+        let at = [[-1500.0, 0.0], [1500.0, 120.0], [0.0, -600.0]];
+        for position in at {
+            let id = graph.node_with(NodeOp::Constant(0.0), &[]);
+            graph.place(id, position).unwrap();
+        }
+        let viewport = Vec2::new(800.0, 600.0);
+        let (centre, scale) = graph_fit(&graph, viewport).expect("a fit");
+        let framed = Rect::from_center_size(centre, viewport * scale);
+        for position in at {
+            let card = Rect::from_center_size(Vec2::new(position[0], position[1]), CARD);
+            assert!(framed.contains(card.min), "a card's corner left the frame");
+            assert!(framed.contains(card.max), "a card's corner left the frame");
+        }
+    }
+
+    // Fitting has to answer with nothing rather than a centre and a scale when there is
+    // nothing to frame, or the Fit button would throw the camera at whatever the empty
+    // bounds came out as.
+    #[test]
+    fn there_is_nothing_to_fit_without_nodes_or_without_a_viewport() {
+        let empty = FieldGraph::new();
+        assert!(graph_fit(&empty, Vec2::new(800.0, 600.0)).is_none());
+
+        let mut graph = FieldGraph::new();
+        graph.node_with(NodeOp::Constant(0.0), &[]);
+        assert!(graph_fit(&graph, Vec2::ZERO).is_none());
     }
 
     // A preview is what the map shows while a node is soloed, so it has to be that

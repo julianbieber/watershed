@@ -11,7 +11,7 @@ use bevy::window::PrimaryWindow;
 
 use super::{
     CanvasCameraTag, CanvasFrame, Grab, MAX_SCALE, MIN_SCALE, NodeCard, NodePin, Selection,
-    ZOOM_PER_STEP, open_graph,
+    ZOOM_PER_STEP, frame_whole_graph, open_graph,
 };
 use crate::document::Document;
 use crate::edit::Edit;
@@ -268,6 +268,44 @@ pub fn undo_keys(
         document.undo()
     };
     report(&mut document, result);
+}
+
+/// F frames the whole of the open field's graph, unless a text field has the keyboard.
+///
+/// Reads the logical key rather than the physical position, so the key printed F fits
+/// on every layout. Does nothing while anything is held: `canvas_drag` recomputes a
+/// held card's position from the camera every frame, so framing mid-drag would pull
+/// that card across the graph and write the move as an edit.
+pub fn fit_key(
+    keys: Res<ButtonInput<Key>>,
+    focus: Option<Res<InputFocus>>,
+    fields: Query<(), With<EditableText>>,
+    grab: Res<Grab>,
+    document: Res<Document>,
+    frame: Res<CanvasFrame>,
+    window: Option<Single<&Window, With<PrimaryWindow>>>,
+    camera: Option<Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>>,
+) {
+    if typing(focus.as_deref(), &fields) || !matches!(*grab, Grab::Idle) {
+        return;
+    }
+    let pressed = keys
+        .get_just_pressed()
+        .any(|key| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("f")));
+    if !pressed {
+        return;
+    }
+    let (Some(window), Some(camera)) = (window, camera) else {
+        return;
+    };
+    let (mut transform, mut projection) = camera.into_inner();
+    frame_whole_graph(
+        &document,
+        &frame,
+        window.into_inner(),
+        &mut transform,
+        &mut projection,
+    );
 }
 
 /// Applies the edit the last drag finished on.
