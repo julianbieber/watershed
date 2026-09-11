@@ -28,6 +28,7 @@ use crate::view::FreeView;
 mod bind;
 mod dialog;
 mod legend;
+mod log;
 mod scroll;
 mod stack;
 mod toolbar;
@@ -45,6 +46,7 @@ impl Plugin for UiPlugin {
             .init_resource::<Expanded>()
             .init_resource::<toolbar::FieldChoices>()
             .init_resource::<stack::Shape>()
+            .init_resource::<log::Open>()
             .add_systems(Startup, shell.spawn())
             .add_systems(
                 Update,
@@ -57,6 +59,7 @@ impl Plugin for UiPlugin {
                     stack::prune,
                     dialog::sync,
                     legend::sync,
+                    log::sync,
                     scroll::send,
                 ),
             )
@@ -310,7 +313,8 @@ fn chrome() -> impl Scene {
                     ),
                     stack::panel(),
                 ]
-            )
+            ),
+            log::panel(),
         ]
     }
 }

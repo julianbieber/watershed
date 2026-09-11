@@ -284,7 +284,7 @@ fn view(world: &mut World) -> Value {
 
 fn log(world: &World) -> Value {
     match world.get_resource::<LogBuffer>() {
-        Some(buffer) => buffer.drain(),
+        Some(buffer) => buffer.since_last_read(),
         None => json!({ "available": false }),
     }
 }
