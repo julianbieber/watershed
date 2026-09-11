@@ -132,8 +132,12 @@ pub struct ShaderEntry {
     /// What the file declares. The last layout that parsed, so a file that is broken
     /// now still draws the panel it drew before.
     pub layout: ParamsLayout,
-    /// Why the file did not parse or compile, in the words the status bar shows.
+    /// Why the file did not parse or compile: `line N: message` against the file's own
+    /// lines, or the bare message when the fault is not on a line the file owns.
     /// `None` when it is good.
+    ///
+    /// The file name is not part of it — every reader already has the name and says it
+    /// in its own words.
     pub error: Option<String>,
     modified: Option<SystemTime>,
     generation: u64,
@@ -366,13 +370,13 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
             Err(reason) => ShaderEntry {
                 source,
                 layout: previous.unwrap_or_default(),
-                error: Some(format!("{name}: {reason}")),
+                error: Some(reason),
                 modified,
                 generation,
             },
         };
-        if let Some(reason) = entry.error.clone() {
-            document.refuse(reason);
+        if let Some(reason) = &entry.error {
+            document.refuse(format!("{name}: {reason}"));
         }
         library.entries.insert(name.clone(), entry);
         changed.push(name);
@@ -688,6 +692,27 @@ pub fn dispatch(
     drop(view);
     staging.unmap();
     Ok(values)
+}
+
+#[cfg(test)]
+impl ShaderLibrary {
+    /// A library holding `file` as a shader that failed with `fault`, for tests that
+    /// need a broken entry without a directory to read one from.
+    pub fn with_fault(file: &str, fault: &str) -> Self {
+        let mut library = Self::default();
+        library.entries.insert(
+            file.to_owned(),
+            ShaderEntry {
+                source: String::new(),
+                layout: ParamsLayout::default(),
+                error: Some(fault.to_owned()),
+                modified: None,
+                generation: 1,
+            },
+        );
+        library.generation = 1;
+        library
+    }
 }
 
 /// Every stock shader parses, which is the only way a copied one arrives with a

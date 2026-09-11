@@ -13,6 +13,7 @@ use super::{
 };
 use crate::document::Document;
 use crate::edit::{op_name, op_summary};
+use crate::gpu::ShaderLibrary;
 use crate::terrain::graph::{FieldGraph, GraphNode, NodeId, NodeOp};
 
 const BODY: Color = Color::srgb(0.16, 0.17, 0.21);
@@ -23,6 +24,11 @@ const SOLOED: Color = Color::srgb(0.72, 0.58, 0.22);
 const SELECTED: Color = Color::srgb(0.85, 0.87, 0.95);
 const WIRE: Color = Color::srgb(0.48, 0.64, 0.86);
 const PIN: Color = Color::srgb(0.78, 0.81, 0.88);
+const BROKEN: Color = Color::srgb(0.72, 0.24, 0.24);
+const FAULT: Color = Color::srgb(1.0, 0.74, 0.72);
+
+const FAULT_SIZE: f32 = 11.0;
+const FAULT_CHARS: usize = 34;
 
 /// Everything the canvas owns, so a rebuild can take it all down in one query.
 #[derive(Component)]
@@ -39,6 +45,11 @@ pub struct CardTitle(pub NodeId);
 /// The text on a card that says what the op is set to.
 #[derive(Component)]
 pub struct CardDetail(pub NodeId);
+
+/// The text on a card that says why its shader will not compile. Empty while the
+/// shader is good.
+#[derive(Component)]
+pub struct CardFault(pub NodeId);
 
 /// Respawns the cards, pins and edges when the open field's graph changes shape.
 ///
@@ -144,6 +155,8 @@ pub fn sync_canvas(
     mut bars: Query<(&CardTitleBar, &mut Sprite)>,
     mut titles: Query<(&CardTitle, &mut Text2d)>,
     mut details: Query<(&CardDetail, &mut Text2d), Without<CardTitle>>,
+    mut faults: Query<(&CardFault, &mut Text2d), (Without<CardTitle>, Without<CardDetail>)>,
+    library: Option<Res<ShaderLibrary>>,
 ) {
     let Some(graph) = open_graph(&document) else {
         return;
@@ -163,7 +176,7 @@ pub fn sync_canvas(
         transform.translation.y = node.position[1];
     }
     for (bar, mut sprite) in &mut bars {
-        sprite.color = title_colour(graph, &selection, bar.0);
+        sprite.color = title_colour(graph, &selection, library.as_deref(), bar.0);
     }
     for (title, mut text) in &mut titles {
         if let Some(node) = graph.node(title.0) {
@@ -175,6 +188,32 @@ pub fn sync_canvas(
             **text = op_summary(&node.op);
         }
     }
+    for (fault, mut text) in &mut faults {
+        if let Some(node) = graph.node(fault.0) {
+            **text = fault_of(node, library.as_deref())
+                .map(fault_line)
+                .unwrap_or_default();
+        }
+    }
+}
+
+fn fault_of<'a>(node: &GraphNode, library: Option<&'a ShaderLibrary>) -> Option<&'a str> {
+    let NodeOp::Shader(shader) = &node.op else {
+        return None;
+    };
+    library?.entry(&shader.file)?.error.as_deref()
+}
+
+fn fault_line(fault: &str) -> String {
+    let first = fault.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= FAULT_CHARS {
+        return first.to_owned();
+    }
+    first
+        .chars()
+        .take(FAULT_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 /// What a card is called: the name a person gave it, or the op it carries.
@@ -188,8 +227,21 @@ fn caption(node: &GraphNode) -> String {
 /// The colour of a card's title bar, which is where a card says what it is.
 ///
 /// The output node and the soloed one are marked here, and the mark is on the bar
-/// rather than on a label so it survives the zoom at which labels are dropped.
-fn title_colour(graph: &FieldGraph, selection: &Selection, node: NodeId) -> Color {
+/// rather than on a label so it survives the zoom at which labels are dropped. A node
+/// whose shader will not compile outranks all three, so clicking the card to find out
+/// what is wrong with it does not take the mark away.
+fn title_colour(
+    graph: &FieldGraph,
+    selection: &Selection,
+    library: Option<&ShaderLibrary>,
+    node: NodeId,
+) -> Color {
+    if graph
+        .node(node)
+        .is_some_and(|node| fault_of(node, library).is_some())
+    {
+        return BROKEN;
+    }
     if selection.soloed == Some(node) {
         return SOLOED;
     }
@@ -292,6 +344,22 @@ fn spawn_card(
             CanvasLabel(DETAIL_SIZE),
             CardDetail(node.id),
         ));
+        if matches!(node.op, NodeOp::Shader(_)) {
+            parent.spawn((
+                Text2d::new(String::new()),
+                TextFont {
+                    font: bevy::text::FontSource::Handle(font.clone()),
+                    font_size: FontSize::Px(FAULT_SIZE),
+                    ..default()
+                },
+                TextColor(FAULT),
+                Anchor::CENTER_LEFT,
+                Transform::from_xyz(-CARD.x * 0.5 + 12.0, -CARD.y * 0.5 + 7.0, 0.02),
+                RenderLayers::layer(CANVAS_LAYER),
+                CanvasLabel(FAULT_SIZE),
+                CardFault(node.id),
+            ));
+        }
 
         let output = super::output_offset(&card);
         parent.spawn((
@@ -359,7 +427,9 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use super::*;
+    use crate::gpu::ShaderLibrary;
     use crate::terrain::graph::NodeOp;
+    use crate::terrain::shader::ShaderLayer;
     use crate::terrain::{Field, TerrainSpec};
 
     /// A world holding one field of one node, with that node's card on the canvas at
@@ -409,6 +479,43 @@ mod tests {
         world.get::<Transform>(card).unwrap().translation.truncate()
     }
 
+    fn shader_world(fault: Option<&str>) -> (World, Entity, Entity) {
+        let mut document = Document::default();
+        document.adopt(TerrainSpec::new(UVec2::splat(16)).with_field(
+            Field::new("height").with_op(NodeOp::Shader(ShaderLayer::new("broken.wgsl"))),
+        ));
+        let node = document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes[0]
+            .id;
+
+        let mut world = World::new();
+        world.insert_resource(document);
+        world.insert_resource(Selection::default());
+        world.insert_resource(Grab::Idle);
+        world.insert_resource(match fault {
+            Some(fault) => ShaderLibrary::with_fault("broken.wgsl", fault),
+            None => ShaderLibrary::default(),
+        });
+        let text = world
+            .spawn((Text2d::new(String::new()), CardFault(node)))
+            .id();
+        let bar = world
+            .spawn((
+                Sprite {
+                    color: BODY,
+                    ..default()
+                },
+                CardTitleBar(node),
+            ))
+            .id();
+        (world, text, bar)
+    }
+
     // The defect this guards was the whole of "I drag a node and it jumps back": the
     // sync runs before the drag, so on the frame the button comes up it would write the
     // document's position over the card the drag had just placed — putting it back
@@ -428,5 +535,40 @@ mod tests {
         let (mut world, card) = world_with(false, Vec2::new(120.0, -80.0));
         world.run_system_once(sync_canvas).unwrap();
         assert_eq!(at(&world, card), Vec2::ZERO);
+    }
+
+    // The point of the task: the fault the compiler reported reaches the card, which is
+    // where the graph is being read, instead of only the status bar line that has
+    // already scrolled away by the time the node is looked at.
+    #[test]
+    fn the_card_of_a_shader_that_will_not_compile_shows_the_fault_and_reddens_the_bar() {
+        let (mut world, text, bar) = shader_world(Some("line 2: unknown type: 'vec4'"));
+        world.run_system_once(sync_canvas).unwrap();
+        let shown = world.get::<Text2d>(text).unwrap();
+        assert!(shown.starts_with("line 2:"), "card shows {:?}", shown.0);
+        assert_eq!(world.get::<Sprite>(bar).unwrap().color, BROKEN);
+    }
+
+    // The second half of the acceptance: fixing the file has to clear the card by
+    // itself, so the good path writes the empty string rather than leaving the last
+    // fault on the card until something else respawns it.
+    #[test]
+    fn a_card_whose_shader_compiles_carries_no_fault_line() {
+        let (mut world, text, bar) = shader_world(None);
+        world.run_system_once(sync_canvas).unwrap();
+        assert_eq!(world.get::<Text2d>(text).unwrap().0, "");
+        assert_ne!(world.get::<Sprite>(bar).unwrap().color, BROKEN);
+    }
+
+    // A naga message can run to a paragraph and a card is 210 units wide, so the line
+    // has to be cut to fit — and cut by character, since a message can quote a token
+    // that is not ASCII.
+    #[test]
+    fn fault_line_keeps_the_first_line_and_cuts_it_to_the_cards_width() {
+        let line =
+            fault_line("line 7: expected ‘;’ but found an identifier of some length\nnote: here");
+        assert!(!line.contains('\n'), "{line:?} spans lines");
+        assert!(line.chars().count() <= FAULT_CHARS, "{line:?} is too wide");
+        assert!(line.ends_with('…'), "{line:?} is not marked as cut");
     }
 }
