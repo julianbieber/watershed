@@ -56,6 +56,7 @@ impl Plugin for CanvasPlugin {
             .add_systems(
                 Update,
                 (
+                    input::undo_keys,
                     scene::rebuild_canvas,
                     frame_graph,
                     scene::sync_canvas,

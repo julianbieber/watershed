@@ -1,8 +1,12 @@
-//! Panning, zooming, dragging and selecting on the canvas, and the edits those make.
+//! Panning, zooming, dragging and selecting on the canvas, the edits those make, and
+//! the keys that take a change back.
 
+use bevy::input::keyboard::Key;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::input_focus::InputFocus;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
+use bevy::text::EditableText;
 use bevy::window::PrimaryWindow;
 
 use super::{
@@ -12,7 +16,7 @@ use super::{
 use crate::document::Document;
 use crate::edit::Edit;
 use crate::terrain::graph::NodeId;
-use crate::ui::{pointer_over_ui, report};
+use crate::ui::{pointer_over_ui, report, typing};
 
 /// How far the pointer may travel, in the viewport's own pixels, and still count as a
 /// click rather than a drag.
@@ -236,11 +240,40 @@ fn connection(
     }
 }
 
+/// Ctrl+Z undoes the last change to the document and Ctrl+Shift+Z redoes it, unless a
+/// text field has the keyboard.
+///
+/// Reads the logical key rather than the physical position, so the key printed Z
+/// undoes on every layout. Runs first in the canvas chain, ahead of the rebuild, so a
+/// card an undo removes is gone before a drag can hold it — and touches the document
+/// only on a frame a chord was pressed.
+pub fn undo_keys(
+    keys: Res<ButtonInput<Key>>,
+    focus: Option<Res<InputFocus>>,
+    fields: Query<(), With<EditableText>>,
+    mut document: ResMut<Document>,
+) {
+    if typing(focus.as_deref(), &fields) || !keys.pressed(Key::Control) {
+        return;
+    }
+    let z = keys
+        .get_just_pressed()
+        .any(|key| matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("z")));
+    if !z {
+        return;
+    }
+    let result = if keys.pressed(Key::Shift) {
+        document.redo()
+    } else {
+        document.undo()
+    };
+    report(&mut document, result);
+}
+
 /// Applies the edit the last drag finished on.
 ///
-/// The one system here that writes the document, and it runs before the document
-/// decides what to bake — so a wire joined this frame is baked this frame rather than
-/// next.
+/// Runs before the document decides what to bake — so a wire joined this frame is
+/// baked this frame rather than next.
 pub fn canvas_commit(mut document: ResMut<Document>, mut finished: ResMut<Finished>) {
     let Some(edit) = finished.0.take() else {
         return;

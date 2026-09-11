@@ -17,6 +17,7 @@ mod control;
 mod document;
 mod edit;
 mod gpu;
+mod history;
 mod material;
 mod preset;
 mod terrain;

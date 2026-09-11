@@ -204,7 +204,7 @@ impl NumberBinding {
         document: &mut Document,
         brush: &mut Brush,
         dialog: &mut NewDialog,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         let value = self.clamp(value);
         match self {
             Self::Shift => {
@@ -214,66 +214,54 @@ impl NumberBinding {
                         path: format!("{active}.shift"),
                         words: vec![(value as u8).to_string()],
                     })
-                    .map(|_| false)
+                    .map(|_| ())
             }
             Self::BrushRadius => {
                 brush.radius_cells = value;
-                Ok(false)
+                Ok(())
             }
             Self::BrushFalloff => {
                 brush.falloff = value;
-                Ok(false)
+                Ok(())
             }
             Self::BrushStrength => {
                 brush.strength = value;
-                Ok(false)
+                Ok(())
             }
             Self::BrushValue => {
                 brush.value = value;
-                Ok(false)
+                Ok(())
             }
             Self::DialogWidth => {
                 dialog.width = value as u32;
-                Ok(false)
+                Ok(())
             }
             Self::DialogHeight => {
                 dialog.height = value as u32;
-                Ok(false)
+                Ok(())
             }
             Self::DialogSeed => {
                 dialog.seed = value as u32;
-                Ok(false)
+                Ok(())
             }
             _ => {
-                let written = self.write_document(value, document);
-                Ok(written)
+                self.write_document(value, document);
+                Ok(())
             }
         }
     }
 
-    fn write_document(self, value: f32, document: &mut Document) -> bool {
+    fn write_document(self, value: f32, document: &mut Document) {
         let active = document.active().to_owned();
-        let Some(terrain) = document.terrain_mut() else {
-            return false;
-        };
-        let Some(field) = terrain.field_mut(&active) else {
-            return false;
-        };
-
-        match self {
+        document.write(&active, |field| match self {
             Self::RangeLow => field.range.0 = value,
             Self::RangeHigh => field.range.1 = value,
             _ => {
-                let Some(id) = self.node() else {
-                    return false;
-                };
-                let Some(node) = field.graph.node_mut(id) else {
-                    return false;
-                };
-                return self.write_op(value, &mut node.op);
+                if let Some(node) = self.node().and_then(|id| field.graph.node_mut(id)) {
+                    self.write_op(value, &mut node.op);
+                }
             }
-        }
-        true
+        });
     }
 
     fn write_op(self, value: f32, op: &mut NodeOp) -> bool {
@@ -499,11 +487,8 @@ fn apply(
     let Ok(binding) = bindings.get(source) else {
         return;
     };
-    match binding.write(value, &mut document, &mut brush.0, &mut dialog) {
-        Ok(true) => document.note_edit(),
-        Ok(false) => {}
-        Err(error) => report(&mut document, Err(error)),
-    }
+    let result = binding.write(value, &mut document, &mut brush.0, &mut dialog);
+    report(&mut document, result);
 }
 
 /// The other direction: writes what the document holds into every bound field.

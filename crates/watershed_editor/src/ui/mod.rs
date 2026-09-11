@@ -8,10 +8,12 @@
 
 use bevy::feathers::theme::ThemeBackgroundColor;
 use bevy::feathers::tokens;
+use bevy::input_focus::InputFocus;
 use bevy::input_focus::tab_navigation::TabGroup;
 use bevy::picking::Pickable;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
+use bevy::text::EditableText;
 use bevy::ui::UiSystems;
 use bevy::window::PrimaryWindow;
 
@@ -332,6 +334,14 @@ pub fn pointer_over_ui(hover: &HoverMap, nodes: &Query<(), With<Node>>) -> bool 
         .values()
         .flat_map(|hits| hits.keys())
         .any(|entity| nodes.contains(*entity))
+}
+
+/// Whether a text field has the keyboard, in which case a key chord belongs to what
+/// is being typed and not to the editor: the keyboard twin of [`pointer_over_ui`].
+pub fn typing(focus: Option<&InputFocus>, fields: &Query<(), With<EditableText>>) -> bool {
+    focus
+        .and_then(InputFocus::get)
+        .is_some_and(|entity| fields.contains(entity))
 }
 
 /// Records a refusal on the document so the toolbar shows it, and logs it.

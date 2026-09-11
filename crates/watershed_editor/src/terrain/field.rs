@@ -123,6 +123,31 @@ impl Field {
         self
     }
 
+    /// A copy of everything a person authored and nothing that was derived from it:
+    /// the graph with every shader node's values dropped, and no bake. A paint or
+    /// external raster is authored data and comes along.
+    ///
+    /// What a history snapshot is made of — the bake and the shader values are
+    /// re-obtained by baking and dispatching, so a copy that carried them would cost
+    /// the size of the document per edit.
+    pub fn authored(&self) -> Self {
+        let mut graph = self.graph.clone();
+        for node in &mut graph.nodes {
+            if let NodeOp::Shader(shader) = &mut node.op {
+                shader.clear();
+            }
+        }
+        Self {
+            id: self.id.clone(),
+            role: self.role,
+            shift: self.shift,
+            range: self.range,
+            export: self.export,
+            graph,
+            baked: Raster::default(),
+        }
+    }
+
     /// [`Field::range`] as `(low, high)`, swapped if it was stored backwards. A
     /// backwards range is not an error anywhere; this is the only correct way to
     /// read it.

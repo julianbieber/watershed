@@ -345,10 +345,7 @@ fn pan_zoom(
         return;
     };
 
-    let typing = focus
-        .as_deref()
-        .and_then(InputFocus::get)
-        .is_some_and(|entity| fields.contains(entity));
+    let typing = crate::ui::typing(focus.as_deref(), &fields);
 
     let mut direction = Vec2::ZERO;
     if !typing {
