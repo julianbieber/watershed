@@ -898,6 +898,44 @@ mod tests {
         assert!(!document.dirty);
     }
 
+    // A display property is saved with the document and undone like any other edit, but
+    // it says how the map draws the field rather than what the field holds — so, like a
+    // card drag, it must cost neither a re-bake nor the solved water.
+    #[test]
+    fn toggling_hillshade_is_undoable_and_does_not_make_the_bake_stale() {
+        let mut document = one_node_document();
+
+        document
+            .apply(&Edit::Set {
+                path: "height.hillshade".to_owned(),
+                words: vec!["on".to_owned()],
+            })
+            .unwrap();
+
+        assert!(
+            document
+                .terrain()
+                .unwrap()
+                .field("height")
+                .unwrap()
+                .hillshade
+        );
+        assert_eq!(document.baked, Baked::Whole);
+        assert_eq!(document.history().undo, 1);
+
+        document.undo().unwrap();
+
+        assert!(
+            !document
+                .terrain()
+                .unwrap()
+                .field("height")
+                .unwrap()
+                .hillshade
+        );
+        assert_eq!(document.baked, Baked::Whole);
+    }
+
     // Changing what a node computes is the other half of the rule: that one does reach
     // the bake, so it has to make it stale.
     #[test]

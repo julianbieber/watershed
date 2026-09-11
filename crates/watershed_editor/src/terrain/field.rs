@@ -35,6 +35,17 @@ pub struct Field {
     /// whatever consumes a baked terrain to decide what an exported field means.
     #[serde(default)]
     pub export: bool,
+    /// Whether the map lights this field's colour ramp by the field's own normal.
+    ///
+    /// Nothing a bake reads looks at this or at [`Field::light_azimuth`], so
+    /// toggling either never makes the bake stale.
+    #[serde(default)]
+    pub hillshade: bool,
+    /// The compass bearing the hillshade light comes from, in degrees: 0 is north
+    /// and 90 is east. Read only while [`Field::hillshade`] is set. Defaults to the
+    /// northwest.
+    #[serde(default = "default_light_azimuth")]
+    pub light_azimuth: f32,
     /// What the field's value is built out of. Evaluation order is derived from the
     /// edges, not stored.
     pub graph: FieldGraph,
@@ -42,10 +53,16 @@ pub struct Field {
     baked: Raster<f32>,
 }
 
+const DEFAULT_LIGHT_AZIMUTH: f32 = 315.0;
+
+fn default_light_azimuth() -> f32 {
+    DEFAULT_LIGHT_AZIMUTH
+}
+
 impl Field {
     /// A field named `id` with an empty graph: role `Custom`, shift 0, range
-    /// `0.0..=1.0`, not exported, and unbaked — so it samples as `0.0` until it is
-    /// baked.
+    /// `0.0..=1.0`, not exported, not hillshaded, lit from the northwest, and
+    /// unbaked — so it samples as `0.0` until it is baked.
     pub fn new(id: impl Into<FieldId>) -> Self {
         Self {
             id: id.into(),
@@ -53,6 +70,8 @@ impl Field {
             shift: 0,
             range: (0.0, 1.0),
             export: false,
+            hillshade: false,
+            light_azimuth: DEFAULT_LIGHT_AZIMUTH,
             graph: FieldGraph::new(),
             baked: Raster::default(),
         }
@@ -143,6 +162,8 @@ impl Field {
             shift: self.shift,
             range: self.range,
             export: self.export,
+            hillshade: self.hillshade,
+            light_azimuth: self.light_azimuth,
             graph,
             baked: Raster::default(),
         }
@@ -293,6 +314,21 @@ mod tests {
         assert_eq!(deps.len(), 2);
         assert!(deps.contains(&"relief") && deps.contains(&"ridge"));
         assert!(!deps.contains(&"hidden"));
+    }
+
+    // A history snapshot is `authored()`, so a display property missing from it is a
+    // property undo silently skips.
+    #[test]
+    fn a_new_field_is_unlit_from_the_northwest_and_carries_both_into_a_snapshot() {
+        let mut field = Field::new("height");
+        assert!(!field.hillshade);
+        assert_eq!(field.light_azimuth, 315.0);
+
+        field.hillshade = true;
+        field.light_azimuth = 90.0;
+        let authored = field.authored();
+        assert!(authored.hillshade);
+        assert_eq!(authored.light_azimuth, 90.0);
     }
 
     // Every loaded document is in this state until it is baked, so sampling one has

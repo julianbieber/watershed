@@ -70,6 +70,11 @@ pub struct FieldSettings {
     pub diverging: f32,
     /// Non-zero to tint standing water and channels over the field.
     pub water_overlay: f32,
+    /// Non-zero to light the ramp by the field's own normal.
+    pub hillshade: f32,
+    /// The compass bearing the hillshade light comes from, in degrees: 0 is north and
+    /// 90 is east. Read only while `hillshade` is non-zero.
+    pub light_azimuth: f32,
 }
 
 impl Default for FieldSettings {
@@ -80,6 +85,8 @@ impl Default for FieldSettings {
             range: Vec2::new(0.0, 1.0),
             diverging: 0.0,
             water_overlay: 1.0,
+            hillshade: 0.0,
+            light_azimuth: 315.0,
         }
     }
 }
