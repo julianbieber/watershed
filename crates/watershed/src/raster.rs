@@ -175,6 +175,47 @@ impl<T: Clone> Raster<T> {
     pub fn fill(&mut self, value: T) {
         self.data.fill(value);
     }
+
+    /// The texels under `rect`, row by row, or `None` for a rectangle that is empty
+    /// or reaches past an edge.
+    ///
+    /// Refused rather than clipped, because a caller keeping the copy to write back
+    /// later has no way to tell a clipped result from a whole one — and would put it
+    /// back at the wrong offsets. Pair with [`Raster::paste_rect`] under the same
+    /// rectangle.
+    pub fn copy_rect(&self, rect: CellRect) -> Option<Vec<T>> {
+        if !self.holds(rect) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
+        for y in rect.min.y..rect.max.y {
+            let start = y as usize * self.size.x as usize + rect.min.x as usize;
+            out.extend_from_slice(&self.data[start..start + rect.width() as usize]);
+        }
+        Some(out)
+    }
+
+    /// Writes `texels` back under `rect`, row by row, answering whether it landed.
+    ///
+    /// Refused, leaving the raster untouched, unless the rectangle fits and `texels`
+    /// is exactly the rectangle's area — the two ways a copy taken from another
+    /// raster could silently smear across rows.
+    pub fn paste_rect(&mut self, rect: CellRect, texels: &[T]) -> bool {
+        if !self.holds(rect) || texels.len() != rect.width() as usize * rect.height() as usize {
+            return false;
+        }
+        for (row, y) in (rect.min.y..rect.max.y).enumerate() {
+            let start = y as usize * self.size.x as usize + rect.min.x as usize;
+            let taken = row * rect.width() as usize;
+            self.data[start..start + rect.width() as usize]
+                .clone_from_slice(&texels[taken..taken + rect.width() as usize]);
+        }
+        true
+    }
+
+    fn holds(&self, rect: CellRect) -> bool {
+        !rect.is_empty() && rect.max.x <= self.size.x && rect.max.y <= self.size.y
+    }
 }
 
 impl<T: Texel> Raster<T> {
@@ -380,6 +421,50 @@ mod tests {
         assert!(raster.get(3, 0).is_none());
         assert!(raster.get(0, 2).is_none());
         assert!(!raster.set(3, 0, 1.0));
+    }
+
+    // The contract a history entry rests on: what comes out under a rectangle goes
+    // back under the same rectangle unchanged, at the right offsets, with the rest of
+    // the raster untouched.
+    #[test]
+    fn a_rectangle_pasted_back_restores_exactly_what_was_copied() {
+        let mut raster = Raster::new(UVec2::new(4, 4), 0u8);
+        for y in 0..4 {
+            for x in 0..4 {
+                raster.set(x, y, (y * 4 + x) as u8);
+            }
+        }
+        let rect = CellRect::new(UVec2::new(1, 1), UVec2::new(3, 3));
+        let held = raster.copy_rect(rect).expect("the rectangle fits");
+        assert_eq!(held, vec![5, 6, 9, 10]);
+
+        raster.fill(200);
+        assert!(raster.paste_rect(rect, &held));
+        assert_eq!(*raster.get(1, 1).unwrap(), 5);
+        assert_eq!(*raster.get(2, 2).unwrap(), 10);
+        assert_eq!(
+            *raster.get(0, 0).unwrap(),
+            200,
+            "a texel outside the rectangle moved"
+        );
+    }
+
+    // Both refusals exist so a copy from one raster cannot smear across the rows of
+    // another: a rectangle past the edge, and a slice that is not the area.
+    #[test]
+    fn a_rectangle_that_does_not_fit_and_a_slice_of_the_wrong_length_are_refused() {
+        let mut raster = Raster::new(UVec2::new(4, 4), 0u8);
+        assert!(
+            raster
+                .copy_rect(CellRect::new(UVec2::new(2, 2), UVec2::new(5, 4)))
+                .is_none()
+        );
+        assert!(raster.copy_rect(CellRect::EMPTY).is_none());
+        assert!(!raster.paste_rect(
+            CellRect::new(UVec2::ZERO, UVec2::new(5, 1)),
+            &[1, 2, 3, 4, 5]
+        ));
+        assert!(!raster.paste_rect(CellRect::new(UVec2::ZERO, UVec2::new(2, 2)), &[1, 2, 3]));
     }
 
     // Fixes the coordinate convention the rest of the crate is written against: a

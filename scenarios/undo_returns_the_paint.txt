@@ -1,0 +1,84 @@
+# Paint a ridge into a document from outside the process, take the stroke back, and watch
+# the height *and* the field downstream of it go back to what they were.
+#
+# Run with:  just drive run scenarios/undo_returns_the_paint.txt
+#
+# What makes this reproducible is that every command holds its reply until its effect has
+# landed: `stroke` answers when the rectangle the paint made stale has been re-baked, and
+# so do `undo` and `redo`. Nothing below counts frames.
+
+observe log
+
+fixed-delta 1/60
+
+new 256 256 7 continents
+wait bake
+zoom fit
+
+# Somewhere for a stroke to go, and something that reads it. `continents` builds moisture
+# out of its own noise, so on its own it would show nothing whatever the brush did; giving
+# it a node that reads height through a slope is what makes "every field downstream" a
+# claim this scenario can check. A slope also reads a neighbourhood, so the rectangle the
+# undo has to re-bake is wider than the one the brush painted.
+node add height paint
+node add height binary add
+node connect height n3 n5 0
+node connect height n4 n5 1
+node output height n5
+
+node add moisture fieldref height
+node add moisture slope 4
+node connect moisture n1 n2 0
+node output moisture n2
+observe nodes
+
+brush mode add radius 12 falloff 0.4 strength 0.9 value 1
+
+# The two baselines every assertion below is against: the height as the preset built it,
+# and the moisture that reads it.
+field height
+observe field
+field moisture
+observe field
+observe document
+
+# One stroke, and both fields move. The history now reaches one change back — a stroke is
+# an entry like any other, which is the whole of what this task added.
+field height
+stroke 40,128 96,120 160,132 216,126
+observe field
+observe document
+field moisture
+observe field
+
+# Ctrl+Z, as the control socket spells it. The claim: both fields read back exactly what
+# they read before the stroke, and `baked` still names an extent rather than falling to
+# `nothing` — an undone stroke re-bakes the ground it reached, the way making the stroke
+# did, instead of throwing the whole document's bake away the way a structural edit does.
+undo
+observe document
+field height
+observe field
+field moisture
+observe field
+
+# And redo puts the same paint back, so the entry describes the change from both sides.
+redo
+field height
+observe field
+field moisture
+observe field
+observe document
+
+# A drag is one undo step, but a stroke from here is its own: three of them cost three.
+# The last undo empties the history, and one more is refused.
+field height
+stroke 40,60 90,64
+stroke 140,60 190,64
+observe document
+undo
+undo
+undo
+observe document
+
+observe log
