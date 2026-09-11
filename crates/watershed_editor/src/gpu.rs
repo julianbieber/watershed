@@ -33,7 +33,9 @@ use watershed::raster::Raster;
 use crate::document::{Document, EditorSystems};
 use crate::terrain::TerrainSpec;
 use crate::terrain::graph::NodeOp;
-use crate::terrain::shader::{ParamsLayout, SHADER_DIR, ShaderInput, parse_inputs, parse_params};
+use crate::terrain::shader::{
+    ParamsLayout, SHADER_DIR, ShaderInput, parse_inputs, parse_params, parse_reach,
+};
 
 /// The source every shader layer is compiled against: the bindings a dispatch
 /// supplies, the noise the CPU layers agree with, and the position helper the entry
@@ -145,6 +147,10 @@ pub struct ShaderEntry {
     /// The input textures the file declares, in pin order. As with the layout, the
     /// last list that parsed.
     pub inputs: Vec<ShaderInput>,
+    /// How far, in document cells, the file declares it reads around the texel it
+    /// writes, or `None` for a file that declares nothing and so re-bakes whole. As
+    /// with the layout, the last reach that parsed.
+    pub reach: Option<u32>,
     /// Why the file did not parse or compile: `line N: message` against the file's own
     /// lines, or the bare message when the fault is not on a line the file owns.
     /// `None` when it is good.
@@ -503,25 +509,28 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
         let previous = library
             .entries
             .get(&name)
-            .map(|held| (held.layout.clone(), held.inputs.clone()));
+            .map(|held| (held.layout.clone(), held.inputs.clone(), held.reach));
         let outcome = parse_params(&source)
             .and_then(|layout| parse_inputs(&source).map(|inputs| (layout, inputs)))
+            .and_then(|(layout, inputs)| parse_reach(&source).map(|reach| (layout, inputs, reach)))
             .map_err(|error| error.to_string())
             .and_then(|declared| validate(&source).map(|()| declared));
         let entry = match outcome {
-            Ok((layout, inputs)) => ShaderEntry {
+            Ok((layout, inputs, reach)) => ShaderEntry {
                 source,
                 layout,
                 inputs,
+                reach,
                 error: None,
                 modified,
             },
             Err(reason) => {
-                let (layout, inputs) = previous.unwrap_or_default();
+                let (layout, inputs, reach) = previous.unwrap_or_default();
                 ShaderEntry {
                     source,
                     layout,
                     inputs,
+                    reach,
                     error: Some(reason),
                     modified,
                 }
@@ -602,6 +611,7 @@ fn attend_shaders(
                 node.inputs.resize(pins, None);
                 moved = true;
             }
+            moved |= shader.reconcile_reach(entry.reach);
             touched |= moved;
         }
     }
@@ -876,6 +886,7 @@ impl ShaderLibrary {
                 source: String::new(),
                 layout: ParamsLayout::default(),
                 inputs: Vec::new(),
+                reach: None,
                 error: Some(fault.to_owned()),
                 modified: None,
             },
@@ -925,13 +936,16 @@ mod tests {
         }
     }
 
-    // The blur the acceptance path asks for, and the only thing short of a GPU that
-    // says a declared input compiles: the binding, the library's two texel helpers and
-    // a neighbourhood read, validated as one source.
+    // The blur the acceptance path asks for, annotation and all, and the only thing
+    // short of a GPU that says it compiles: the binding, the library's two texel
+    // helpers and a neighbourhood read, validated as one source. The `@reach` line is
+    // a comment to WGSL and must stay one — a declared reach that broke the compile
+    // would make the narrowed re-bake unreachable.
     #[test]
     fn a_shader_that_declares_an_input_and_blurs_it_compiles() {
-        let source = "@group(0) @binding(3) var source: texture_2d<f32>; // @in \"Source\"\n\nfn value(p: vec2<f32>) -> f32 {\n    let at = field_texel(p);\n    var total = 0.0;\n    for (var dy = -1; dy <= 1; dy = dy + 1) {\n        for (var dx = -1; dx <= 1; dx = dx + 1) {\n            total = total + input_texel(source, at + vec2<i32>(dx, dy));\n        }\n    }\n    return total / 9.0;\n}\n";
+        let source = "// @reach 2\n@group(0) @binding(3) var source: texture_2d<f32>; // @in \"Source\"\n\nfn value(p: vec2<f32>) -> f32 {\n    let at = field_texel(p);\n    var total = 0.0;\n    for (var dy = -1; dy <= 1; dy = dy + 1) {\n        for (var dx = -1; dx <= 1; dx = dx + 1) {\n            total = total + input_texel(source, at + vec2<i32>(dx, dy));\n        }\n    }\n    return total / 9.0;\n}\n";
         assert_eq!(parse_inputs(source).unwrap().len(), 1);
+        assert_eq!(parse_reach(source).unwrap(), Some(2));
         if let Err(error) = validate(source) {
             panic!("a blur over a declared input does not compile: {error}");
         }

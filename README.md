@@ -85,10 +85,14 @@ fn value(p: vec2<f32>) -> f32 {
 ```
 
 Bindings start at 3, since 0, 1 and 2 are the globals, the output and the parameters,
-and an unwired pin reads `0.0`. Because such a shader may read *any* texel of its
-input, a document holding one wired up re-bakes whole rather than by rectangle: what
-the pin carries is evaluated over the whole field and dispatched inside the bake,
-which is also where the raster the shader produces is read back.
+and an unwired pin reads `0.0`. What the pin carries is evaluated over the whole field
+and dispatched inside the bake, which is also where the raster the shader produces is
+read back.
+
+A document holding such a shader wired up re-bakes the **whole field** on every
+upstream edit, because nothing bounds how far the shader reads — unless the file says
+so with `@reach`, in which case the re-bake stays inside the visible rectangle and
+pads by the declared reach.
 
 A shader names no field, so it still adds no bake-order dependency. It composes with
 the rest of the stack through the layer's own amplitude, mask and blend, exactly as
@@ -115,6 +119,26 @@ and is expected to be broken for as long as it takes to type the next line.
 A parameter the document carries that the file no longer declares is dropped when the
 file is re-read; one the file declares that the document lacks takes the file's
 default. A file whose name begins with `_` is a template and is not offered as a layer.
+
+### `@reach`
+
+How far the shader reads around the texel it writes, on a line of its own:
+
+```wgsl
+// @reach 2
+```
+
+The unit is **document cells** — the unit `p` is measured in — so a shader that
+offsets in texels of its own field declares `offset << shift` cells. The line may sit
+anywhere in the file, and only a whole line counts: a trailing `// @reach 2` after
+code declares nothing, and neither does a commented-out `// // @reach 2`. Declaring it
+twice, or declaring anything but a non-negative whole number, is a parse error.
+
+Without it, a wired shader re-bakes the whole field. With it, an edit upstream re-bakes
+only the visible rectangle, widened by the declared reach at each dependency hop the
+way a slope's sample distance already widens one. Nothing checks the number against
+what the shader actually samples: a shader that reads further than it declares leaves
+stale values inside the rectangle.
 
 ## The water solve
 
