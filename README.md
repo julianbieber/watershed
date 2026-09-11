@@ -68,10 +68,15 @@ fn value(p: vec2<f32>) -> f32 {
 
 `p` is a position in **document cells**, not a normalised coordinate, so a scale means
 the same thing at every shift and a rectangle re-bake produces what a whole bake
-would. The entry point is appended by the editor; the bindings, the noise and
-`cell_position` come from `assets/shaders/field_lib.wgsl`, whose noise is the same
-algorithm the CPU noise layers use so one name does not mean two functions inside one
-stack.
+would. The entry point is appended by the editor; the bindings, the noise,
+`cell_position`, and `uv` and `document_extent` — the 0..1 coordinate across the
+document, and the cells it spans — come from `assets/shaders/field_lib.wgsl`, whose
+noise is the same algorithm the CPU noise layers use so one name does not mean two
+functions inside one stack.
+
+A copied shader arrives with all of this in its own header: every library function,
+the bindings, the coordinate convention and the annotations below, so the file need
+not be left to write the first line.
 
 A shader may also declare input textures, one pin on its node per declaration, and
 read the upstream raster at any texel:
