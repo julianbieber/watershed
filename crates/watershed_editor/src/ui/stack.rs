@@ -395,13 +395,15 @@ fn brush_section(document: &Document, brush: &BrushSettings, expanded: &Expanded
                 @FeathersButton {
                     @caption: bsn! { Text("Add paint node") ThemedText },
                 }
-                on(move |_: On<Activate>, mut document: ResMut<Document>| {
+                on(move |_: On<Activate>, mut document: ResMut<Document>, selection: Res<Selection>| {
                     let active = document.active().to_owned();
+                    let at = field_of(&document)
+                        .map(|field| field.graph.free_position_beside(selection.node));
                     let result = document
                         .apply(&Edit::AddNode {
                             field: active,
                             op: NodeOp::Paint(Raster::default()),
-                            position: None,
+                            position: at,
                         })
                         .map(|_| ());
                     report(&mut document, result);
@@ -836,7 +838,9 @@ fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
             @FeathersButton {
                 @caption: bsn! { Text("Add node") ThemedText },
             }
-            on(move |_: On<Activate>, mut document: ResMut<Document>, mut library: ResMut<ShaderLibrary>| {
+            on(move |_: On<Activate>, mut document: ResMut<Document>, mut library: ResMut<ShaderLibrary>, selection: Res<Selection>| {
+                let at = field_of(&document)
+                    .map(|field| field.graph.free_position_beside(selection.node));
                 let op = match stock_of(&chosen) {
                     Some(stock) => match library.adopt(stock) {
                         Ok(file) => NodeOp::Shader(ShaderLayer::new(file)),
@@ -851,7 +855,7 @@ fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
                     .apply(&Edit::AddNode {
                         field: active.clone(),
                         op,
-                        position: None,
+                        position: at,
                     })
                     .map(|_| ());
                 report(&mut document, result);

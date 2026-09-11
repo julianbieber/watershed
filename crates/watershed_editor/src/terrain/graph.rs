@@ -403,26 +403,50 @@ impl FieldGraph {
         self.nodes.iter_mut().find(|node| node.id == id)
     }
 
+    fn clear(&self, at: [f32; 2]) -> bool {
+        !self.nodes.iter().any(|node| {
+            (node.position[0] - at[0]).abs() < NODE_STEP[0] * 0.5
+                && (node.position[1] - at[1]).abs() < NODE_STEP[1] * 0.5
+        })
+    }
+
     /// A spot no card is sitting on, for a node added without one.
     ///
     /// Laid out in rows below the origin, so a graph built entirely through control
     /// verbs comes out readable rather than as a stack of cards on one another.
     pub fn free_position(&self) -> [f32; 2] {
-        let clear = |at: [f32; 2]| {
-            !self.nodes.iter().any(|node| {
-                (node.position[0] - at[0]).abs() < NODE_STEP[0] * 0.5
-                    && (node.position[1] - at[1]).abs() < NODE_STEP[1] * 0.5
-            })
-        };
         for row in 0..64 {
             for column in 0..8 {
                 let at = [column as f32 * NODE_STEP[0], -(row as f32) * NODE_STEP[1]];
-                if clear(at) {
+                if self.clear(at) {
                     return at;
                 }
             }
         }
         [0.0, 0.0]
+    }
+
+    /// A spot no card is sitting on, one `NODE_STEP` right of `anchor`.
+    ///
+    /// An `anchor` the graph does not hold is not an error: it falls back to the
+    /// output node, as `None` does, and a graph with neither falls back to
+    /// `free_position`. The spot returned overlaps no existing card.
+    pub fn free_position_beside(&self, anchor: Option<NodeId>) -> [f32; 2] {
+        let beside = anchor
+            .filter(|id| self.node(*id).is_some())
+            .or(self.output)
+            .and_then(|id| self.node(id));
+        let Some(beside) = beside else {
+            return self.free_position();
+        };
+        let column = beside.position[0] + NODE_STEP[0];
+        for row in 0..64 {
+            let at = [column, beside.position[1] - row as f32 * NODE_STEP[1]];
+            if self.clear(at) {
+                return at;
+            }
+        }
+        self.free_position()
     }
 
     /// Adds an unconnected node of `op` and returns the id it was given.
@@ -1005,5 +1029,44 @@ mod tests {
         assert_eq!(curve.apply(0.5), 1.0);
         let doubled = Curve::new(vec![point(0.0, 0.0), point(1.0, 5.0), point(1.0, 9.0)]);
         assert_eq!(doubled.apply(1.0), 9.0);
+    }
+
+    // The whole point of the change: a node added while something is selected lands
+    // beside that selection rather than in the next free grid slot.
+    #[test]
+    fn a_spot_beside_an_anchor_is_one_step_right_of_it() {
+        let mut graph = graph();
+        let anchor = graph.add_node(NodeOp::Constant(1.0), [400.0, -300.0]);
+        assert_eq!(
+            graph.free_position_beside(Some(anchor)),
+            [400.0 + NODE_STEP[0], -300.0]
+        );
+    }
+
+    // Landing beside the selection is worth nothing if the card lands on top of one
+    // that is already there, which is exactly the crowded case the probe exists for.
+    #[test]
+    fn a_spot_beside_an_anchor_avoids_a_card_already_sitting_there() {
+        let mut graph = graph();
+        let anchor = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        graph.add_node(NodeOp::Constant(2.0), [NODE_STEP[0], 0.0]);
+        let at = graph.free_position_beside(Some(anchor));
+        assert!(graph.nodes.iter().all(|node| {
+            (node.position[0] - at[0]).abs() >= NODE_STEP[0] * 0.5
+                || (node.position[1] - at[1]).abs() >= NODE_STEP[1] * 0.5
+        }));
+    }
+
+    // Nothing selected is the ordinary state of a fresh field, and the issue asks for
+    // the output node to stand in as the anchor there.
+    #[test]
+    fn a_spot_beside_nothing_anchors_on_the_output_node() {
+        let mut graph = graph();
+        let first = graph.add_node(NodeOp::Constant(1.0), [700.0, -100.0]);
+        assert_eq!(graph.output, Some(first));
+        assert_eq!(
+            graph.free_position_beside(None),
+            [700.0 + NODE_STEP[0], -100.0]
+        );
     }
 }
