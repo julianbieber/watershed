@@ -177,13 +177,15 @@ impl TerrainSpec {
         &self.runtime
     }
 
-    /// Whether any field's evaluation order reaches a shader node with something
-    /// wired into it.
+    /// Whether any field's evaluation order reaches a shader node that has something
+    /// wired into it and whose file declares no reach.
     ///
     /// Such a shader may read any texel of its input, so nothing bounds the ground an
     /// edit under it can move: a document this holds for is re-baked whole rather
-    /// than by rectangle.
-    pub fn samples_upstream(&self) -> bool {
+    /// than by rectangle. A wired shader whose file declares a reach is bounded by
+    /// it, widens the re-bake by that much like a `Slope` does, and re-bakes by
+    /// rectangle.
+    pub fn samples_unbounded(&self) -> bool {
         self.fields.iter().any(|field| {
             field
                 .graph
@@ -191,8 +193,11 @@ impl TerrainSpec {
                 .unwrap_or_default()
                 .iter()
                 .filter_map(|&id| field.graph.node(id))
-                .any(|node| {
-                    matches!(node.op, NodeOp::Shader(_)) && node.inputs.iter().any(Option::is_some)
+                .any(|node| match &node.op {
+                    NodeOp::Shader(shader) => {
+                        shader.reach.is_none() && node.inputs.iter().any(Option::is_some)
+                    }
+                    _ => false,
                 })
         })
     }
@@ -643,12 +648,13 @@ impl TerrainSpec {
     fn halo_between(&self, reader: usize, referenced: usize) -> u32 {
         let field = &self.fields[reader];
         let reach = slope_reach_to(field, &self.fields[referenced].id);
-        let reach = if reach.is_finite() {
-            reach.ceil() as u32
-        } else {
-            0
-        };
-        step(field.shift) + reach + 2 * step(self.fields[referenced].shift) + 2
+        if !reach.is_finite() {
+            return u32::MAX;
+        }
+        step(field.shift)
+            .saturating_add(reach.ceil() as u32)
+            .saturating_add(2 * step(self.fields[referenced].shift))
+            .saturating_add(2)
     }
 
     /// Which cells of the *whole document* could bake differently because one field changed
@@ -663,7 +669,10 @@ impl TerrainSpec {
     ///
     /// `CellRect::EMPTY` if the document carries no such field or the rectangle is
     /// outside it. A document that cannot be planned answers with the whole
-    /// document: no ordering can be computed, so nothing can be ruled out.
+    /// document: no ordering can be computed, so nothing can be ruled out. So does
+    /// one holding a hop that reads without bound — a wired shader whose file
+    /// declares no reach — since under-reporting such a hop leaves stale cells on
+    /// the map.
     pub fn influence_of(&self, changed: &str, rect: CellRect) -> CellRect {
         let document = self.rect();
         let rect = rect.intersect(document);
@@ -702,10 +711,12 @@ impl TerrainSpec {
 /// How far, in document cells, this field's graph reaches around a texel when it
 /// reads `referenced`.
 ///
-/// A `Slope` node reads a neighbourhood of its input, so every reference underneath
-/// one is read that much wider — and a chain of them *sums*, because each widens
-/// what the one below it already widened. Across fields the same quantity is a max,
-/// since two separate references do not compound.
+/// A `Slope` node reads a neighbourhood of its input, and so does a shader node with
+/// a wired pin — by the reach its file declares, or without bound when it declares
+/// none, which answers `f32::INFINITY`. Every reference underneath one is read that
+/// much wider, and a chain of them *sums*, because each widens what the one below it
+/// already widened. Across fields the same quantity is a max, since two separate
+/// references do not compound.
 fn slope_reach_to(field: &Field, referenced: &FieldId) -> f32 {
     let order = field.graph.evaluation_order().unwrap_or_default();
     let mut reach = vec![0.0f32; order.len()];
@@ -717,6 +728,9 @@ fn slope_reach_to(field: &Field, referenced: &FieldId) -> f32 {
         };
         let widens = match (&node.op, node.bypassed) {
             (NodeOp::Slope { sample_tiles, .. }, false) => sample_tiles.abs(),
+            (NodeOp::Shader(layer), false) => {
+                layer.reach.map_or(f32::INFINITY, |cells| cells as f32)
+            }
             _ => 0.0,
         };
         for source in field.graph.effective_sources(order[at]) {
@@ -2559,6 +2573,75 @@ mod tests {
             }
         }
         assert!(moved > 0, "the stroke moved nothing at all");
+    }
+
+    fn shader_over_a_field(wired: bool, reach: Option<u32>) -> TerrainSpec {
+        use crate::terrain::shader::ShaderLayer;
+        let mut layer = ShaderLayer::new("blur.wgsl");
+        layer.inputs = vec!["source".to_owned()];
+        layer.reach = reach;
+
+        let mut graph = FieldGraph::new();
+        let source = graph.node_with(NodeOp::FieldRef(FieldId::from("base")), &[]);
+        let pins: Vec<NodeId> = if wired { vec![source] } else { Vec::new() };
+        let shaded = graph.node_with(NodeOp::Shader(layer), &pins);
+        let out = graph.node_with(NodeOp::Binary(Binary::Add), &[source, shaded]);
+        graph.set_output(Some(out)).unwrap();
+
+        TerrainSpec::new(UVec2::new(96, 80))
+            .with_field(Field::new("base").with_shift(0).with_op(noise_op(7)))
+            .with_field(Field::new("height").with_shift(0).with_graph(graph))
+    }
+
+    // The unit the annotation is written in, pinned against the only thing that can
+    // read it wrong: a reach of two cells widens what an edit reaches by two cells on
+    // each side, so the answer is four cells wider than the same document declaring
+    // nothing to reach. Both documents also read `base` directly, which is what keeps
+    // it a dependency whatever the shader pin does and makes the two halos comparable.
+    #[test]
+    fn a_declared_reach_widens_the_influence_by_that_many_cells_a_side() {
+        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        let none = shader_over_a_field(true, Some(0)).influence_of("base", painted);
+        let two = shader_over_a_field(true, Some(2)).influence_of("base", painted);
+
+        assert!(!two.is_empty());
+        assert_eq!(two.union(none), two, "{two:?} does not contain {none:?}");
+        assert_eq!(two.width(), none.width() + 4);
+        assert_eq!(two.height(), none.height() + 4);
+    }
+
+    // A wired shader that declares nothing may read any texel of its input, so the
+    // answer has to be the whole document rather than a halo that under-reports and
+    // leaves stale cells on the map.
+    #[test]
+    fn a_wired_shader_declaring_no_reach_influences_the_whole_document() {
+        let terrain = shader_over_a_field(true, None);
+        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        assert_eq!(terrain.influence_of("base", painted), terrain.rect());
+    }
+
+    // An unwired pin reads `0.0` and so reads nothing of the document, which means a
+    // shader with no input bounds nothing whatever its file declares — it must not
+    // widen a halo and must not force a whole re-bake. The direct read of `base`
+    // alongside the shader is what leaves a halo to compare at all.
+    #[test]
+    fn an_unwired_shader_pin_widens_nothing() {
+        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        let unwired = shader_over_a_field(false, None);
+        assert!(!unwired.samples_unbounded());
+        assert_eq!(
+            unwired.influence_of("base", painted),
+            shader_over_a_field(true, Some(0)).influence_of("base", painted)
+        );
+    }
+
+    // The question that decides rectangle against whole field: it is the missing
+    // declaration that forces the whole document, not the wiring on its own.
+    #[test]
+    fn only_a_wired_shader_without_a_declared_reach_samples_unbounded() {
+        assert!(shader_over_a_field(true, None).samples_unbounded());
+        assert!(!shader_over_a_field(true, Some(2)).samples_unbounded());
+        assert!(!shader_over_a_field(false, None).samples_unbounded());
     }
 
     // The two empty answers have to stay empty rather than falling back to the whole

@@ -62,9 +62,9 @@ impl Snapshot {
     }
 
     /// Puts the fields back into `terrain`, keeping what the history does not own:
-    /// each live field's bake, and the live raster or shader values of a node that
-    /// is the same op under the same id on both sides. A graph's next id is never
-    /// lowered, so an id freed by an undo is not handed out again.
+    /// each live field's bake, and the live raster, shader values and declared reach
+    /// of a node that is the same op under the same id on both sides. A graph's next
+    /// id is never lowered, so an id freed by an undo is not handed out again.
     pub fn restore(self, terrain: &mut TerrainSpec) {
         let mut fields = self.fields;
         for field in &mut fields {
@@ -86,6 +86,7 @@ impl Snapshot {
                     }
                     (NodeOp::Shader(shader), NodeOp::Shader(theirs)) => {
                         shader.put_values(theirs.take_values());
+                        shader.reach = theirs.reach;
                     }
                     _ => {}
                 }

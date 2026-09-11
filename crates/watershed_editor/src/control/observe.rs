@@ -298,7 +298,9 @@ fn log(world: &World) -> Value {
 ///
 /// The parameters are named rather than counted, because a caller setting one has to
 /// know what it is called; the inputs likewise, because a caller wiring a pin has to
-/// know which pin it is.
+/// know which pin it is. The reach is reported because it is what decides whether an
+/// edit under a wired node re-bakes by rectangle or whole, and a caller has no other
+/// way to see that the annotation was read; `null` is a file that declares none.
 fn shaders(world: &mut World) -> Value {
     let library = world.resource::<ShaderLibrary>();
     let files: Vec<Value> = library
@@ -326,6 +328,7 @@ fn shaders(world: &mut World) -> Value {
                         "binding": input.binding,
                     }))
                     .collect::<Vec<_>>(),
+                "reach": entry.reach,
                 "error": entry.error,
             })
         })

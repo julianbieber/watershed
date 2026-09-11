@@ -322,14 +322,15 @@ impl Document {
 
     /// What a re-bake covering `rect` has to actually be asked for: the rectangle, or
     /// `None` — the whole document — when the document holds a shader with something
-    /// wired into it.
+    /// wired into it whose file declares no reach.
     ///
     /// Such a shader may read *any* texel of what is wired into it, so no rectangle
-    /// bounds the ground an edit under it moves. Narrowing that is what a declared
-    /// reach would be for; until then the answer is the whole field.
+    /// bounds the ground an edit under it moves. One whose file declares
+    /// `// @reach <cells>` is bounded by that, the bake widens the rectangle by it
+    /// per hop, and the answer stays the rectangle.
     pub fn bake_ask(&self, rect: CellRect) -> Option<CellRect> {
-        let samples_upstream = self.terrain().is_some_and(TerrainSpec::samples_upstream);
-        (!samples_upstream).then_some(rect)
+        let unbounded = self.terrain().is_some_and(TerrainSpec::samples_unbounded);
+        (!unbounded).then_some(rect)
     }
 
     /// Installs what a shader node is dispatched through, when there is a document to
@@ -941,12 +942,13 @@ mod tests {
         document
     }
 
-    fn shader_document(wired: bool) -> Document {
+    fn shader_document(wired: bool, reach: Option<u32>) -> Document {
         use crate::terrain::graph::NodeOp;
         use crate::terrain::shader::ShaderLayer;
         use crate::terrain::{Field, TerrainSpec};
         let mut layer = ShaderLayer::new("blur.wgsl");
         layer.inputs = vec!["source".to_owned()];
+        layer.reach = reach;
         let mut field = Field::new("height").with_op(NodeOp::Constant(0.5));
         let upstream = field.graph.nodes[0].id;
         let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
@@ -960,15 +962,17 @@ mod tests {
         document
     }
 
-    // A shader may read any texel of what is wired into it, so the rectangle a stroke
-    // moved says nothing about the ground that bakes differently — the whole document
-    // has to be re-baked, where the same document with the pin unwired pays only for
-    // the rectangle.
+    // What a wired pin costs turns on the file's declaration, and this draws the
+    // line: undeclared, a shader may read any texel of its input and the rectangle a
+    // stroke moved says nothing about the ground that bakes differently, so the whole
+    // document is re-baked; declared, the reach bounds it and the rectangle stands,
+    // as it does with the pin unwired.
     #[test]
-    fn a_wired_shader_pin_turns_a_rectangle_re_bake_into_a_whole_one() {
+    fn only_an_undeclared_reach_turns_a_rectangle_re_bake_into_a_whole_one() {
         let asked = rect(0, 8);
-        assert_eq!(shader_document(true).bake_ask(asked), None);
-        assert_eq!(shader_document(false).bake_ask(asked), Some(asked));
+        assert_eq!(shader_document(true, None).bake_ask(asked), None);
+        assert_eq!(shader_document(true, Some(2)).bake_ask(asked), Some(asked));
+        assert_eq!(shader_document(false, None).bake_ask(asked), Some(asked));
     }
 
     fn only_node(document: &Document) -> String {

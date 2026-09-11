@@ -847,11 +847,13 @@ mod tests {
     }
 
     // A shader layer's recipe is the file it names and the values for its parameters —
-    // and not the raster, which is derived and is re-dispatched on the way in.
+    // and not the raster or the declared reach, both of which are derived from the
+    // file and are re-read on the way in rather than saved.
     #[test]
     fn a_shader_layer_carries_its_file_and_its_parameters_and_no_values() {
         let mut shader = ShaderLayer::new("ridged.wgsl");
         shader.params.insert("scale".to_owned(), vec![0.03]);
+        shader.reach = Some(2);
         shader.put_values(Raster::new(SIZE, 0.5));
         let spec = TerrainSpec::new(SIZE).with_field(
             Field::new("height")
@@ -866,6 +868,7 @@ mod tests {
                 assert_eq!(shader.file, "ridged.wgsl");
                 assert_eq!(shader.params.get("scale"), Some(&vec![0.03]));
                 assert!(shader.values().is_empty(), "the values were serialized");
+                assert_eq!(shader.reach, None, "the reach was serialized");
             }
             other => panic!("{other:?}"),
         }

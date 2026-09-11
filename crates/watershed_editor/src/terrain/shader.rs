@@ -525,6 +525,44 @@ pub fn parse_inputs(source: &str) -> Result<Vec<ShaderInput>, ParamError> {
     Ok(inputs)
 }
 
+/// How far, in document cells, the file declares it reads around the texel it
+/// writes, or `None` for a file that declares nothing.
+///
+/// The annotation is a line of its own:
+///
+/// ```text
+/// // @reach <cells>
+/// ```
+///
+/// The whole line, trimmed, has to be it — a `// @reach 2` trailing a line of code
+/// declares nothing, and neither does a commented-out `// // @reach 2`, which is
+/// what lets a template carry an example. `<cells>` is a non-negative whole number
+/// of document cells, which is the unit `p` is measured in inside a shader; a
+/// shader offsetting in texels of its own field declares `offset << shift` cells.
+/// The line may sit anywhere in the file.
+///
+/// Declaring it twice is a fault, as is a value that is not a count.
+///
+/// Fails on the first fault and reports the line it is on.
+pub fn parse_reach(source: &str) -> Result<Option<u32>, ParamError> {
+    let mut reach = None;
+    for (index, line) in source.lines().enumerate() {
+        let number = index + 1;
+        let Some(rest) = line.trim().strip_prefix("// @reach") else {
+            continue;
+        };
+        if reach.is_some() {
+            return Err(fault(number, "a reach is declared twice"));
+        }
+        let rest = rest.trim();
+        let cells = rest
+            .parse::<u32>()
+            .map_err(|_| fault(number, format!("`{rest}` is not a count of cells")))?;
+        reach = Some(cells);
+    }
+    Ok(reach)
+}
+
 fn parse_input_declaration(line: usize, declaration: &str) -> Result<ShaderInput, ParamError> {
     let form = "an input is `@group(0) @binding(N) var <name>: texture_2d<f32>;`";
     let rest = declaration
@@ -595,6 +633,18 @@ pub struct ShaderLayer {
     /// read and the edges it saved still land on them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
+    /// How far, in document cells, the file says this shader reads around the texel
+    /// it writes — the whole of what lets a re-bake stay inside a rectangle. `None`
+    /// is a file that declared nothing, and a node of it with a wired pin re-bakes
+    /// the whole field. Nothing checks the declaration against what the shader
+    /// actually samples: one that reads further than it says leaves stale values
+    /// inside the re-baked rectangle.
+    ///
+    /// Derived from the file rather than authored here, so it is not serialized: a
+    /// loaded document re-bakes whole until the shader directory has been read,
+    /// which is the conservative answer and costs one sweep.
+    #[serde(skip)]
+    pub reach: Option<u32>,
     #[serde(skip)]
     values: Raster<f32>,
     #[serde(skip)]
@@ -609,6 +659,7 @@ impl ShaderLayer {
             file: file.into(),
             params: BTreeMap::new(),
             inputs: Vec::new(),
+            reach: None,
             values: Raster::default(),
             stamp: None,
         }
@@ -713,6 +764,18 @@ impl ShaderLayer {
             return false;
         }
         self.inputs = names;
+        true
+    }
+
+    /// Takes the reach the file now declares, answering whether it moved.
+    ///
+    /// `true` means a re-bake under this node is bounded differently than it was, so
+    /// a caller sweeping every node each frame has to ask for one.
+    pub fn reconcile_reach(&mut self, declared: Option<u32>) -> bool {
+        if self.reach == declared {
+            return false;
+        }
+        self.reach = declared;
         true
     }
 }
@@ -1033,6 +1096,58 @@ mod tests {
         assert!(layer.reconcile_inputs(&declared));
         assert_eq!(layer.inputs, vec!["a".to_owned()]);
         assert!(!layer.reconcile_inputs(&declared));
+    }
+
+    // The reach is what bounds a re-bake to a rectangle, and its unit is document
+    // cells — the number read here is the number the halo is widened by.
+    #[test]
+    fn a_declared_reach_reads_as_a_count_of_cells() {
+        assert_eq!(
+            parse_reach("// @reach 2\nfn value() {}\n").unwrap(),
+            Some(2)
+        );
+    }
+
+    // Absent is the answer every shader written before this annotation existed gives,
+    // and it has to mean the whole-field re-bake rather than a reach of zero.
+    #[test]
+    fn a_file_without_the_annotation_declares_no_reach() {
+        assert_eq!(parse_reach("fn value() {}\n").unwrap(), None);
+    }
+
+    // Two declarations leave no way to say which one the bake trusts, so the file is
+    // faulted rather than one of them being picked.
+    #[test]
+    fn a_reach_declared_twice_is_a_fault() {
+        let error = parse_reach("// @reach 2\n// @reach 4\n").unwrap_err();
+        assert_eq!(error.line, 2);
+    }
+
+    // A reach the bake cannot read as a count would otherwise fall back to absent,
+    // silently costing a whole re-bake on a file that meant to declare one.
+    #[test]
+    fn a_reach_that_is_not_a_count_is_a_fault() {
+        assert_eq!(parse_reach("// @reach two\n").unwrap_err().line, 1);
+        assert_eq!(parse_reach("// @reach -1\n").unwrap_err().line, 1);
+        assert_eq!(parse_reach("// @reach\n").unwrap_err().line, 1);
+    }
+
+    // The annotation is the whole line, so a shader may write `// @reach 2` after a
+    // line of code as prose without narrowing anything.
+    #[test]
+    fn a_reach_trailing_a_line_of_code_declares_nothing() {
+        assert_eq!(
+            parse_reach("let at = field_texel(p); // @reach 2\n").unwrap(),
+            None
+        );
+    }
+
+    // The template carries a commented-out example, so the acceptance path is
+    // uncommenting one line — which only works if the commented form declares
+    // nothing.
+    #[test]
+    fn a_commented_out_reach_declares_nothing() {
+        assert_eq!(parse_reach("// // @reach 2\n").unwrap(), None);
     }
 
     // A hidden parameter still occupies its slot in the uniform, so leaving it out of

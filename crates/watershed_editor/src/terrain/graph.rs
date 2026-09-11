@@ -227,11 +227,12 @@ pub enum NodeOp {
     ///
     /// One input pin per input the file declares, in declaration order, each read
     /// inside the shader as a texture of the whole upstream raster; an unwired pin
-    /// reads `0.0`. The shader reads no *field*, so this op contributes no dependency
-    /// and widens no re-bake — a shader with a wired pin may read any texel of its
-    /// input, and that is answered by baking the field whole rather than by a halo.
-    /// The values are not serialized: a loaded document reads the node as `0.0` until
-    /// it has been dispatched again.
+    /// reads `0.0`. The shader reads no *field*, so this op contributes no dependency,
+    /// but a wired pin does widen the re-bake: by the reach the file declares, like a
+    /// [`NodeOp::Slope`] does, or — for a file that declares none, which may read any
+    /// texel of its input — by baking the field whole instead. The values are not
+    /// serialized: a loaded document reads the node as `0.0` until it has been
+    /// dispatched again.
     Shader(ShaderLayer),
     /// A value derived from the region tiling at the position.
     ///
