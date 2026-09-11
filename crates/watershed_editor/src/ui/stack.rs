@@ -1,5 +1,5 @@
-//! The panel beside the map: the field's own properties, the brush, and the node the
-//! canvas has selected.
+//! The panel beside the map: what the editor shows about the document, and what it
+//! lets a person change anywhere but on the canvas itself.
 //!
 //! Everything here follows from one rule. **A choice is shape and a number is a
 //! value**: choosing an op or a mode changes which widgets exist, so the panel
@@ -31,7 +31,7 @@ use crate::edit::{
     BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, Slot, binary_name, brush_mode_name,
     noise_kind_name, op_name, op_summary, parse_region_output, region_output_name, slope_mode_name,
 };
-use crate::gpu::{STOCK, ShaderLibrary};
+use crate::gpu::{STOCK, ShaderLibrary, shader_reference};
 use crate::terrain::graph::{Binary, Curve, GraphNode, NodeId, NodeOp};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
@@ -183,6 +183,8 @@ fn fingerprint(
     key.push('|');
     key.push_str(if expanded.brush { "open" } else { "shut" });
     key.push('|');
+    key.push_str(if expanded.reference { "ref" } else { "noref" });
+    key.push('|');
     key.push_str(if shift_is_pinned(document) {
         "pinned"
     } else {
@@ -293,14 +295,19 @@ fn contents(
     }
 
     match selected.and_then(|node| field.graph.node(node)) {
-        Some(node) => children.push(widgets::boxed(node_entry(
-            &active,
-            node,
-            field.graph.output == Some(node.id),
-            &names,
-            expanded.has(node.id),
-            library,
-        ))),
+        Some(node) => {
+            children.push(widgets::boxed(node_entry(
+                &active,
+                node,
+                field.graph.output == Some(node.id),
+                &names,
+                expanded.has(node.id),
+                library,
+            )));
+            if matches!(node.op, NodeOp::Shader(_)) {
+                children.push(widgets::boxed(reference_section(expanded.reference)));
+            }
+        }
         None => children.push(widgets::boxed(widgets::small(
             "select a node on the canvas",
         ))),
@@ -957,6 +964,31 @@ fn section(
     }
 }
 
+const REFERENCE_HEIGHT: f32 = 260.0;
+
+fn reference_section(open: bool) -> impl Scene {
+    section(
+        "Reference",
+        open,
+        vec![one(reference_body())],
+        |open, expanded: &mut Expanded| expanded.reference = open,
+    )
+}
+
+fn reference_body() -> impl Scene {
+    let reference = shader_reference();
+    bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Stretch,
+            max_height: {px(REFERENCE_HEIGHT)},
+            overflow: {Overflow::scroll_y()},
+        }
+        Children [ widgets::small(reference) ]
+    }
+}
+
 fn field_menu(
     current: &FieldId,
     names: &[String],
@@ -1177,6 +1209,7 @@ mod tests {
             &BrushSettings::default(),
             &Expanded {
                 brush: false,
+                reference: false,
                 nodes: vec![opened],
             },
             &AddLayer::default(),
@@ -1203,5 +1236,37 @@ mod tests {
             &Selection::default(),
         );
         assert_ne!(selected, deselected);
+    }
+
+    // The toggle is a choice, and a choice is shape: a Reference flag outside the key
+    // would leave the panel showing what it showed before the toggle was pressed.
+    #[test]
+    fn opening_the_reference_changes_the_shape() {
+        let document = document_with(vec![NodeOp::Constant(0.5)]);
+        let shut = key(&document);
+        let open = fingerprint(
+            &document,
+            &BrushSettings::default(),
+            &Expanded {
+                brush: false,
+                reference: true,
+                nodes: Vec::new(),
+            },
+            &AddLayer::default(),
+            &ShaderLibrary::default(),
+            &selecting(&document),
+        );
+        assert_ne!(shut, open);
+    }
+
+    // The acceptance, as far as it can be asserted without a window: the text the
+    // section renders is what carries the signature, so the panel is empty of it the
+    // day the header drops it.
+    #[test]
+    fn the_reference_carries_the_ridged_fbm_signature() {
+        assert!(
+            shader_reference()
+                .contains("ridged_fbm(p, octaves: u32, persistence: f32, lacunarity: f32) -> f32")
+        );
     }
 }
