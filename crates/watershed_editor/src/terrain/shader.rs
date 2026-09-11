@@ -479,6 +479,12 @@ impl ShaderLayer {
         &self.values
     }
 
+    /// Moves the dispatch result out, leaving the layer reading as `0.0` until it is
+    /// resolved again or the raster is put back with [`ShaderLayer::put_values`].
+    pub fn take_values(&mut self) -> Raster<f32> {
+        std::mem::take(&mut self.values)
+    }
+
     /// Installs `values` as the dispatch result, dropping whatever was there.
     /// Nothing checks it against the field's resolution.
     pub fn put_values(&mut self, values: Raster<f32>) {

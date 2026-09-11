@@ -543,16 +543,11 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                     one(bsn! {
                         widgets::item_caption(noise_kind_name(kind))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            let changed = with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, |op| {
                                 let NodeOp::Noise(spec) = op else {
-                                    return false;
-                                };
-                                spec.kind = kind;
-                                true
+                                    return;
+                                };                                spec.kind = kind;
                             });
-                            if changed == Some(true) {
-                                document.note_edit();
-                            }
                         })
                     })
                 })
@@ -606,16 +601,11 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                     one(bsn! {
                         widgets::item_caption(slope_mode_name(candidate))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            let changed = with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, |op| {
                                 let NodeOp::Slope { mode, .. } = op else {
-                                    return false;
-                                };
-                                *mode = candidate;
-                                true
+                                    return;
+                                };                                *mode = candidate;
                             });
-                            if changed == Some(true) {
-                                document.note_edit();
-                            }
                         })
                     })
                 })
@@ -631,12 +621,10 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                 "of",
                 one(field_menu(read, names, move |document, chosen| {
                     with_op(document, id, |op| {
-                        let NodeOp::FieldRef(held) = op else {
-                            return false;
-                        };
-                        *held = chosen;
-                        true
-                    })
+                        if let NodeOp::FieldRef(held) = op {
+                            *held = chosen;
+                        }
+                    });
                 })),
             )));
         }
@@ -654,16 +642,11 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                         widgets::item_caption(name)
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
                             let picked = parse_region_output(&chosen);
-                            let changed = with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, |op| {
                                 let NodeOp::Regions { output, .. } = op else {
-                                    return false;
-                                };
-                                *output = picked;
-                                true
+                                    return;
+                                };                                *output = picked;
                             });
-                            if changed == Some(true) {
-                                document.note_edit();
-                            }
                         })
                     })
                 })
@@ -712,16 +695,11 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                     one(bsn! {
                         widgets::item_caption(binary_name(candidate))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            let changed = with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, |op| {
                                 let NodeOp::Binary(held) = op else {
-                                    return false;
-                                };
-                                *held = candidate;
-                                true
+                                    return;
+                                };                                *held = candidate;
                             });
-                            if changed == Some(true) {
-                                document.note_edit();
-                            }
                         })
                     })
                 })
@@ -931,7 +909,7 @@ fn section(
 fn field_menu(
     current: &FieldId,
     names: &[String],
-    write: impl Fn(&mut Document, FieldId) -> Option<bool> + Clone + Send + Sync + 'static,
+    write: impl Fn(&mut Document, FieldId) + Clone + Send + Sync + 'static,
 ) -> impl Scene {
     let current = current.to_string();
     let items: Vec<Box<dyn SceneList>> = names
@@ -942,9 +920,7 @@ fn field_menu(
             one(bsn! {
                 widgets::item_caption(name.clone())
                 on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                    if write(&mut document, chosen.clone()) == Some(true) {
-                        document.note_edit();
-                    }
+                    write(&mut document, chosen.clone());
                 })
             })
         })
@@ -952,15 +928,13 @@ fn field_menu(
     widgets::menu(current, items)
 }
 
-fn with_op<R>(
-    document: &mut Document,
-    id: NodeId,
-    write: impl FnOnce(&mut NodeOp) -> R,
-) -> Option<R> {
+fn with_op(document: &mut Document, id: NodeId, write: impl FnOnce(&mut NodeOp)) {
     let active = document.active().to_owned();
-    let terrain = document.terrain_mut()?;
-    let field = terrain.field_mut(&active)?;
-    field.graph.node_mut(id).map(|node| write(&mut node.op))
+    document.write(&active, |field| {
+        if let Some(node) = field.graph.node_mut(id) {
+            write(&mut node.op);
+        }
+    });
 }
 
 /// The stock shader a `shader:` entry of [`ADDABLE`] names, or `None` for an entry

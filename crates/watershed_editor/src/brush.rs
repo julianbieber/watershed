@@ -9,7 +9,8 @@
 //! document is busy are queued and laid down as one polyline once it is free, so a
 //! drag is a continuous line however many frames its own baking takes; and a drag
 //! refused — started over a panel, or aimed at a field with nowhere to paint — is
-//! refused once, not once a frame while the button is down.
+//! refused once, not once a frame while the button is down. Every piece after the
+//! first joins the history entry the drag opened, so the whole drag is one undo step.
 
 use crate::terrain::Field;
 use crate::terrain::brush::Brush;
@@ -21,6 +22,7 @@ use serde_json::{Value, json};
 use watershed::raster::{Raster, resolution};
 
 use crate::document::{Document, EditorSystems};
+use crate::history::StrokePatch;
 use crate::view::{EditorCamera, cell_at_cursor};
 
 /// Runs the pointer-driven painting system, ahead of the document's own systems each
@@ -48,6 +50,7 @@ pub struct BrushSettings(pub Brush);
 struct Painting {
     pending: Vec<Vec2>,
     blocked: bool,
+    laid: bool,
 }
 
 impl Painting {
@@ -89,13 +92,18 @@ pub fn target_of(document: &Document) -> Option<(String, NodeId)> {
     paint_node(field).map(|id| (field.id.to_string(), id))
 }
 
-/// Applies a stroke and tells the document what it reached — the one path a brush
-/// reaches a document by, whether the points came from a drag or from the control
-/// client.
+/// Applies a stroke, records it in the history and tells the document what it reached —
+/// the one path a brush reaches a document by, whether the points came from a drag or
+/// from the control client.
 ///
 /// `points` are in document cells. Refused, with a message fit to show, if there are
 /// no points, if a job is already running, if there is no document, or if the active
-/// field has no single paint node.
+/// field has no single paint node. A stroke that could move no texel at all writes
+/// nothing, allocates nothing and records nothing, and answers with no cells.
+///
+/// `joins` asks for this to extend the history entry the same drag opened rather than
+/// to open one; a stroke that starts a drag, and one from the control client, passes
+/// `false`.
 ///
 /// The target node's raster is allocated on first use at the field's own resolution,
 /// so a texel of the field reads exactly one painted texel and a stroke is never finer
@@ -110,6 +118,7 @@ pub fn apply_stroke(
     document: &mut Document,
     brush: &Brush,
     points: &[Vec2],
+    joins: bool,
 ) -> Result<Value, String> {
     if points.is_empty() {
         return Err("a stroke needs somewhere to go".to_owned());
@@ -119,7 +128,7 @@ pub fn apply_stroke(
     }
     let name = document.active().to_owned();
 
-    let (id, painted, bleed) = {
+    let (id, piece, painted, bleed) = {
         let terrain = document
             .terrain_mut()
             .ok_or("there is no document to paint on")?;
@@ -134,27 +143,28 @@ pub fn apply_stroke(
         let NodeOp::Paint(raster) = &mut node.op else {
             return Err("the brush's target stopped being a paint node".to_owned());
         };
+        let texels = if raster.is_empty() {
+            resolution(size, shift)
+        } else {
+            raster.size()
+        };
+        let Some(footprint) = brush.footprint(texels, size, points) else {
+            return Ok(
+                json!({ "field": name, "node": crate::edit::node_path(id), "cells": Value::Null }),
+            );
+        };
+        let piece = StrokePatch::before(raster, footprint, texels);
         if raster.is_empty() {
-            *raster = Raster::new(resolution(size, shift), 0u8);
+            *raster = Raster::new(texels, 0u8);
         }
         let bleed = (size.x.div_ceil(raster.width().max(1)))
             .max(size.y.div_ceil(raster.height().max(1)))
             + 1;
-        (id, brush.stroke(raster, size, points), bleed)
+        (id, piece, brush.stroke(raster, size, points), bleed)
     };
 
-    if painted.is_empty() {
-        return Ok(
-            json!({ "field": name, "node": crate::edit::node_path(id), "cells": Value::Null }),
-        );
-    }
     let painted = painted.expand(bleed);
-
-    let reached = match document.terrain() {
-        Some(terrain) => terrain.influence_of(&name, painted),
-        None => painted,
-    };
-    document.note_stroke(reached);
+    let reached = document.record_stroke(&name, id, piece, painted, joins);
 
     Ok(json!({
         "field": name,
@@ -178,6 +188,7 @@ fn paint(
     if !buttons.pressed(MouseButton::Left) {
         painting.pending.clear();
         painting.blocked = false;
+        painting.laid = false;
         return;
     }
     if painting.blocked {
@@ -208,8 +219,8 @@ fn paint(
         return;
     };
     let brush = settings.0;
-    match apply_stroke(&mut document, &brush, &points) {
-        Ok(_) => {}
+    match apply_stroke(&mut document, &brush, &points, painting.laid) {
+        Ok(_) => painting.laid = true,
         Err(error) => {
             painting.blocked = true;
             warn!("{error}");
@@ -224,6 +235,27 @@ mod tests {
     use crate::terrain::TerrainSpec;
     use crate::terrain::graph::NodeOp;
     use watershed::raster::CellRect;
+
+    fn painted_document() -> Document {
+        let mut document = Document::default();
+        let terrain = TerrainSpec::new(UVec2::splat(64)).with_field(
+            Field::new("height")
+                .with_sum([NodeOp::Constant(0.25), NodeOp::Paint(Raster::default())]),
+        );
+        document.adopt(terrain);
+        document
+    }
+
+    fn height_texels(document: &Document) -> Vec<u8> {
+        let field = document.terrain().unwrap().field("height").unwrap();
+        let Some(target) = paint_node(field) else {
+            return Vec::new();
+        };
+        match &field.graph.node(target).unwrap().op {
+            NodeOp::Paint(raster) => raster.data().to_vec(),
+            _ => Vec::new(),
+        }
+    }
 
     fn field_with(ops: Vec<NodeOp>) -> Field {
         ops.into_iter()
@@ -293,6 +325,47 @@ mod tests {
         );
     }
 
+    // A drag is one undo step: its pieces join the entry it opened, and a stroke from
+    // the control client — which passes no drag — is its own.
+    #[test]
+    fn a_drag_is_one_undo_step_and_an_unjoined_stroke_is_another() {
+        let mut document = painted_document();
+        let brush = Brush {
+            radius_cells: 6.0,
+            strength: 0.9,
+            ..Brush::default()
+        };
+
+        apply_stroke(&mut document, &brush, &[Vec2::splat(20.0)], false).unwrap();
+        apply_stroke(&mut document, &brush, &[Vec2::splat(24.0)], true).unwrap();
+        apply_stroke(&mut document, &brush, &[Vec2::splat(28.0)], true).unwrap();
+        assert_eq!(document.history().undo, 1);
+
+        apply_stroke(&mut document, &brush, &[Vec2::splat(40.0)], false).unwrap();
+        assert_eq!(document.history().undo, 2);
+    }
+
+    // A stroke that could move no texel — every point off the document — must not
+    // allocate the raster, because an allocation nothing recorded cannot be undone.
+    #[test]
+    fn a_stroke_that_reaches_no_texel_allocates_nothing_and_records_nothing() {
+        let mut document = painted_document();
+        let reply = apply_stroke(
+            &mut document,
+            &Brush::default(),
+            &[Vec2::splat(4000.0)],
+            false,
+        )
+        .unwrap();
+
+        assert!(reply["cells"].is_null());
+        assert_eq!(document.history().undo, 0);
+        assert!(
+            height_texels(&document).is_empty(),
+            "an untracked raster was left behind"
+        );
+    }
+
     // A held button reports the same cell every frame; queuing each one would grow the
     // polyline without bound and make a stationary brush behave differently from a
     // moving one.
@@ -329,8 +402,10 @@ mod tests {
     #[test]
     fn a_stroke_is_refused_where_there_is_nothing_to_paint_into() {
         let mut document = Document::default();
-        assert!(apply_stroke(&mut document, &Brush::default(), &[Vec2::splat(4.0)]).is_err());
-        assert!(apply_stroke(&mut document, &Brush::default(), &[]).is_err());
+        assert!(
+            apply_stroke(&mut document, &Brush::default(), &[Vec2::splat(4.0)], false).is_err()
+        );
+        assert!(apply_stroke(&mut document, &Brush::default(), &[], false).is_err());
     }
 
     // The seam the whole module is written against: a stroke lands in the layer, and
@@ -349,7 +424,7 @@ mod tests {
             strength: 0.5,
             ..Brush::default()
         };
-        let reply = apply_stroke(&mut document, &brush, &[Vec2::splat(32.0)]).unwrap();
+        let reply = apply_stroke(&mut document, &brush, &[Vec2::splat(32.0)], false).unwrap();
         assert!(document.is_dirty());
 
         let field = document.terrain().unwrap().field("height").unwrap();

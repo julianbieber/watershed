@@ -135,6 +135,15 @@ pub(super) enum Command {
         /// says the PNG is on disk, so the reply never races a half-written file.
         entity: Option<Entity>,
     },
+    /// Takes the last change back, or replays the last one taken back, and the
+    /// re-bake that answers it, on the same terms as [`Command::Edit`]: the reply
+    /// says how far the history reaches each way once the document is settled.
+    History {
+        /// Redo rather than undo.
+        redo: bool,
+        /// The reply from the history itself, once it has moved.
+        applied: Option<Value>,
+    },
     /// Answers a question about the editor's state. See [`Topic`].
     Observe(Topic),
     /// Pins the frame delta, so a run is reproducible.
@@ -192,6 +201,8 @@ impl Command {
             Self::Pan(_) => "pan",
             Self::Zoom(_) => "zoom",
             Self::Capture { .. } => "capture",
+            Self::History { redo: false, .. } => "undo",
+            Self::History { redo: true, .. } => "redo",
             Self::Observe(_) => "observe",
             Self::FixedDelta(_) => "fixed-delta",
             Self::Realtime => "realtime",
@@ -308,6 +319,14 @@ impl Command {
                 path: PathBuf::from(rest.first().ok_or("capture needs a path")?),
                 entity: None,
             }),
+            "undo" => Ok(Self::History {
+                redo: false,
+                applied: None,
+            }),
+            "redo" => Ok(Self::History {
+                redo: true,
+                applied: None,
+            }),
             "observe" => Ok(Self::Observe(Topic::parse(
                 rest.first().ok_or("observe needs a topic")?,
             )?)),
@@ -386,14 +405,25 @@ impl Command {
                     }
                     return Poll::Running;
                 }
-                let document = world.resource::<Document>();
-                if !document.is_settled() {
+                answered(world, applied)
+            }
+
+            Self::History { redo, applied } => {
+                if applied.is_none() {
+                    let mut document = world.resource_mut::<Document>();
+                    let moved = if *redo {
+                        document.redo()
+                    } else {
+                        document.undo()
+                    };
+                    if let Err(error) = moved {
+                        return Poll::Failed(error);
+                    }
+                    let depth = document.history();
+                    *applied = Some(json!({ "undo": depth.undo, "redo": depth.redo }));
                     return Poll::Running;
                 }
-                match document.error() {
-                    Some(error) => Poll::Failed(error.to_owned()),
-                    None => Poll::Done(applied.take().unwrap_or_else(|| json!({}))),
-                }
+                answered(world, applied)
             }
 
             Self::Brush(changes) => {
@@ -408,20 +438,13 @@ impl Command {
                 if applied.is_none() {
                     let brush = world.resource::<BrushSettings>().0;
                     let mut document = world.resource_mut::<Document>();
-                    match apply_stroke(&mut document, &brush, points) {
+                    match apply_stroke(&mut document, &brush, points, false) {
                         Ok(value) => *applied = Some(value),
                         Err(error) => return Poll::Failed(error),
                     }
                     return Poll::Running;
                 }
-                let document = world.resource::<Document>();
-                if !document.is_settled() {
-                    return Poll::Running;
-                }
-                match document.error() {
-                    Some(error) => Poll::Failed(error.to_owned()),
-                    None => Poll::Done(applied.take().unwrap_or_else(|| json!({}))),
-                }
+                answered(world, applied)
             }
 
             Self::Bake { started } => {
@@ -613,6 +636,17 @@ fn directory_bytes(path: &Path) -> u64 {
         .filter(|meta| meta.is_file())
         .map(|meta| meta.len())
         .sum()
+}
+
+fn answered(world: &World, applied: &mut Option<Value>) -> Poll {
+    let document = world.resource::<Document>();
+    if !document.is_settled() {
+        return Poll::Running;
+    }
+    match document.error() {
+        Some(error) => Poll::Failed(error.to_owned()),
+        None => Poll::Done(applied.take().unwrap_or_else(|| json!({}))),
+    }
 }
 
 fn finished(world: &mut World, fields: impl FnOnce(&Document) -> Value) -> Poll {
@@ -822,6 +856,8 @@ mod tests {
             ("zoom fit", "zoom"),
             ("zoom 512", "zoom"),
             ("capture /tmp/a.png", "capture"),
+            ("undo", "undo"),
+            ("redo", "redo"),
             ("observe water", "observe"),
             ("fixed-delta 1/60", "fixed-delta"),
             ("realtime", "realtime"),

@@ -1,0 +1,77 @@
+# Change a field's graph from outside the process, take the changes back one at a time,
+# and replay them — from `observe field` and `observe nodes` rather than from a person
+# pressing Ctrl+Z and looking.
+#
+# Run with:  just drive run scenarios/undo_returns_the_graph.txt
+#
+# What makes this reproducible is that `undo` and `redo` hold their reply exactly as an
+# edit does: until the re-bake the change provoked has landed. Nothing below counts
+# frames.
+
+observe log
+
+fixed-delta 1/60
+
+new 256 256 7 continents
+wait bake
+zoom fit
+
+# The graph and the field as the preset built them: the "before" every undo below has
+# to get back to. `continents` builds height as n0 continent noise, n1 relief noise, n2
+# a scale on n1, and n3 the sum it reads from.
+observe nodes
+observe field
+observe document
+
+# The three edits the task is named for: add a node, connect it, set a parameter. Each
+# one moves the field, and the history now reaches three changes back.
+node add height constant 0.25
+node add height binary add
+node connect height n3 n5 0
+node connect height n4 n5 1
+node output height n5
+set height.n4.value 0.5
+observe field
+observe document
+
+# Three undos, and three more for the wiring: after each the reply carries what can
+# still be undone, and the field has re-baked. At the end the nodes and the quantiles
+# must match the first two observations exactly.
+undo
+observe field
+undo
+undo
+undo
+undo
+undo
+observe nodes
+observe field
+observe document
+
+# Redo replays every one of them: the field is what it was after the edits.
+redo
+redo
+redo
+redo
+redo
+redo
+observe nodes
+observe field
+observe document
+
+# A move reaches no bake, so taking it back must leave `baked` exactly where it was —
+# whole after the redo's re-bake, not nothing.
+node place height n5 100 100
+undo
+observe document
+
+# Everything back to the preset, and the last reply says so: nothing left to undo. One
+# more would be refused, which is what `undo` answers with an empty history and what the
+# unit tests pin.
+undo
+undo
+undo
+undo
+undo
+undo
+observe document

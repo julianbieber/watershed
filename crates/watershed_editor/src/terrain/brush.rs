@@ -106,7 +106,7 @@ impl Brush {
     /// that did not change. Empty when the stroke touched nothing — no points, no
     /// radius, or entirely off the document.
     pub fn stroke(&self, raster: &mut Raster<u8>, size: UVec2, points: &[Vec2]) -> CellRect {
-        let Some(texels) = self.touched_texels(raster.size(), size, points) else {
+        let Some(texels) = self.footprint(raster.size(), size, points) else {
             return CellRect::EMPTY;
         };
         let per_texel = cells_per_texel(raster.size(), size);
@@ -150,7 +150,15 @@ impl Brush {
         .intersect(CellRect::from_size(size))
     }
 
-    fn touched_texels(&self, resolution: UVec2, size: UVec2, points: &[Vec2]) -> Option<CellRect> {
+    /// The texels of a `resolution`-texel raster over a `size`-cell document that a
+    /// stroke of `points` could move, or `None` when it could move none — no points,
+    /// no radius, a degenerate raster or document, or a polyline entirely off it.
+    ///
+    /// Read before the stroke by a caller that has to copy what is under it first;
+    /// [`Brush::stroke`] writes no texel outside what this answers for the same
+    /// arguments. In the raster's own texels, not in document cells, unlike the
+    /// rectangle `stroke` reports.
+    pub fn footprint(&self, resolution: UVec2, size: UVec2, points: &[Vec2]) -> Option<CellRect> {
         if points.is_empty()
             || resolution.x == 0
             || resolution.y == 0
@@ -266,6 +274,52 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The contract a history entry rests on: a caller copies the footprint out before the
+    // stroke and puts it back to undo, so a texel written outside what `footprint`
+    // answered would survive the undo as paint nobody could remove.
+    #[test]
+    fn a_stroke_writes_no_texel_outside_the_footprint_it_answers() {
+        let size = UVec2::splat(64);
+        let brush = Brush {
+            radius_cells: 7.0,
+            strength: 1.0,
+            mode: BrushMode::Add,
+            ..Brush::default()
+        };
+        let points = [Vec2::new(20.0, 20.0), Vec2::new(30.0, 44.0)];
+        let mut raster = Raster::new(size, 3u8);
+        let footprint = brush
+            .footprint(raster.size(), size, &points)
+            .expect("the stroke is on the document");
+
+        brush.stroke(&mut raster, size, &points);
+        for y in 0..size.y {
+            for x in 0..size.x {
+                if !footprint.contains(x, y) {
+                    assert_eq!(
+                        *raster.get(x, y).unwrap(),
+                        3,
+                        "the stroke wrote at {x},{y}, outside its own footprint"
+                    );
+                }
+            }
+        }
+    }
+
+    // Both answer "this stroke moves nothing", and a caller that checked only one of
+    // them would either record an entry for a stroke that painted nothing or paint
+    // without recording one.
+    #[test]
+    fn a_stroke_that_answers_no_footprint_answers_no_rectangle_either() {
+        let size = UVec2::splat(32);
+        let brush = Brush::default();
+        let mut raster = Raster::new(size, 0u8);
+        for points in [vec![], vec![Vec2::splat(900.0)]] {
+            assert!(brush.footprint(raster.size(), size, &points).is_none());
+            assert!(brush.stroke(&mut raster, size, &points).is_empty());
+        }
+    }
 
     fn raster(size: u32) -> Raster<u8> {
         Raster::new(UVec2::splat(size), 0u8)

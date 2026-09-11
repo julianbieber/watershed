@@ -92,6 +92,8 @@ fn document(world: &World) -> Value {
             _ => Value::Null,
         },
         "size": [document.size.x, document.size.y],
+        "undo": document.history().undo,
+        "redo": document.history().redo,
         "seed": document.seed,
         "preset": document.preset.name(),
         "path": document.path.as_ref().map(|path| path.display().to_string()),

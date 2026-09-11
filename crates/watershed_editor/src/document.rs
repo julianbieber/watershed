@@ -19,7 +19,9 @@ use serde_json::Value;
 use watershed::CellRect;
 
 use crate::edit::Edit;
+use crate::history::{History, HistoryDepth, Restored, Snapshot, StrokePatch};
 use crate::preset::Preset;
+use crate::terrain::graph::NodeId;
 use crate::view::VisibleCells;
 
 const REBAKE_MARGIN_CELLS: u32 = 64;
@@ -179,6 +181,9 @@ pub struct Document {
     /// Only edits no bake reads ever land here, so draining them cannot invalidate the
     /// bake that was running while they were made.
     deferred: Vec<Edit>,
+    /// What the document can go back to. Every change a person makes goes through
+    /// [`Document::apply`] or [`Document::write`], which is what puts it here.
+    history: History,
     pub size: UVec2,
     pub seed: u32,
     pub preset: Preset,
@@ -189,6 +194,7 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             deferred: Vec::new(),
+            history: History::default(),
             terrain: None,
             job: Job::Idle,
             active: "height".to_owned(),
@@ -275,9 +281,14 @@ impl Document {
         !self.is_busy() && !self.dirty
     }
 
-    /// The terrain, to be edited in place. Whatever is changed through this has to be
-    /// followed by [`Document::note_edit`] — which is why the panel and
-    /// [`Document::apply`] are the only two callers, and why the second one exists at all.
+    /// The terrain, to be edited in place, for a change the history does not own: a
+    /// shader's resolved values, the parameters a re-read shader file reconciled.
+    /// Whatever is changed through this has to be followed by [`Document::note_edit`],
+    /// and cannot be undone.
+    ///
+    /// Anything a person authors goes through [`Document::apply`], [`Document::write`]
+    /// or — for a stroke, which paints through here and is recorded afterwards —
+    /// [`Document::record_stroke`]. That is what puts it in the history.
     pub fn terrain_mut(&mut self) -> Option<&mut TerrainSpec> {
         self.terrain.as_mut()
     }
@@ -301,17 +312,7 @@ impl Document {
         }
     }
 
-    /// What a stroke leaves behind, where [`Document::note_edit`] is what a change to the
-    /// *stack* leaves behind. The bake keeps the extent it had and the rectangle is added to
-    /// what the next one has to cover — so a stroke costs its own footprint rather than the
-    /// whole document, and a document that was wholly baked before one is wholly baked after.
-    ///
-    /// `reached` is the rectangle the change *reaches* through the fields that read the
-    /// painted one, not the rectangle the brush covered — the caller gets it from
-    /// [`TerrainSpec::influence_of`], which is the only thing that knows how far a
-    /// change travels. Passing the painted rectangle instead leaves a stale fringe in
-    /// every field downstream.
-    pub fn note_stroke(&mut self, reached: CellRect) {
+    fn note_stroke(&mut self, reached: CellRect) {
         self.dirty = true;
         self.error = None;
         self.bake_failed = false;
@@ -322,6 +323,33 @@ impl Document {
             terrain.invalidate_water();
             self.water_revision += 1;
         }
+    }
+
+    /// Records a stroke that has just painted `painted` into `node` of `field`, `piece`
+    /// being what was under it beforehand, and arranges the re-bake it asks for. Answers
+    /// the rectangle the stroke *reaches* through the fields that read the painted one,
+    /// which is wider than the cells painted.
+    ///
+    /// `joins` asks for this to extend the entry the same drag opened rather than to make
+    /// one, so a drag is one undo step however many frames it took; a scripted stroke
+    /// passes `false` and is its own.
+    ///
+    /// The bake keeps the extent it had and the reached rectangle is added to what the
+    /// next one has to cover — so a stroke costs its own footprint rather than the whole
+    /// document, and a document that was wholly baked before one is wholly baked after.
+    pub fn record_stroke(
+        &mut self,
+        field: &str,
+        node: NodeId,
+        piece: StrokePatch,
+        painted: CellRect,
+        joins: bool,
+    ) -> CellRect {
+        self.history
+            .record_stroke(field, node, piece, painted, joins);
+        let reached = self.reach_of(field, painted);
+        self.note_stroke(reached);
+        reached
     }
 
     /// Applies a structural edit and notes it, which is why an edit goes through here
@@ -349,13 +377,108 @@ impl Document {
             .terrain
             .as_mut()
             .ok_or("there is no document to edit")?;
+        let before = Snapshot::take(terrain, edit.reaches_the_bake());
         let reply = edit.apply(terrain)?;
+        self.history.record(before, terrain);
         if edit.reaches_the_bake() {
             self.note_edit();
         } else {
             self.revision += 1;
         }
         Ok(reply)
+    }
+
+    /// Writes one field in place through `write`, as one change in the history: the
+    /// path for a panel control whose value the [`Edit`] grammar cannot spell — a
+    /// shader parameter, a cell of a region table.
+    ///
+    /// Answers whether the field's authored state differs afterwards, and only then
+    /// records and notes the change; the closure's own opinion is not consulted, so a
+    /// control committed at the value it already had leaves no entry and no re-bake.
+    /// Answers `false` without calling `write` while a job runs, with no document, or
+    /// with no field of that name.
+    pub fn write(&mut self, field: &str, write: impl FnOnce(&mut crate::terrain::Field)) -> bool {
+        if self.is_busy() {
+            return false;
+        }
+        let Some(terrain) = self.terrain.as_mut() else {
+            return false;
+        };
+        let before = Snapshot::take(terrain, true);
+        let Some(target) = terrain.field_mut(field) else {
+            return false;
+        };
+        let was = target.authored();
+        write(target);
+        if target.authored() == was {
+            return false;
+        }
+        self.history.record(before, terrain);
+        self.note_edit();
+        true
+    }
+
+    /// Puts the document back to before the last change and arranges the re-bake that
+    /// follows, if the change reached the bake. Refused while a job runs, with no
+    /// document open, or with nothing to undo — in each case the history is untouched.
+    pub fn undo(&mut self) -> Result<(), String> {
+        self.busy_check()?;
+        let terrain = self
+            .terrain
+            .as_mut()
+            .ok_or("there is no document to undo in")?;
+        let restored = self.history.undo(terrain).ok_or("nothing to undo")?;
+        self.note_restored(restored);
+        Ok(())
+    }
+
+    /// Replays the last change undone, on the same terms as [`Document::undo`].
+    pub fn redo(&mut self) -> Result<(), String> {
+        self.busy_check()?;
+        let terrain = self
+            .terrain
+            .as_mut()
+            .ok_or("there is no document to redo in")?;
+        let restored = self.history.redo(terrain).ok_or("nothing to redo")?;
+        self.note_restored(restored);
+        Ok(())
+    }
+
+    /// How many changes can be undone, and how many redone.
+    pub fn history(&self) -> HistoryDepth {
+        self.history.depth()
+    }
+
+    fn note_restored(&mut self, restored: Restored) {
+        match restored {
+            Restored::Fields { reaches_bake: true } => self.note_edit(),
+            Restored::Fields { .. } => self.revision += 1,
+            Restored::Stroke { field, cells } => {
+                let reached = self.reach_of(&field, cells);
+                self.note_stroke(reached);
+            }
+        }
+    }
+
+    fn reach_of(&self, field: &str, painted: CellRect) -> CellRect {
+        match self.terrain.as_ref() {
+            Some(terrain) => terrain.influence_of(field, painted),
+            None => painted,
+        }
+    }
+
+    fn land_deferred(&mut self) {
+        let held = std::mem::take(&mut self.deferred);
+        let Some(terrain) = self.terrain.as_mut() else {
+            return;
+        };
+        for edit in &held {
+            let before = Snapshot::take(terrain, edit.reaches_the_bake());
+            match edit.apply(terrain) {
+                Ok(_) => self.history.record(before, terrain),
+                Err(error) => warn!("a held edit was refused: {error}"),
+            }
+        }
     }
 
     /// Puts a field on screen.
@@ -458,6 +581,8 @@ impl Document {
         self.terrain = None;
         self.baked = Baked::Nothing;
         self.stroke_rect = CellRect::EMPTY;
+        self.history.clear();
+        self.deferred.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut terrain = preset.build(size, seed);
@@ -553,6 +678,8 @@ impl Document {
         self.terrain = None;
         self.baked = Baked::Nothing;
         self.stroke_rect = CellRect::EMPTY;
+        self.history.clear();
+        self.deferred.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             match TerrainSpec::load_from_dir(&path) {
@@ -609,17 +736,7 @@ fn finish_job(mut document: ResMut<Document>) {
         document.size = terrain.size;
         document.terrain = Some(terrain);
     }
-    // The edits held while the terrain was away, now that it is back. None of them
-    // reaches the bake, so applying them here cannot make the bake that just landed
-    // stale.
-    let held = std::mem::take(&mut document.deferred);
-    if let Some(terrain) = document.terrain.as_mut() {
-        for edit in &held {
-            if let Err(error) = edit.apply(terrain) {
-                warn!("a held edit was refused: {error}");
-            }
-        }
-    }
+    document.land_deferred();
     document.revision += 1;
     document.water_revision += 1;
 
@@ -829,6 +946,319 @@ mod tests {
                     words: vec!["0.75".to_owned()],
                 })
                 .is_err()
+        );
+    }
+
+    fn painted_texels(document: &Document) -> Vec<u8> {
+        let field = document.terrain().unwrap().field("height").unwrap();
+        field
+            .graph
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                crate::terrain::graph::NodeOp::Paint(raster) => Some(raster.data().to_vec()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn graph_of(document: &Document) -> crate::terrain::graph::FieldGraph {
+        let mut graph = document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .graph
+            .clone();
+        graph.next_id = 0;
+        graph
+    }
+
+    // The task's own acceptance, made where it can be made without a window: three
+    // undos return the graph to what it was, each one leaving the document with a
+    // re-bake to run, and three redos replay the edits.
+    #[test]
+    fn three_undos_return_the_graph_and_three_redos_replay_the_edits() {
+        use crate::terrain::graph::NodeOp;
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        let original = graph_of(&document);
+
+        document
+            .apply(&Edit::AddNode {
+                field: "height".to_owned(),
+                op: NodeOp::Scale(2.0),
+                position: None,
+            })
+            .unwrap();
+        let added = graph_of(&document).nodes.last().unwrap().id.to_string();
+        document
+            .apply(&Edit::Connect {
+                field: "height".to_owned(),
+                from: node.clone(),
+                to: added.clone(),
+                pin: 0,
+            })
+            .unwrap();
+        document
+            .apply(&Edit::Set {
+                path: format!("height.{added}.factor"),
+                words: vec!["3".to_owned()],
+            })
+            .unwrap();
+        let edited = graph_of(&document);
+        assert_ne!(edited, original);
+        assert_eq!(document.history().undo, 3);
+
+        for remaining in [2, 1, 0] {
+            document.baked = Baked::Whole;
+            document.dirty = false;
+            document.undo().unwrap();
+            assert_eq!(document.baked, Baked::Nothing, "no re-bake was asked for");
+            assert!(document.dirty);
+            assert_eq!(document.history().undo, remaining);
+        }
+        assert_eq!(graph_of(&document), original);
+        assert_eq!(document.undo(), Err("nothing to undo".to_owned()));
+
+        for _ in 0..3 {
+            document.redo().unwrap();
+        }
+        assert_eq!(graph_of(&document), edited);
+        assert_eq!(document.history().redo, 0);
+    }
+
+    // Undoing a move is the same kind of change as making one: the bake was never
+    // reached, so taking the move back must not throw it away either.
+    #[test]
+    fn undoing_a_move_does_not_make_the_bake_stale() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        document
+            .apply(&Edit::PlaceNode {
+                field: "height".to_owned(),
+                node,
+                position: [40.0, -20.0],
+            })
+            .unwrap();
+
+        document.undo().unwrap();
+        assert_eq!(document.baked, Baked::Whole);
+        assert!(!document.dirty);
+        assert_eq!(graph_of(&document).nodes[0].position, [0.0, 0.0]);
+    }
+
+    // The task's own acceptance, made where it can be made without a window: paint, take
+    // it back, and the paint is gone — with the document asking to re-bake the ground the
+    // stroke reached rather than dropping the extent it had.
+    #[test]
+    fn painting_and_undoing_leaves_the_document_as_it_was_and_asks_for_the_rebake() {
+        use crate::brush::apply_stroke;
+        use crate::terrain::brush::Brush;
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::{Field, TerrainSpec};
+        use watershed::raster::Raster;
+
+        let mut document = Document::default();
+        document.adopt(
+            TerrainSpec::new(UVec2::splat(64)).with_field(
+                Field::new("height")
+                    .with_sum([NodeOp::Constant(0.25), NodeOp::Paint(Raster::default())]),
+            ),
+        );
+        let brush = Brush {
+            radius_cells: 6.0,
+            strength: 0.9,
+            ..Brush::default()
+        };
+
+        let reply = apply_stroke(&mut document, &brush, &[Vec2::splat(32.0)], false).unwrap();
+        assert!(painted_texels(&document).iter().any(|byte| *byte > 0));
+        assert_eq!(document.history().undo, 1, "the stroke left no undo step");
+        let reached = &reply["reached"];
+        let reached = CellRect::new(
+            UVec2::new(
+                reached[0].as_u64().unwrap() as u32,
+                reached[1].as_u64().unwrap() as u32,
+            ),
+            UVec2::new(
+                reached[2].as_u64().unwrap() as u32,
+                reached[3].as_u64().unwrap() as u32,
+            ),
+        );
+
+        document.baked = Baked::Whole;
+        document.dirty = false;
+        document.stroke_rect = CellRect::EMPTY;
+        document.undo().unwrap();
+
+        assert!(
+            painted_texels(&document).iter().all(|byte| *byte == 0),
+            "the paint outlived the undo"
+        );
+        assert!(
+            document.is_dirty(),
+            "nothing would re-bake the undone stroke"
+        );
+        assert_eq!(
+            document.baked,
+            Baked::Whole,
+            "an undone stroke dropped the document's extent"
+        );
+        assert_eq!(
+            document.stroke_rect, reached,
+            "the undo asked for other ground than the stroke reached"
+        );
+    }
+
+    // An undo that restores a stroke needs the terrain exactly as one that restores a
+    // stack change does, so a job holding it refuses both alike.
+    #[test]
+    fn undoing_a_stroke_is_refused_while_a_job_holds_the_terrain() {
+        use crate::brush::apply_stroke;
+        use crate::terrain::brush::Brush;
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::{Field, TerrainSpec};
+        use watershed::raster::Raster;
+
+        let mut document = Document::default();
+        document.adopt(
+            TerrainSpec::new(UVec2::splat(64)).with_field(
+                Field::new("height")
+                    .with_sum([NodeOp::Constant(0.25), NodeOp::Paint(Raster::default())]),
+            ),
+        );
+        apply_stroke(
+            &mut document,
+            &Brush {
+                radius_cells: 6.0,
+                ..Brush::default()
+            },
+            &[Vec2::splat(32.0)],
+            false,
+        )
+        .unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake(None).unwrap();
+
+        assert!(document.undo().is_err());
+        assert_eq!(document.history().undo, 1);
+    }
+
+    // A refusal leaves the document as it was, so there is nothing to go back to — an
+    // entry for it would undo a change that never happened.
+    #[test]
+    fn a_refused_edit_leaves_no_history_entry() {
+        let mut document = one_node_document();
+        assert!(
+            document
+                .apply(&Edit::RemoveNode {
+                    field: "height".to_owned(),
+                    node: "n9".to_owned(),
+                })
+                .is_err()
+        );
+        assert_eq!(document.history().undo, 0);
+    }
+
+    // Undo needs the terrain exactly as an edit that reaches the bake does, and a job
+    // has it — so it is refused, and the entry stays where it was for the next try.
+    #[test]
+    fn undo_is_refused_while_a_job_holds_the_terrain_and_keeps_its_entry() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        document
+            .apply(&Edit::Set {
+                path: format!("height.{node}.value"),
+                words: vec!["0.75".to_owned()],
+            })
+            .unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake(None).unwrap();
+
+        assert!(document.undo().is_err());
+        assert_eq!(document.history().undo, 1);
+    }
+
+    // The panel's path into the history: a control committed at the value the field
+    // already has is not a change, so it must neither re-bake nor cost a redo.
+    #[test]
+    fn a_write_that_changes_nothing_records_nothing() {
+        use crate::terrain::graph::NodeOp;
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        document
+            .apply(&Edit::Set {
+                path: format!("height.{node}.value"),
+                words: vec!["0.75".to_owned()],
+            })
+            .unwrap();
+        document.undo().unwrap();
+        assert_eq!(document.history().redo, 1);
+
+        let changed = document.write("height", |field| {
+            field.graph.nodes[0].op = NodeOp::Constant(0.5);
+        });
+        assert!(!changed);
+        assert_eq!(document.history().redo, 1, "a no-op write forgot the redo");
+
+        let changed = document.write("height", |field| {
+            field.graph.nodes[0].op = NodeOp::Constant(0.25);
+        });
+        assert!(changed);
+        assert_eq!(
+            document.history(),
+            crate::history::HistoryDepth { undo: 1, redo: 0 }
+        );
+        assert_eq!(document.baked, Baked::Nothing);
+    }
+
+    // A move made while a job held the terrain lands when the job does, and it is a
+    // change like any other — so it has to be undoable from there too, and a held edit
+    // the landed document refuses must not leave an entry.
+    #[test]
+    fn a_held_move_is_recorded_when_it_lands_and_a_refused_one_is_not() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        document.deferred.push(Edit::PlaceNode {
+            field: "height".to_owned(),
+            node,
+            position: [12.0, 34.0],
+        });
+        document.deferred.push(Edit::PlaceNode {
+            field: "height".to_owned(),
+            node: "n9".to_owned(),
+            position: [1.0, 1.0],
+        });
+
+        document.land_deferred();
+        assert_eq!(document.history().undo, 1);
+        assert_eq!(graph_of(&document).nodes[0].position, [12.0, 34.0]);
+        document.undo().unwrap();
+        assert_eq!(graph_of(&document).nodes[0].position, [0.0, 0.0]);
+    }
+
+    // A new document has nothing to go back to: an entry from the one before would
+    // restore fields that never belonged to it.
+    #[test]
+    fn a_new_document_starts_with_an_empty_history() {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        document
+            .apply(&Edit::PlaceNode {
+                field: "height".to_owned(),
+                node,
+                position: [1.0, 2.0],
+            })
+            .unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document
+            .start_new(UVec2::splat(16), 1, Preset::default())
+            .unwrap();
+
+        assert_eq!(
+            document.history(),
+            crate::history::HistoryDepth { undo: 0, redo: 0 }
         );
     }
 
