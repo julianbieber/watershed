@@ -498,6 +498,34 @@ impl ShaderLayer {
         self.values = Raster::default();
     }
 
+    /// The layer's parameter values as one line, for a place that has room for a
+    /// line and not for a panel.
+    ///
+    /// With a `layout`, the shader's own declaration order and labels, and a
+    /// parameter the layer carries no value for takes the declared default; a
+    /// [`Widget::Hidden`] parameter is left out, since nothing offers it. Without
+    /// one, whatever values the layer stores, in name order. A vector's components
+    /// are written comma-separated.
+    pub fn params_line(&self, layout: Option<&ParamsLayout>) -> String {
+        let written: Vec<String> = match layout.filter(|held| !held.fields.is_empty()) {
+            Some(layout) => layout
+                .fields
+                .iter()
+                .filter(|field| field.widget != Widget::Hidden)
+                .map(|field| {
+                    let value = self.params.get(&field.name).unwrap_or(&field.default);
+                    format!("{} {}", field.label, components(value))
+                })
+                .collect(),
+            None => self
+                .params
+                .iter()
+                .map(|(name, value)| format!("{name} {}", components(value)))
+                .collect(),
+        };
+        written.join("  ")
+    }
+
     /// Drops every value the layout does not declare and fills in every default it
     /// declares that is missing, which is what a shader edited under a document
     /// leaves behind.
@@ -511,9 +539,84 @@ impl ShaderLayer {
     }
 }
 
+fn components(value: &[f32]) -> String {
+    value
+        .iter()
+        .map(|component| number(*component))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn number(value: f32) -> String {
+    if value == value.trunc() && value.is_finite() {
+        return format!("{value:.0}");
+    }
+    let written = format!("{value:.4}");
+    written
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn warped_layout() -> ParamsLayout {
+        parse_params(
+            "struct Params {\n  scale: f32, // @ui 8.0 [0.1, 64.0]\n  octaves: u32, // @ui 4 [1, 8] step 1\n  seed: u32, // @ui hidden\n}\n",
+        )
+        .unwrap()
+    }
+
+    // The line is read the way the shader's panel is read, so it has to follow the
+    // declaration order the panel draws in — a `BTreeMap` would put `octaves` first
+    // and the line would disagree with the panel above it.
+    #[test]
+    fn the_line_follows_declaration_order_and_not_the_name_order() {
+        let layer = ShaderLayer::new("warped.wgsl");
+        let line = layer.params_line(Some(&warped_layout()));
+        assert!(
+            line.find("scale").unwrap() < line.find("octaves").unwrap(),
+            "{line:?} is not in declaration order"
+        );
+    }
+
+    // A hidden parameter is one nothing offers, so putting it on the card would spend
+    // the card's one line on a value a person cannot change.
+    #[test]
+    fn a_hidden_parameter_is_left_off_the_line() {
+        let layer = ShaderLayer::new("warped.wgsl");
+        assert!(!layer.params_line(Some(&warped_layout())).contains("seed"));
+    }
+
+    // A value the layer does not carry takes the shader's declared default, which is
+    // what the dispatch is handed — so the line says what is actually being run.
+    #[test]
+    fn a_missing_value_is_written_as_the_declared_default() {
+        let layer = ShaderLayer::new("warped.wgsl");
+        let line = layer.params_line(Some(&warped_layout()));
+        assert!(line.contains("scale 8"), "{line:?}");
+        assert!(line.contains("octaves 4"), "{line:?}");
+    }
+
+    // A loaded document holds values before its file has been parsed, and the card is
+    // drawn on that frame too: with no layout the line is whatever is stored.
+    #[test]
+    fn a_layer_with_no_layout_still_writes_the_values_it_holds() {
+        let mut layer = ShaderLayer::new("warped.wgsl");
+        layer.params.insert("offset".to_owned(), vec![1.0, 2.0]);
+        assert_eq!(layer.params_line(None), "offset 1,2");
+    }
+
+    // A card is a few characters wide and a warp scale reaches down to 0.0005, so the
+    // written form has to be short without rounding a small value away to nothing.
+    #[test]
+    fn a_number_is_written_short_but_not_rounded_to_nothing() {
+        assert_eq!(number(8.0), "8");
+        assert_eq!(number(0.0005), "0.0005");
+        assert_eq!(number(0.25), "0.25");
+    }
 
     // The common case, and the one every stock shader is written in: a scalar with a
     // default and a range, read into a slider.

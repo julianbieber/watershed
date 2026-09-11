@@ -4,6 +4,7 @@
 mod edges;
 mod input;
 mod scene;
+mod thumb;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Camera, ClearColorConfig, Viewport};
@@ -14,11 +15,17 @@ use crate::document::{Document, EditorSystems};
 use crate::terrain::graph::NodeId;
 
 /// The width and height of a card, in canvas units.
-pub const CARD: Vec2 = Vec2::new(210.0, 118.0);
+///
+/// Stays under the `NODE_STEP` an auto-placed graph is laid out on, or every
+/// control-built graph is a stack of overlapping cards.
+pub const CARD: Vec2 = Vec2::new(240.0, 140.0);
 const TITLE_BAR: f32 = 30.0;
-const THUMB: f32 = 60.0;
+const THUMB: f32 = 78.0;
+const MARGIN: f32 = 8.0;
+const ROW_STEP: f32 = 19.0;
 const TITLE_SIZE: f32 = 17.0;
-const DETAIL_SIZE: f32 = 13.0;
+const DETAIL_SIZE: f32 = 12.0;
+const PARAM_SIZE: f32 = 11.0;
 const PIN_RADIUS: f32 = 7.0;
 const ZOOM_PER_STEP: f32 = 1.2;
 const MIN_SCALE: f32 = 0.05;
@@ -60,6 +67,7 @@ impl Plugin for CanvasPlugin {
                     scene::rebuild_canvas,
                     frame_graph,
                     scene::sync_canvas,
+                    thumb::sync_thumbnails,
                     input::canvas_camera,
                     input::canvas_solo,
                     input::canvas_drag,
