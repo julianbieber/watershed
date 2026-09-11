@@ -117,3 +117,18 @@ fn cell_position(id: vec2<u32>) -> vec2<f32> {
     let step = f32(1u << globals.shift);
     return (vec2<f32>(texel) + vec2<f32>(0.5, 0.5)) * step;
 }
+
+// The texel of this field's own raster a document position falls in — the inverse of
+// `cell_position`, and how a shader turns a neighbour's position into an index into
+// an input.
+fn field_texel(p: vec2<f32>) -> vec2<i32> {
+    return vec2<i32>(floor(p / f32(1u << globals.shift)));
+}
+
+// One texel of an input texture, clamped to its edge — so a neighbourhood read at the
+// border repeats the edge rather than reading nothing, and an unwired input, which is
+// one texel of zero, reads 0.0 everywhere.
+fn input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32 {
+    let last = vec2<i32>(textureDimensions(source)) - vec2<i32>(1, 1);
+    return textureLoad(source, clamp(at, vec2<i32>(0, 0), last), 0).r;
+}

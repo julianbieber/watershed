@@ -1,29 +1,39 @@
 //! Running a shader layer: what WGSL a document carries, what each file declares,
 //! and the dispatch that turns one into the raster its layer reads.
 //!
-//! A shader is resolved to a whole raster *before* a field's stack is walked, because
-//! the walk is a per-texel CPU function and a dispatch cannot join it. What lands in
-//! the layer is then read exactly as a painted raster is, which is why every other
-//! node around it — the scale on it, the lerp it feeds — needs no arm for this.
+//! A shader is dispatched to a whole raster *before* the field's stack is walked,
+//! because the walk is a per-texel CPU function and a dispatch cannot join it. What
+//! lands in the layer is then read exactly as a painted raster is, which is why every
+//! other node around it — the scale on it, the lerp it feeds — needs no arm for this.
+//!
+//! When a dispatch happens is the bake's business, not this module's: a shader's
+//! inputs exist only inside the bake, which is off the main thread. What is
+//! answered for here is everything a dispatch needs before it can run.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    BindGroupEntry, BindGroupLayoutEntry, BindingType, BufferBindingType, BufferDescriptor,
-    BufferInitDescriptor, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor, MapMode,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PollType, RawComputePipelineDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    BindGroupEntry, BindGroupLayoutEntry, BindingResource, BindingType, BufferBindingType,
+    BufferDescriptor, BufferInitDescriptor, BufferUsages, CommandEncoderDescriptor,
+    ComputePassDescriptor, Extent3d, MapMode, Origin3d, PipelineCompilationOptions,
+    PipelineLayoutDescriptor, PollType, RawComputePipelineDescriptor, ShaderModuleDescriptor,
+    ShaderSource, ShaderStages, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureView, TextureViewDescriptor, TextureViewDimension,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use glam::UVec2;
-use watershed::raster::{Raster, resolution};
+use watershed::raster::Raster;
 
-use crate::document::Document;
-use crate::terrain::graph::{NodeId, NodeOp};
-use crate::terrain::shader::{ParamsLayout, SHADER_DIR, parse_params};
+use crate::document::{Document, EditorSystems};
+use crate::terrain::TerrainSpec;
+use crate::terrain::graph::NodeOp;
+use crate::terrain::shader::{ParamsLayout, SHADER_DIR, ShaderInput, parse_inputs, parse_params};
 
 /// The source every shader layer is compiled against: the bindings a dispatch
 /// supplies, the noise the CPU layers agree with, and the position helper the entry
@@ -132,6 +142,9 @@ pub struct ShaderEntry {
     /// What the file declares. The last layout that parsed, so a file that is broken
     /// now still draws the panel it drew before.
     pub layout: ParamsLayout,
+    /// The input textures the file declares, in pin order. As with the layout, the
+    /// last list that parsed.
+    pub inputs: Vec<ShaderInput>,
     /// Why the file did not parse or compile: `line N: message` against the file's own
     /// lines, or the bare message when the fault is not on a line the file owns.
     /// `None` when it is good.
@@ -140,7 +153,6 @@ pub struct ShaderEntry {
     /// in its own words.
     pub error: Option<String>,
     modified: Option<SystemTime>,
-    generation: u64,
 }
 
 /// What a shader is told about where it is being evaluated.
@@ -260,27 +272,162 @@ impl ShaderLibrary {
     }
 }
 
-/// The systems that keep a document's shaders read, parsed and resolved.
+/// The systems that keep a document's shaders read, parsed and runnable.
 pub struct ShaderPlugin;
 
 impl Plugin for ShaderPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ShaderLibrary>()
-            .init_resource::<Resolved>()
-            .add_systems(Update, (follow_document, scan, resolve).chain());
+        app.init_resource::<ShaderLibrary>().add_systems(
+            Update,
+            (follow_document, scan, attend_shaders)
+                .chain()
+                .before(EditorSystems::Document),
+        );
     }
 }
 
-/// What each shader layer was last resolved from, so a dispatch happens when
-/// something it depends on moved and not once a frame.
-#[derive(Resource, Default)]
-struct Resolved(BTreeMap<(String, NodeId), Stamp>);
+/// One shader file, ready to run: everything a dispatch needs and nothing that has to
+/// be looked up on the main thread.
+#[derive(Clone, Debug)]
+pub struct ShaderProgram {
+    /// The file's own source, without the library or the entry point.
+    pub source: String,
+    /// What its `Params` struct declares, and what a layer's values are packed
+    /// against.
+    pub layout: ParamsLayout,
+    /// The inputs it declares, in pin order.
+    pub inputs: Vec<ShaderInput>,
+}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Stamp {
+struct Runtime {
+    device: RenderDevice,
+    queue: RenderQueue,
+    programs: BTreeMap<String, ShaderProgram>,
     generation: u64,
-    params: u64,
-    texels: UVec2,
+    seed: u32,
+}
+
+/// What a bake needs to run a shader: the device, the queue, and every program the
+/// document's shader directory currently compiles to.
+///
+/// Derived state a document carries so that a bake — which is off the main thread and
+/// holds the document — can dispatch without reaching back for a resource. Cloning is
+/// an `Arc` clone, so a history snapshot costs nothing; two runtimes always compare
+/// equal, because what a document *is* does not include the device it was last run
+/// against.
+///
+/// A default one holds no device, and running anything through it is an error rather
+/// than a panic — which is what a headless test and a document baked before the first
+/// sweep both get.
+#[derive(Clone, Default)]
+pub struct ShaderRuntime(Option<Arc<Runtime>>);
+
+impl fmt::Debug for ShaderRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(runtime) => write!(
+                f,
+                "ShaderRuntime(generation {}, {} programs)",
+                runtime.generation,
+                runtime.programs.len()
+            ),
+            None => f.write_str("ShaderRuntime(none)"),
+        }
+    }
+}
+
+impl PartialEq for ShaderRuntime {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl ShaderRuntime {
+    /// The library's error-free entries as programs, held with the device that will
+    /// run them and the document seed they will be told about.
+    pub fn compile(
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        library: &ShaderLibrary,
+        seed: u32,
+    ) -> Self {
+        let programs = library
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.error.is_none())
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    ShaderProgram {
+                        source: entry.source.clone(),
+                        layout: entry.layout.clone(),
+                        inputs: entry.inputs.clone(),
+                    },
+                )
+            })
+            .collect();
+        Self(Some(Arc::new(Runtime {
+            device: device.clone(),
+            queue: queue.clone(),
+            programs,
+            generation: library.generation,
+            seed,
+        })))
+    }
+
+    /// The library generation these programs were taken at, or `None` for a runtime
+    /// holding no device. What decides that the programs are stale.
+    pub fn generation(&self) -> Option<u64> {
+        self.0.as_ref().map(|runtime| runtime.generation)
+    }
+
+    /// The document seed a dispatch through this runtime tells the shader, or `None`
+    /// for a runtime holding no device. Part of the runtime because a bake has no
+    /// other way to reach the document's seed.
+    pub fn seed(&self) -> Option<u32> {
+        self.0.as_ref().map(|runtime| runtime.seed)
+    }
+
+    /// The program for that file, or `None` for a name this runtime does not carry —
+    /// a file that does not compile, or one added since the programs were taken.
+    pub fn program(&self, file: &str) -> Option<&ShaderProgram> {
+        self.0.as_ref()?.programs.get(file)
+    }
+
+    /// Runs one program over the whole of `globals.texels` and answers its values,
+    /// row-major.
+    ///
+    /// `inputs` is one entry per declared input, in pin order; `None` is an unwired
+    /// pin and reads `0.0` everywhere. A shorter slice leaves the pins after it
+    /// unwired.
+    ///
+    /// Blocks until the GPU has finished and the result has been read back. Answers
+    /// an error rather than panicking when the runtime holds no device.
+    pub fn run(
+        &self,
+        program: &ShaderProgram,
+        params: &[u8],
+        globals: DispatchGlobals,
+        inputs: &[Option<&Raster<f32>>],
+    ) -> Result<Vec<f32>, String> {
+        let Some(runtime) = &self.0 else {
+            return Err("there is no render device to dispatch a shader on".to_owned());
+        };
+        let bound: Vec<(u32, Option<&Raster<f32>>)> = program
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(pin, input)| (input.binding, inputs.get(pin).copied().flatten()))
+            .collect();
+        dispatch(
+            &runtime.device,
+            &runtime.queue,
+            &program.source,
+            params,
+            globals,
+            &bound,
+        )
+    }
 }
 
 fn follow_document(document: Res<Document>, mut library: ResMut<ShaderLibrary>) {
@@ -335,7 +482,6 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
     };
 
     let mut seen: Vec<String> = Vec::new();
-    let mut changed: Vec<String> = Vec::new();
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with(".wgsl") {
@@ -354,33 +500,38 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
             continue;
         };
         library.generation += 1;
-        let generation = library.generation;
-        let previous = library.entries.get(&name).map(|held| held.layout.clone());
+        let previous = library
+            .entries
+            .get(&name)
+            .map(|held| (held.layout.clone(), held.inputs.clone()));
         let outcome = parse_params(&source)
+            .and_then(|layout| parse_inputs(&source).map(|inputs| (layout, inputs)))
             .map_err(|error| error.to_string())
-            .and_then(|layout| validate(&source).map(|()| layout));
+            .and_then(|declared| validate(&source).map(|()| declared));
         let entry = match outcome {
-            Ok(layout) => ShaderEntry {
+            Ok((layout, inputs)) => ShaderEntry {
                 source,
                 layout,
+                inputs,
                 error: None,
                 modified,
-                generation,
             },
-            Err(reason) => ShaderEntry {
-                source,
-                layout: previous.unwrap_or_default(),
-                error: Some(reason),
-                modified,
-                generation,
-            },
+            Err(reason) => {
+                let (layout, inputs) = previous.unwrap_or_default();
+                ShaderEntry {
+                    source,
+                    layout,
+                    inputs,
+                    error: Some(reason),
+                    modified,
+                }
+            }
         };
         if let Some(reason) = &entry.error {
             warn!("{name}: {reason}");
             document.refuse(format!("{name}: {reason}"));
         }
-        library.entries.insert(name.clone(), entry);
-        changed.push(name);
+        library.entries.insert(name, entry);
     }
 
     let gone: Vec<String> = library
@@ -393,26 +544,65 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
         library.entries.remove(&name);
         library.generation += 1;
     }
+}
 
-    if changed.is_empty() {
+fn shaders_moved(terrain: &TerrainSpec, current: &ShaderRuntime, next: &ShaderRuntime) -> bool {
+    let reseeded = current.seed() != next.seed();
+    terrain.fields.iter().any(|field| {
+        field.graph.nodes.iter().any(|node| match &node.op {
+            NodeOp::Shader(shader) => {
+                reseeded
+                    || next.program(&shader.file).map(|held| &held.source)
+                        != current.program(&shader.file).map(|held| &held.source)
+            }
+            _ => false,
+        })
+    })
+}
+
+fn attend_shaders(
+    device: Option<Res<RenderDevice>>,
+    queue: Option<Res<RenderQueue>>,
+    library: Res<ShaderLibrary>,
+    mut document: ResMut<Document>,
+) {
+    if document.is_busy() {
         return;
     }
+    let Some(terrain) = document.terrain() else {
+        return;
+    };
+    let current = terrain.shader_runtime().clone();
+    let stale =
+        current.generation() != Some(library.generation) || current.seed() != Some(document.seed);
+    let mut touched = false;
+    if stale && let (Some(device), Some(queue)) = (device, queue) {
+        let seed = document.seed;
+        let next = ShaderRuntime::compile(&device, &queue, &library, seed);
+        touched = document
+            .terrain()
+            .is_some_and(|terrain| shaders_moved(terrain, &current, &next));
+        document.set_shader_runtime(next);
+    }
+
     let Some(terrain) = document.terrain_mut() else {
         return;
     };
-    let mut touched = false;
     for field in &mut terrain.fields {
         for node in &mut field.graph.nodes {
             let NodeOp::Shader(shader) = &mut node.op else {
                 continue;
             };
-            if !changed.contains(&shader.file) {
+            let Some(entry) = library.entry(&shader.file) else {
                 continue;
+            };
+            let mut moved = shader.reconcile(&entry.layout);
+            if shader.reconcile_inputs(&entry.inputs) {
+                let pins = shader.inputs.len();
+                node.inputs.resize(pins, None);
+                moved = true;
             }
-            if let Some(entry) = library.entries.get(&shader.file) {
-                shader.reconcile(&entry.layout);
-                touched = true;
-            }
+            touched |= moved;
         }
     }
     if touched {
@@ -420,107 +610,17 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
     }
 }
 
-fn resolve(
-    device: Option<Res<RenderDevice>>,
-    queue: Option<Res<RenderQueue>>,
-    library: Res<ShaderLibrary>,
-    mut resolved: ResMut<Resolved>,
-    mut document: ResMut<Document>,
-) {
-    let (Some(device), Some(queue)) = (device, queue) else {
-        return;
-    };
-    if document.is_busy() {
-        return;
-    }
-    let size = document.size;
-    let seed = document.seed;
-    let Some(terrain) = document.terrain() else {
-        return;
-    };
-
-    let mut work: Vec<(String, NodeId, Stamp, String, Vec<u8>, DispatchGlobals)> = Vec::new();
-    for field in &terrain.fields {
-        for node in &field.graph.nodes {
-            let NodeOp::Shader(shader) = &node.op else {
-                continue;
-            };
-            let Some(entry) = library.entry(&shader.file) else {
-                continue;
-            };
-            if entry.error.is_some() {
-                continue;
-            }
-            let texels = resolution(size, field.shift);
-            let params = entry.layout.pack(&shader.params);
-            let stamp = Stamp {
-                generation: entry.generation,
-                params: fingerprint(&params),
-                texels,
-            };
-            let key = (field.id.as_str().to_owned(), node.id);
-            if resolved.0.get(&key) == Some(&stamp) && !shader.values().is_empty() {
-                continue;
-            }
-            work.push((
-                key.0,
-                node.id,
-                stamp,
-                entry.source.clone(),
-                params,
-                DispatchGlobals {
-                    document: size,
-                    texels,
-                    origin: UVec2::ZERO,
-                    shift: field.shift as u32,
-                    seed,
-                },
-            ));
-        }
-    }
-    if work.is_empty() {
-        return;
-    }
-
-    let mut produced: Vec<((String, NodeId), Stamp, Raster<f32>)> = Vec::new();
-    let mut failure = None;
-    for (name, id, stamp, source, params, globals) in work {
-        match dispatch(&device, &queue, &source, &params, globals) {
-            Ok(values) => match Raster::from_vec(globals.texels, values) {
-                Some(raster) => produced.push(((name, id), stamp, raster)),
-                None => failure = Some("a dispatch produced the wrong number of texels".to_owned()),
-            },
-            Err(error) => failure = Some(error),
-        }
-    }
-
-    if produced.is_empty() {
-        if let Some(error) = failure {
-            document.refuse(error);
-        }
-        return;
-    }
-
-    let Some(terrain) = document.terrain_mut() else {
-        return;
-    };
-    for ((name, id), stamp, raster) in produced {
-        let Some(field) = terrain.field_mut(&name) else {
-            continue;
-        };
-        let Some(node) = field.graph.node_mut(id) else {
-            continue;
-        };
-        let NodeOp::Shader(shader) = &mut node.op else {
-            continue;
-        };
-        shader.put_values(raster);
-        resolved.0.insert((name, id), stamp);
-    }
-    document.note_edit();
-    if let Some(error) = failure {
-        document.refuse(error);
-    }
+/// A key over everything one dispatch's result depends on that a caller can cheaply
+/// re-derive: the source, the packed parameters and the extent.
+///
+/// What a shader *reads* is not in it — a node with a wired pin is dispatched on
+/// every bake regardless, because the raster on that pin may have moved.
+pub fn dispatch_key(source: &str, params: &[u8], texels: UVec2) -> u64 {
+    let mut bytes = source.as_bytes().to_vec();
+    bytes.extend_from_slice(params);
+    bytes.extend_from_slice(&texels.x.to_le_bytes());
+    bytes.extend_from_slice(&texels.y.to_le_bytes());
+    fingerprint(&bytes)
 }
 
 fn fingerprint(bytes: &[u8]) -> u64 {
@@ -532,10 +632,59 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// One shader run over one rectangle, read back into the values its layer holds.
+fn upload_input(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    raster: Option<&Raster<f32>>,
+) -> TextureView {
+    let zero = [0.0f32];
+    let (size, data) = match raster.filter(|held| !held.is_empty()) {
+        Some(raster) => (raster.size(), raster.data()),
+        None => (UVec2::ONE, &zero[..]),
+    };
+    let extent = Extent3d {
+        width: size.x,
+        height: size.y,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("watershed shader input"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &bytes,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size.x * 4),
+            rows_per_image: Some(size.y),
+        },
+        extent,
+    );
+    texture.create_view(&TextureViewDescriptor::default())
+}
+
+/// One shader run over one rectangle, read back as the values its layer holds.
+///
+/// `inputs` is `(binding, raster)` per declared input. A `None` raster is bound as a
+/// single texel of `0.0`, which is what makes an unwired pin read `0.0` without a
+/// branch in the shader or a hole in the bind group.
 ///
 /// Blocks until the GPU has finished and the result has been mapped: a shader layer
-/// has to be resolved before the field's stack is walked, and the walk is synchronous.
+/// has to be dispatched before the field's stack is walked, and the walk is
+/// synchronous.
 ///
 /// The shader is compiled from the library, the file's own source and the entry
 /// point, in that order, because WGSL has no forward declaration.
@@ -545,6 +694,7 @@ pub fn dispatch(
     source: &str,
     params: &[u8],
     globals: DispatchGlobals,
+    inputs: &[(u32, Option<&Raster<f32>>)],
 ) -> Result<Vec<f32>, String> {
     let texels = (globals.texels.x as u64) * (globals.texels.y as u64);
     if texels == 0 {
@@ -568,23 +718,38 @@ pub fn dispatch(
         },
         count: None,
     };
-    let layout = device.create_bind_group_layout(
-        Some("watershed field shader"),
-        &[
-            uniform(0),
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
+    let mut layout_entries = vec![
+        uniform(0),
+        BindGroupLayoutEntry {
+            binding: 1,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
             },
-            uniform(2),
-        ],
-    );
+            count: None,
+        },
+        uniform(2),
+    ];
+    for (binding, _) in inputs {
+        layout_entries.push(BindGroupLayoutEntry {
+            binding: *binding,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Texture {
+                sample_type: TextureSampleType::Float { filterable: false },
+                view_dimension: TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        });
+    }
+    let layout = device.create_bind_group_layout(Some("watershed field shader"), &layout_entries);
+
+    let views: Vec<(u32, TextureView)> = inputs
+        .iter()
+        .map(|(binding, raster)| (*binding, upload_input(device, queue, *raster)))
+        .collect();
 
     let globals_buffer = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("watershed shader globals"),
@@ -614,24 +779,28 @@ pub fn dispatch(
         mapped_at_creation: false,
     });
 
-    let bind_group = device.create_bind_group(
-        Some("watershed field shader"),
-        &layout,
-        &[
-            BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: output.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 2,
-                resource: params_buffer.as_entire_binding(),
-            },
-        ],
-    );
+    let mut group_entries = vec![
+        BindGroupEntry {
+            binding: 0,
+            resource: globals_buffer.as_entire_binding(),
+        },
+        BindGroupEntry {
+            binding: 1,
+            resource: output.as_entire_binding(),
+        },
+        BindGroupEntry {
+            binding: 2,
+            resource: params_buffer.as_entire_binding(),
+        },
+    ];
+    for (binding, view) in &views {
+        group_entries.push(BindGroupEntry {
+            binding: *binding,
+            resource: BindingResource::TextureView(view),
+        });
+    }
+    let bind_group =
+        device.create_bind_group(Some("watershed field shader"), &layout, &group_entries);
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("watershed field shader"),
@@ -706,9 +875,9 @@ impl ShaderLibrary {
             ShaderEntry {
                 source: String::new(),
                 layout: ParamsLayout::default(),
+                inputs: Vec::new(),
                 error: Some(fault.to_owned()),
                 modified: None,
-                generation: 1,
             },
         );
         library.generation = 1;
@@ -753,6 +922,18 @@ mod tests {
             if let Err(error) = validate(source) {
                 panic!("{name} does not compile: {error}");
             }
+        }
+    }
+
+    // The blur the acceptance path asks for, and the only thing short of a GPU that
+    // says a declared input compiles: the binding, the library's two texel helpers and
+    // a neighbourhood read, validated as one source.
+    #[test]
+    fn a_shader_that_declares_an_input_and_blurs_it_compiles() {
+        let source = "@group(0) @binding(3) var source: texture_2d<f32>; // @in \"Source\"\n\nfn value(p: vec2<f32>) -> f32 {\n    let at = field_texel(p);\n    var total = 0.0;\n    for (var dy = -1; dy <= 1; dy = dy + 1) {\n        for (var dx = -1; dx <= 1; dx = dx + 1) {\n            total = total + input_texel(source, at + vec2<i32>(dx, dy));\n        }\n    }\n    return total / 9.0;\n}\n";
+        assert_eq!(parse_inputs(source).unwrap().len(), 1);
+        if let Err(error) = validate(source) {
+            panic!("a blur over a declared input does not compile: {error}");
         }
     }
 

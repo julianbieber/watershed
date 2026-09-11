@@ -11,6 +11,7 @@ use thiserror::Error;
 use watershed::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
 use watershed::field::{FieldId, FieldRole};
 
+use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
 use crate::terrain::field::Field;
 use crate::terrain::graph::{Binary, Curve, GraphError, NodeId, NodeOp};
 use crate::terrain::graph::{Remap, SlopeMode};
@@ -21,11 +22,12 @@ use watershed::meta::WaterInfo;
 use watershed::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
 use watershed::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 
-/// Everything structurally wrong with a document, all of it detectable without
-/// evaluating a single texel.
+/// Everything structurally wrong with a document, and the one fault that is not.
 ///
-/// These are what planning is for: a document that plans can be baked, and a bake
-/// that has started cannot fail this way.
+/// Planning is what these are for: a document that plans can be baked, and a bake
+/// that has started cannot fail any of these ways —
+/// [`PlanError::ShaderDispatch`] excepted, which is raised while a field is being
+/// evaluated, because the raster a sampling shader reads is produced inside the bake.
 #[derive(Debug, Error)]
 pub enum PlanError {
     /// The document has no cells.
@@ -83,6 +85,17 @@ pub enum PlanError {
     /// texel per cell and will not resample.
     #[error("field `{0}` holds the role `height` at shift {1}")]
     CoarseHeight(String, u8),
+    /// A shader node could not be dispatched. The one fault here that is raised
+    /// during evaluation rather than before it.
+    #[error("the shader at node n{node} of field `{field}` did not run: {reason}")]
+    ShaderDispatch {
+        /// The field whose graph it is.
+        field: String,
+        /// The node that could not be dispatched.
+        node: u32,
+        /// What the dispatch answered.
+        reason: String,
+    },
 }
 
 /// What can go wrong once a plan exists.
@@ -135,6 +148,8 @@ pub struct TerrainSpec {
     pub water_spec: Option<WaterSpec>,
     #[serde(skip)]
     pub(crate) water: Option<WaterState>,
+    #[serde(skip)]
+    pub(crate) runtime: ShaderRuntime,
 }
 
 impl TerrainSpec {
@@ -145,7 +160,41 @@ impl TerrainSpec {
             fields: Vec::new(),
             water_spec: None,
             water: None,
+            runtime: ShaderRuntime::default(),
         }
+    }
+
+    /// Installs what a shader node is dispatched through. Derived state: it is not
+    /// part of what the document is, it is not saved, and installing it is not an
+    /// edit.
+    pub fn set_shader_runtime(&mut self, runtime: ShaderRuntime) {
+        self.runtime = runtime;
+    }
+
+    /// What a shader node is currently dispatched through. A default runtime holds no
+    /// device, and every shader node under it reads `0.0`.
+    pub fn shader_runtime(&self) -> &ShaderRuntime {
+        &self.runtime
+    }
+
+    /// Whether any field's evaluation order reaches a shader node with something
+    /// wired into it.
+    ///
+    /// Such a shader may read any texel of its input, so nothing bounds the ground an
+    /// edit under it can move: a document this holds for is re-baked whole rather
+    /// than by rectangle.
+    pub fn samples_upstream(&self) -> bool {
+        self.fields.iter().any(|field| {
+            field
+                .graph
+                .evaluation_order()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|&id| field.graph.node(id))
+                .any(|node| {
+                    matches!(node.op, NodeOp::Shader(_)) && node.inputs.iter().any(Option::is_some)
+                })
+        })
     }
 
     /// Appends a field. Order here is declaration order, not evaluation order: a
@@ -276,7 +325,9 @@ impl TerrainSpec {
         for (field, raster) in self.fields.iter_mut().zip(baked) {
             field.put_baked(raster);
         }
-        result
+        let made = result?;
+        self.install_dispatched(target, made);
+        Ok(())
     }
 
     /// Drop a field's baked raster, keeping the layers that would rebuild it.
@@ -324,13 +375,14 @@ impl TerrainSpec {
         shifts: &[u8],
         categorical: &[bool],
         baked: &mut [Raster<f32>],
-    ) -> Result<(), PlanError> {
+    ) -> Result<Vec<Dispatched>, PlanError> {
         let field = &self.fields[target];
         let texels = rect.to_texels(field.shift, baked[target].size());
         if texels.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let graph = compile_graph(field, index_of, self.size)?;
+        let mut graph = compile_graph(field, index_of, self.size)?;
+        let made = self.dispatch_shaders(&mut graph, field, shifts, categorical, baked)?;
         let bounds = field.bounds();
         let shift = field.shift;
         let rows = {
@@ -339,6 +391,7 @@ impl TerrainSpec {
                 baked,
                 shifts,
                 categorical,
+                made: &made,
             };
             let scratch_len = graph.nodes.len() * graph.levels;
             map_rows(texels.min.y, texels.max.y, |j| {
@@ -355,7 +408,117 @@ impl TerrainSpec {
                 target_raster.set(texels.min.x + n as u32, j, value);
             }
         }
-        Ok(())
+        Ok(made)
+    }
+
+    fn dispatch_shaders(
+        &self,
+        graph: &mut CompiledGraph<'_>,
+        field: &Field,
+        shifts: &[u8],
+        categorical: &[bool],
+        baked: &[Raster<f32>],
+    ) -> Result<Vec<Dispatched>, PlanError> {
+        let texels = resolution(self.size, field.shift);
+        let mut made: Vec<Dispatched> = Vec::new();
+        for at in 0..graph.nodes.len() {
+            let CompiledOp::Shaded(Shaded::Held(held), _) = graph.nodes[at].op else {
+                continue;
+            };
+            if graph.nodes[at].bypassed {
+                continue;
+            }
+            let id = graph.nodes[at].id;
+            let Some(NodeOp::Shader(shader)) = field.graph.node(id).map(|node| &node.op) else {
+                continue;
+            };
+            let Some(program) = self.runtime.program(&shader.file) else {
+                continue;
+            };
+            let params = program.layout.pack(&shader.params);
+            let key = dispatch_key(&program.source, &params, texels);
+            let pins = graph.nodes[at].inputs.clone();
+            let wired = pins.iter().any(Option::is_some);
+            if !wired && shader.stamp() == Some(key) && held.size() == texels {
+                continue;
+            }
+
+            let sources: Vec<Option<Raster<f32>>> = pins
+                .iter()
+                .map(|pin| {
+                    pin.map(|source| {
+                        self.evaluate_whole(graph, &made, source, field, shifts, categorical, baked)
+                    })
+                })
+                .collect();
+            let inputs: Vec<Option<&Raster<f32>>> = sources.iter().map(Option::as_ref).collect();
+            let globals = DispatchGlobals {
+                document: self.size,
+                texels,
+                origin: UVec2::ZERO,
+                shift: field.shift as u32,
+                seed: self.runtime.seed().unwrap_or_default(),
+            };
+            let values = self
+                .runtime
+                .run(program, &params, globals, &inputs)
+                .and_then(|values| {
+                    Raster::from_vec(texels, values).ok_or_else(|| {
+                        "the dispatch produced the wrong number of texels".to_owned()
+                    })
+                })
+                .map_err(|reason| PlanError::ShaderDispatch {
+                    field: field.id.to_string(),
+                    node: id.0,
+                    reason,
+                })?;
+            graph.nodes[at].op = CompiledOp::Shaded(Shaded::Made(made.len()), field.shift);
+            made.push((id, values, key));
+        }
+        Ok(made)
+    }
+
+    fn evaluate_whole(
+        &self,
+        graph: &CompiledGraph<'_>,
+        made: &[Dispatched],
+        upto: usize,
+        field: &Field,
+        shifts: &[u8],
+        categorical: &[bool],
+        baked: &[Raster<f32>],
+    ) -> Raster<f32> {
+        let texels = resolution(self.size, field.shift);
+        let shift = field.shift;
+        let context = Evaluator {
+            size: self.size,
+            baked,
+            shifts,
+            categorical,
+            made,
+        };
+        let scratch_len = graph.nodes.len() * graph.levels;
+        let rows = map_rows(0, texels.y, |j| {
+            let mut scratch = vec![0.0f32; scratch_len];
+            (0..texels.x)
+                .map(|i| {
+                    let position = Vec2::new(texel_center(i, shift), texel_center(j, shift));
+                    context.eval(graph, upto, position, &mut scratch, 0)
+                })
+                .collect()
+        });
+        let values: Vec<f32> = rows.into_iter().flatten().collect();
+        Raster::from_vec(texels, values).unwrap_or_default()
+    }
+
+    fn install_dispatched(&mut self, target: usize, made: Vec<Dispatched>) {
+        for (id, raster, key) in made {
+            if let Some(node) = self.fields[target].graph.node_mut(id)
+                && let NodeOp::Shader(shader) = &mut node.op
+            {
+                shader.put_dispatch(raster, key);
+            }
+        }
     }
 
     /// Re-bakes every field, but only over the cells a change inside `rect` can
@@ -392,23 +555,30 @@ impl TerrainSpec {
             .map(|field| field.take_baked())
             .collect();
 
+        let mut dispatched: Vec<(usize, Vec<Dispatched>)> = Vec::new();
         let mut result = Ok(());
         for &target in &order {
-            result = self.evaluate(
+            match self.evaluate(
                 target,
                 required[target],
                 &index_of,
                 &shifts,
                 &categorical,
                 &mut baked,
-            );
-            if result.is_err() {
-                break;
+            ) {
+                Ok(made) => dispatched.push((target, made)),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
             }
         }
 
         for (field, raster) in self.fields.iter_mut().zip(baked) {
             field.put_baked(raster);
+        }
+        for (target, made) in dispatched {
+            self.install_dispatched(target, made);
         }
         result
     }
@@ -642,12 +812,19 @@ fn visit(
     Ok(())
 }
 
+type Dispatched = (NodeId, Raster<f32>, u64);
+
+enum Shaded<'a> {
+    Held(&'a Raster<f32>),
+    Made(usize),
+}
+
 enum CompiledOp<'a> {
     Constant(f32),
     Noise(Noise),
     Painted(&'a Raster<u8>),
     Raster(&'a Raster<f32>),
-    Shaded(&'a Raster<f32>, u8),
+    Shaded(Shaded<'a>, u8),
     FieldRef(usize),
     Regions(RegionMap, CompiledOutput),
     Slope { sample_tiles: f32, mode: SlopeMode },
@@ -659,6 +836,7 @@ enum CompiledOp<'a> {
 }
 
 struct CompiledNode<'a> {
+    id: NodeId,
     op: CompiledOp<'a>,
     inputs: Vec<Option<usize>>,
     bypassed: bool,
@@ -705,7 +883,9 @@ fn compile_graph<'a>(
             NodeOp::Noise(spec) => CompiledOp::Noise(Noise::new(spec)),
             NodeOp::Paint(raster) => CompiledOp::Painted(raster),
             NodeOp::External(raster) => CompiledOp::Raster(raster),
-            NodeOp::Shader(shader) => CompiledOp::Shaded(shader.values(), field.shift),
+            NodeOp::Shader(shader) => {
+                CompiledOp::Shaded(Shaded::Held(shader.values()), field.shift)
+            }
             NodeOp::FieldRef(id) => CompiledOp::FieldRef(lookup(index_of, id, &field.id)?),
             NodeOp::Slope { sample_tiles, mode } => CompiledOp::Slope {
                 sample_tiles: *sample_tiles,
@@ -738,6 +918,7 @@ fn compile_graph<'a>(
             .map(|pin| pin.and_then(|source| position.get(&source).copied()))
             .collect();
         nodes.push(CompiledNode {
+            id,
             op,
             inputs,
             bypassed: node.bypassed,
@@ -771,6 +952,7 @@ struct Evaluator<'a> {
     baked: &'a [Raster<f32>],
     shifts: &'a [u8],
     categorical: &'a [bool],
+    made: &'a [Dispatched],
 }
 
 impl Evaluator<'_> {
@@ -900,10 +1082,16 @@ impl Evaluator<'_> {
                     CompiledOp::Raster(raster) => {
                         raster.sample_over(self.size, position.x, position.y)
                     }
-                    CompiledOp::Shaded(raster, shift) => raster.sample_bilinear(
-                        raster_coord(position.x, *shift),
-                        raster_coord(position.y, *shift),
-                    ),
+                    CompiledOp::Shaded(shaded, shift) => {
+                        let raster = match shaded {
+                            Shaded::Held(raster) => *raster,
+                            Shaded::Made(index) => &self.made[*index].1,
+                        };
+                        raster.sample_bilinear(
+                            raster_coord(position.x, *shift),
+                            raster_coord(position.y, *shift),
+                        )
+                    }
                     CompiledOp::FieldRef(index) => self.field(*index, position),
                     CompiledOp::Regions(map, output) => map.sample(*output, position.x, position.y),
                     CompiledOp::Binary(binary) => binary.apply(a, b),
@@ -1669,6 +1857,33 @@ mod tests {
             let wanted: Vec<u32> = full[index].iter().map(|v| v.to_bits()).collect();
             assert_eq!(bits, wanted, "field {}", field.id);
         }
+    }
+
+    // Every test here, and any document baked before the editor has seen a render
+    // device, bakes without a runtime: a shader node under one has to read as `0.0`,
+    // exactly as an undispatched one already does, rather than failing the bake.
+    #[test]
+    fn a_shader_with_no_runtime_bakes_as_zero_rather_than_failing() {
+        use crate::terrain::shader::ShaderLayer;
+        let mut layer = ShaderLayer::new("blur.wgsl");
+        layer.inputs = vec!["source".to_owned()];
+        let mut field = Field::new("height").with_op(NodeOp::Constant(0.5));
+        let source = field.graph.nodes[0].id;
+        let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
+        field.graph.connect(source, shaded, 0).unwrap();
+        field.graph.set_output(Some(shaded)).unwrap();
+
+        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(field);
+        terrain.bake_in_place().expect("the bake was refused");
+        assert!(
+            terrain
+                .field("height")
+                .unwrap()
+                .baked()
+                .data()
+                .iter()
+                .all(|value| *value == 0.0)
+        );
     }
 
     // A ramp has a slope that is known in closed form, so this pins the units: the
