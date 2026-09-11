@@ -200,6 +200,7 @@ fn fingerprint(
     };
     key.push_str(field.role.as_str());
     key.push_str(&format!("|hillshade:{}", field.hillshade));
+    key.push_str(&format!("|contours:{}", field.contours));
     key.push_str(&format!(
         "|out:{}",
         field
@@ -358,6 +359,15 @@ fn properties(active: &str, field: &crate::terrain::Field, pinned: bool) -> impl
             vec![
                 one(widgets::small("azimuth")),
                 one(widgets::number(NumberBinding::LightAzimuth)),
+            ],
+        )),
+        one(toggle_row(
+            &active,
+            "contours",
+            field.contours,
+            vec![
+                one(widgets::small("interval")),
+                one(widgets::number(NumberBinding::ContourInterval)),
             ],
         )),
     ])

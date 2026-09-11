@@ -46,6 +46,18 @@ pub struct Field {
     /// northwest.
     #[serde(default = "default_light_azimuth")]
     pub light_azimuth: f32,
+    /// Whether the map draws an iso-line at every multiple of
+    /// [`Field::contour_interval`] over this field's colour ramp.
+    ///
+    /// Nothing a bake reads looks at this or at [`Field::contour_interval`], so
+    /// toggling either never makes the bake stale.
+    #[serde(default)]
+    pub contours: bool,
+    /// The spacing between iso-lines, in the field's own units. Read only while
+    /// [`Field::contours`] is set. Defaults to a tenth, which divides the default
+    /// range into ten bands.
+    #[serde(default = "default_contour_interval")]
+    pub contour_interval: f32,
     /// What the field's value is built out of. Evaluation order is derived from the
     /// edges, not stored.
     pub graph: FieldGraph,
@@ -54,15 +66,21 @@ pub struct Field {
 }
 
 const DEFAULT_LIGHT_AZIMUTH: f32 = 315.0;
+const DEFAULT_CONTOUR_INTERVAL: f32 = 0.1;
 
 fn default_light_azimuth() -> f32 {
     DEFAULT_LIGHT_AZIMUTH
 }
 
+fn default_contour_interval() -> f32 {
+    DEFAULT_CONTOUR_INTERVAL
+}
+
 impl Field {
     /// A field named `id` with an empty graph: role `Custom`, shift 0, range
-    /// `0.0..=1.0`, not exported, not hillshaded, lit from the northwest, and
-    /// unbaked — so it samples as `0.0` until it is baked.
+    /// `0.0..=1.0`, not exported, not hillshaded, lit from the northwest, without
+    /// contours at a tenth-unit interval, and unbaked — so it samples as `0.0`
+    /// until it is baked.
     pub fn new(id: impl Into<FieldId>) -> Self {
         Self {
             id: id.into(),
@@ -72,6 +90,8 @@ impl Field {
             export: false,
             hillshade: false,
             light_azimuth: DEFAULT_LIGHT_AZIMUTH,
+            contours: false,
+            contour_interval: DEFAULT_CONTOUR_INTERVAL,
             graph: FieldGraph::new(),
             baked: Raster::default(),
         }
@@ -164,6 +184,8 @@ impl Field {
             export: self.export,
             hillshade: self.hillshade,
             light_azimuth: self.light_azimuth,
+            contours: self.contours,
+            contour_interval: self.contour_interval,
             graph,
             baked: Raster::default(),
         }
@@ -329,6 +351,21 @@ mod tests {
         let authored = field.authored();
         assert!(authored.hillshade);
         assert_eq!(authored.light_azimuth, 90.0);
+    }
+
+    // Same reason as the hillshade pair above: a contour property dropped by
+    // `authored()` is one undo would silently skip.
+    #[test]
+    fn a_new_field_has_no_contours_at_a_tenth_and_carries_both_into_a_snapshot() {
+        let mut field = Field::new("height");
+        assert!(!field.contours);
+        assert_eq!(field.contour_interval, 0.1);
+
+        field.contours = true;
+        field.contour_interval = 0.25;
+        let authored = field.authored();
+        assert!(authored.contours);
+        assert_eq!(authored.contour_interval, 0.25);
     }
 
     // Every loaded document is in this state until it is baked, so sampling one has

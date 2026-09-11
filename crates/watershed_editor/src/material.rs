@@ -75,6 +75,11 @@ pub struct FieldSettings {
     /// The compass bearing the hillshade light comes from, in degrees: 0 is north and
     /// 90 is east. Read only while `hillshade` is non-zero.
     pub light_azimuth: f32,
+    /// Non-zero to draw an iso-line at every multiple of `contour_interval`.
+    pub contours: f32,
+    /// The spacing between iso-lines, in the field's own units. Read only while
+    /// `contours` is non-zero.
+    pub contour_interval: f32,
 }
 
 impl Default for FieldSettings {
@@ -87,6 +92,8 @@ impl Default for FieldSettings {
             water_overlay: 1.0,
             hillshade: 0.0,
             light_azimuth: 315.0,
+            contours: 0.0,
+            contour_interval: 0.1,
         }
     }
 }

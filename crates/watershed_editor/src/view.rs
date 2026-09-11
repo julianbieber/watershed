@@ -235,6 +235,8 @@ fn sync_maps(
     if let Some(field) = terrain.field(document.active()) {
         material.settings.hillshade = if field.hillshade { 1.0 } else { 0.0 };
         material.settings.light_azimuth = field.light_azimuth;
+        material.settings.contours = if field.contours { 1.0 } else { 0.0 };
+        material.settings.contour_interval = field.contour_interval;
     }
 
     if revisions.field != Some((document.revision(), solo.generation)) {
