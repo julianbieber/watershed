@@ -28,7 +28,7 @@ use crate::brush::{BrushSettings, target_of};
 use crate::canvas::Selection;
 use crate::document::{Baked, Document};
 use crate::edit::{
-    BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, binary_name, brush_mode_name,
+    BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, Slot, binary_name, brush_mode_name,
     noise_kind_name, op_name, op_summary, parse_region_output, region_output_name, slope_mode_name,
 };
 use crate::gpu::{STOCK, ShaderLibrary};
@@ -592,7 +592,7 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                     one(bsn! {
                         widgets::item_caption(noise_kind_name(kind))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, move |op| {
                                 let NodeOp::Noise(spec) = op else {
                                     return;
                                 };                                spec.kind = kind;
@@ -650,7 +650,7 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                     one(bsn! {
                         widgets::item_caption(slope_mode_name(candidate))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, move |op| {
                                 let NodeOp::Slope { mode, .. } = op else {
                                     return;
                                 };                                *mode = candidate;
@@ -669,7 +669,7 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
             rows.push(one(widgets::captioned(
                 "of",
                 one(field_menu(read, names, move |document, chosen| {
-                    with_op(document, id, |op| {
+                    with_op(document, id, move |op| {
                         if let NodeOp::FieldRef(held) = op {
                             *held = chosen;
                         }
@@ -691,7 +691,7 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                         widgets::item_caption(name)
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
                             let picked = parse_region_output(&chosen);
-                            with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, move |op| {
                                 let NodeOp::Regions { output, .. } = op else {
                                     return;
                                 };                                *output = picked;
@@ -744,7 +744,7 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
                     one(bsn! {
                         widgets::item_caption(binary_name(candidate))
                         on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                            with_op(&mut document, id, |op| {
+                            with_op(&mut document, id, move |op| {
                                 let NodeOp::Binary(held) = op else {
                                     return;
                                 };                                *held = candidate;
@@ -979,9 +979,13 @@ fn field_menu(
     widgets::menu(current, items)
 }
 
-fn with_op(document: &mut Document, id: NodeId, write: impl FnOnce(&mut NodeOp)) {
+fn with_op(
+    document: &mut Document,
+    id: NodeId,
+    write: impl FnOnce(&mut NodeOp) + Send + Sync + 'static,
+) {
     let active = document.active().to_owned();
-    document.write(&active, |field| {
+    document.write(&active, Slot::Once, move |field| {
         if let Some(node) = field.graph.node_mut(id) {
             write(&mut node.op);
         }

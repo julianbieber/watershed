@@ -18,6 +18,34 @@ use serde_json::{Value, json};
 use watershed::FieldRole;
 use watershed::raster::Raster;
 
+/// The place in a document a change writes, for deciding whether a later change
+/// makes an earlier one pointless.
+///
+/// It exists only so that a stream of values aimed at one control costs one held
+/// change rather than a queue: two changes with equal slots are the same place written
+/// twice, and only the last of them has to land. A change that overwrites nothing in
+/// particular is [`Slot::Once`] and is never dropped for another.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Slot {
+    /// Writes nothing a later change can make pointless — a node added, an edge
+    /// wired, a node removed. Never dropped, however many pile up.
+    Once,
+    /// Writes the property at this dotted path: the one [`Edit::Set`] names, or one
+    /// built in the same shape for a change that always writes the same property of a
+    /// node.
+    Path(String),
+    /// Writes a control in the field panel, named by the property it edits rather
+    /// than by a path, because a panel binding does not build one.
+    Control {
+        /// What the control edits, distinct per binding.
+        property: &'static str,
+        /// The node it belongs to, or `None` for a field-level control.
+        node: Option<NodeId>,
+        /// Which of a property's several numbers, or `[0, 0]` when it has one.
+        index: [usize; 2],
+    },
+}
+
 /// A structural change to a document, as a value rather than a method.
 ///
 /// Being a value is the point: a button builds one and a socket parses one, and both
@@ -110,6 +138,20 @@ pub enum Edit {
 }
 
 impl Edit {
+    /// The place this edit writes, for [`Slot`]'s purpose.
+    ///
+    /// Only the edits that write one place over and over name it: a property, a card's
+    /// position, a node's name. Everything else is [`Slot::Once`], so two of them held
+    /// together both land.
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Set { path, .. } => Slot::Path(path.clone()),
+            Self::PlaceNode { field, node, .. } => Slot::Path(format!("{field}.{node}.position")),
+            Self::RenameNode { field, node, .. } => Slot::Path(format!("{field}.{node}.name")),
+            _ => Slot::Once,
+        }
+    }
+
     /// Whether what this edit changes is read by a bake.
     ///
     /// A node's position and its name are authoring data: they are written to the
@@ -1435,5 +1477,32 @@ mod tests {
             let name = region_output_name(&output);
             assert_eq!(parse_region_output(&name), output);
         }
+    }
+
+    // `hold` drops an earlier held change only when a later one writes the same place,
+    // so the slot has to separate two values for one property from two values for two
+    // — and has to keep every structural edit apart from every other.
+    #[test]
+    fn an_edit_that_overwrites_a_value_names_the_slot_it_overwrites() {
+        let set = |path: &str| Edit::Set {
+            path: path.to_owned(),
+            words: vec!["1".to_owned()],
+        };
+        assert_eq!(set("base.n0.value").slot(), set("base.n0.value").slot());
+        assert_ne!(set("base.n0.value").slot(), set("base.n1.value").slot());
+
+        let add = Edit::AddNode {
+            field: "base".to_owned(),
+            op: NodeOp::Constant(0.5),
+            position: None,
+        };
+        let connect = Edit::Connect {
+            field: "base".to_owned(),
+            from: "n0".to_owned(),
+            to: "n1".to_owned(),
+            pin: 0,
+        };
+        assert_eq!(add.slot(), Slot::Once);
+        assert_eq!(connect.slot(), Slot::Once);
     }
 }

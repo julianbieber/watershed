@@ -2,9 +2,14 @@
 //!
 //! Every expensive operation — baking, solving, saving, loading — is a *job*, and a
 //! job takes the terrain: it is moved onto a task pool and moved back when the job
-//! lands. So while one is in flight the editor has no terrain at all, the view is
-//! showing the textures the last job left behind, and every other operation is
-//! refused rather than queued. There is one job slot and no queue.
+//! lands. So while one is in flight the editor has no terrain at all, and the view is
+//! showing the textures the last job left behind.
+//!
+//! There is one job slot and no queue, but an edit made while it is full is *held*
+//! rather than refused: it is applied when the terrain comes back, and the bake that
+//! follows starts from it. Holding a second change for the same place drops the
+//! first, so a hand faster than the bake costs one held change rather than a queue —
+//! the map lags but never falls further behind.
 //!
 //! What the bake on screen is worth is tracked apart from the terrain, because an
 //! edit invalidates a bake without touching it: see [`Baked`] for how much of the
@@ -18,7 +23,7 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use serde_json::Value;
 use watershed::CellRect;
 
-use crate::edit::Edit;
+use crate::edit::{Edit, Slot};
 use crate::history::{History, HistoryDepth, Restored, Snapshot, StrokePatch};
 use crate::preset::Preset;
 use crate::terrain::graph::NodeId;
@@ -143,11 +148,33 @@ enum Job {
     Running { kind: JobKind, task: Task<Outcome> },
 }
 
+enum Held {
+    Edit {
+        edit: Edit,
+        slot: Slot,
+    },
+    Write {
+        field: String,
+        slot: Slot,
+        write: Box<dyn FnOnce(&mut crate::terrain::Field) + Send + Sync>,
+    },
+}
+
+impl Held {
+    fn slot(&self) -> &Slot {
+        match self {
+            Self::Edit { slot, .. } | Self::Write { slot, .. } => slot,
+        }
+    }
+}
+
 /// The open document and everything the editor knows about its state.
 ///
 /// While a job is running the terrain is `None` — it has been moved onto the pool —
-/// so every reader has to cope with there being no document, and every operation that
-/// would need one is refused until the job lands.
+/// so every reader has to cope with there being no document. An edit made in that
+/// window is held and applied when the job lands; an operation that needs the terrain
+/// for something other than an edit — an undo, a save, a second job — is refused
+/// until it does.
 #[derive(Resource)]
 pub struct Document {
     terrain: Option<TerrainSpec>,
@@ -176,11 +203,9 @@ pub struct Document {
     /// What a stroke has made stale since the last bake was opened. A rectangle rather than
     /// a flag because that is the whole of what a stroke costs — see [`Document::note_stroke`].
     stroke_rect: CellRect,
-    /// Edits made while a job held the terrain, waiting for it to come back.
-    ///
-    /// Only edits no bake reads ever land here, so draining them cannot invalidate the
-    /// bake that was running while they were made.
-    deferred: Vec<Edit>,
+    /// Changes made while a job held the terrain, waiting for it to come back, in the
+    /// order they were made. At most one per [`Slot`] other than [`Slot::Once`].
+    held: Vec<Held>,
     /// What the document can go back to. Every change a person makes goes through
     /// [`Document::apply`] or [`Document::write`], which is what puts it here.
     history: History,
@@ -193,7 +218,7 @@ pub struct Document {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            deferred: Vec::new(),
+            held: Vec::new(),
             history: History::default(),
             terrain: None,
             job: Job::Idle,
@@ -258,8 +283,9 @@ impl Document {
         }
     }
 
-    /// Whether a job is running. While it is, there is no terrain to read and every
-    /// operation that needs one is refused.
+    /// Whether a job is running. While it is, there is no terrain to read: an edit is
+    /// held until the job lands, and everything else that needs the terrain is
+    /// refused.
     pub fn is_busy(&self) -> bool {
         matches!(self.job, Job::Running { .. })
     }
@@ -357,20 +383,16 @@ impl Document {
     /// an edit applied without being noted leaves a stale bake on screen with nothing
     /// arranged to replace it.
     ///
-    /// Refused while a job is running or with no document open. On a refusal from the
-    /// edit itself the document is untouched.
+    /// While a job holds the terrain the edit is held rather than applied, and the
+    /// answer is `true` rather than the reply the edit would have made; it lands, and
+    /// asks for its re-bake, when the job does. Refused only with no document open, or
+    /// by the edit itself — and a refusal leaves the document untouched.
     pub fn apply(&mut self, edit: &Edit) -> Result<Value, String> {
-        // An edit no bake reads is held until the terrain comes back rather than
-        // refused: a job takes the terrain with it, and a card dropped while one was
-        // running would otherwise spring back to where it was picked up.
         if self.is_busy() {
-            if edit.reaches_the_bake() {
-                return Err(format!(
-                    "a {} is running",
-                    self.job().map(JobKind::name).unwrap_or("job")
-                ));
-            }
-            self.deferred.push(edit.clone());
+            self.hold(Held::Edit {
+                edit: edit.clone(),
+                slot: edit.slot(),
+            });
             return Ok(Value::Bool(true));
         }
         let terrain = self
@@ -392,14 +414,31 @@ impl Document {
     /// path for a panel control whose value the [`Edit`] grammar cannot spell — a
     /// shader parameter, a cell of a region table.
     ///
-    /// Answers whether the field's authored state differs afterwards, and only then
-    /// records and notes the change; the closure's own opinion is not consulted, so a
-    /// control committed at the value it already had leaves no entry and no re-bake.
-    /// Answers `false` without calling `write` while a job runs, with no document, or
-    /// with no field of that name.
-    pub fn write(&mut self, field: &str, write: impl FnOnce(&mut crate::terrain::Field)) -> bool {
+    /// Answers whether the document has changed or will change: the field's authored
+    /// state differs afterwards, and only then is the change recorded and noted — the
+    /// closure's own opinion is not consulted, so a control committed at the value it
+    /// already had leaves no entry and no re-bake.
+    ///
+    /// While a job holds the terrain the closure is held under `slot` and run when the
+    /// job lands, which answers `true` before anything has been written. Two writes
+    /// held under one slot leave only the second, so `slot` has to name the control
+    /// being written and not merely the field.
+    ///
+    /// Answers `false` with no document open, with no field of that name, or for a
+    /// value the field already had.
+    pub fn write(
+        &mut self,
+        field: &str,
+        slot: Slot,
+        write: impl FnOnce(&mut crate::terrain::Field) + Send + Sync + 'static,
+    ) -> bool {
         if self.is_busy() {
-            return false;
+            self.hold(Held::Write {
+                field: field.to_owned(),
+                slot,
+                write: Box::new(write),
+            });
+            return true;
         }
         let Some(terrain) = self.terrain.as_mut() else {
             return false;
@@ -467,17 +506,55 @@ impl Document {
         }
     }
 
-    fn land_deferred(&mut self) {
-        let held = std::mem::take(&mut self.deferred);
+    fn hold(&mut self, change: Held) {
+        if *change.slot() != Slot::Once {
+            let slot = change.slot().clone();
+            self.held.retain(|held| *held.slot() != slot);
+        }
+        self.held.push(change);
+    }
+
+    fn land_held(&mut self) {
+        let held = std::mem::take(&mut self.held);
         let Some(terrain) = self.terrain.as_mut() else {
             return;
         };
-        for edit in &held {
-            let before = Snapshot::take(terrain, edit.reaches_the_bake());
-            match edit.apply(terrain) {
-                Ok(_) => self.history.record(before, terrain),
-                Err(error) => warn!("a held edit was refused: {error}"),
+        let mut landed = false;
+        let mut reached_the_bake = false;
+        for change in held {
+            match change {
+                Held::Edit { edit, .. } => {
+                    let before = Snapshot::take(terrain, edit.reaches_the_bake());
+                    match edit.apply(terrain) {
+                        Ok(_) => {
+                            self.history.record(before, terrain);
+                            landed = true;
+                            reached_the_bake |= edit.reaches_the_bake();
+                        }
+                        Err(error) => warn!("a held edit was refused: {error}"),
+                    }
+                }
+                Held::Write { field, write, .. } => {
+                    let before = Snapshot::take(terrain, true);
+                    let Some(target) = terrain.field_mut(&field) else {
+                        warn!("a held write names no field `{field}`");
+                        continue;
+                    };
+                    let was = target.authored();
+                    write(target);
+                    if target.authored() == was {
+                        continue;
+                    }
+                    self.history.record(before, terrain);
+                    landed = true;
+                    reached_the_bake = true;
+                }
             }
+        }
+        if reached_the_bake {
+            self.note_edit();
+        } else if landed {
+            self.revision += 1;
         }
     }
 
@@ -582,7 +659,7 @@ impl Document {
         self.baked = Baked::Nothing;
         self.stroke_rect = CellRect::EMPTY;
         self.history.clear();
-        self.deferred.clear();
+        self.held.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut terrain = preset.build(size, seed);
@@ -679,7 +756,7 @@ impl Document {
         self.baked = Baked::Nothing;
         self.stroke_rect = CellRect::EMPTY;
         self.history.clear();
-        self.deferred.clear();
+        self.held.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             match TerrainSpec::load_from_dir(&path) {
@@ -736,7 +813,6 @@ fn finish_job(mut document: ResMut<Document>) {
         document.size = terrain.size;
         document.terrain = Some(terrain);
     }
-    document.land_deferred();
     document.revision += 1;
     document.water_revision += 1;
 
@@ -746,6 +822,8 @@ fn finish_job(mut document: ResMut<Document>) {
         document.bake_failed = true;
     }
     document.baking = Baked::Nothing;
+
+    document.land_held();
 
     if let Some(error) = outcome.error {
         error!("{} failed: {error}", kind.name());
@@ -992,14 +1070,14 @@ mod tests {
     }
 
     // A job takes the terrain with it, so an edit made while one runs has nothing to
-    // write to. One that reaches no bake is held rather than refused, because a card
-    // dropped mid-bake would otherwise spring back to where it was picked up.
+    // write to — and is held rather than refused, whether or not a bake reads it. A
+    // card dropped mid-bake would otherwise spring back to where it was picked up, and
+    // a value committed mid-bake would be lost with a refusal in the status bar. The
+    // job is real and never polled, because the terrain has to be genuinely gone.
     #[test]
     fn a_move_made_while_a_job_holds_the_terrain_is_kept_rather_than_refused() {
         let mut document = one_node_document();
         let node = only_node(&document);
-        // A real job, because the point of the test is that the terrain is genuinely
-        // gone while one runs; it is never polled, so nothing here waits on it.
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         document.start_bake(None).unwrap();
         assert!(document.is_busy());
@@ -1013,15 +1091,13 @@ mod tests {
             })
             .expect("a move is held, not refused");
 
-        // An edit that does reach the bake still has nowhere to go and is refused.
-        assert!(
-            document
-                .apply(&Edit::Set {
-                    path: format!("height.{node}.value"),
-                    words: vec!["0.75".to_owned()],
-                })
-                .is_err()
-        );
+        document
+            .apply(&Edit::Set {
+                path: format!("height.{node}.value"),
+                words: vec!["0.75".to_owned()],
+            })
+            .expect("a value is held too, not refused");
+        assert_eq!(document.held.len(), 2);
     }
 
     fn painted_texels(document: &Document) -> Vec<u8> {
@@ -1271,13 +1347,13 @@ mod tests {
         document.undo().unwrap();
         assert_eq!(document.history().redo, 1);
 
-        let changed = document.write("height", |field| {
+        let changed = document.write("height", Slot::Once, |field| {
             field.graph.nodes[0].op = NodeOp::Constant(0.5);
         });
         assert!(!changed);
         assert_eq!(document.history().redo, 1, "a no-op write forgot the redo");
 
-        let changed = document.write("height", |field| {
+        let changed = document.write("height", Slot::Once, |field| {
             field.graph.nodes[0].op = NodeOp::Constant(0.25);
         });
         assert!(changed);
@@ -1295,22 +1371,203 @@ mod tests {
     fn a_held_move_is_recorded_when_it_lands_and_a_refused_one_is_not() {
         let mut document = one_node_document();
         let node = only_node(&document);
-        document.deferred.push(Edit::PlaceNode {
+        let held = |edit: Edit| Held::Edit {
+            slot: edit.slot(),
+            edit,
+        };
+        document.hold(held(Edit::PlaceNode {
             field: "height".to_owned(),
             node,
             position: [12.0, 34.0],
-        });
-        document.deferred.push(Edit::PlaceNode {
+        }));
+        document.hold(held(Edit::PlaceNode {
             field: "height".to_owned(),
             node: "n9".to_owned(),
             position: [1.0, 1.0],
-        });
+        }));
 
-        document.land_deferred();
+        document.land_held();
         assert_eq!(document.history().undo, 1);
         assert_eq!(graph_of(&document).nodes[0].position, [12.0, 34.0]);
         document.undo().unwrap();
         assert_eq!(graph_of(&document).nodes[0].position, [0.0, 0.0]);
+    }
+
+    fn landed(document: Document) -> Document {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(document);
+        for _ in 0..2000 {
+            world.run_system_once(finish_job).unwrap();
+            if !world.resource::<Document>().is_busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let document = world.remove_resource::<Document>().expect("the document");
+        assert!(!document.is_busy(), "the job never landed");
+        document
+    }
+
+    fn constant_of(document: &Document) -> f32 {
+        match graph_of(document).nodes[0].op {
+            crate::terrain::graph::NodeOp::Constant(value) => value,
+            _ => panic!("the one node is not a constant"),
+        }
+    }
+
+    fn bake_in_flight() -> (Document, String) {
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake(None).unwrap();
+        assert!(document.terrain().is_none(), "a job holds the terrain");
+        (document, node)
+    }
+
+    // The task's own acceptance, made where it can be made without a window: a value
+    // committed while a bake holds the terrain is accepted rather than refused, lands
+    // when the bake does, and leaves the document asking for the re-bake that shows
+    // it — so the map follows the last value rather than dropping it.
+    #[test]
+    fn an_edit_made_while_a_job_runs_lands_when_the_job_does_and_asks_for_the_rebake() {
+        let (mut document, node) = bake_in_flight();
+
+        document
+            .apply(&Edit::Set {
+                path: format!("height.{node}.value"),
+                words: vec!["0.75".to_owned()],
+            })
+            .expect("an edit made during a bake is accepted");
+
+        let document = landed(document);
+        assert_eq!(constant_of(&document), 0.75);
+        assert!(document.is_dirty(), "the landed edit asks for its re-bake");
+        assert_eq!(
+            document.baked,
+            Baked::Nothing,
+            "the bake that landed answered the document as it was before the edit"
+        );
+        assert_eq!(document.history().undo, 1);
+    }
+
+    // The other half of accepting a stream: a hand faster than the bake costs one held
+    // change and one undo step, not one of each per value it passed through.
+    #[test]
+    fn two_values_for_one_control_held_together_leave_only_the_last() {
+        let (mut document, node) = bake_in_flight();
+
+        for value in ["0.6", "0.7", "0.8"] {
+            document
+                .apply(&Edit::Set {
+                    path: format!("height.{node}.value"),
+                    words: vec![value.to_owned()],
+                })
+                .unwrap();
+        }
+        assert_eq!(document.held.len(), 1, "one control, one held change");
+
+        let document = landed(document);
+        assert_eq!(constant_of(&document), 0.8);
+        assert_eq!(
+            document.history().undo,
+            1,
+            "the values passed through are not undo steps"
+        );
+    }
+
+    // Dropping the earlier change is only safe because it is confined to changes that
+    // write one place: two structural edits pile up, and the second needs the first to
+    // have landed before it.
+    #[test]
+    fn a_node_added_and_wired_while_a_job_runs_both_land_in_order() {
+        use crate::terrain::graph::NodeOp;
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        let added = format!(
+            "n{}",
+            document
+                .terrain()
+                .unwrap()
+                .field("height")
+                .unwrap()
+                .graph
+                .next_id
+        );
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake(None).unwrap();
+
+        document
+            .apply(&Edit::AddNode {
+                field: "height".to_owned(),
+                op: NodeOp::Scale(2.0),
+                position: None,
+            })
+            .unwrap();
+        document
+            .apply(&Edit::Connect {
+                field: "height".to_owned(),
+                from: node,
+                to: added,
+                pin: 0,
+            })
+            .unwrap();
+        assert_eq!(document.held.len(), 2, "neither drops the other");
+
+        let graph = graph_of(&landed(document));
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.nodes[1].inputs[0], Some(graph.nodes[0].id));
+    }
+
+    // The panel's own path is `write` rather than `apply`, so it has to be held on the
+    // same terms — a shader parameter committed during a bake is the case the issue
+    // was raised about.
+    #[test]
+    fn a_write_held_while_a_job_runs_lands_when_the_job_does() {
+        use crate::terrain::graph::NodeOp;
+        let (mut document, _) = bake_in_flight();
+        let slot = Slot::Control {
+            property: "constant",
+            node: None,
+            index: [0, 0],
+        };
+
+        for value in [0.6, 0.8] {
+            assert!(
+                document.write("height", slot.clone(), move |field| {
+                    field.graph.nodes[0].op = NodeOp::Constant(value);
+                }),
+                "a write during a bake is accepted"
+            );
+        }
+        assert_eq!(document.held.len(), 1);
+
+        let document = landed(document);
+        assert_eq!(constant_of(&document), 0.8);
+        assert!(document.is_dirty());
+        assert_eq!(document.history().undo, 1);
+    }
+
+    // A held write is not consulted about whether it changed anything until it runs, so
+    // the check `write` makes when it is idle has to be made again when it lands — or a
+    // control committed at the value it already had would cost a re-bake and a redo.
+    #[test]
+    fn a_held_write_that_changes_nothing_records_nothing() {
+        use crate::terrain::graph::NodeOp;
+        let (mut document, _) = bake_in_flight();
+
+        document.write("height", Slot::Once, |field| {
+            field.graph.nodes[0].op = NodeOp::Constant(0.5);
+        });
+
+        let document = landed(document);
+        assert_eq!(constant_of(&document), 0.5);
+        assert_eq!(
+            document.history().undo,
+            0,
+            "nothing changed, nothing to undo"
+        );
+        assert!(!document.is_dirty(), "and nothing to re-bake");
     }
 
     // A new document has nothing to go back to: an entry from the one before would

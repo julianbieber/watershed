@@ -14,7 +14,7 @@ use bevy::ui_widgets::ValueChange;
 
 use crate::brush::BrushSettings;
 use crate::document::Document;
-use crate::edit::Edit;
+use crate::edit::{Edit, Slot};
 use crate::ui::{NewDialog, report};
 
 /// Which number a number field stands for.
@@ -275,9 +275,50 @@ impl NumberBinding {
         }
     }
 
+    fn slot(self) -> Slot {
+        let property = match self {
+            Self::RangeLow => "range.low",
+            Self::RangeHigh => "range.high",
+            Self::ScaleFactor(_) => "scale.factor",
+            Self::RemapFromLow(_) => "remap.from.low",
+            Self::RemapFromHigh(_) => "remap.from.high",
+            Self::RemapToLow(_) => "remap.to.low",
+            Self::RemapToHigh(_) => "remap.to.high",
+            Self::Constant(_) => "constant",
+            Self::NoiseSeed(_) => "noise.seed",
+            Self::NoiseScale(_) => "noise.scale",
+            Self::NoiseOctaves(_) => "noise.octaves",
+            Self::NoiseStrike(_) => "noise.strike",
+            Self::NoiseAspect(_) => "noise.aspect",
+            Self::WarpAmplitude(_) => "warp.amplitude",
+            Self::WarpScale(_) => "warp.scale",
+            Self::WarpOctaves(_) => "warp.octaves",
+            Self::SlopeSampleTiles(_) => "slope.sample_tiles",
+            Self::RegionSeed(_) => "region.seed",
+            Self::RegionCellTiles(_) => "region.cell_tiles",
+            Self::RegionBlendTiles(_) => "region.blend_tiles",
+            Self::RegionWeight(..) => "region.weight",
+            Self::RegionValue(..) => "region.value",
+            Self::ShaderParam(..) => "shader.param",
+            _ => return Slot::Once,
+        };
+        let index = match self {
+            Self::RegionWeight(_, region) => [region, 0],
+            Self::RegionValue(_, region, column) | Self::ShaderParam(_, region, column) => {
+                [region, column]
+            }
+            _ => [0, 0],
+        };
+        Slot::Control {
+            property,
+            node: self.node(),
+            index,
+        }
+    }
+
     fn write_document(self, value: f32, document: &mut Document) {
         let active = document.active().to_owned();
-        document.write(&active, |field| match self {
+        document.write(&active, self.slot(), move |field| match self {
             Self::RangeLow => field.range.0 = value,
             Self::RangeHigh => field.range.1 = value,
             _ => {
