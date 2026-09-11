@@ -438,7 +438,7 @@ impl Command {
                 if applied.is_none() {
                     let brush = world.resource::<BrushSettings>().0;
                     let mut document = world.resource_mut::<Document>();
-                    match apply_stroke(&mut document, &brush, points) {
+                    match apply_stroke(&mut document, &brush, points, false) {
                         Ok(value) => *applied = Some(value),
                         Err(error) => return Poll::Failed(error),
                     }
