@@ -936,6 +936,43 @@ mod tests {
         assert_eq!(document.baked, Baked::Whole);
     }
 
+    // The contour overlay is the second display property pair, added after the
+    // hillshade one, and is under the same rule: undoable, and free of the bake.
+    #[test]
+    fn toggling_contours_is_undoable_and_does_not_make_the_bake_stale() {
+        let mut document = one_node_document();
+
+        document
+            .apply(&Edit::Set {
+                path: "height.contours".to_owned(),
+                words: vec!["on".to_owned()],
+            })
+            .unwrap();
+
+        assert!(
+            document
+                .terrain()
+                .unwrap()
+                .field("height")
+                .unwrap()
+                .contours
+        );
+        assert_eq!(document.baked, Baked::Whole);
+        assert_eq!(document.history().undo, 1);
+
+        document.undo().unwrap();
+
+        assert!(
+            !document
+                .terrain()
+                .unwrap()
+                .field("height")
+                .unwrap()
+                .contours
+        );
+        assert_eq!(document.baked, Baked::Whole);
+    }
+
     // Changing what a node computes is the other half of the rule: that one does reach
     // the bake, so it has to make it stale.
     #[test]

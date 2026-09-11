@@ -33,6 +33,7 @@ pub enum NumberBinding {
     RangeLow,
     RangeHigh,
     LightAzimuth,
+    ContourInterval,
     BrushRadius,
     BrushFalloff,
     BrushStrength,
@@ -102,6 +103,7 @@ impl NumberBinding {
         match self {
             Self::Shift => Some((0.0, 8.0)),
             Self::LightAzimuth => Some((0.0, 360.0)),
+            Self::ContourInterval => Some((crate::edit::MIN_CONTOUR_INTERVAL, f32::MAX)),
             Self::BrushRadius => Some((0.0, 512.0)),
             Self::BrushFalloff => Some((0.0, 1.0)),
             Self::NoiseScale(_) | Self::WarpScale(_) => Some((0.0, 1.0)),
@@ -145,6 +147,7 @@ impl NumberBinding {
             Self::RangeLow => field(document)?.range.0,
             Self::RangeHigh => field(document)?.range.1,
             Self::LightAzimuth => field(document)?.light_azimuth,
+            Self::ContourInterval => field(document)?.contour_interval,
             Self::BrushRadius => brush.radius_cells,
             Self::BrushFalloff => brush.falloff,
             Self::BrushStrength => brush.strength,
@@ -224,6 +227,15 @@ impl NumberBinding {
                 document
                     .apply(&Edit::Set {
                         path: format!("{active}.light_azimuth"),
+                        words: vec![value.to_string()],
+                    })
+                    .map(|_| ())
+            }
+            Self::ContourInterval => {
+                let active = document.active().to_owned();
+                document
+                    .apply(&Edit::Set {
+                        path: format!("{active}.contour_interval"),
                         words: vec![value.to_string()],
                     })
                     .map(|_| ())

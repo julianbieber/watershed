@@ -181,6 +181,8 @@ fn nodes(world: &World) -> Value {
                 "range": [field.range.0, field.range.1],
                 "hillshade": field.hillshade,
                 "light_azimuth": field.light_azimuth,
+                "contours": field.contours,
+                "contour_interval": field.contour_interval,
                 "categorical": field.is_categorical(),
                 "output": field.graph.output.map(|id| id.to_string()),
                 "nodes": nodes,

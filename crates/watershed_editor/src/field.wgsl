@@ -17,6 +17,8 @@ struct FieldUniform {
     water_overlay: f32,
     hillshade: f32,
     light_azimuth: f32,
+    contours: f32,
+    contour_interval: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> settings: FieldUniform;
@@ -36,6 +38,9 @@ const CHANNEL_TINT: vec3<f32> = vec3<f32>(0.365, 0.749, 0.867);
 const LIGHT_ALTITUDE: f32 = 45.0;
 const HILLSHADE_GAIN: f32 = 8.0;
 const HILLSHADE_DEPTH: f32 = 0.7;
+
+const CONTOUR_HALF_WIDTH: f32 = 0.6;
+const CONTOUR_STRENGTH: f32 = 0.85;
 
 // `t` is on 0..1, clamped. Monotone in lightness, so a larger value always reads as
 // darker.
@@ -89,6 +94,43 @@ fn relief(texel: vec2<f32>, size: vec2<f32>, span: f32, azimuth: f32) -> f32 {
     return mix(1.0, lit, HILLSHADE_DEPTH);
 }
 
+// The field read as a smooth surface rather than as texels: bilinear between the four
+// texels around `uv`, clamped at the border the same way `field_at` clamps. The colour
+// ramp does not go through here and stays an exact per-texel fetch.
+fn field_smooth(uv: vec2<f32>, size: vec2<f32>) -> f32 {
+    let p = uv * size - vec2<f32>(0.5, 0.5);
+    let base = floor(p);
+    let t = p - base;
+    let v00 = field_at(base, size);
+    let v10 = field_at(base + vec2<f32>(1.0, 0.0), size);
+    let v01 = field_at(base + vec2<f32>(0.0, 1.0), size);
+    let v11 = field_at(base + vec2<f32>(1.0, 1.0), size);
+    return mix(mix(v00, v10, t.x), mix(v01, v11, t.x), t.y);
+}
+
+// How much of this pixel an iso-line covers, on 0..1: `1.0` on a pixel sitting across a
+// multiple of `interval`, falling to zero a pixel away from one.
+//
+// `interval` is in the field's own units, so the levels are absolute multiples and do
+// not move with the fitted range. Flat ground yields zero, having no level crossing
+// within a pixel of it, and so does ground steep enough that the lines come within
+// about a pixel of each other — which fades a too-small interval out rather than
+// drawing it as moire. Must be called from uniform control flow: it takes a screen-space
+// derivative.
+fn contour_coverage(uv: vec2<f32>, size: vec2<f32>, interval: f32) -> f32 {
+    if interval <= 0.0 {
+        return 0.0;
+    }
+    let level = field_smooth(uv, size) / interval;
+    let per_pixel = fwidth(level);
+    if per_pixel <= 0.0 {
+        return 0.0;
+    }
+    let to_line = abs(fract(level + 0.5) - 0.5) / per_pixel;
+    let line = 1.0 - smoothstep(CONTOUR_HALF_WIDTH, CONTOUR_HALF_WIDTH + 1.0, to_line);
+    return line * (1.0 - smoothstep(0.25, 1.0, per_pixel));
+}
+
 // The quad's v runs down from the top while row zero of a raster is the bottom, so
 // both textures are read with v flipped and the Rust side uploads them unaltered.
 //
@@ -121,6 +163,13 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     if settings.hillshade > 0.5 {
         let lit = relief(texel, field_size, span, settings.light_azimuth);
         colour = clamp(colour * lit, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
+    if settings.contours > 0.5 {
+        let luma = dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let ink = select(vec3<f32>(1.0), vec3<f32>(0.0), luma > 0.5);
+        let coverage = contour_coverage(uv, field_size, settings.contour_interval);
+        colour = mix(colour, ink, coverage * CONTOUR_STRENGTH);
     }
 
     if settings.water_overlay > 0.5 {

@@ -428,6 +428,21 @@ fn set_other_field_property(
             field.light_azimuth = degrees;
             Ok(json!({ "light_azimuth": degrees }))
         }
+        Some("contours") => {
+            let on = boolean(first(words)?)?;
+            field.contours = on;
+            Ok(json!({ "contours": on }))
+        }
+        Some("contour_interval") => {
+            let spacing: f32 = number(first(words)?)?;
+            if !(spacing >= MIN_CONTOUR_INTERVAL) {
+                return Err(format!(
+                    "a contour interval has to be at least {MIN_CONTOUR_INTERVAL}"
+                ));
+            }
+            field.contour_interval = spacing;
+            Ok(json!({ "contour_interval": spacing }))
+        }
         Some(other) => Err(format!("a field has nothing called `{other}`")),
         None => Err("a path needs something after the field name".to_owned()),
     }
@@ -793,7 +808,13 @@ pub fn op_summary(op: &NodeOp) -> String {
     }
 }
 
-const DISPLAY_PROPERTIES: [&str; 2] = ["hillshade", "light_azimuth"];
+/// The smallest contour interval the map will draw. Below this an `f32` cannot
+/// separate one level from the next on a field of order one, so the lines would be
+/// noise rather than a reading.
+pub const MIN_CONTOUR_INTERVAL: f32 = 1e-6;
+
+const DISPLAY_PROPERTIES: [&str; 4] =
+    ["hillshade", "light_azimuth", "contours", "contour_interval"];
 
 fn is_display_property(path: &str) -> bool {
     let parts: Vec<&str> = path.split('.').collect();
@@ -1339,8 +1360,9 @@ mod tests {
         assert!(parse_op(&words("curve 0 0 1")).is_err());
     }
 
-    // The two display properties are the only field properties the panel writes that a
-    // bake never reads, so both the write and its reply are pinned here.
+    // The display properties are the only field properties the panel writes that a
+    // bake never reads, so both the write and its reply are pinned here, along with the
+    // one value an interval refuses.
     #[test]
     fn the_display_properties_are_written_and_reported_back() {
         let mut terrain = document();
@@ -1353,7 +1375,17 @@ mod tests {
         assert_eq!(reply, json!({ "light_azimuth": 135.0 }));
         assert_eq!(terrain.field("height").unwrap().light_azimuth, 135.0);
 
+        let reply = set_line(&mut terrain, "height.contours on").unwrap();
+        assert_eq!(reply, json!({ "contours": true }));
+        assert!(terrain.field("height").unwrap().contours);
+
+        let reply = set_line(&mut terrain, "height.contour_interval 0.25").unwrap();
+        assert_eq!(reply, json!({ "contour_interval": 0.25 }));
+        assert_eq!(terrain.field("height").unwrap().contour_interval, 0.25);
+
         assert!(set_line(&mut terrain, "height.hillshade sideways").is_err());
+        assert!(set_line(&mut terrain, "height.contour_interval 0").is_err());
+        assert_eq!(terrain.field("height").unwrap().contour_interval, 0.25);
     }
 
     // How the map draws a field is not what the field holds, so toggling an overlay must
@@ -1371,6 +1403,8 @@ mod tests {
 
         assert!(!exempt("height.hillshade"));
         assert!(!exempt("height.light_azimuth"));
+        assert!(!exempt("height.contours"));
+        assert!(!exempt("height.contour_interval"));
         assert!(exempt("height.range"));
         assert!(exempt("height.n3.hillshade"));
     }
