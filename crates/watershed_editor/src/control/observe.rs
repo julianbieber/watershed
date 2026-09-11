@@ -297,7 +297,8 @@ fn log(world: &World) -> Value {
 /// why it did not parse.
 ///
 /// The parameters are named rather than counted, because a caller setting one has to
-/// know what it is called.
+/// know what it is called; the inputs likewise, because a caller wiring a pin has to
+/// know which pin it is.
 fn shaders(world: &mut World) -> Value {
     let library = world.resource::<ShaderLibrary>();
     let files: Vec<Value> = library
@@ -314,6 +315,15 @@ fn shaders(world: &mut World) -> Value {
                         "name": param.name,
                         "type": param.ty.as_str(),
                         "group": param.group,
+                    }))
+                    .collect::<Vec<_>>(),
+                "inputs": entry
+                    .inputs
+                    .iter()
+                    .map(|input| json!({
+                        "name": input.name,
+                        "label": input.label,
+                        "binding": input.binding,
                     }))
                     .collect::<Vec<_>>(),
                 "error": entry.error,

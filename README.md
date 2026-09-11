@@ -73,11 +73,27 @@ would. The entry point is appended by the editor; the bindings, the noise and
 algorithm the CPU noise layers use so one name does not mean two functions inside one
 stack.
 
-A shader reads only its position, its parameters and the extent it is dispatched over.
-It names no field, so it adds no bake-order dependency and widens no re-bake. It
-composes with the rest of the stack through the layer's own amplitude, mask and blend,
-exactly as every other op does — the shader is resolved to a raster first, and the
-stack is then walked on the CPU as it always was.
+A shader may also declare input textures, one pin on its node per declaration, and
+read the upstream raster at any texel:
+
+```wgsl
+@group(0) @binding(3) var source: texture_2d<f32>; // @in "Source"
+
+fn value(p: vec2<f32>) -> f32 {
+    return input_texel(source, field_texel(p) + vec2<i32>(1, 0));
+}
+```
+
+Bindings start at 3, since 0, 1 and 2 are the globals, the output and the parameters,
+and an unwired pin reads `0.0`. Because such a shader may read *any* texel of its
+input, a document holding one wired up re-bakes whole rather than by rectangle: what
+the pin carries is evaluated over the whole field and dispatched inside the bake,
+which is also where the raster the shader produces is read back.
+
+A shader names no field, so it still adds no bake-order dependency. It composes with
+the rest of the stack through the layer's own amplitude, mask and blend, exactly as
+every other op does — the shader is dispatched to a raster first, and the stack is
+then walked on the CPU as it always was.
 
 ### `@ui` annotations
 

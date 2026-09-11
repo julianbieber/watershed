@@ -24,6 +24,7 @@ use serde_json::Value;
 use watershed::CellRect;
 
 use crate::edit::{Edit, Slot};
+use crate::gpu::ShaderRuntime;
 use crate::history::{History, HistoryDepth, Restored, Snapshot, StrokePatch};
 use crate::preset::Preset;
 use crate::terrain::graph::NodeId;
@@ -317,6 +318,30 @@ impl Document {
     /// [`Document::record_stroke`]. That is what puts it in the history.
     pub fn terrain_mut(&mut self) -> Option<&mut TerrainSpec> {
         self.terrain.as_mut()
+    }
+
+    /// What a re-bake covering `rect` has to actually be asked for: the rectangle, or
+    /// `None` — the whole document — when the document holds a shader with something
+    /// wired into it.
+    ///
+    /// Such a shader may read *any* texel of what is wired into it, so no rectangle
+    /// bounds the ground an edit under it moves. Narrowing that is what a declared
+    /// reach would be for; until then the answer is the whole field.
+    pub fn bake_ask(&self, rect: CellRect) -> Option<CellRect> {
+        let samples_upstream = self.terrain().is_some_and(TerrainSpec::samples_upstream);
+        (!samples_upstream).then_some(rect)
+    }
+
+    /// Installs what a shader node is dispatched through, when there is a document to
+    /// install it into.
+    ///
+    /// Not an edit and not a revision: the runtime is derived from the shader
+    /// directory and the render device, so noting it would ask for a bake on the
+    /// frame the editor first sees a GPU and on every frame a file is saved.
+    pub fn set_shader_runtime(&mut self, runtime: ShaderRuntime) {
+        if let Some(terrain) = self.terrain.as_mut() {
+            terrain.set_shader_runtime(runtime);
+        }
     }
 
     /// Records that the stack has changed: the whole bake is stale, the last error no
@@ -869,7 +894,8 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
     ) {
         None => document.dirty = false,
         Some(rect) => {
-            if let Err(error) = document.start_bake(Some(rect)) {
+            let asked = document.bake_ask(rect);
+            if let Err(error) = document.start_bake(asked) {
                 warn!("{error}");
             }
         }
@@ -913,6 +939,36 @@ mod tests {
         document.dirty = false;
         document.baked = Baked::Whole;
         document
+    }
+
+    fn shader_document(wired: bool) -> Document {
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::shader::ShaderLayer;
+        use crate::terrain::{Field, TerrainSpec};
+        let mut layer = ShaderLayer::new("blur.wgsl");
+        layer.inputs = vec!["source".to_owned()];
+        let mut field = Field::new("height").with_op(NodeOp::Constant(0.5));
+        let upstream = field.graph.nodes[0].id;
+        let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
+        if wired {
+            field.graph.connect(upstream, shaded, 0).unwrap();
+        }
+        field.graph.set_output(Some(shaded)).unwrap();
+
+        let mut document = Document::default();
+        document.adopt(TerrainSpec::new(UVec2::splat(16)).with_field(field));
+        document
+    }
+
+    // A shader may read any texel of what is wired into it, so the rectangle a stroke
+    // moved says nothing about the ground that bakes differently — the whole document
+    // has to be re-baked, where the same document with the pin unwired pays only for
+    // the rectangle.
+    #[test]
+    fn a_wired_shader_pin_turns_a_rectangle_re_bake_into_a_whole_one() {
+        let asked = rect(0, 8);
+        assert_eq!(shader_document(true).bake_ask(asked), None);
+        assert_eq!(shader_document(false).bake_ask(asked), Some(asked));
     }
 
     fn only_node(document: &Document) -> String {

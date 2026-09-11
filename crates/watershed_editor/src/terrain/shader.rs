@@ -21,6 +21,15 @@ pub const PARAMS_STRUCT: &str = "Params";
 /// The largest uniform a shader's parameters may pack into.
 pub const MAX_PARAM_BYTES: usize = 1024;
 
+/// The most input textures one shader may declare, which is also the widest a shader
+/// node's pin row can get.
+pub const MAX_INPUTS: usize = 8;
+
+/// The lowest binding an input may take: 0, 1 and 2 are the globals, the output and
+/// the parameters, and a shader that took one of those back would be handed the
+/// wrong buffer.
+pub const FIRST_INPUT_BINDING: u32 = 3;
+
 /// What a parameter is, which decides how many components it has and how it packs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParamType {
@@ -444,11 +453,134 @@ fn parse_numbers(line: usize, text: &str) -> Result<Vec<f32>, ParamError> {
         .collect()
 }
 
+/// One input texture a shader declares: a pin on its node, read inside the shader as
+/// a texture of the upstream raster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderInput {
+    /// The variable name the WGSL declaration spells.
+    pub name: String,
+    /// What the pin is called on the card. The variable name unless the annotation
+    /// overrode it.
+    pub label: String,
+    /// The binding the declaration takes, which is the slot a dispatch writes the
+    /// upstream raster into. At least [`FIRST_INPUT_BINDING`].
+    pub binding: u32,
+}
+
+/// The input textures a shader declares, in declaration order — which is pin order,
+/// whatever order the bindings are written in.
+///
+/// An input is a `var` of `texture_2d<f32>` annotated `@in`, at group 0 and a binding
+/// of [`FIRST_INPUT_BINDING`] or above. A line whose code half is empty is a comment
+/// and declares nothing, which is what lets a template carry a commented-out example.
+/// A source declaring no inputs is not a fault.
+///
+/// Fails on the first fault and reports the line it is on.
+pub fn parse_inputs(source: &str) -> Result<Vec<ShaderInput>, ParamError> {
+    let mut inputs: Vec<ShaderInput> = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let number = index + 1;
+        let Some((declaration, annotation)) = line.split_once("//") else {
+            continue;
+        };
+        let declaration = declaration.trim();
+        if declaration.is_empty() {
+            continue;
+        }
+        let Some(annotation) = annotation.trim().strip_prefix("@in") else {
+            continue;
+        };
+        let (label, _) = split_label(annotation.trim());
+
+        let input = parse_input_declaration(number, declaration)?;
+        if input.binding < FIRST_INPUT_BINDING {
+            return Err(fault(
+                number,
+                format!(
+                    "binding {} is reserved; an input starts at {FIRST_INPUT_BINDING}",
+                    input.binding
+                ),
+            ));
+        }
+        if inputs.iter().any(|held| held.binding == input.binding) {
+            return Err(fault(
+                number,
+                format!("binding {} is declared twice", input.binding),
+            ));
+        }
+        if inputs.iter().any(|held| held.name == input.name) {
+            return Err(fault(number, format!("`{}` is declared twice", input.name)));
+        }
+        inputs.push(ShaderInput {
+            label: label.unwrap_or_else(|| input.name.clone()),
+            ..input
+        });
+        if inputs.len() > MAX_INPUTS {
+            return Err(fault(
+                number,
+                format!("a shader declares at most {MAX_INPUTS} inputs"),
+            ));
+        }
+    }
+    Ok(inputs)
+}
+
+fn parse_input_declaration(line: usize, declaration: &str) -> Result<ShaderInput, ParamError> {
+    let form = "an input is `@group(0) @binding(N) var <name>: texture_2d<f32>;`";
+    let rest = declaration
+        .strip_prefix("@group(")
+        .ok_or_else(|| fault(line, form))?;
+    let (group, rest) = rest.split_once(')').ok_or_else(|| fault(line, form))?;
+    if group.trim() != "0" {
+        return Err(fault(
+            line,
+            format!("an input is declared at group 0, not {}", group.trim()),
+        ));
+    }
+    let rest = rest
+        .trim_start()
+        .strip_prefix("@binding(")
+        .ok_or_else(|| fault(line, form))?;
+    let (binding, rest) = rest.split_once(')').ok_or_else(|| fault(line, form))?;
+    let binding = binding
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| fault(line, format!("`{}` is not a binding", binding.trim())))?;
+
+    let rest = rest
+        .trim_start()
+        .strip_prefix("var")
+        .ok_or_else(|| fault(line, form))?;
+    let (name, ty) = rest
+        .trim_start()
+        .trim_end()
+        .trim_end_matches(';')
+        .split_once(':')
+        .ok_or_else(|| fault(line, form))?;
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        return Err(fault(line, form));
+    }
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    if ty != "texture_2d<f32>" {
+        return Err(fault(
+            line,
+            format!("`{ty}` is not an input type; an input is a `texture_2d<f32>`"),
+        ));
+    }
+    Ok(ShaderInput {
+        label: name.clone(),
+        name,
+        binding,
+    })
+}
+
 /// A layer whose values a WGSL shader produces.
 ///
-/// Holds what a document carries — the file and the parameter values — and the
-/// raster the last dispatch left. The raster is derived, so it is not serialized and
-/// a loaded document reads the layer as zero until it has been resolved.
+/// Holds what a document carries — the file, the parameter values and the names of
+/// the inputs its pins stand for — and the raster the last dispatch left. The raster
+/// is derived, so it is not serialized and a loaded document reads the layer as zero
+/// until it has been dispatched.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShaderLayer {
     /// The file, as a plain name inside the document's `shaders` directory. Never a
@@ -458,8 +590,15 @@ pub struct ShaderLayer {
     /// spells. A key the shader no longer declares is dropped when the file is
     /// parsed; one it declares that is missing here takes the shader's default.
     pub params: BTreeMap<String, Vec<f32>>,
+    /// The inputs the file declared when it was last read, in pin order. Serialized,
+    /// so a loaded document draws the right number of pins before the file has been
+    /// read and the edges it saved still land on them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
     #[serde(skip)]
     values: Raster<f32>,
+    #[serde(skip)]
+    stamp: Option<u64>,
 }
 
 impl ShaderLayer {
@@ -469,7 +608,9 @@ impl ShaderLayer {
         Self {
             file: file.into(),
             params: BTreeMap::new(),
+            inputs: Vec::new(),
             values: Raster::default(),
+            stamp: None,
         }
     }
 
@@ -485,10 +626,25 @@ impl ShaderLayer {
         std::mem::take(&mut self.values)
     }
 
-    /// Installs `values` as the dispatch result, dropping whatever was there.
-    /// Nothing checks it against the field's resolution.
+    /// Installs `values` as the dispatch result, dropping whatever was there and
+    /// forgetting which dispatch produced it. Nothing checks it against the field's
+    /// resolution.
     pub fn put_values(&mut self, values: Raster<f32>) {
         self.values = values;
+        self.stamp = None;
+    }
+
+    /// Installs a dispatch result together with the key of the dispatch that made it,
+    /// so a later bake can tell that nothing it depends on has moved.
+    pub fn put_dispatch(&mut self, values: Raster<f32>, stamp: u64) {
+        self.values = values;
+        self.stamp = Some(stamp);
+    }
+
+    /// The key of the dispatch the held values came from, or `None` for values whose
+    /// dispatch is not known — which is what a raster put back any other way is.
+    pub fn stamp(&self) -> Option<u64> {
+        self.stamp
     }
 
     /// Drops the values, leaving the layer reading as `0.0` until it is resolved
@@ -496,6 +652,7 @@ impl ShaderLayer {
     /// produced.
     pub fn clear(&mut self) {
         self.values = Raster::default();
+        self.stamp = None;
     }
 
     /// The layer's parameter values as one line, for a place that has room for a
@@ -529,13 +686,34 @@ impl ShaderLayer {
     /// Drops every value the layout does not declare and fills in every default it
     /// declares that is missing, which is what a shader edited under a document
     /// leaves behind.
-    pub fn reconcile(&mut self, layout: &ParamsLayout) {
+    ///
+    /// Answers whether anything moved, so a caller sweeping every node each frame can
+    /// tell an edit from a frame in which nothing changed.
+    pub fn reconcile(&mut self, layout: &ParamsLayout) -> bool {
+        let before = self.params.len();
         self.params.retain(|name, _| layout.field(name).is_some());
+        let mut moved = self.params.len() != before;
         for field in &layout.fields {
-            self.params
-                .entry(field.name.clone())
-                .or_insert_with(|| field.default.clone());
+            if !self.params.contains_key(&field.name) {
+                self.params
+                    .insert(field.name.clone(), field.default.clone());
+                moved = true;
+            }
         }
+        moved
+    }
+
+    /// Takes the inputs the file now declares, answering whether the list moved.
+    ///
+    /// `true` means the node's pins no longer match the layer and have to be resized;
+    /// the edges on the pins that survive are the caller's to keep.
+    pub fn reconcile_inputs(&mut self, declared: &[ShaderInput]) -> bool {
+        let names: Vec<String> = declared.iter().map(|input| input.name.clone()).collect();
+        if self.inputs == names {
+            return false;
+        }
+        self.inputs = names;
+        true
     }
 }
 
@@ -799,6 +977,62 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.line, 3);
+    }
+
+    // The declaration an input is written as, and the whole of what a pin is: the
+    // label the card prints and the binding the dispatch writes the raster into.
+    #[test]
+    fn an_input_is_read_with_its_label_and_its_binding() {
+        let inputs =
+            parse_inputs("@group(0) @binding(3) var height: texture_2d<f32>; // @in \"Height\"\n")
+                .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "height");
+        assert_eq!(inputs[0].label, "Height");
+        assert_eq!(inputs[0].binding, 3);
+    }
+
+    // The template carries a commented-out example so the acceptance path is
+    // uncommenting one line — which only works if a fully commented line declares
+    // nothing.
+    #[test]
+    fn a_fully_commented_line_declares_no_input() {
+        let inputs =
+            parse_inputs("// @group(0) @binding(3) var height: texture_2d<f32>; // @in\n").unwrap();
+        assert!(inputs.is_empty());
+    }
+
+    // Bindings 0, 1 and 2 are the globals, the output and the parameters. An input
+    // that took one back would be handed the wrong buffer at dispatch.
+    #[test]
+    fn an_input_at_a_reserved_binding_is_a_fault() {
+        let error = parse_inputs("@group(0) @binding(2) var height: texture_2d<f32>; // @in\n")
+            .unwrap_err();
+        assert_eq!(error.line, 1);
+    }
+
+    // Pin order is what a saved edge refers to, so it follows the order the file
+    // declares its inputs in rather than the order of the bindings.
+    #[test]
+    fn pin_order_follows_the_declaration_and_not_the_binding() {
+        let inputs = parse_inputs(
+            "@group(0) @binding(4) var second: texture_2d<f32>; // @in\n@group(0) @binding(3) var first: texture_2d<f32>; // @in\n",
+        )
+        .unwrap();
+        assert_eq!(inputs[0].name, "second");
+        assert_eq!(inputs[1].name, "first");
+    }
+
+    // The layer's pins are resized off this answer, so a list that did not move must
+    // not report that it did — a sweep runs every frame and would never settle.
+    #[test]
+    fn reconciling_inputs_reports_only_a_list_that_moved() {
+        let declared =
+            parse_inputs("@group(0) @binding(3) var a: texture_2d<f32>; // @in\n").unwrap();
+        let mut layer = ShaderLayer::new("blur.wgsl");
+        assert!(layer.reconcile_inputs(&declared));
+        assert_eq!(layer.inputs, vec!["a".to_owned()]);
+        assert!(!layer.reconcile_inputs(&declared));
     }
 
     // A hidden parameter still occupies its slot in the uniform, so leaving it out of

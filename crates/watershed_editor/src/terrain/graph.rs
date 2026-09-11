@@ -225,9 +225,13 @@ pub enum NodeOp {
     External(Raster<f32>),
     /// A raster a WGSL shader produced, at the field's own resolution.
     ///
-    /// The shader reads no field, so this op contributes no dependency and widens no
-    /// re-bake. The values are not serialized: a loaded document reads the node as
-    /// `0.0` until it has been dispatched again.
+    /// One input pin per input the file declares, in declaration order, each read
+    /// inside the shader as a texture of the whole upstream raster; an unwired pin
+    /// reads `0.0`. The shader reads no *field*, so this op contributes no dependency
+    /// and widens no re-bake — a shader with a wired pin may read any texel of its
+    /// input, and that is answered by baking the field whole rather than by a halo.
+    /// The values are not serialized: a loaded document reads the node as `0.0` until
+    /// it has been dispatched again.
     Shader(ShaderLayer),
     /// A value derived from the region tiling at the position.
     ///
@@ -278,9 +282,9 @@ impl NodeOp {
             | NodeOp::Noise(_)
             | NodeOp::Paint(_)
             | NodeOp::External(_)
-            | NodeOp::Shader(_)
             | NodeOp::Regions { .. }
             | NodeOp::FieldRef(_) => 0,
+            NodeOp::Shader(shader) => shader.inputs.len(),
             NodeOp::Slope { .. } | NodeOp::Scale(_) | NodeOp::Remap(_) | NodeOp::Curve(_) => 1,
             NodeOp::Binary(_) => 2,
             NodeOp::Lerp => 3,
@@ -979,6 +983,18 @@ mod tests {
         assert_eq!(NodeOp::Lerp.arity(), 3);
         let node = GraphNode::new(NodeId(0), NodeOp::Lerp, [0.0, 0.0]);
         assert_eq!(node.inputs.len(), 3);
+    }
+
+    // A shader's pins come from the file it names rather than from a fixed table, so
+    // a node added for a two-input shader has to be born with two pins.
+    #[test]
+    fn a_shader_node_carries_one_pin_per_input_its_file_declares() {
+        use crate::terrain::shader::ShaderLayer;
+        let mut layer = ShaderLayer::new("blur.wgsl");
+        layer.inputs = vec!["a".to_owned(), "b".to_owned()];
+        let op = NodeOp::Shader(layer);
+        assert_eq!(op.arity(), 2);
+        assert_eq!(GraphNode::new(NodeId(0), op, [0.0, 0.0]).inputs.len(), 2);
     }
 
     // Slope is the only op that reads a neighbourhood, and the whole halo calculation
