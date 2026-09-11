@@ -15,8 +15,8 @@ use bevy::{log::BoxedLayer, prelude::*};
 /// Without it the plugin is inert and the editor behaves as though it were absent.
 pub struct ControlPlugin;
 
-/// The extra tracing layer that keeps the run's warnings and errors where `observe log`
-/// can reach them.
+/// The extra tracing layer that keeps the run's warnings and errors where the window's
+/// log panel and `observe log` can both reach them. Always installed.
 ///
 /// Passed to `LogPlugin::custom_layer` in `main.rs` rather than installed by
 /// [`ControlPlugin`], because a log layer has to exist before the logger does and
@@ -31,6 +31,8 @@ impl Plugin for ControlPlugin {
         server::build(app);
     }
 }
+
+pub(crate) use log::{LogBuffer, LogView};
 
 mod command;
 mod log;

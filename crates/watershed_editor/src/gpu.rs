@@ -376,6 +376,7 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
             },
         };
         if let Some(reason) = &entry.error {
+            warn!("{name}: {reason}");
             document.refuse(format!("{name}: {reason}"));
         }
         library.entries.insert(name.clone(), entry);
