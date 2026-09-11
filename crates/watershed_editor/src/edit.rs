@@ -731,33 +731,46 @@ pub fn op_name(op: &NodeOp) -> &'static str {
     }
 }
 
-/// One line describing an op and its parameters, for the inspector's collapsed row
-/// and the control client's listing. Not a path, and nothing reads it back.
-pub fn op_summary(op: &NodeOp) -> String {
+/// What an op is set to, without the op's own name: the parameter half of
+/// [`op_summary`], and what a node's card shows on its own line under the op name.
+///
+/// Empty for an op that carries no parameters.
+pub fn op_params(op: &NodeOp) -> String {
     match op {
-        NodeOp::Constant(value) => format!("constant {value}"),
+        NodeOp::Constant(value) => format!("{value}"),
         NodeOp::Noise(spec) => format!(
             "{} scale {} x{}",
             noise_kind_name(spec.kind),
             spec.scale,
             spec.octaves
         ),
-        NodeOp::Paint(raster) => format!("paint {}x{}", raster.width(), raster.height()),
+        NodeOp::Paint(raster) => format!("{}x{}", raster.width(), raster.height()),
         NodeOp::Slope { sample_tiles, mode } => {
-            format!("slope over {sample_tiles} by {}", slope_mode_name(*mode))
+            format!("over {sample_tiles} by {}", slope_mode_name(*mode))
         }
-        NodeOp::FieldRef(id) => format!("fieldref {id}"),
-        NodeOp::Regions { output, .. } => format!("regions {}", region_output_name(output)),
-        NodeOp::External(raster) => format!("external {}x{}", raster.width(), raster.height()),
-        NodeOp::Shader(shader) => format!("shader {}", shader.file),
-        NodeOp::Binary(binary) => format!("binary {}", binary_name(*binary)),
-        NodeOp::Lerp => "lerp".to_owned(),
-        NodeOp::Scale(factor) => format!("scale {factor}"),
+        NodeOp::FieldRef(id) => format!("{id}"),
+        NodeOp::Regions { output, .. } => region_output_name(output),
+        NodeOp::External(raster) => format!("{}x{}", raster.width(), raster.height()),
+        NodeOp::Shader(shader) => shader.params_line(None),
+        NodeOp::Binary(binary) => binary_name(*binary).to_owned(),
+        NodeOp::Lerp => String::new(),
+        NodeOp::Scale(factor) => format!("{factor}"),
         NodeOp::Remap(remap) => format!(
-            "remap {}..{} -> {}..{}",
+            "{}..{} -> {}..{}",
             remap.from.0, remap.from.1, remap.to.0, remap.to.1
         ),
-        NodeOp::Curve(curve) => format!("curve of {} points", curve.points.len()),
+        NodeOp::Curve(curve) => format!("of {} points", curve.points.len()),
+    }
+}
+
+/// One line describing an op and its parameters, for the inspector's collapsed row
+/// and the control client's listing. Not a path, and nothing reads it back.
+pub fn op_summary(op: &NodeOp) -> String {
+    match op {
+        NodeOp::Noise(_) => op_params(op),
+        NodeOp::Lerp => "lerp".to_owned(),
+        NodeOp::Shader(shader) => format!("shader {}", shader.file),
+        _ => format!("{} {}", op_name(op), op_params(op)),
     }
 }
 
@@ -791,6 +804,78 @@ mod tests {
                 NodeOp::FieldRef(FieldId::from("base")),
                 NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
             ]))
+    }
+
+    // `op_summary` is read by the control client, the inspector's collapsed row and
+    // this module's own JSON replies, and none of them parse it back — so a change to
+    // its wording is invisible until someone reads a listing and cannot find their
+    // node. Pinning one op of every variant is what holds the split into `op_params`
+    // to the spelling it replaced.
+    #[test]
+    fn every_op_summarises_to_the_words_it_always_did() {
+        use crate::terrain::regions::{Region, RegionSpec};
+
+        let regions = RegionSpec::new(7, 128, 16, ["base"]).with_region(Region::new(4, [0.5]));
+        let cases = [
+            (NodeOp::Constant(0.25), "constant 0.25"),
+            (
+                NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02).with_octaves(4)),
+                "fbm scale 0.02 x4",
+            ),
+            (
+                NodeOp::Paint(Raster::new(UVec2::new(4, 2), 0u8)),
+                "paint 4x2",
+            ),
+            (
+                NodeOp::External(Raster::new(UVec2::new(8, 3), 0.0f32)),
+                "external 8x3",
+            ),
+            (
+                NodeOp::Slope {
+                    sample_tiles: 2.0,
+                    mode: SlopeMode::Gradient,
+                },
+                "slope over 2 by gradient",
+            ),
+            (NodeOp::FieldRef(FieldId::from("base")), "fieldref base"),
+            (
+                NodeOp::Regions {
+                    spec: regions,
+                    output: RegionOutput::Blended("base".to_owned()),
+                },
+                "regions base",
+            ),
+            (
+                NodeOp::Shader(ShaderLayer::new("warped.wgsl")),
+                "shader warped.wgsl",
+            ),
+            (NodeOp::Binary(Binary::Add), "binary add"),
+            (NodeOp::Lerp, "lerp"),
+            (NodeOp::Scale(1.5), "scale 1.5"),
+            (
+                NodeOp::Remap(Remap {
+                    from: (0.0, 1.0),
+                    to: (2.0, 3.0),
+                }),
+                "remap 0..1 -> 2..3",
+            ),
+            (
+                NodeOp::Curve(Curve::new(vec![
+                    CurvePoint {
+                        input: 0.0,
+                        output: 0.0,
+                    },
+                    CurvePoint {
+                        input: 1.0,
+                        output: 1.0,
+                    },
+                ])),
+                "curve of 2 points",
+            ),
+        ];
+        for (op, expected) in cases {
+            assert_eq!(op_summary(&op), expected);
+        }
     }
 
     fn words(line: &str) -> Vec<String> {
