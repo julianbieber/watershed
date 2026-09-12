@@ -433,8 +433,8 @@ impl Document {
         let before = Snapshot::take(terrain, edit.reaches_the_bake(), &active);
         let reply = edit.apply(terrain)?;
         self.history.record(before, terrain);
-        if let Some(shown) = edit.shows() {
-            self.active = shown.to_owned();
+        if let Some(shown) = edit.shows(terrain, &active) {
+            self.active = shown;
         }
         if edit.reaches_the_bake() {
             self.note_edit();
@@ -580,8 +580,8 @@ impl Document {
                     match edit.apply(terrain) {
                         Ok(_) => {
                             self.history.record(before, terrain);
-                            if let Some(shown) = edit.shows() {
-                                active = shown.to_owned();
+                            if let Some(shown) = edit.shows(terrain, &active) {
+                                active = shown;
                             }
                             landed = true;
                             reached_the_bake |= edit.reaches_the_bake();
@@ -972,6 +972,26 @@ mod tests {
         document
     }
 
+    fn two_field_document() -> Document {
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::{Field, TerrainSpec, WaterSpec};
+        use watershed::{FieldId, FieldRole};
+        let mut document = Document::default();
+        let mut terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
+            .with_field(
+                Field::new("height")
+                    .with_role(FieldRole::Height)
+                    .with_op(NodeOp::FieldRef(FieldId::from("base"))),
+            );
+        terrain.water_spec = Some(WaterSpec::new("height").with_moisture("base"));
+        terrain.bake_in_place().unwrap();
+        document.adopt(terrain);
+        document.dirty = false;
+        document.baked = Baked::Whole;
+        document
+    }
+
     fn shader_document(wired: bool, reach: Option<u32>) -> Document {
         use crate::terrain::graph::NodeOp;
         use crate::terrain::shader::ShaderLayer;
@@ -1072,6 +1092,105 @@ mod tests {
         document.redo().unwrap();
         assert_eq!(document.active(), "biomes");
         assert_eq!(document.field_names(), ["height", "biomes"]);
+    }
+
+    // Acceptance 7, first half: a rename is one entry on the undo stack, and crossing
+    // it has to put the old name back everywhere it was written — in the reader's
+    // reference and in the water spec, not only on the field itself.
+    #[test]
+    fn renaming_a_field_is_one_undo_step_that_restores_the_readers_and_the_water_spec() {
+        let mut document = two_field_document();
+        let before = document.history().undo;
+
+        document
+            .apply(&Edit::RenameField {
+                from: "base".to_owned(),
+                to: "continent".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(document.history().undo, before + 1);
+        assert_eq!(document.field_names(), ["continent", "height"]);
+        assert_eq!(declared_reads(&document, "height"), ["continent"]);
+        assert_eq!(water_moisture(&document), Some("continent".to_owned()));
+
+        document.undo().unwrap();
+        assert_eq!(document.field_names(), ["base", "height"]);
+        assert_eq!(declared_reads(&document, "height"), ["base"]);
+        assert_eq!(water_moisture(&document), Some("base".to_owned()));
+    }
+
+    // Acceptance 7, second half: undoing a removal has to bring the field back with
+    // the graph it had, not an empty one, or the undo would lose the work silently.
+    #[test]
+    fn removing_a_field_is_one_undo_step_that_brings_it_back_with_its_graph() {
+        let mut document = two_field_document();
+        document.reset_water().unwrap();
+        document
+            .apply(&Edit::RemoveField {
+                name: "height".to_owned(),
+            })
+            .unwrap();
+        let before = document.history().undo;
+
+        document
+            .apply(&Edit::RemoveField {
+                name: "base".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(document.history().undo, before + 1);
+        assert!(document.field_names().is_empty());
+
+        document.undo().unwrap();
+        assert_eq!(document.field_names(), ["base"]);
+        assert_eq!(
+            document
+                .terrain()
+                .unwrap()
+                .field("base")
+                .unwrap()
+                .graph
+                .nodes
+                .len(),
+            1
+        );
+    }
+
+    // Acceptance 6, the editor half: the panel is always about the field on screen, so
+    // removing that field has to leave some other field showing rather than a name the
+    // document no longer has.
+    #[test]
+    fn removing_the_field_on_screen_puts_another_one_on_screen() {
+        let mut document = two_field_document();
+        document.reset_water().unwrap();
+        document.set_active("height").unwrap();
+
+        document
+            .apply(&Edit::RemoveField {
+                name: "height".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(document.active(), "base");
+    }
+
+    fn declared_reads(document: &Document, field: &str) -> Vec<String> {
+        document
+            .terrain()
+            .unwrap()
+            .field(field)
+            .unwrap()
+            .declared_reads()
+            .map(|id| id.to_string())
+            .collect()
+    }
+
+    fn water_moisture(document: &Document) -> Option<String> {
+        document
+            .terrain()
+            .unwrap()
+            .water_spec
+            .as_ref()
+            .and_then(|spec| spec.moisture.as_ref())
+            .map(|id| id.to_string())
     }
 
     // A field nothing reads yet moves no texel of any field already baked, so adding

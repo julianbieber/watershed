@@ -11,19 +11,23 @@ use watershed::CellRect;
 use watershed::raster::Raster;
 
 use crate::terrain::graph::{NodeId, NodeOp};
-use crate::terrain::{Field, TerrainSpec};
+use crate::terrain::{Field, TerrainSpec, WaterSpec};
 
 /// How many changes can be undone. Recording past this drops the oldest.
 pub const HISTORY_DEPTH: usize = 100;
 
-/// The authored state of every field on the far side of one change, the field that
-/// was on screen there, and whether crossing that change reaches the bake.
+/// The authored state of every field on the far side of one change, the water spec
+/// there, the field that was on screen, and whether crossing that change reaches the
+/// bake.
 ///
 /// Which field was on screen is part of what one change leaves behind because a
 /// change may move the view: a field added is the one shown afterwards, so going
-/// back across that change has to put the earlier one back, in the same step.
+/// back across that change has to put the earlier one back, in the same step. The
+/// water spec is held for the same reason: a change may rewrite it, as a field renamed
+/// rewrites the name the spec solves over.
 pub struct Snapshot {
     fields: Vec<Field>,
+    water_spec: Option<WaterSpec>,
     active: String,
     reaches_bake: bool,
 }
@@ -38,6 +42,7 @@ impl Snapshot {
     pub fn take(terrain: &TerrainSpec, reaches_bake: bool, active: &str) -> Self {
         Self {
             fields: terrain.fields.iter().map(Field::authored).collect(),
+            water_spec: terrain.water_spec.clone(),
             active: active.to_owned(),
             reaches_bake,
         }
@@ -70,10 +75,12 @@ impl Snapshot {
         }
     }
 
-    /// Puts the fields back into `terrain`, keeping what the history does not own:
-    /// each live field's bake, and the live raster, shader values and declared reach
-    /// of a node that is the same op under the same id on both sides. A graph's next
-    /// id is never lowered, so an id freed by an undo is not handed out again.
+    /// Puts the fields and the water spec back into `terrain`, keeping what the
+    /// history does not own: each live field's bake, and the live raster, shader
+    /// values and declared reach of a node that is the same op under the same id on
+    /// both sides. A live field the snapshot does not name keeps nothing — it is not
+    /// in the document afterwards. A graph's next id is never lowered, so an id freed
+    /// by an undo is not handed out again.
     pub fn restore(self, terrain: &mut TerrainSpec) {
         let mut fields = self.fields;
         for field in &mut fields {
@@ -102,6 +109,7 @@ impl Snapshot {
             }
         }
         terrain.fields = fields;
+        terrain.water_spec = self.water_spec;
     }
 }
 

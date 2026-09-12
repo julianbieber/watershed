@@ -134,6 +134,22 @@ pub enum Edit {
         /// field of that name.
         name: String,
     },
+    /// Renames a field and rewrites everything that named the old name: every
+    /// [`NodeOp::FieldRef`] in the document, and the water spec's height or moisture
+    /// field.
+    RenameField {
+        /// The field to rename. Must exist. Surrounding whitespace is trimmed.
+        from: String,
+        /// What to call it. Trimmed too; refused when what is left is blank, or when
+        /// the document already has a field of that name.
+        to: String,
+    },
+    /// Takes a field out of the document, with its graph and its bake.
+    RemoveField {
+        /// The field to remove. Must exist, must be declared read by no other field,
+        /// and must not be named by the water spec.
+        name: String,
+    },
     /// Writes one property, named by a dotted path. See the module's grammar.
     Set {
         /// `field.property`, or `field.node.property`, where node is `n<id>` or the
@@ -176,6 +192,12 @@ impl Edit {
     /// raster and nothing reads it, so no texel of any field already baked changes
     /// value. Were it not exempt, adding a field would discard every bake in the
     /// document.
+    ///
+    /// A rename changes no value either, and is still not exempt.
+    /// [`Snapshot::restore`](crate::history::Snapshot::restore) matches a held field to
+    /// the live document by name, so undoing a rename puts the field back under its old
+    /// name with no bake to give it; the document has to be re-baked from both sides of
+    /// the change for that field to hold values again. A removal has the same hole.
     pub fn reaches_the_bake(&self) -> bool {
         match self {
             Self::PlaceNode { .. } | Self::RenameNode { .. } | Self::AddField { .. } => false,
@@ -296,6 +318,10 @@ impl Edit {
                 Ok(json!({ "added": name, "fields": terrain.fields.len() }))
             }
 
+            Self::RenameField { from, to } => rename_field(terrain, from.trim(), to.trim()),
+
+            Self::RemoveField { name } => remove_field(terrain, name.trim()),
+
             Self::Set { path, words } => set(terrain, path, words),
         }
     }
@@ -306,9 +332,18 @@ impl Edit {
     /// [`Document::apply`](crate::document::Document::apply) reads this and puts the
     /// field on screen as part of the same change, so undoing the edit puts the
     /// previously shown field back in the same step.
-    pub fn shows(&self) -> Option<&str> {
+    ///
+    /// `terrain` is the document *after* the edit applied and `active` the field that
+    /// was on screen before it. A rename and a removal answer only when it was the
+    /// shown field they changed; a removal then answers the first field left in the
+    /// document, and `None` when none is left.
+    pub fn shows(&self, terrain: &TerrainSpec, active: &str) -> Option<String> {
         match self {
-            Self::AddField { name } => Some(name.trim()),
+            Self::AddField { name } => Some(name.trim().to_owned()),
+            Self::RenameField { from, to } => (active == from.trim()).then(|| to.trim().to_owned()),
+            Self::RemoveField { name } => (active == name.trim())
+                .then(|| terrain.fields.first().map(|field| field.id.to_string()))
+                .flatten(),
             _ => None,
         }
     }
@@ -410,6 +445,93 @@ fn reaches(
     }
     path.pop();
     false
+}
+
+/// The fields that declare a read of `name`, in declaration order, each named once.
+///
+/// The same relation [`check_field_ref`] walks, read from the other end. A reference
+/// under a bypassed node does not count, which is the rule
+/// [`Field::declared_reads`](crate::terrain::Field::declared_reads) already applies.
+/// The answer is derived from the document on every call rather than cached, so it
+/// cannot fall out of step with an edit.
+pub fn readers_of(terrain: &TerrainSpec, name: &str) -> Vec<String> {
+    terrain
+        .fields
+        .iter()
+        .filter(|field| field.id.as_str() != name)
+        .filter(|field| field.declared_reads().any(|id| id.as_str() == name))
+        .map(|field| field.id.to_string())
+        .collect()
+}
+
+fn rename_field(terrain: &mut TerrainSpec, from: &str, to: &str) -> Result<Value, String> {
+    if to.is_empty() {
+        return Err("a field needs a name".to_owned());
+    }
+    if terrain.field(from).is_none() {
+        return Err(format!("no field named `{from}`"));
+    }
+    if terrain.field(to).is_some() {
+        return Err(format!("this document already has a field named `{to}`"));
+    }
+
+    let mut references = 0usize;
+    for field in &mut terrain.fields {
+        if field.id.as_str() == from {
+            field.id = FieldId::from(to);
+        }
+        for node in &mut field.graph.nodes {
+            if let NodeOp::FieldRef(id) = &mut node.op
+                && id.as_str() == from
+            {
+                *id = FieldId::from(to);
+                references += 1;
+            }
+        }
+    }
+
+    let mut water = false;
+    if let Some(spec) = &mut terrain.water_spec {
+        if spec.height.as_str() == from {
+            spec.height = FieldId::from(to);
+            water = true;
+        }
+        if spec.moisture.as_ref().is_some_and(|id| id.as_str() == from) {
+            spec.moisture = Some(FieldId::from(to));
+            water = true;
+        }
+    }
+
+    Ok(json!({ "renamed": from, "to": to, "references": references, "water": water }))
+}
+
+fn remove_field(terrain: &mut TerrainSpec, name: &str) -> Result<Value, String> {
+    if terrain.field(name).is_none() {
+        return Err(format!("no field named `{name}`"));
+    }
+
+    let readers = readers_of(terrain, name);
+    if !readers.is_empty() {
+        let list = readers
+            .iter()
+            .map(|reader| format!("`{reader}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "`{name}` is read by {list} — take those references out first"
+        ));
+    }
+
+    if terrain.water_spec.as_ref().is_some_and(|spec| {
+        spec.height.as_str() == name || spec.moisture.as_ref().is_some_and(|id| id.as_str() == name)
+    }) {
+        return Err(format!(
+            "`{name}` is named by the water spec of this terrain — reset the water first"
+        ));
+    }
+
+    terrain.fields.retain(|field| field.id.as_str() != name);
+    Ok(json!({ "removed": name, "fields": terrain.fields.len() }))
 }
 
 fn field_ref_written(
@@ -1240,7 +1362,257 @@ mod tests {
             name: " biomes ".to_owned(),
         };
         assert!(!edit.reaches_the_bake());
-        assert_eq!(edit.shows(), Some("biomes"));
+        assert_eq!(edit.shows(&document(), "height"), Some("biomes".to_owned()));
+    }
+
+    // Acceptance 1: the rename that the issue names, from the document's side — the
+    // field answers to the new name and the reader's `FieldRef` was rewritten with it,
+    // so nothing is left naming a name no field carries.
+    #[test]
+    fn renaming_a_field_rewrites_the_references_that_read_it() {
+        let mut terrain = document();
+        let reply = Edit::RenameField {
+            from: "base".to_owned(),
+            to: " continent ".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+
+        assert_eq!(reply["renamed"], "base");
+        assert_eq!(reply["to"], "continent");
+        assert_eq!(reply["references"], 1);
+        assert!(terrain.field("base").is_none());
+        assert!(terrain.field("continent").is_some());
+        let reads: Vec<String> = terrain
+            .field("height")
+            .unwrap()
+            .declared_reads()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(reads, vec!["continent".to_owned()]);
+    }
+
+    // Acceptance 2: the water spec names fields by name too, so a rename that left it
+    // behind would point the solve at a field the document no longer has.
+    #[test]
+    fn renaming_a_field_rewrites_the_water_spec_that_names_it() {
+        let mut terrain = document();
+        terrain.water_spec = Some(WaterSpec::new("height").with_moisture("base"));
+
+        Edit::RenameField {
+            from: "height".to_owned(),
+            to: "elevation".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+        let reply = Edit::RenameField {
+            from: "base".to_owned(),
+            to: "continent".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+
+        assert_eq!(reply["water"], true);
+        let spec = terrain.water_spec.clone().unwrap();
+        assert_eq!(spec.height.as_str(), "elevation");
+        assert_eq!(
+            spec.moisture.map(|id| id.to_string()),
+            Some("continent".to_owned())
+        );
+    }
+
+    // Acceptance 3: a name already taken would make every path that addresses a field
+    // ambiguous, and the refusal has to leave the document alone — the rule a refused
+    // `AddField` is held to.
+    #[test]
+    fn renaming_a_field_onto_a_taken_name_is_refused_and_changes_nothing() {
+        let mut terrain = document();
+        let before = terrain.clone();
+        let error = Edit::RenameField {
+            from: "base".to_owned(),
+            to: "height".to_owned(),
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("height"), "{error}");
+        assert_eq!(terrain, before);
+    }
+
+    // Acceptance 3, the other half: a blank name is what an empty name box sends, and
+    // a field nothing can address would be unreachable from either surface.
+    #[test]
+    fn renaming_a_field_to_a_blank_name_is_refused_and_changes_nothing() {
+        let mut terrain = document();
+        let before = terrain.clone();
+        for name in ["", "   "] {
+            let error = Edit::RenameField {
+                from: "base".to_owned(),
+                to: name.to_owned(),
+            }
+            .apply(&mut terrain)
+            .unwrap_err();
+            assert!(error.contains("name"), "{error}");
+        }
+        assert_eq!(terrain, before);
+    }
+
+    // A rename must not manufacture the dangling reference `check_field_ref` exists to
+    // refuse, so the document it leaves behind still plans a bake.
+    #[test]
+    fn a_renamed_document_still_bakes() {
+        let mut terrain = document();
+        Edit::RenameField {
+            from: "base".to_owned(),
+            to: "continent".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+        assert!(terrain.bake_order().is_ok());
+    }
+
+    // Bypass turns a reference off, it does not unname it: a bypassed `FieldRef` left
+    // naming the old name would fail at the bake the moment it was un-bypassed.
+    #[test]
+    fn renaming_a_field_rewrites_a_reference_under_a_bypassed_node() {
+        let mut terrain = document();
+        let reference = terrain
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.op, NodeOp::FieldRef(_)))
+            .unwrap()
+            .id;
+        Edit::Bypass {
+            field: "height".to_owned(),
+            node: node_path(reference),
+            bypassed: Some(true),
+        }
+        .apply(&mut terrain)
+        .unwrap();
+
+        let reply = Edit::RenameField {
+            from: "base".to_owned(),
+            to: "continent".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+
+        assert_eq!(reply["references"], 1);
+        let op = &terrain
+            .field("height")
+            .unwrap()
+            .graph
+            .node(reference)
+            .unwrap()
+            .op;
+        assert!(matches!(op, NodeOp::FieldRef(id) if id.as_str() == "continent"));
+    }
+
+    // Acceptance 4: removing a field something reads would orphan that reference, so
+    // it is refused — and the message names the readers, which is the whole of what
+    // tells someone what to take out first.
+    #[test]
+    fn removing_a_field_a_reference_reads_is_refused_and_names_the_reader() {
+        let mut terrain = document();
+        let before = terrain.clone();
+        let error = Edit::RemoveField {
+            name: "base".to_owned(),
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("height"), "{error}");
+        assert_eq!(terrain, before);
+    }
+
+    // Acceptance 5: the water spec names a field the same way a reference does, and
+    // the refusal ends on the clause changing the height role already ends on.
+    #[test]
+    fn removing_a_field_the_water_spec_names_is_refused() {
+        for spec in [
+            WaterSpec::new("height"),
+            WaterSpec::new("base").with_moisture("height"),
+        ] {
+            let mut terrain = document();
+            terrain.water_spec = Some(spec);
+            let before = terrain.clone();
+            let error = Edit::RemoveField {
+                name: "height".to_owned(),
+            }
+            .apply(&mut terrain)
+            .unwrap_err();
+            assert!(error.contains("reset the water"), "{error}");
+            assert_eq!(terrain, before);
+        }
+    }
+
+    // Acceptance 6, the document half: with nothing reading it and no water spec over
+    // it, the field goes and every other field is left exactly as it was.
+    #[test]
+    fn removing_an_unread_field_takes_it_out_and_leaves_the_rest_alone() {
+        let mut terrain = document();
+        let base = terrain.field("base").unwrap().clone();
+        let reply = Edit::RemoveField {
+            name: " height ".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("nothing reads `height` and no water spec names it");
+
+        assert_eq!(reply["removed"], "height");
+        assert_eq!(reply["fields"], 1);
+        assert!(terrain.field("height").is_none());
+        assert_eq!(terrain.field("base"), Some(&base));
+    }
+
+    // `readers_of` is the relation both the removal refusal and issue #41's panel read,
+    // so it has to answer the declared readers and only those: not the field itself,
+    // and not a reader whose reference is bypassed.
+    #[test]
+    fn readers_of_names_the_declared_readers_and_nothing_else() {
+        let mut terrain = document();
+        assert_eq!(readers_of(&terrain, "base"), vec!["height".to_owned()]);
+        assert!(readers_of(&terrain, "height").is_empty());
+
+        let reference = terrain
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.op, NodeOp::FieldRef(_)))
+            .unwrap()
+            .id;
+        Edit::Bypass {
+            field: "height".to_owned(),
+            node: node_path(reference),
+            bypassed: Some(true),
+        }
+        .apply(&mut terrain)
+        .unwrap();
+        assert!(readers_of(&terrain, "base").is_empty());
+    }
+
+    // The view has to follow the field it was on: a rename of the shown field keeps it
+    // on screen under its new name, a removal falls back to a field that still exists,
+    // and an edit to some other field leaves the view alone.
+    #[test]
+    fn a_rename_and_a_removal_move_the_view_only_when_it_was_on_that_field() {
+        let terrain = document();
+        let rename = Edit::RenameField {
+            from: "base".to_owned(),
+            to: "continent".to_owned(),
+        };
+        assert_eq!(rename.shows(&terrain, "base"), Some("continent".to_owned()));
+        assert_eq!(rename.shows(&terrain, "height"), None);
+
+        let mut removed = document();
+        let removal = Edit::RemoveField {
+            name: "height".to_owned(),
+        };
+        removal.apply(&mut removed).expect("nothing reads `height`");
+        assert_eq!(removal.shows(&removed, "height"), Some("base".to_owned()));
+        assert_eq!(removal.shows(&removed, "base"), None);
     }
 
     // The reference guard has to hold over a field this edit created just as it does

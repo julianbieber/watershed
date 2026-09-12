@@ -35,7 +35,7 @@ pub(super) enum Topic {
     Nodes,
     /// The brush's settings and where a stroke would land.
     Brush,
-    /// The solved water, counted.
+    /// The solved water, counted, and the fields the water spec is over.
     Water,
     /// Where the camera is and what the ramp is fitted to.
     View,
@@ -219,8 +219,20 @@ fn brush(world: &World) -> Value {
 
 fn water(world: &World) -> Value {
     let document = world.resource::<Document>();
-    let Some(state) = document.terrain().and_then(|terrain| terrain.water()) else {
+    let Some(terrain) = document.terrain() else {
         return json!({ "available": false });
+    };
+    let height = terrain
+        .water_spec
+        .as_ref()
+        .map(|spec| spec.height.to_string());
+    let moisture = terrain
+        .water_spec
+        .as_ref()
+        .and_then(|spec| spec.moisture.as_ref())
+        .map(|id| id.to_string());
+    let Some(state) = terrain.water() else {
+        return json!({ "available": false, "height": height, "moisture": moisture });
     };
 
     let size = state.size();
@@ -238,6 +250,8 @@ fn water(world: &World) -> Value {
         "channel_cells": channel_cells,
         "channel_fraction": channel_cells as f64 / cells.max(1) as f64,
         "sinks": sinks,
+        "height": height,
+        "moisture": moisture,
     })
 }
 

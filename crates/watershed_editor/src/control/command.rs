@@ -192,7 +192,9 @@ impl Command {
             Self::Field(_) => "field",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
-                Edit::AddField { .. } => "field",
+                Edit::AddField { .. } | Edit::RenameField { .. } | Edit::RemoveField { .. } => {
+                    "field"
+                }
                 _ => "node",
             },
             Self::Brush(_) => "brush",
@@ -254,6 +256,21 @@ impl Command {
                     },
                     applied: None,
                 }),
+                ["rename", from, to, ..] => Ok(Self::Edit {
+                    edit: Edit::RenameField {
+                        from: (*from).to_owned(),
+                        to: (*to).to_owned(),
+                    },
+                    applied: None,
+                }),
+                ["rm", name, ..] => Ok(Self::Edit {
+                    edit: Edit::RemoveField {
+                        name: (*name).to_owned(),
+                    },
+                    applied: None,
+                }),
+                ["rename", ..] => Err("field rename needs the old name and the new one".to_owned()),
+                ["rm"] => Err("field rm needs a name".to_owned()),
                 [name, ..] => Ok(Self::Field((*name).to_owned())),
                 [] => Err("field needs a name".to_owned()),
             },
@@ -838,6 +855,8 @@ mod tests {
             ("new 256 256 7 ridges", "new"),
             ("field height", "field"),
             ("field add biomes", "field"),
+            ("field rename base continent", "field"),
+            ("field rm base", "field"),
             ("node add height noise fbm 0.01", "node"),
             ("node add height constant 0.25", "node"),
             ("node add height slope 4", "node"),
