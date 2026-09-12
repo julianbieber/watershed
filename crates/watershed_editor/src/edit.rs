@@ -127,6 +127,13 @@ pub enum Edit {
         /// zero rather than refusing the document.
         node: Option<String>,
     },
+    /// Adds an empty field to the document and leaves every other field alone.
+    AddField {
+        /// The name the field is addressed by. Surrounding whitespace is trimmed.
+        /// Refused when what is left is blank, or when the document already has a
+        /// field of that name.
+        name: String,
+    },
     /// Writes one property, named by a dotted path. See the module's grammar.
     Set {
         /// `field.property`, or `field.node.property`, where node is `n<id>` or the
@@ -164,9 +171,14 @@ impl Edit {
     /// draws the field, not what the field holds, so a `Set` on one of them is exempt
     /// too. An overlay added later adds its properties to that list rather than
     /// replacing it.
+    ///
+    /// A field that has just been added is exempt for a different reason: it holds no
+    /// raster and nothing reads it, so no texel of any field already baked changes
+    /// value. Were it not exempt, adding a field would discard every bake in the
+    /// document.
     pub fn reaches_the_bake(&self) -> bool {
         match self {
-            Self::PlaceNode { .. } | Self::RenameNode { .. } => false,
+            Self::PlaceNode { .. } | Self::RenameNode { .. } | Self::AddField { .. } => false,
             Self::Set { path, .. } => !is_display_property(path),
             _ => true,
         }
@@ -272,7 +284,32 @@ impl Edit {
                 Ok(json!({ "output": id.map(node_path) }))
             }
 
+            Self::AddField { name } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err("a field needs a name".to_owned());
+                }
+                if terrain.field(name).is_some() {
+                    return Err(format!("this document already has a field named `{name}`"));
+                }
+                terrain.fields.push(Field::new(name));
+                Ok(json!({ "added": name, "fields": terrain.fields.len() }))
+            }
+
             Self::Set { path, words } => set(terrain, path, words),
+        }
+    }
+
+    /// The field this edit leaves on screen, or `None` for an edit that leaves the
+    /// view where it was.
+    ///
+    /// [`Document::apply`](crate::document::Document::apply) reads this and puts the
+    /// field on screen as part of the same change, so undoing the edit puts the
+    /// previously shown field back in the same step.
+    pub fn shows(&self) -> Option<&str> {
+        match self {
+            Self::AddField { name } => Some(name.trim()),
+            _ => None,
         }
     }
 }
@@ -1137,6 +1174,103 @@ mod tests {
         .apply(&mut terrain)
         .unwrap();
         assert_eq!(terrain.field("height").unwrap().graph.nodes.len(), before);
+    }
+
+    // Every default the issue names: nothing in the graph, shift 0, the unit range,
+    // and last in declaration order so the field menu grows at the end.
+    #[test]
+    fn a_field_added_from_the_editor_is_empty_at_shift_zero_over_the_unit_range() {
+        let mut terrain = document();
+        let reply = Edit::AddField {
+            name: " biomes ".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+
+        assert_eq!(reply["added"], "biomes");
+        let added = terrain.field("biomes").expect("the field was added");
+        assert_eq!(added.role, FieldRole::Custom);
+        assert_eq!(added.shift, 0);
+        assert_eq!(added.range, (0.0, 1.0));
+        assert!(added.graph.nodes.is_empty());
+        assert_eq!(added.graph.output, None);
+        assert_eq!(
+            terrain.fields.last().map(|field| field.id.as_str()),
+            Some("biomes")
+        );
+    }
+
+    // A second field of one name would make every path that addresses a field
+    // ambiguous, so the name is refused — and the refusal has to leave the document
+    // alone, the same rule a refused node edit is held to.
+    #[test]
+    fn a_field_whose_name_is_already_taken_is_refused_and_changes_nothing() {
+        let mut terrain = document();
+        let before = terrain.clone();
+        let error = Edit::AddField {
+            name: "height".to_owned(),
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("height"), "{error}");
+        assert_eq!(terrain, before);
+    }
+
+    // A blank name is what an empty name box sends, and a field nothing can address
+    // would be unreachable from either surface.
+    #[test]
+    fn a_field_with_a_blank_name_is_refused() {
+        let mut terrain = document();
+        for name in ["", "   "] {
+            let error = Edit::AddField {
+                name: name.to_owned(),
+            }
+            .apply(&mut terrain)
+            .unwrap_err();
+            assert!(error.contains("name"), "{error}");
+        }
+        assert_eq!(terrain.fields.len(), 2);
+    }
+
+    // The two properties the acceptance criteria rest on: adding a field throws away
+    // no bake, and the field added is the one left on screen.
+    #[test]
+    fn adding_a_field_reaches_no_bake_and_shows_the_field_it_added() {
+        let edit = Edit::AddField {
+            name: " biomes ".to_owned(),
+        };
+        assert!(!edit.reaches_the_bake());
+        assert_eq!(edit.shows(), Some("biomes"));
+    }
+
+    // The reference guard has to hold over a field this edit created just as it does
+    // over one that came out of a file: `biomes` may read `height`, and `height` may
+    // then not read `biomes` back.
+    #[test]
+    fn a_reference_may_name_a_field_that_was_added_from_the_editor() {
+        let mut terrain = document();
+        Edit::AddField {
+            name: "biomes".to_owned(),
+        }
+        .apply(&mut terrain)
+        .expect("a free name is accepted");
+
+        Edit::AddNode {
+            field: "biomes".to_owned(),
+            op: NodeOp::FieldRef(FieldId::from("height")),
+            position: None,
+        }
+        .apply(&mut terrain)
+        .expect("reading an existing field is allowed");
+
+        let error = Edit::AddNode {
+            field: "height".to_owned(),
+            op: NodeOp::FieldRef(FieldId::from("biomes")),
+            position: None,
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("height -> biomes -> height"), "{error}");
     }
 
     // An edge that would make the graph feed itself has to be refused where it is

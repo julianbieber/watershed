@@ -16,10 +16,15 @@ use crate::terrain::{Field, TerrainSpec};
 /// How many changes can be undone. Recording past this drops the oldest.
 pub const HISTORY_DEPTH: usize = 100;
 
-/// The authored state of every field on the far side of one change, and whether
-/// crossing that change reaches the bake.
+/// The authored state of every field on the far side of one change, the field that
+/// was on screen there, and whether crossing that change reaches the bake.
+///
+/// Which field was on screen is part of what one change leaves behind because a
+/// change may move the view: a field added is the one shown afterwards, so going
+/// back across that change has to put the earlier one back, in the same step.
 pub struct Snapshot {
     fields: Vec<Field>,
+    active: String,
     reaches_bake: bool,
 }
 
@@ -27,9 +32,13 @@ impl Snapshot {
     /// Copies every field's authored state as it stands: no bake, no shader values,
     /// every paint and external raster still held. Call [`Snapshot::shed`] once the
     /// change has been made, or the copy keeps rasters the document still has.
-    pub fn take(terrain: &TerrainSpec, reaches_bake: bool) -> Self {
+    ///
+    /// `active` is the field on screen at the moment of the copy, which crossing the
+    /// change puts back.
+    pub fn take(terrain: &TerrainSpec, reaches_bake: bool, active: &str) -> Self {
         Self {
             fields: terrain.fields.iter().map(Field::authored).collect(),
+            active: active.to_owned(),
             reaches_bake,
         }
     }
@@ -201,6 +210,9 @@ pub enum Restored {
     Fields {
         /// Whether crossing this change reaches the bake.
         reaches_bake: bool,
+        /// The field that was on screen on the far side of the change. Equal to the
+        /// current one for every change that did not move the view.
+        active: String,
     },
     /// A stroke, naming the field it painted and the cells it covered.
     Stroke {
@@ -275,18 +287,24 @@ impl History {
 
     /// Puts the document back to before the last change and says what came back, or
     /// `None` with nothing to undo.
-    pub fn undo(&mut self, terrain: &mut TerrainSpec) -> Option<Restored> {
+    ///
+    /// `active` is the field on screen now, recorded so that redoing the change puts
+    /// it back.
+    pub fn undo(&mut self, terrain: &mut TerrainSpec, active: &str) -> Option<Restored> {
         let entry = self.undo.pop()?;
-        let (restored, back) = swap(entry, terrain, Order::Backward);
+        let (restored, back) = swap(entry, terrain, Order::Backward, active);
         self.redo.push(back);
         Some(restored)
     }
 
     /// Replays the last change undone and says what came back, or `None` with nothing to
     /// redo.
-    pub fn redo(&mut self, terrain: &mut TerrainSpec) -> Option<Restored> {
+    ///
+    /// `active` is the field on screen now, recorded so that undoing the change again
+    /// puts it back.
+    pub fn redo(&mut self, terrain: &mut TerrainSpec, active: &str) -> Option<Restored> {
         let entry = self.redo.pop()?;
-        let (restored, back) = swap(entry, terrain, Order::Forward);
+        let (restored, back) = swap(entry, terrain, Order::Forward, active);
         self.undo.push(back);
         Some(restored)
     }
@@ -325,14 +343,23 @@ fn paint_raster<'a>(
     }
 }
 
-fn swap(entry: Change, terrain: &mut TerrainSpec, order: Order) -> (Restored, Change) {
+fn swap(
+    entry: Change,
+    terrain: &mut TerrainSpec,
+    order: Order,
+    active: &str,
+) -> (Restored, Change) {
     match entry {
         Change::Fields(entry) => {
             let reaches_bake = entry.reaches_bake();
-            let mut now = Snapshot::take(terrain, reaches_bake);
+            let restored = Restored::Fields {
+                reaches_bake,
+                active: entry.active.clone(),
+            };
+            let mut now = Snapshot::take(terrain, reaches_bake, active);
             entry.restore(terrain);
             now.shed(terrain);
-            (Restored::Fields { reaches_bake }, Change::Fields(now))
+            (restored, Change::Fields(now))
         }
         Change::Stroke(stroke) => {
             let restored = Restored::Stroke {
@@ -407,13 +434,15 @@ mod tests {
     }
 
     fn edit(terrain: &mut TerrainSpec, history: &mut History, shift: u8) {
-        let before = Snapshot::take(terrain, true);
+        let before = Snapshot::take(terrain, true, "height");
         terrain.field_mut("height").unwrap().shift = shift;
         history.record(before, terrain);
     }
 
     fn undone(history: &mut History, terrain: &mut TerrainSpec) -> Restored {
-        history.undo(terrain).expect("there is something to undo")
+        history
+            .undo(terrain, "height")
+            .expect("there is something to undo")
     }
 
     // The whole reason a snapshot is affordable: a raster the document still holds
@@ -422,7 +451,7 @@ mod tests {
     fn a_recorded_snapshot_sheds_the_raster_the_document_still_holds() {
         let terrain = painted(8);
         let mut history = History::default();
-        history.record(Snapshot::take(&terrain, true), &terrain);
+        history.record(Snapshot::take(&terrain, true, "height"), &terrain);
 
         let Change::Fields(entry) = &history.undo[0] else {
             panic!("a change to the stack was not recorded as one");
@@ -441,7 +470,7 @@ mod tests {
     fn undoing_a_removal_brings_the_nodes_raster_back() {
         let mut terrain = painted(8);
         let mut history = History::default();
-        let before = Snapshot::take(&terrain, true);
+        let before = Snapshot::take(&terrain, true, "height");
         terrain
             .field_mut("height")
             .unwrap()
@@ -453,7 +482,10 @@ mod tests {
 
         assert!(matches!(
             undone(&mut history, &mut terrain),
-            Restored::Fields { reaches_bake: true }
+            Restored::Fields {
+                reaches_bake: true,
+                ..
+            }
         ));
         assert_eq!(paint_of(&terrain).unwrap().data(), &[7u8; 64][..]);
     }
@@ -465,7 +497,7 @@ mod tests {
     fn a_live_raster_survives_an_undo_and_a_redo_that_keep_its_node() {
         let mut terrain = painted(8);
         let mut history = History::default();
-        let before = Snapshot::take(&terrain, true);
+        let before = Snapshot::take(&terrain, true, "height");
         terrain.field_mut("height").unwrap().shift = 2;
         history.record(before, &terrain);
         if let NodeOp::Paint(raster) = &mut terrain
@@ -479,10 +511,10 @@ mod tests {
             raster.data_mut()[3] = 200;
         }
 
-        history.undo(&mut terrain).unwrap();
+        history.undo(&mut terrain, "height").unwrap();
         assert_eq!(terrain.field("height").unwrap().shift, 0);
         assert_eq!(paint_of(&terrain).unwrap().data()[3], 200);
-        history.redo(&mut terrain).unwrap();
+        history.redo(&mut terrain, "height").unwrap();
         assert_eq!(terrain.field("height").unwrap().shift, 2);
         assert_eq!(paint_of(&terrain).unwrap().data()[3], 200);
     }
@@ -493,11 +525,11 @@ mod tests {
     fn restoring_keeps_the_bake_the_document_has() {
         let mut terrain = painted(8);
         let mut history = History::default();
-        let before = Snapshot::take(&terrain, true);
+        let before = Snapshot::take(&terrain, true, "height");
         terrain.field_mut("height").unwrap().range = (0.0, 2.0);
         history.record(before, &terrain);
 
-        history.undo(&mut terrain).unwrap();
+        history.undo(&mut terrain, "height").unwrap();
         assert!(!terrain.field("height").unwrap().baked().is_empty());
     }
 
@@ -507,7 +539,7 @@ mod tests {
     fn an_id_freed_by_an_undo_is_not_reused() {
         let mut terrain = painted(8);
         let mut history = History::default();
-        let before = Snapshot::take(&terrain, true);
+        let before = Snapshot::take(&terrain, true, "height");
         let first = terrain
             .field_mut("height")
             .unwrap()
@@ -515,7 +547,7 @@ mod tests {
             .add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
         history.record(before, &terrain);
 
-        history.undo(&mut terrain).unwrap();
+        history.undo(&mut terrain, "height").unwrap();
         let second = terrain
             .field_mut("height")
             .unwrap()
@@ -531,20 +563,20 @@ mod tests {
         let mut terrain = painted(8);
         let mut history = History::default();
         for step in 0..(HISTORY_DEPTH + 5) {
-            let before = Snapshot::take(&terrain, true);
+            let before = Snapshot::take(&terrain, true, "height");
             terrain.field_mut("height").unwrap().range = (0.0, step as f32);
             history.record(before, &terrain);
         }
         assert_eq!(history.depth().undo, HISTORY_DEPTH);
 
-        history.undo(&mut terrain).unwrap();
-        history.undo(&mut terrain).unwrap();
+        history.undo(&mut terrain, "height").unwrap();
+        history.undo(&mut terrain, "height").unwrap();
         assert_eq!(history.depth().redo, 2);
-        let before = Snapshot::take(&terrain, true);
+        let before = Snapshot::take(&terrain, true, "height");
         terrain.field_mut("height").unwrap().range = (0.0, 1.0);
         history.record(before, &terrain);
         assert_eq!(history.depth().redo, 0);
-        assert!(history.redo(&mut terrain).is_none());
+        assert!(history.redo(&mut terrain, "height").is_none());
     }
 
     // The task's own claim, at the level the history can make it: a stroke goes back to
@@ -575,9 +607,9 @@ mod tests {
             "the first stroke left a texel behind"
         );
 
-        history.redo(&mut terrain).unwrap();
+        history.redo(&mut terrain, "height").unwrap();
         assert_eq!(texels_of(&terrain), after_first);
-        history.redo(&mut terrain).unwrap();
+        history.redo(&mut terrain, "height").unwrap();
         assert_eq!(texels_of(&terrain), after_second);
     }
 
@@ -605,7 +637,7 @@ mod tests {
         );
         assert_eq!(texels_of(&terrain), clean);
 
-        history.redo(&mut terrain).unwrap();
+        history.redo(&mut terrain, "height").unwrap();
         assert_eq!(texels_of(&terrain), drawn);
     }
 
@@ -628,7 +660,7 @@ mod tests {
             "a raster of zeros was left where there had been none"
         );
 
-        history.redo(&mut terrain).unwrap();
+        history.redo(&mut terrain, "height").unwrap();
         assert_eq!(texels_of(&terrain), drawn);
         undone(&mut history, &mut terrain);
         assert!(paint_of(&terrain).unwrap().is_empty());

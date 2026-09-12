@@ -413,6 +413,10 @@ impl Document {
     /// answer is `true` rather than the reply the edit would have made; it lands, and
     /// asks for its re-bake, when the job does. Refused only with no document open, or
     /// by the edit itself — and a refusal leaves the document untouched.
+    ///
+    /// An edit that names a field to show — see [`Edit::shows`] — also puts that field
+    /// on screen, as part of the same change: undoing it puts back both the document
+    /// and the field that was being looked at.
     pub fn apply(&mut self, edit: &Edit) -> Result<Value, String> {
         if self.is_busy() {
             self.hold(Held::Edit {
@@ -421,13 +425,17 @@ impl Document {
             });
             return Ok(Value::Bool(true));
         }
+        let active = self.active.clone();
         let terrain = self
             .terrain
             .as_mut()
             .ok_or("there is no document to edit")?;
-        let before = Snapshot::take(terrain, edit.reaches_the_bake());
+        let before = Snapshot::take(terrain, edit.reaches_the_bake(), &active);
         let reply = edit.apply(terrain)?;
         self.history.record(before, terrain);
+        if let Some(shown) = edit.shows() {
+            self.active = shown.to_owned();
+        }
         if edit.reaches_the_bake() {
             self.note_edit();
         } else {
@@ -466,10 +474,11 @@ impl Document {
             });
             return true;
         }
+        let active = self.active.clone();
         let Some(terrain) = self.terrain.as_mut() else {
             return false;
         };
-        let before = Snapshot::take(terrain, true);
+        let before = Snapshot::take(terrain, true, &active);
         let Some(target) = terrain.field_mut(field) else {
             return false;
         };
@@ -488,11 +497,15 @@ impl Document {
     /// document open, or with nothing to undo — in each case the history is untouched.
     pub fn undo(&mut self) -> Result<(), String> {
         self.busy_check()?;
+        let active = self.active.clone();
         let terrain = self
             .terrain
             .as_mut()
             .ok_or("there is no document to undo in")?;
-        let restored = self.history.undo(terrain).ok_or("nothing to undo")?;
+        let restored = self
+            .history
+            .undo(terrain, &active)
+            .ok_or("nothing to undo")?;
         self.note_restored(restored);
         Ok(())
     }
@@ -500,11 +513,15 @@ impl Document {
     /// Replays the last change undone, on the same terms as [`Document::undo`].
     pub fn redo(&mut self) -> Result<(), String> {
         self.busy_check()?;
+        let active = self.active.clone();
         let terrain = self
             .terrain
             .as_mut()
             .ok_or("there is no document to redo in")?;
-        let restored = self.history.redo(terrain).ok_or("nothing to redo")?;
+        let restored = self
+            .history
+            .redo(terrain, &active)
+            .ok_or("nothing to redo")?;
         self.note_restored(restored);
         Ok(())
     }
@@ -516,8 +533,16 @@ impl Document {
 
     fn note_restored(&mut self, restored: Restored) {
         match restored {
-            Restored::Fields { reaches_bake: true } => self.note_edit(),
-            Restored::Fields { .. } => self.revision += 1,
+            Restored::Fields {
+                reaches_bake,
+                active,
+            } => {
+                self.active = active;
+                self.revision += 1;
+                if reaches_bake {
+                    self.note_edit();
+                }
+            }
             Restored::Stroke { field, cells } => {
                 let reached = self.reach_of(&field, cells);
                 self.note_stroke(reached);
@@ -542,6 +567,7 @@ impl Document {
 
     fn land_held(&mut self) {
         let held = std::mem::take(&mut self.held);
+        let mut active = self.active.clone();
         let Some(terrain) = self.terrain.as_mut() else {
             return;
         };
@@ -550,10 +576,13 @@ impl Document {
         for change in held {
             match change {
                 Held::Edit { edit, .. } => {
-                    let before = Snapshot::take(terrain, edit.reaches_the_bake());
+                    let before = Snapshot::take(terrain, edit.reaches_the_bake(), &active);
                     match edit.apply(terrain) {
                         Ok(_) => {
                             self.history.record(before, terrain);
+                            if let Some(shown) = edit.shows() {
+                                active = shown.to_owned();
+                            }
                             landed = true;
                             reached_the_bake |= edit.reaches_the_bake();
                         }
@@ -561,7 +590,7 @@ impl Document {
                     }
                 }
                 Held::Write { field, write, .. } => {
-                    let before = Snapshot::take(terrain, true);
+                    let before = Snapshot::take(terrain, true, &active);
                     let Some(target) = terrain.field_mut(&field) else {
                         warn!("a held write names no field `{field}`");
                         continue;
@@ -577,6 +606,7 @@ impl Document {
                 }
             }
         }
+        self.active = active;
         if reached_the_bake {
             self.note_edit();
         } else if landed {
@@ -1015,6 +1045,57 @@ mod tests {
                 .nodes[0]
                 .position,
             [40.0, -20.0]
+        );
+    }
+
+    // The whole of what the panel's Add field button and `field add` have to do,
+    // including that it is one undo step rather than two: the field arrives, it is on
+    // screen, and going back takes both away together.
+    #[test]
+    fn adding_a_field_puts_it_on_screen_and_undo_puts_the_previous_one_back() {
+        let mut document = one_node_document();
+        let before = document.history().undo;
+
+        document
+            .apply(&Edit::AddField {
+                name: "biomes".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(document.active(), "biomes");
+        assert_eq!(document.field_names(), ["height", "biomes"]);
+        assert_eq!(document.history().undo, before + 1);
+
+        document.undo().unwrap();
+        assert_eq!(document.active(), "height");
+        assert_eq!(document.field_names(), ["height"]);
+
+        document.redo().unwrap();
+        assert_eq!(document.active(), "biomes");
+        assert_eq!(document.field_names(), ["height", "biomes"]);
+    }
+
+    // A field nothing reads yet moves no texel of any field already baked, so adding
+    // one must not throw the bake away — the same rule a card drag is held to, and
+    // what keeps `observe document` reporting the bake it reported before.
+    #[test]
+    fn adding_a_field_leaves_the_bake_where_it_was() {
+        let mut document = one_node_document();
+        let baked = document.baked();
+
+        document
+            .apply(&Edit::AddField {
+                name: "biomes".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            document.baked(),
+            baked,
+            "an added field invalidated the bake"
+        );
+        assert!(
+            !document.is_dirty(),
+            "an added field made the document dirty"
         );
     }
 

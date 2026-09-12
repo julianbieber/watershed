@@ -66,7 +66,8 @@ pub(super) enum Command {
         /// Whether the job has been asked for yet.
         started: bool,
     },
-    /// Puts a field on screen.
+    /// Puts a field on screen. `field add <name>` is a different thing — an
+    /// [`Edit`] — and parses to [`Command::Edit`].
     Field(String),
     /// An edit and the re-bake that answers it, held together: the reply says the
     /// effect has happened, and for an edit the effect is the bake rather than the
@@ -191,6 +192,7 @@ impl Command {
             Self::Field(_) => "field",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
+                Edit::AddField { .. } => "field",
                 _ => "node",
             },
             Self::Brush(_) => "brush",
@@ -245,9 +247,16 @@ impl Command {
                     started: false,
                 })
             }
-            "field" => Ok(Self::Field(
-                rest.first().ok_or("field needs a name")?.to_string(),
-            )),
+            "field" => match rest.as_slice() {
+                ["add", name, ..] => Ok(Self::Edit {
+                    edit: Edit::AddField {
+                        name: (*name).to_owned(),
+                    },
+                    applied: None,
+                }),
+                [name, ..] => Ok(Self::Field((*name).to_owned())),
+                [] => Err("field needs a name".to_owned()),
+            },
             "node" => Ok(Self::Edit {
                 edit: node_edit(&rest)?,
                 applied: None,
@@ -828,6 +837,7 @@ mod tests {
             ("wait water 600", "wait"),
             ("new 256 256 7 ridges", "new"),
             ("field height", "field"),
+            ("field add biomes", "field"),
             ("node add height noise fbm 0.01", "node"),
             ("node add height constant 0.25", "node"),
             ("node add height slope 4", "node"),
@@ -886,6 +896,7 @@ mod tests {
         assert!(Command::parse("new 256 256 1 nothing-like-this").is_err());
         assert!(Command::parse("zoom").is_err());
         assert!(Command::parse("save /tmp/a-terrain sideways").is_err());
+        assert!(Command::parse("field").is_err());
         assert!(Command::parse("node").is_err());
         assert!(Command::parse("node add height").is_err());
         assert!(Command::parse("layer sideways height 1").is_err());
