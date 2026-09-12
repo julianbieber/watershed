@@ -59,10 +59,12 @@ impl Plugin for CanvasPlugin {
             .init_resource::<CanvasShape>()
             .init_resource::<Solo>()
             .init_resource::<input::Finished>()
+            .add_message::<OpenField>()
             .add_systems(Startup, spawn_canvas_camera)
             .add_systems(
                 Update,
                 (
+                    apply_open_field,
                     input::undo_keys,
                     scene::rebuild_canvas,
                     frame_graph,
@@ -162,6 +164,39 @@ impl Selection {
         if self.soloed == Some(gone) {
             self.soloed = None;
         }
+    }
+}
+
+/// Asks for another field of the open document to be put on screen.
+///
+/// The one way anything asks for a field change: the canvas's double-click, the
+/// panel's `reads` and `read by` buttons, and whatever else comes to want it all write
+/// this rather than reaching for the document themselves. It is a view change and not
+/// an edit — nothing is written to the terrain, no history entry is made, and no bake
+/// is started — so a field opened this way can be shut again by opening the first one.
+///
+/// A name no field of the document carries is refused the way any other bad reference
+/// is, and the view stays where it was.
+#[derive(Message)]
+pub struct OpenField {
+    /// The field to open. Must be one the document carries.
+    pub field: String,
+    /// A node of the field being opened to select once it is up, or `None` to leave
+    /// nothing selected.
+    pub select: Option<NodeId>,
+}
+
+fn apply_open_field(
+    mut open: MessageReader<OpenField>,
+    mut document: ResMut<Document>,
+    mut selection: ResMut<Selection>,
+) {
+    for message in open.read() {
+        let opened = document.set_active(&message.field);
+        if opened.is_ok() {
+            selection.select(message.select);
+        }
+        crate::ui::report(&mut document, opened);
     }
 }
 
@@ -535,12 +570,30 @@ fn input_offset(card: &NodeCard, index: usize) -> Vec2 {
 
 #[cfg(test)]
 mod tests {
+    use bevy::ecs::system::RunSystemOnce;
+
     use super::*;
     use crate::terrain::graph::{FieldGraph, NodeOp};
     use crate::terrain::{Field, TerrainSpec};
 
     fn node(id: u32) -> NodeId {
         NodeId(id)
+    }
+
+    fn open_field_world() -> World {
+        let mut document = Document::default();
+        document.adopt(
+            TerrainSpec::new(UVec2::splat(16))
+                .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
+                .with_field(Field::new("height").with_op(NodeOp::Constant(0.5))),
+        );
+        document.set_active("height").unwrap();
+
+        let mut world = World::new();
+        world.insert_resource(document);
+        world.insert_resource(Selection::default());
+        world.init_resource::<Messages<OpenField>>();
+        world
     }
 
     // A solo is an inspection that ends with the selection that made it, so every path
@@ -662,6 +715,44 @@ mod tests {
         assert!(preview.data().iter().all(|value| *value == 0.25));
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
         assert_eq!(terrain, before, "a preview moved the document");
+    }
+
+    // Acceptance criterion seven: opening a field is a view change, so the field on
+    // screen moves while the history and the dirty flag stand still — otherwise
+    // following a `reads` link would make a document that has to be saved.
+    #[test]
+    fn opening_a_field_moves_the_view_without_making_an_edit() {
+        let mut world = open_field_world();
+        let before = world.resource::<Document>().history();
+        world.write_message(OpenField {
+            field: "base".to_owned(),
+            select: Some(node(4)),
+        });
+        world.run_system_once(apply_open_field).unwrap();
+
+        let document = world.resource::<Document>();
+        assert_eq!(document.active(), "base");
+        assert_eq!(document.history().undo, before.undo);
+        assert_eq!(document.history().redo, before.redo);
+        assert!(!document.is_dirty());
+        assert_eq!(world.resource::<Selection>().node, Some(node(4)));
+    }
+
+    // A name no field carries has to leave the view where it was and say so, because
+    // the panel and the canvas both write this message from names they read off a
+    // document that may have moved under them.
+    #[test]
+    fn opening_a_field_that_is_not_there_leaves_the_view_alone() {
+        let mut world = open_field_world();
+        world.write_message(OpenField {
+            field: "nowhere".to_owned(),
+            select: None,
+        });
+        world.run_system_once(apply_open_field).unwrap();
+
+        let document = world.resource::<Document>();
+        assert_eq!(document.active(), "height");
+        assert!(document.error().is_some(), "the refusal was not reported");
     }
 
     // A node the document does not carry has to answer with nothing rather than baking

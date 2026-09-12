@@ -27,7 +27,7 @@ use watershed::raster::Raster;
 use watershed::{FieldId, FieldRole};
 
 use crate::brush::{BrushSettings, target_of};
-use crate::canvas::Selection;
+use crate::canvas::{OpenField, Selection};
 use crate::document::{Baked, Document};
 use crate::edit::{
     BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, Slot, binary_name, brush_mode_name,
@@ -204,6 +204,11 @@ fn fingerprint(
     }
     key.push('|');
 
+    if let Some(terrain) = document.terrain() {
+        key.push_str(&crate::edit::readers_of(terrain, document.active()).join(","));
+    }
+    key.push('|');
+
     let Some(field) = field_of(document) else {
         return key + "empty";
     };
@@ -294,10 +299,17 @@ fn contents(
     // where a person looks for what the field is, and with nothing selected there is
     // nothing else the panel could be about.
     if selected.is_none_or(|node| field.graph.output == Some(node)) {
+        let reads = crate::edit::reads_of(field);
+        let read_by = document
+            .terrain()
+            .map(|terrain| crate::edit::readers_of(terrain, &active))
+            .unwrap_or_default();
         children.push(widgets::boxed(properties(
             &active,
             field,
             shift_is_pinned(document),
+            &reads,
+            &read_by,
         )));
     }
 
@@ -411,7 +423,45 @@ pub fn seed_field_name(
     }
 }
 
-fn properties(active: &str, field: &crate::terrain::Field, pinned: bool) -> impl Scene {
+fn field_links(caption: &str, names: &[String]) -> impl Scene {
+    let mut children: Vec<Box<dyn SceneList>> = vec![one(widgets::small(caption.to_owned()))];
+    if names.is_empty() {
+        children.push(one(widgets::small("none")));
+    }
+    for name in names {
+        let field = name.clone();
+        children.push(one(bsn! {
+            @FeathersButton {
+                @caption: bsn! { Text({name.clone()}) ThemedText },
+            }
+            on(move |_: On<Activate>, mut open: MessageWriter<OpenField>| {
+                open.write(OpenField {
+                    field: field.clone(),
+                    select: None,
+                });
+            })
+        }));
+    }
+    bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            flex_wrap: FlexWrap::Wrap,
+            column_gap: px(4),
+            row_gap: px(4),
+        }
+        Children [ {children} ]
+    }
+}
+
+fn properties(
+    active: &str,
+    field: &crate::terrain::Field,
+    pinned: bool,
+    reads: &[String],
+    read_by: &[String],
+) -> impl Scene {
     let active = active.to_owned();
     let role = field.role;
     let role_items: Vec<Box<dyn SceneList>> = FieldRole::ALL
@@ -471,6 +521,8 @@ fn properties(active: &str, field: &crate::terrain::Field, pinned: bool) -> impl
                 one(widgets::number(NumberBinding::ContourInterval)),
             ],
         )),
+        one(field_links("reads", reads)),
+        one(field_links("read by", read_by)),
     ])
 }
 
@@ -1203,6 +1255,31 @@ mod tests {
             &ShaderLibrary::default(),
             &selecting(document),
         )
+    }
+
+    // The `read by` row is derived from every *other* field's graph, so retargeting a
+    // reference elsewhere changes neither the field names nor any node of the field on
+    // screen. Without the readers in the key the row would keep naming the old reader
+    // with nothing left to correct it.
+    #[test]
+    fn retargeting_another_fields_reference_rebuilds_the_panel() {
+        let mut document = Document::default();
+        document.adopt(
+            TerrainSpec::new(UVec2::splat(64))
+                .with_field(crate::terrain::Field::new("height").with_op(NodeOp::Constant(0.5)))
+                .with_field(crate::terrain::Field::new("other").with_op(NodeOp::Constant(0.25)))
+                .with_field(
+                    crate::terrain::Field::new("reader")
+                        .with_op(NodeOp::FieldRef(FieldId::from("height"))),
+                ),
+        );
+        document.set_active("height").unwrap();
+        let before = key(&document);
+
+        let field = document.terrain_mut().unwrap().field_mut("reader").unwrap();
+        let node = field.graph.nodes[0].id;
+        field.graph.node_mut(node).unwrap().op = NodeOp::FieldRef(FieldId::from("other"));
+        assert_ne!(key(&document), before, "`read by` went stale");
     }
 
     // The rule the panel is built on, from the side that would break it quietly: a

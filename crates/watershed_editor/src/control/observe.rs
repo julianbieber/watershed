@@ -114,9 +114,17 @@ fn field(world: &World) -> Value {
         return json!({ "available": false });
     };
 
+    let reads = crate::edit::reads_of(field);
+    let read_by = crate::edit::readers_of(terrain, document.active());
+
     let baked = field.baked();
     if baked.is_empty() {
-        return json!({ "available": false, "reason": "not baked" });
+        return json!({
+            "available": false,
+            "reason": "not baked",
+            "reads": reads,
+            "read_by": read_by,
+        });
     }
 
     let mut values: Vec<f32> = baked
@@ -139,6 +147,8 @@ fn field(world: &World) -> Value {
         "median": at(0.50),
         "p90": at(0.90),
         "max": at(1.0),
+        "reads": reads,
+        "read_by": read_by,
     })
 }
 
@@ -352,4 +362,38 @@ fn shaders(world: &mut World) -> Value {
         "shaders": files,
         "stock": STOCK.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terrain::graph::NodeOp;
+    use crate::terrain::{Field, TerrainSpec};
+    use watershed::FieldId;
+
+    // Acceptance criterion five, which is the socket's half of the whole task: a caller
+    // driving the editor over the control port can read the dependency both ways round
+    // without walking every field's graph itself.
+    #[test]
+    fn observing_a_field_reports_both_ends_of_the_relation() {
+        let mut terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
+            .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
+        terrain.bake_in_place().expect("a bake");
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        document.set_active("height").unwrap();
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let height = field(&world);
+        assert_eq!(height["reads"], json!(["base"]));
+        assert_eq!(height["read_by"], json!([]));
+
+        world.resource_mut::<Document>().set_active("base").unwrap();
+        let base = field(&world);
+        assert_eq!(base["reads"], json!([]));
+        assert_eq!(base["read_by"], json!(["height"]));
+    }
 }

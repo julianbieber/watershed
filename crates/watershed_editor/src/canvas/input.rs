@@ -10,8 +10,8 @@ use bevy::text::EditableText;
 use bevy::window::PrimaryWindow;
 
 use super::{
-    CanvasCameraTag, CanvasFrame, Grab, MAX_SCALE, MIN_SCALE, NodeCard, NodePin, Selection,
-    ZOOM_PER_STEP, frame_whole_graph, open_graph,
+    CanvasCameraTag, CanvasFrame, Grab, MAX_SCALE, MIN_SCALE, NodeCard, NodePin, OpenField,
+    Selection, ZOOM_PER_STEP, frame_whole_graph, open_graph,
 };
 use crate::document::Document;
 use crate::edit::Edit;
@@ -25,6 +25,8 @@ use crate::ui::{pointer_over_ui, report, typing};
 /// slow drag is still a drag; and in viewport pixels rather than canvas units, so
 /// panning the camera under the pointer does not read as pointer movement.
 const CLICK_SLOP: f32 = 4.0;
+
+const DOUBLE_CLICK: f32 = 0.4;
 
 /// What the canvas holds between the frame a drag is finished on and the frame the
 /// edit it makes is applied.
@@ -98,10 +100,13 @@ pub fn canvas_drag(
     camera: Option<Single<(&Transform, &Projection), (With<CanvasCameraTag>, Without<NodeCard>)>>,
     mut cards: Query<(Entity, &NodeCard, &mut Transform), Without<CanvasCameraTag>>,
     pins: Query<(&NodePin, &GlobalTransform)>,
+    time: Res<Time>,
+    mut open: MessageWriter<OpenField>,
     mut grab: ResMut<Grab>,
     mut selection: ResMut<Selection>,
     mut finished: ResMut<Finished>,
     mut pressed_at: Local<Option<Vec2>>,
+    mut last_click: Local<Option<(f32, NodeId)>>,
 ) {
     let (Some(window), Some(camera)) = (window, camera) else {
         return;
@@ -131,6 +136,24 @@ pub fn canvas_drag(
             .map(|(entity, card, at)| (entity, card.node, at.translation.truncate()));
 
         *pressed_at = Some(cursor);
+        let now = time.elapsed_secs();
+        match on_card {
+            Some((_, node, _)) => {
+                let again = last_click
+                    .is_some_and(|(at, before)| before == node && now - at <= DOUBLE_CLICK);
+                match again.then(|| field_referenced(&document, node)).flatten() {
+                    Some(field) => {
+                        open.write(OpenField {
+                            field,
+                            select: None,
+                        });
+                        *last_click = None;
+                    }
+                    None => *last_click = Some((now, node)),
+                }
+            }
+            None => *last_click = None,
+        }
         *grab = match (on_pin, on_card) {
             (Some(pin), _) => {
                 selection.select(Some(pin.node));
@@ -238,6 +261,18 @@ fn connection(
         (Some(pin), None) => Some((landed.node, from_node, pin)),
         _ => None,
     }
+}
+
+fn field_referenced(document: &Document, node: NodeId) -> Option<String> {
+    let terrain = document.terrain()?;
+    let name = terrain
+        .field(document.active())?
+        .graph
+        .node(node)?
+        .op
+        .dependency()?;
+    terrain.field(name.as_str())?;
+    Some(name.to_string())
 }
 
 /// Ctrl+Z undoes the last change to the document and Ctrl+Shift+Z redoes it, unless a

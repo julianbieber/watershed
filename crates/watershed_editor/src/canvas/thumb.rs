@@ -1,5 +1,5 @@
-//! The picture on a node's card: what a node that holds a raster of its own is shown
-//! as, and what keeps that picture in step with the values the node last produced.
+//! The picture on a node's card: which nodes are drawn rather than left flat, what
+//! raster each is drawn from, and what keeps those pictures in step with the document.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
@@ -7,8 +7,9 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use watershed::raster::{Raster, Texel};
 
-use super::{CanvasShape, open_graph};
+use super::CanvasShape;
 use crate::document::Document;
+use crate::terrain::TerrainSpec;
 use crate::terrain::graph::{GraphNode, NodeId, NodeOp};
 
 const TEXELS: u32 = 64;
@@ -34,11 +35,13 @@ impl CardThumb {
     }
 }
 
-/// Redraws each card's picture from the node's own raster.
+/// Redraws each card's picture from the raster behind it.
 ///
-/// Only a node that holds a raster — a shader, a painted or an imported one — has a
-/// picture; every other op keeps the flat accent square, because drawing one would
-/// mean a preview bake of a whole field per card per edit.
+/// A node holding a raster of its own — a shader, a painted or an imported one — is
+/// drawn from that, and a reference is drawn from the bake of the field it names. Every
+/// other op keeps the flat accent square, because drawing one would mean a preview bake
+/// of a whole field per card per edit; a reference costs nothing extra, since the field
+/// it names is already baked.
 pub fn sync_thumbnails(
     document: Res<Document>,
     shape: Res<CanvasShape>,
@@ -48,11 +51,16 @@ pub fn sync_thumbnails(
     if !document.is_changed() && !shape.is_changed() {
         return;
     }
-    let Some(graph) = open_graph(&document) else {
+    let Some(terrain) = document.terrain() else {
+        return;
+    };
+    let Some(graph) = terrain.field(document.active()).map(|field| &field.graph) else {
         return;
     };
     for (mut thumb, mut sprite) in &mut thumbs {
-        let picture = graph.node(thumb.node).and_then(node_picture);
+        let picture = graph
+            .node(thumb.node)
+            .and_then(|node| node_picture(terrain, node));
         match picture {
             Some(bytes) => {
                 let mark = hash(&bytes);
@@ -75,11 +83,14 @@ pub fn sync_thumbnails(
     }
 }
 
-fn node_picture(node: &GraphNode) -> Option<Vec<u8>> {
+fn node_picture(terrain: &TerrainSpec, node: &GraphNode) -> Option<Vec<u8>> {
     match &node.op {
         NodeOp::Shader(shader) => picture(shader.values()),
         NodeOp::External(raster) => picture(raster),
         NodeOp::Paint(raster) => picture(raster),
+        NodeOp::FieldRef(id) => terrain
+            .field(id.as_str())
+            .and_then(|field| picture(field.baked())),
         _ => None,
     }
 }
@@ -148,6 +159,9 @@ fn hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::Field;
+    use crate::terrain::noise::{NoiseKind, NoiseSpec};
+    use watershed::FieldId;
 
     fn ramp(size: u32) -> Raster<f32> {
         let mut raster = Raster::new(UVec2::splat(size), 0.0);
@@ -201,11 +215,53 @@ mod tests {
         assert_ne!(row(&bytes, 0), row(&bytes, TEXELS - 1));
     }
 
+    fn two_field_terrain() -> TerrainSpec {
+        let mut terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(
+                Field::new("base")
+                    .with_range((0.0, 1.0))
+                    .with_op(NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.05))),
+            )
+            .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
+        terrain.bake_in_place().expect("a bake");
+        terrain
+    }
+
     // A node with no raster of its own keeps the flat accent square rather than
     // drawing a picture of nothing.
     #[test]
     fn an_op_with_no_raster_has_no_picture() {
+        let terrain = two_field_terrain();
         let node = GraphNode::new(NodeId(0), NodeOp::Constant(0.5), [0.0, 0.0]);
-        assert!(node_picture(&node).is_none());
+        assert!(node_picture(&terrain, &node).is_none());
+    }
+
+    // The first acceptance criterion: a reference card stops being a blank square and
+    // shows the field it names, drawn from that field's own bake — so an edit to the
+    // referenced field moves the thumbnail with it.
+    #[test]
+    fn a_reference_draws_the_baked_raster_of_the_field_it_names() {
+        let terrain = two_field_terrain();
+        let node = GraphNode::new(
+            NodeId(0),
+            NodeOp::FieldRef(FieldId::from("base")),
+            [0.0, 0.0],
+        );
+        let drawn = node_picture(&terrain, &node).expect("a picture of `base`");
+        let expected = picture(terrain.field("base").unwrap().baked()).expect("a picture");
+        assert_eq!(drawn, expected);
+    }
+
+    // A reference the document cannot resolve draws nothing rather than panicking or
+    // drawing whatever field happens to be first; the broken card is what says so.
+    #[test]
+    fn a_reference_to_a_field_that_is_not_there_has_no_picture() {
+        let terrain = two_field_terrain();
+        let node = GraphNode::new(
+            NodeId(0),
+            NodeOp::FieldRef(FieldId::from("nowhere")),
+            [0.0, 0.0],
+        );
+        assert!(node_picture(&terrain, &node).is_none());
     }
 }
