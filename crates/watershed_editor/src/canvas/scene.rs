@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use bevy::text::FontSize;
 
-use super::thumb::CardThumb;
+use super::thumb::{CardThumb, ThumbSource};
 use super::{
     CANVAS_LAYER, CARD, CanvasLabel, CanvasShape, DETAIL_SIZE, Grab, MARGIN, NodeCard, NodeEdge,
     NodePin, PARAM_SIZE, PIN_RADIUS, ROW_STEP, Selection, THUMB, TITLE_BAR, TITLE_SIZE, open_graph,
@@ -17,19 +17,24 @@ use crate::edit::{op_name, op_params};
 use crate::gpu::ShaderLibrary;
 use crate::terrain::graph::{FieldGraph, GraphNode, NodeId, NodeOp};
 
-const BODY: Color = Color::srgb(0.16, 0.17, 0.21);
+/// What a card's body is painted.
+pub(super) const BODY: Color = Color::srgb(0.16, 0.17, 0.21);
 const SOURCE: Color = Color::srgb(0.29, 0.42, 0.62);
 const OPERATOR: Color = Color::srgb(0.46, 0.35, 0.24);
 const OUTPUT: Color = Color::srgb(0.30, 0.55, 0.38);
 const SOLOED: Color = Color::srgb(0.72, 0.58, 0.22);
-const SELECTED: Color = Color::srgb(0.85, 0.87, 0.95);
-const WIRE: Color = Color::srgb(0.48, 0.64, 0.86);
+/// What the title bar of the card the panel is built for is painted.
+pub(super) const SELECTED: Color = Color::srgb(0.85, 0.87, 0.95);
+/// What an edge between two cards is painted.
+pub(super) const WIRE: Color = Color::srgb(0.48, 0.64, 0.86);
 const PIN: Color = Color::srgb(0.78, 0.81, 0.88);
 const BROKEN: Color = Color::srgb(0.72, 0.24, 0.24);
 const FAULT: Color = Color::srgb(1.0, 0.74, 0.72);
 
-const DETAIL: Color = Color::srgb(0.72, 0.76, 0.85);
-const PARAM: Color = Color::srgb(0.62, 0.66, 0.76);
+/// What a card's first text row is painted.
+pub(super) const DETAIL: Color = Color::srgb(0.72, 0.76, 0.85);
+/// What a card's second text row is painted.
+pub(super) const PARAM: Color = Color::srgb(0.62, 0.66, 0.76);
 
 const FAULT_SIZE: f32 = 11.0;
 const FAULT_CHARS: usize = 34;
@@ -262,19 +267,27 @@ fn params_line(node: &GraphNode, library: Option<&ShaderLibrary>) -> String {
     )
 }
 
-fn body_top() -> f32 {
+/// The top of a card's body, under its title bar, relative to the card's centre in
+/// canvas units.
+pub(super) fn body_top() -> f32 {
     CARD.y * 0.5 - TITLE_BAR
 }
 
-fn row_y(index: usize) -> f32 {
+/// Where a card's row `index` sits, relative to the card's centre in canvas units.
+/// Rows run downward from the top of the body; an index past the rows a card has is
+/// answered rather than refused, and lands below it.
+pub(super) fn row_y(index: usize) -> f32 {
     body_top() - 11.0 - ROW_STEP * index as f32
 }
 
-fn text_left() -> f32 {
+/// Where a card's text column starts, relative to the card's centre in canvas units:
+/// clear of the thumbnail to its left.
+pub(super) fn text_left() -> f32 {
     -CARD.x * 0.5 + MARGIN * 2.0 + THUMB
 }
 
-fn thumb_centre() -> Vec2 {
+/// Where a card's thumbnail sits, relative to the card's centre in canvas units.
+pub(super) fn thumb_centre() -> Vec2 {
     Vec2::new(
         -CARD.x * 0.5 + MARGIN + THUMB * 0.5,
         body_top() - 6.0 - THUMB * 0.5,
@@ -399,7 +412,7 @@ fn spawn_card(
             },
             Transform::from_translation(thumb_centre().extend(0.01)),
             RenderLayers::layer(CANVAS_LAYER),
-            CardThumb::new(node.id, blank),
+            CardThumb::new(ThumbSource::Node(node.id), blank),
         ));
         let row = |parent: &mut ChildSpawnerCommands,
                    index: usize,
@@ -503,6 +516,7 @@ fn spawn_card(
 /// nothing that only decides where they sit or what they are called.
 fn fingerprint(document: &Document) -> String {
     let mut key = String::new();
+    key.push_str("graph|");
     key.push_str(document.active());
     let Some(graph) = open_graph(document) else {
         key.push_str("|none");

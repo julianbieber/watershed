@@ -3,8 +3,11 @@
 
 mod edges;
 mod input;
+mod overview;
 mod scene;
 mod thumb;
+
+pub use overview::Overview;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Camera, ClearColorConfig, Viewport};
@@ -54,6 +57,7 @@ pub struct CanvasPlugin;
 impl Plugin for CanvasPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Selection>()
+            .init_resource::<Overview>()
             .init_resource::<Grab>()
             .init_resource::<CanvasFrame>()
             .init_resource::<CanvasShape>()
@@ -66,17 +70,21 @@ impl Plugin for CanvasPlugin {
                 (
                     apply_open_field,
                     input::undo_keys,
-                    scene::rebuild_canvas,
+                    scene::rebuild_canvas.run_if(not(overview_showing)),
+                    overview::rebuild_overview.run_if(overview_showing),
                     frame_graph,
-                    scene::sync_canvas,
+                    scene::sync_canvas.run_if(not(overview_showing)),
                     thumb::sync_thumbnails,
                     input::canvas_camera,
                     input::fit_key,
+                    overview::overview_key,
                     input::canvas_solo,
-                    input::canvas_drag,
+                    input::canvas_drag.run_if(not(overview_showing)),
+                    overview::overview_drag.run_if(overview_showing),
                     input::canvas_commit,
                     solo_preview,
                     edges::route_edges,
+                    overview::route_field_ribbons.run_if(overview_showing),
                     scale_canvas_labels,
                 )
                     .chain()
@@ -84,6 +92,20 @@ impl Plugin for CanvasPlugin {
             )
             .add_systems(PostUpdate, size_canvas_viewport.after(UiSystems::Layout));
     }
+}
+
+/// Whether the canvas is showing the document's fields rather than one field's graph.
+fn overview_showing(overview: Res<Overview>) -> bool {
+    overview.showing
+}
+
+/// Which of the two things the canvas draws is on screen.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CanvasView {
+    /// One field's node graph, by the field's name.
+    Graph(String),
+    /// The whole document, as one card per field.
+    Overview,
 }
 
 /// The camera the canvas is drawn through. Orthographic, and the only camera that
@@ -175,8 +197,9 @@ impl Selection {
 /// an edit — nothing is written to the terrain, no history entry is made, and no bake
 /// is started — so a field opened this way can be shut again by opening the first one.
 ///
-/// A name no field of the document carries is refused the way any other bad reference
-/// is, and the view stays where it was.
+/// Opening a field leaves the overview, because the field's graph is what was asked
+/// for. A name no field of the document carries is refused the way any other bad
+/// reference is, and the view stays where it was — overview and all.
 #[derive(Message)]
 pub struct OpenField {
     /// The field to open. Must be one the document carries.
@@ -190,11 +213,13 @@ fn apply_open_field(
     mut open: MessageReader<OpenField>,
     mut document: ResMut<Document>,
     mut selection: ResMut<Selection>,
+    mut overview: ResMut<Overview>,
 ) {
     for message in open.read() {
         let opened = document.set_active(&message.field);
         if opened.is_ok() {
             selection.select(message.select);
+            overview.showing = false;
         }
         crate::ui::report(&mut document, opened);
     }
@@ -300,9 +325,9 @@ pub struct Solo {
 pub struct CanvasShape {
     /// The shape the cards on screen were built from.
     pub key: String,
-    /// The field the camera was last framed for, so opening another field frames it
+    /// The view the camera was last framed for, so switching to another one frames it
     /// once rather than fighting a pan the person made afterwards.
-    pub framed: Option<String>,
+    pub framed: Option<CanvasView>,
 }
 
 fn spawn_canvas_camera(mut commands: Commands) {
@@ -393,52 +418,66 @@ fn solo_preview(
     });
 }
 
-/// Puts the whole of the open field's graph in view, once per field.
+/// Puts the whole of whatever the canvas is showing in view, once per view.
 ///
 /// Once, because after that the pan and the zoom are the person's: a frame on every
-/// edit would drag the view out from under someone adding a node at the far edge. The
-/// on-demand path is [`frame_whole_graph`], which the canvas's Fit button and the key F
-/// both take.
+/// edit would drag the view out from under someone adding a node at the far edge.
+/// Switching the overview on is another view, so it is framed once too. The on-demand
+/// path is [`frame_canvas`], which the canvas's Fit button and the key F both take.
 fn frame_graph(
     document: Res<Document>,
+    overview: Res<Overview>,
     frame: Res<CanvasFrame>,
     window: Option<Single<&Window, With<bevy::window::PrimaryWindow>>>,
     mut shape: ResMut<CanvasShape>,
     camera: Option<Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>>,
 ) {
-    let active = document.active().to_owned();
-    if shape.framed.as_deref() == Some(active.as_str()) {
+    let wanted = if overview.showing {
+        CanvasView::Overview
+    } else {
+        CanvasView::Graph(document.active().to_owned())
+    };
+    if shape.framed.as_ref() == Some(&wanted) {
         return;
     }
     let (Some(camera), Some(window)) = (camera, window) else {
         return;
     };
-    let Some(graph) = open_graph(&document) else {
-        return;
+    let empty = if overview.showing {
+        document.terrain().map(|terrain| terrain.fields.is_empty())
+    } else {
+        open_graph(&document).map(|graph| graph.nodes.is_empty())
     };
-    if graph.nodes.is_empty() {
-        shape.framed = Some(active);
-        return;
+    match empty {
+        None => return,
+        Some(true) => {
+            shape.framed = Some(wanted);
+            return;
+        }
+        Some(false) => {}
     }
     let (mut transform, mut projection) = camera.into_inner();
-    if frame_whole_graph(
+    if frame_canvas(
         &document,
+        &overview,
         &frame,
         window.into_inner(),
         &mut transform,
         &mut projection,
     ) {
-        shape.framed = Some(active);
+        shape.framed = Some(wanted);
     }
 }
 
-/// Puts the whole of the open field's graph in view on the canvas camera.
+/// Puts the whole of whatever the canvas is showing in view on the canvas camera.
 ///
-/// What the canvas's Fit button and the key F both do. Answers whether the camera was
-/// moved: `false` when the document carries no graph for the open field, when that
-/// graph has no nodes, and when the canvas has not been measured yet.
-pub fn frame_whole_graph(
+/// What the canvas's Fit button and the key F both do, for the open field's graph and
+/// for the document's fields alike. Answers whether the camera was moved: `false` when
+/// there is no document, when the view has nothing in it to frame, and when the canvas
+/// has not been measured yet.
+pub fn frame_canvas(
     document: &Document,
+    overview: &Overview,
     frame: &CanvasFrame,
     window: &Window,
     transform: &mut Transform,
@@ -448,13 +487,18 @@ pub fn frame_whole_graph(
     if !scale_factor.is_finite() || scale_factor <= 0.0 {
         return false;
     }
-    let Some(graph) = open_graph(document) else {
-        return false;
-    };
     let Projection::Orthographic(ortho) = projection else {
         return false;
     };
-    let Some((centre, scale)) = graph_fit(graph, frame.size / scale_factor) else {
+    let viewport = frame.size / scale_factor;
+    let fitted = if overview.showing {
+        document
+            .terrain()
+            .and_then(|terrain| overview::overview_fit(terrain, viewport))
+    } else {
+        open_graph(document).and_then(|graph| graph_fit(graph, viewport))
+    };
+    let Some((centre, scale)) = fitted else {
         return false;
     };
     ortho.scale = scale;
@@ -592,6 +636,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(document);
         world.insert_resource(Selection::default());
+        world.insert_resource(Overview { showing: true });
         world.init_resource::<Messages<OpenField>>();
         world
     }
@@ -717,9 +762,10 @@ mod tests {
         assert_eq!(terrain, before, "a preview moved the document");
     }
 
-    // Acceptance criterion seven: opening a field is a view change, so the field on
-    // screen moves while the history and the dirty flag stand still — otherwise
-    // following a `reads` link would make a document that has to be saved.
+    // Opening a field is a view change, so the field on screen moves while the history
+    // and the dirty flag stand still — otherwise following a `reads` link would make a
+    // document that has to be saved. It also leaves the overview, which is what makes
+    // the canvas bar's toggle read as off after a double-click on a card.
     #[test]
     fn opening_a_field_moves_the_view_without_making_an_edit() {
         let mut world = open_field_world();
@@ -736,6 +782,7 @@ mod tests {
         assert_eq!(document.history().redo, before.redo);
         assert!(!document.is_dirty());
         assert_eq!(world.resource::<Selection>().node, Some(node(4)));
+        assert!(!world.resource::<Overview>().showing);
     }
 
     // A name no field carries has to leave the view where it was and say so, because
@@ -753,6 +800,10 @@ mod tests {
         let document = world.resource::<Document>();
         assert_eq!(document.active(), "height");
         assert!(document.error().is_some(), "the refusal was not reported");
+        assert!(
+            world.resource::<Overview>().showing,
+            "a refusal moved the view"
+        );
     }
 
     // A node the document does not carry has to answer with nothing rather than baking

@@ -1,0 +1,43 @@
+# Read the document as one graph of fields rather than as a list of what is in the
+# file: which fields there are, what each reads, and the order the bake visits them in
+# — from `observe fields`, which is the socket's half of the canvas overview the
+# toolbar's `fields` switch and the key O put on screen.
+#
+# Run with:  just drive run scenarios/the_document_is_one_graph_of_fields.txt
+#
+# The cycle case is not in this file: replay stops at the first failure, and a cycle
+# cannot be built through the editor's own guard, so it is pinned by the unit tests in
+# `overview.rs` and `observe.rs` the way the other scenarios leave their refusals there.
+
+observe log
+
+fixed-delta 1/60
+
+# `regions` builds `moisture`, `base`, `relief` and `height`, with `height` reading
+# both `base` and `relief`. The order is the bake's: the two it reads come before it,
+# and `moisture`, which is at neither end of the relation, reads nothing.
+new 256 256 1 regions
+wait bake
+observe fields
+
+# A field added from outside the process joins the list without anything being
+# switched off and on — the overview is keyed on the fields, not on when it was drawn.
+# It comes in reading nothing, so it has no ribbon.
+field add temperature
+observe fields
+
+# And a reference added to a graph moves the relation: `moisture` now reads `base`.
+# The bake order does not move, because a reference node wired into nothing feeds no
+# output and so constrains nothing about when the field is baked — which is exactly the
+# case the overview's layout has to place from what is read rather than from the order.
+node add moisture fieldref base
+wait bake
+observe fields
+
+# Taking the reference back takes the edge with it, which is what makes the overview a
+# view of the document rather than a picture of it taken once.
+undo
+wait bake
+observe fields
+
+observe log

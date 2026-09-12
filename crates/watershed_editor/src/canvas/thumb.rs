@@ -14,21 +14,33 @@ use crate::terrain::graph::{GraphNode, NodeId, NodeOp};
 
 const TEXELS: u32 = 64;
 
-/// The square on a card that shows what the node produced.
+/// Which raster a card's picture is drawn from.
+///
+/// The two kinds of card the canvas draws: a node of the open field's graph, drawn
+/// from whatever that node produced, and a field of the document, drawn from that
+/// field's own bake.
+pub enum ThumbSource {
+    /// A node of the open field's graph.
+    Node(NodeId),
+    /// A field of the document, by name.
+    Field(String),
+}
+
+/// The square on a card that shows what the card stands for.
 #[derive(Component)]
 pub struct CardThumb {
-    /// The node the picture is read from.
-    pub node: NodeId,
+    /// What the picture is read from.
+    pub source: ThumbSource,
     blank: Color,
     drawn: Option<u64>,
 }
 
 impl CardThumb {
-    /// A thumbnail for `node`, showing `blank` until the node has a raster to draw
-    /// and again if it loses it.
-    pub fn new(node: NodeId, blank: Color) -> Self {
+    /// A thumbnail for `source`, showing `blank` until there is a raster to draw and
+    /// again if it loses one.
+    pub fn new(source: ThumbSource, blank: Color) -> Self {
         Self {
-            node,
+            source,
             blank,
             drawn: None,
         }
@@ -41,7 +53,8 @@ impl CardThumb {
 /// drawn from that, and a reference is drawn from the bake of the field it names. Every
 /// other op keeps the flat accent square, because drawing one would mean a preview bake
 /// of a whole field per card per edit; a reference costs nothing extra, since the field
-/// it names is already baked.
+/// it names is already baked. A field card is drawn from that field's own bake, and so
+/// keeps the flat square until the field has been baked once.
 pub fn sync_thumbnails(
     document: Res<Document>,
     shape: Res<CanvasShape>,
@@ -54,13 +67,8 @@ pub fn sync_thumbnails(
     let Some(terrain) = document.terrain() else {
         return;
     };
-    let Some(graph) = terrain.field(document.active()).map(|field| &field.graph) else {
-        return;
-    };
     for (mut thumb, mut sprite) in &mut thumbs {
-        let picture = graph
-            .node(thumb.node)
-            .and_then(|node| node_picture(terrain, node));
+        let picture = source_picture(terrain, document.active(), &thumb.source);
         match picture {
             Some(bytes) => {
                 let mark = hash(&bytes);
@@ -80,6 +88,16 @@ pub fn sync_thumbnails(
                 thumb.drawn = None;
             }
         }
+    }
+}
+
+fn source_picture(terrain: &TerrainSpec, active: &str, source: &ThumbSource) -> Option<Vec<u8>> {
+    match source {
+        ThumbSource::Node(id) => terrain
+            .field(active)
+            .and_then(|field| field.graph.node(*id))
+            .and_then(|node| node_picture(terrain, node)),
+        ThumbSource::Field(name) => terrain.field(name).and_then(|field| picture(field.baked())),
     }
 }
 
@@ -250,6 +268,27 @@ mod tests {
         let drawn = node_picture(&terrain, &node).expect("a picture of `base`");
         let expected = picture(terrain.field("base").unwrap().baked()).expect("a picture");
         assert_eq!(drawn, expected);
+    }
+
+    // Acceptance criterion two's half that is a picture: a field's card is drawn from
+    // that field's own bake, which is the same raster the map shows when the field is
+    // opened.
+    #[test]
+    fn a_field_source_draws_that_fields_baked_raster() {
+        let terrain = two_field_terrain();
+        let drawn = source_picture(&terrain, "height", &ThumbSource::Field("base".to_owned()))
+            .expect("a picture of `base`");
+        let expected = picture(terrain.field("base").unwrap().baked()).expect("a picture");
+        assert_eq!(drawn, expected);
+        assert!(
+            source_picture(
+                &terrain,
+                "height",
+                &ThumbSource::Field("nowhere".to_owned())
+            )
+            .is_none(),
+            "a field the document does not carry drew something"
+        );
     }
 
     // A reference the document cannot resolve draws nothing rather than panicking or

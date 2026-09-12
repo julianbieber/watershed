@@ -11,7 +11,7 @@ use bevy::window::PrimaryWindow;
 
 use super::{
     CanvasCameraTag, CanvasFrame, Grab, MAX_SCALE, MIN_SCALE, NodeCard, NodePin, OpenField,
-    Selection, ZOOM_PER_STEP, frame_whole_graph, open_graph,
+    Overview, Selection, ZOOM_PER_STEP, frame_canvas, open_graph,
 };
 use crate::document::Document;
 use crate::edit::Edit;
@@ -26,7 +26,9 @@ use crate::ui::{pointer_over_ui, report, typing};
 /// panning the camera under the pointer does not read as pointer movement.
 const CLICK_SLOP: f32 = 4.0;
 
-const DOUBLE_CLICK: f32 = 0.4;
+/// How long after a click a second one on the same card still reads as a double-click,
+/// in seconds.
+pub(super) const DOUBLE_CLICK: f32 = 0.4;
 
 /// What the canvas holds between the frame a drag is finished on and the frame the
 /// edit it makes is applied.
@@ -305,7 +307,8 @@ pub fn undo_keys(
     report(&mut document, result);
 }
 
-/// F frames the whole of the open field's graph, unless a text field has the keyboard.
+/// F frames the whole of whichever view the canvas is showing, unless a text field has
+/// the keyboard.
 ///
 /// Reads the logical key rather than the physical position, so the key printed F fits
 /// on every layout. Does nothing while anything is held: `canvas_drag` recomputes a
@@ -317,6 +320,7 @@ pub fn fit_key(
     fields: Query<(), With<EditableText>>,
     grab: Res<Grab>,
     document: Res<Document>,
+    overview: Res<Overview>,
     frame: Res<CanvasFrame>,
     window: Option<Single<&Window, With<PrimaryWindow>>>,
     camera: Option<Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>>,
@@ -334,8 +338,9 @@ pub fn fit_key(
         return;
     };
     let (mut transform, mut projection) = camera.into_inner();
-    frame_whole_graph(
+    frame_canvas(
         &document,
+        &overview,
         &frame,
         window.into_inner(),
         &mut transform,
@@ -360,7 +365,7 @@ pub fn canvas_commit(mut document: ResMut<Document>, mut finished: ResMut<Finish
 ///
 /// `None` when the pointer is outside the canvas — over the map or over the panel —
 /// which is what keeps a drag on one from reaching the other.
-fn canvas_cursor(window: &Window, frame: &CanvasFrame, cursor: Vec2) -> Option<Vec2> {
+pub(super) fn canvas_cursor(window: &Window, frame: &CanvasFrame, cursor: Vec2) -> Option<Vec2> {
     let scale = window.scale_factor();
     if !scale.is_finite() || scale <= 0.0 {
         return None;
