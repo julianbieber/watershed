@@ -29,7 +29,8 @@ use crate::canvas::Selection;
 use crate::document::{Baked, Document};
 use crate::edit::{
     BINARIES, BRUSH_MODES, Edit, NOISE_KINDS, SLOPE_MODES, Slot, binary_name, brush_mode_name,
-    noise_kind_name, op_name, op_summary, parse_region_output, region_output_name, slope_mode_name,
+    node_path, noise_kind_name, op_name, op_summary, parse_region_output, region_output_name,
+    slope_mode_name,
 };
 use crate::gpu::{STOCK, ShaderLibrary, shader_reference};
 use crate::terrain::graph::{Binary, Curve, GraphNode, NodeId, NodeOp};
@@ -673,14 +674,21 @@ fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary)
         }
 
         NodeOp::FieldRef(read) => {
+            let current = read.clone();
             rows.push(one(widgets::captioned(
                 "of",
                 one(field_menu(read, names, move |document, chosen| {
-                    with_op(document, id, move |op| {
-                        if let NodeOp::FieldRef(held) = op {
-                            *held = chosen;
-                        }
-                    });
+                    if chosen == current {
+                        return;
+                    }
+                    let active = document.active().to_owned();
+                    let result = document
+                        .apply(&Edit::Set {
+                            path: format!("{active}.{}.field", node_path(id)),
+                            words: vec![chosen.to_string()],
+                        })
+                        .map(|_| ());
+                    report(document, result);
                 })),
             )));
         }
