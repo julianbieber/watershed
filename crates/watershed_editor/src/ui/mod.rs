@@ -6,7 +6,7 @@
 //! window can do can be driven from outside the process. The rule runs that way round:
 //! a new action is written where both can reach it, and then given a button.
 
-use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton, FeathersToggleSwitch};
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
 use bevy::input_focus::InputFocus;
@@ -15,11 +15,12 @@ use bevy::picking::Pickable;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::text::EditableText;
+use bevy::ui::Checked;
 use bevy::ui::UiSystems;
-use bevy::ui_widgets::Activate;
+use bevy::ui_widgets::{Activate, ValueChange};
 use bevy::window::PrimaryWindow;
 
-use crate::canvas::{CanvasCameraTag, CanvasFrame, CanvasViewport, frame_whole_graph};
+use crate::canvas::{CanvasCameraTag, CanvasFrame, CanvasViewport, Overview, frame_canvas};
 use crate::document::Document;
 use crate::preset::Preset;
 use crate::terrain::graph::NodeId;
@@ -62,6 +63,7 @@ impl Plugin for UiPlugin {
                     dialog::sync,
                     legend::sync,
                     log::sync,
+                    sync_overview_toggle,
                     scroll::send,
                 ),
             )
@@ -248,12 +250,14 @@ fn canvas_bar() -> impl Scene {
                 }
                 on(|_: On<Activate>,
                     document: Res<Document>,
+                    overview: Res<Overview>,
                     frame: Res<CanvasFrame>,
                     window: Single<&Window, With<PrimaryWindow>>,
                     camera: Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>| {
                     let (mut transform, mut projection) = camera.into_inner();
-                    frame_whole_graph(
+                    frame_canvas(
                         &document,
+                        &overview,
                         &frame,
                         *window,
                         &mut transform,
@@ -261,7 +265,40 @@ fn canvas_bar() -> impl Scene {
                     );
                 })
             ),
+            (
+                @FeathersToggleSwitch
+                OverviewToggle
+                on(|change: On<ValueChange<bool>>, mut overview: ResMut<Overview>| {
+                    overview.showing = change.value;
+                })
+            ),
+            widgets::small("fields"),
         ]
+    }
+}
+
+/// The canvas bar's switch between the open field's graph and the document's fields.
+#[derive(Component, Default, Clone)]
+pub struct OverviewToggle;
+
+/// Writes the overview's state onto the switch that reads it.
+///
+/// `Checked` is state the widget is given rather than state it holds, so nothing else
+/// that switches the overview — the key `O`, a double-click on a card — would move the
+/// switch without this.
+fn sync_overview_toggle(
+    overview: Res<Overview>,
+    toggle: Option<Single<(Entity, Has<Checked>), With<OverviewToggle>>>,
+    mut commands: Commands,
+) {
+    let Some(toggle) = toggle else {
+        return;
+    };
+    let (entity, checked) = *toggle;
+    if overview.showing && !checked {
+        commands.entity(entity).insert(Checked);
+    } else if !overview.showing && checked {
+        commands.entity(entity).remove::<Checked>();
     }
 }
 

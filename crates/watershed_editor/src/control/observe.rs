@@ -44,6 +44,9 @@ pub(super) enum Topic {
     /// The shaders the document carries, what each declares, and why one did not
     /// parse.
     Shaders,
+    /// Every field of the document in bake order, what each one reads, and the cycle
+    /// that stopped the order from being computed.
+    Fields,
 }
 
 impl Topic {
@@ -58,6 +61,7 @@ impl Topic {
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
             "shaders" => Ok(Self::Shaders),
+            "fields" => Ok(Self::Fields),
             other => Err(format!("nothing to observe called {other}")),
         }
     }
@@ -76,6 +80,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::View => view(world),
         Topic::Log => log(world),
         Topic::Shaders => shaders(world),
+        Topic::Fields => fields(world),
     }
 }
 
@@ -201,6 +206,57 @@ fn nodes(world: &World) -> Value {
         .collect();
 
     json!({ "available": true, "active": document.active(), "fields": fields })
+}
+
+/// Every field, in the order the bake visits them, with what each one reads.
+///
+/// The order is named rather than assumed: a document whose fields cannot be ordered
+/// is answered in declaration order with the cycle spelled out, which is the same
+/// thing the overview's cards and its status line say.
+fn fields(world: &World) -> Value {
+    let document = world.resource::<Document>();
+    let Some(terrain) = document.terrain() else {
+        return json!({ "available": false });
+    };
+    let (names, order, cycle) = match terrain.bake_order() {
+        Ok(order) => (
+            order
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<String>>(),
+            "bake",
+            Value::Null,
+        ),
+        Err(error) => (
+            terrain
+                .fields
+                .iter()
+                .map(|field| field.id.to_string())
+                .collect(),
+            "declaration",
+            json!(error.to_string()),
+        ),
+    };
+    let fields: Vec<Value> = names
+        .iter()
+        .filter_map(|name| terrain.field(name))
+        .map(|field| {
+            json!({
+                "name": field.id.to_string(),
+                "role": field.role.as_str(),
+                "shift": field.shift,
+                "reads": crate::edit::reads_of(field),
+            })
+        })
+        .collect();
+
+    json!({
+        "available": true,
+        "active": document.active(),
+        "order": order,
+        "cycle": cycle,
+        "fields": fields,
+    })
 }
 
 fn brush(world: &World) -> Value {
@@ -395,5 +451,54 @@ mod tests {
         let base = field(&world);
         assert_eq!(base["reads"], json!([]));
         assert_eq!(base["read_by"], json!(["height"]));
+    }
+
+    // Acceptance criterion seven: the whole document's shape over the socket, in the
+    // order the bake visits the fields in, so a caller sees the same picture the
+    // overview draws without walking every graph itself.
+    #[test]
+    fn observing_the_fields_reports_them_in_bake_order_with_what_each_reads() {
+        let terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))))
+            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)));
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let answer = fields(&world);
+        assert_eq!(answer["order"], json!("bake"));
+        assert_eq!(answer["cycle"], Value::Null);
+        let listed = answer["fields"].as_array().expect("an array of fields");
+        assert_eq!(listed[0]["name"], json!("base"));
+        assert_eq!(listed[0]["reads"], json!([]));
+        assert_eq!(listed[0]["role"], json!("custom"));
+        assert_eq!(listed[0]["shift"], json!(0));
+        assert_eq!(listed[1]["name"], json!("height"));
+        assert_eq!(listed[1]["reads"], json!(["base"]));
+    }
+
+    // Acceptance criterion eight, read from the socket rather than from the status bar:
+    // a document whose fields cannot be ordered still reports every one of them, says
+    // the order is the declared one, and names the cycle.
+    #[test]
+    fn observing_the_fields_of_a_cyclic_document_names_the_cycle() {
+        let terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("here").with_op(NodeOp::FieldRef(FieldId::from("there"))))
+            .with_field(Field::new("there").with_op(NodeOp::FieldRef(FieldId::from("here"))));
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let answer = fields(&world);
+        assert_eq!(answer["order"], json!("declaration"));
+        let cycle = answer["cycle"].as_str().expect("the cycle, as text");
+        assert!(cycle.contains("cycle"), "{cycle:?} does not name the cycle");
+        let listed = answer["fields"].as_array().expect("an array of fields");
+        assert_eq!(listed[0]["name"], json!("here"));
+        assert_eq!(listed[1]["name"], json!("there"));
     }
 }

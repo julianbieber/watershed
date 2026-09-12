@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use super::{CanvasCameraTag, NodeCard, NodeEdge, input_offset, output_offset};
 
 /// How thick an edge is on screen, in pixels, at every zoom.
-const EDGE_PIXELS: f32 = 3.0;
+pub(super) const EDGE_PIXELS: f32 = 3.0;
 /// How many points the curve is sampled at before it is made into a ribbon.
 const EDGE_SAMPLES: usize = 48;
 /// The least an edge's control points are pushed out along x, so two edges into one
@@ -50,9 +50,18 @@ pub fn route_edges(
         let start = from_at.translation.truncate() + output_offset(from);
         let end = to_at.translation.truncate() + input_offset(to, edge.pin);
         if let Some(mut mesh) = meshes.get_mut(&handle.0) {
-            *mesh = ribbon(&curve(start, end), half_width);
+            *mesh = ribbon_between(start, end, half_width);
         }
     }
+}
+
+/// The mesh an edge between two canvas points is drawn as, `half_width` canvas units
+/// either side of the curve joining them.
+///
+/// The one shape an edge has, whether it joins two pins of a node graph or two field
+/// cards of the overview.
+pub(super) fn ribbon_between(start: Vec2, end: Vec2, half_width: f32) -> Mesh {
+    ribbon(&curve(start, end), half_width)
 }
 
 /// A cubic bezier from an output pin to an input pin, sampled.
