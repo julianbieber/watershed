@@ -131,7 +131,8 @@ impl Default for AddLayer {
     }
 }
 
-/// The name the panel's "Add field" button will give a new field, as typed.
+/// The name typed into the panel's field box: what "Add field" will call a new field,
+/// and what "Rename" will call the field on screen.
 ///
 /// Held across frames because typing a name and pressing the button are two separate
 /// acts, and because the panel is rebuilt whenever the document changes shape — a name

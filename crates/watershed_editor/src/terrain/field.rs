@@ -18,8 +18,11 @@ use crate::terrain::regions::RegionOutput;
 /// bake state are not equal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
-    /// The name this field is referenced by. Changing it does not rewrite the
-    /// graphs of other fields that reference the old name.
+    /// The name this field is referenced by. Assigning it does not rewrite the
+    /// graphs of other fields that reference the old name, nor the water spec that
+    /// names it; renaming a field in a document is
+    /// [`Edit::RenameField`](crate::edit::Edit::RenameField), which rewrites both in
+    /// one change.
     pub id: FieldId,
     /// What the bake may do with the field. See [`FieldRole`] for the constraints
     /// a document carrying this has to satisfy.

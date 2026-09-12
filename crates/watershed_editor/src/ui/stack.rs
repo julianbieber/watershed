@@ -321,43 +321,81 @@ fn contents(
     }
 
     children.push(widgets::boxed(add_row(&active, &names, add)));
-    children.push(widgets::boxed(field_row()));
+    children.push(widgets::boxed(field_row(&active)));
     children
 }
 
-fn field_row() -> impl Scene {
-    widgets::row(vec![
-        one(bsn! {
-            @FeathersTextInputContainer
-            Node { width: px(120) }
-            Children [
-                (
-                    @FeathersTextInput
-                    NewFieldInput
-                    on(|change: On<TextEditChange>,
-                        texts: Query<&EditableText>,
-                        mut name: ResMut<NewField>| {
-                        if let Ok(text) = texts.get(change.event_target()) {
-                            name.0 = text.value().to_string();
-                        }
-                    })
-                )
-            ]
-        }),
-        one(bsn! {
-            @FeathersButton {
-                @caption: bsn! { Text("Add field") ThemedText },
-            }
-            on(|_: On<Activate>, mut document: ResMut<Document>, mut name: ResMut<NewField>| {
-                let result = document
-                    .apply(&Edit::AddField { name: name.0.clone() })
-                    .map(|_| ());
-                if result.is_ok() {
-                    name.0.clear();
+fn field_row(active: &str) -> impl Scene {
+    let rename_from = active.to_owned();
+    let remove = active.to_owned();
+    widgets::column(vec![
+        one(widgets::row(vec![
+            one(bsn! {
+                @FeathersTextInputContainer
+                Node { width: px(120) }
+                Children [
+                    (
+                        @FeathersTextInput
+                        NewFieldInput
+                        on(|change: On<TextEditChange>,
+                            texts: Query<&EditableText>,
+                            mut name: ResMut<NewField>| {
+                            if let Ok(text) = texts.get(change.event_target()) {
+                                name.0 = text.value().to_string();
+                            }
+                        })
+                    )
+                ]
+            }),
+            one(bsn! {
+                @FeathersButton {
+                    @caption: bsn! { Text("Add field") ThemedText },
                 }
-                report(&mut document, result);
-            })
-        }),
+                on(|_: On<Activate>, mut document: ResMut<Document>, mut name: ResMut<NewField>| {
+                    let result = document
+                        .apply(&Edit::AddField { name: name.0.clone() })
+                        .map(|_| ());
+                    if result.is_ok() {
+                        name.0.clear();
+                    }
+                    report(&mut document, result);
+                })
+            }),
+        ])),
+        one(widgets::row(vec![
+            one(bsn! {
+                @FeathersButton {
+                    @caption: bsn! { Text("Rename") ThemedText },
+                }
+                on(move |_: On<Activate>,
+                    mut document: ResMut<Document>,
+                    mut name: ResMut<NewField>| {
+                    let result = document
+                        .apply(&Edit::RenameField {
+                            from: rename_from.clone(),
+                            to: name.0.clone(),
+                        })
+                        .map(|_| ());
+                    if result.is_ok() {
+                        name.0.clear();
+                    }
+                    report(&mut document, result);
+                })
+            }),
+            one(bsn! {
+                @FeathersButton {
+                    @caption: bsn! { Text("Remove field") ThemedText },
+                }
+                on(move |_: On<Activate>, mut document: ResMut<Document>| {
+                    let result = document
+                        .apply(&Edit::RemoveField {
+                            name: remove.clone(),
+                        })
+                        .map(|_| ());
+                    report(&mut document, result);
+                })
+            }),
+        ])),
     ])
 }
 

@@ -1,0 +1,83 @@
+# Rename a field and take one out from outside the process, and watch what named them
+# follow: the references that read the renamed field, the water spec that solves over
+# it, and the field list a removal leaves behind — from `observe nodes`, `observe water`
+# and `observe document` rather than from a person clicking Rename and looking.
+#
+# Run with:  just drive run scenarios/a_field_is_renamed_and_removed.txt
+#
+# The refusals the task also names — a name already taken, a blank name, removing a
+# field something reads, removing one the water spec names — are not in this file:
+# replay stops at the first failure, so they are pinned by the unit tests in `edit.rs`
+# instead, the way `a_field_is_added_from_the_socket.txt` leaves its two refusals there.
+
+observe log
+
+fixed-delta 1/60
+
+# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` from two
+# separate reference nodes — which is what makes the rewrite below worth watching.
+new 256 256 7 ridges
+wait bake
+zoom fit
+
+# The "before": three fields, and a water spec over `height` and `moisture`.
+observe document
+observe water
+
+# The quantiles the rename must not move. `height` is what reads the field about to be
+# renamed, so it is the field that would go wrong if a reference were left behind.
+field height
+observe field
+
+# The rename itself. Both of `height`'s reference nodes now say `fieldref continent`,
+# and the field bakes to the numbers it did before, because only the name changed.
+field rename base continent
+wait bake
+observe nodes
+field height
+observe field
+observe document
+
+# One undo step, not one per reference: `base` comes back and both references say
+# `fieldref base` again.
+undo
+wait bake
+observe nodes
+
+# And the redo puts the new name back on both.
+redo
+wait bake
+observe nodes
+
+# A rename of the field the water spec solves over. The spec follows the name, so the
+# solve still has a field to read.
+field rename height elevation
+wait bake
+observe water
+solve-water
+observe water
+field elevation
+observe field
+
+# With the water gone, nothing names `moisture` any more and it can be taken out.
+reset-water
+field rm moisture
+observe document
+
+# One undo step for the removal too: the field comes back with the graph it had.
+undo
+wait bake
+observe document
+redo
+wait bake
+observe document
+
+# A round trip through the terrain directory. The new name and the references rewritten
+# with it are what was written, so they are what comes back.
+save /tmp/watershed-scenario/renamed-field
+load /tmp/watershed-scenario/renamed-field
+observe document
+observe nodes
+
+# And again at the end, for anything the saving and loading provoked.
+observe log
