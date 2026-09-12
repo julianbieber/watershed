@@ -63,6 +63,8 @@ impl Plugin for CanvasPlugin {
             .init_resource::<CanvasShape>()
             .init_resource::<Solo>()
             .init_resource::<input::Finished>()
+            .init_resource::<overview::Wired>()
+            .init_resource::<overview::WiredStep>()
             .add_message::<OpenField>()
             .add_systems(Startup, spawn_canvas_camera)
             .add_systems(
@@ -70,6 +72,7 @@ impl Plugin for CanvasPlugin {
                 (
                     apply_open_field,
                     input::undo_keys,
+                    overview::overview_after_undo,
                     scene::rebuild_canvas.run_if(not(overview_showing)),
                     overview::rebuild_overview.run_if(overview_showing),
                     frame_graph,
@@ -82,6 +85,7 @@ impl Plugin for CanvasPlugin {
                     input::canvas_drag.run_if(not(overview_showing)),
                     overview::overview_drag.run_if(overview_showing),
                     input::canvas_commit,
+                    overview::commit_field_wire,
                     solo_preview,
                     edges::route_edges,
                     overview::route_field_ribbons.run_if(overview_showing),
@@ -227,9 +231,9 @@ fn apply_open_field(
 
 /// What the pointer is currently doing on the canvas.
 ///
-/// An enum rather than a set of flags because dragging a card, dragging a wire and
-/// panning are three things the pointer cannot be doing at once, and a shape that
-/// admitted all three would need a rule for what to do when it held them.
+/// An enum rather than a set of flags because dragging a card, dragging a wire, wiring
+/// two fields together and panning are four things the pointer cannot be doing at once,
+/// and a shape that admitted several would need a rule for what to do when it held them.
 #[derive(Resource, Default)]
 pub enum Grab {
     /// Nothing is held.
@@ -256,6 +260,11 @@ pub enum Grab {
         node: NodeId,
         /// Which pin it left, so releasing over another can tell which end is which.
         pin: Option<usize>,
+    },
+    /// A dependency is being dragged from one field's card to another's.
+    FieldWire {
+        /// The field the drag left, which the reference it makes will read.
+        from: String,
     },
     /// The canvas is being panned. The anchor is the canvas point held under the
     /// cursor.
