@@ -19,6 +19,7 @@ use crate::brush::{BrushSettings, apply_stroke};
 use crate::document::Document;
 use crate::edit::{BrushChange, Edit, brush_summary, parse_op};
 use crate::preset::Preset;
+use crate::ui::report;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
 
 const DEFAULT_WAIT_FRAMES: u32 = 36_000;
@@ -71,6 +72,8 @@ pub(super) enum Command {
     /// effect has happened, and for an edit the effect is the bake rather than the
     /// changed number. A stack that no longer bakes — a cycle a toggle uncovered —
     /// reports that error here rather than answering with a success nothing followed.
+    /// A refused edit also reaches the status bar and the log panel, so a person at the
+    /// editor sees why a command driven from elsewhere changed nothing.
     Edit {
         /// The change to make.
         edit: Edit,
@@ -401,7 +404,10 @@ impl Command {
                     let mut document = world.resource_mut::<Document>();
                     match document.apply(edit) {
                         Ok(value) => *applied = Some(value),
-                        Err(error) => return Poll::Failed(error),
+                        Err(error) => {
+                            report(&mut document, Err(error.clone()));
+                            return Poll::Failed(error);
+                        }
                     }
                     return Poll::Running;
                 }

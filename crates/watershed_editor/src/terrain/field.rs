@@ -284,6 +284,21 @@ impl Field {
     pub fn dependencies(&self) -> impl Iterator<Item = &FieldId> {
         self.graph.dependencies().into_iter()
     }
+
+    /// Every field this one's graph names in a `FieldRef`, whether or not the node is
+    /// wired to anything, with duplicates kept.
+    ///
+    /// Wider than [`Field::dependencies`], which reports only what the output reaches:
+    /// an unconnected reference reads nothing yet, but it is a declared read, and the
+    /// editor refuses one that could not be wired up later. A bypassed node is left out
+    /// of both, because bypass is how a reference is turned off.
+    pub fn declared_reads(&self) -> impl Iterator<Item = &FieldId> {
+        self.graph
+            .nodes
+            .iter()
+            .filter(|node| !node.bypassed)
+            .filter_map(|node| node.op.dependency())
+    }
 }
 
 #[cfg(test)]

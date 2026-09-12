@@ -15,6 +15,7 @@ use crate::terrain::regions::RegionOutput;
 use crate::terrain::shader::ShaderLayer;
 use crate::terrain::{Field, TerrainSpec};
 use serde_json::{Value, json};
+use watershed::FieldId;
 use watershed::FieldRole;
 use watershed::raster::Raster;
 
@@ -189,6 +190,9 @@ impl Edit {
                 position,
             } => {
                 let name = op_name(op);
+                if let Some(referenced) = op.dependency() {
+                    check_field_ref(terrain, field, referenced)?;
+                }
                 let field = field_mut(terrain, field)?;
                 let at = position.unwrap_or_else(|| field.graph.free_position());
                 let id = field.graph.add_node(op.clone(), at);
@@ -306,6 +310,90 @@ fn field_mut<'a>(terrain: &'a mut TerrainSpec, name: &str) -> Result<&'a mut Fie
         .ok_or_else(|| format!("no field named `{name}`"))
 }
 
+/// Refuses a `FieldRef` in `owner`'s graph that names `referenced`, when the document
+/// has no such field or when reading it would make the fields read each other in a
+/// circle.
+///
+/// Every path that writes a reference's field name goes through here — the `node` and
+/// `set` verbs, the panel's op menu, the panel's add row — so a cycle or a dangling
+/// name cannot reach a bake from an edit made in the editor. A cycle is reported as the
+/// chain `owner -> ... -> owner`, the spelling
+/// [`PlanError::Cycle`](crate::terrain::bake::PlanError::Cycle) uses. A document loaded
+/// with a cycle already in it is not this function's business and still fails at the
+/// bake.
+pub fn check_field_ref(
+    terrain: &TerrainSpec,
+    owner: &str,
+    referenced: &FieldId,
+) -> Result<(), String> {
+    if terrain.field(referenced.as_str()).is_none() {
+        return Err(format!(
+            "field `{referenced}`, read by `{owner}`, is not in the document"
+        ));
+    }
+    let Some(chain) = field_cycle(terrain, owner, referenced) else {
+        return Ok(());
+    };
+    let chain = std::iter::once(owner.to_owned())
+        .chain(chain)
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    Err(format!(
+        "reading `{referenced}` from `{owner}` makes the fields depend on each other in a cycle: {chain}"
+    ))
+}
+
+fn field_cycle(terrain: &TerrainSpec, owner: &str, referenced: &FieldId) -> Option<Vec<String>> {
+    let mut seen = Vec::new();
+    let mut path = Vec::new();
+    reaches(terrain, owner, referenced.as_str(), &mut seen, &mut path).then_some(path)
+}
+
+fn reaches(
+    terrain: &TerrainSpec,
+    owner: &str,
+    current: &str,
+    seen: &mut Vec<String>,
+    path: &mut Vec<String>,
+) -> bool {
+    if seen.iter().any(|name| name == current) {
+        return false;
+    }
+    seen.push(current.to_owned());
+    path.push(current.to_owned());
+    if current == owner {
+        return true;
+    }
+    if let Some(field) = terrain.field(current) {
+        for read in field.declared_reads() {
+            if reaches(terrain, owner, read.as_str(), seen, path) {
+                return true;
+            }
+        }
+    }
+    path.pop();
+    false
+}
+
+fn field_ref_written(
+    field: &Field,
+    id: NodeId,
+    property: &str,
+    nested: Option<&str>,
+    words: &[String],
+) -> Result<Option<FieldId>, String> {
+    match (property, nested) {
+        ("op", None) => Ok(parse_op(words)?.dependency().cloned()),
+        ("op", Some("field")) | ("field", None) => {
+            match field.graph.node(id).map(|node| &node.op) {
+                Some(NodeOp::FieldRef(_)) => Ok(Some(first(words)?.as_str().into())),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 fn set(terrain: &mut TerrainSpec, path: &str, words: &[String]) -> Result<Value, String> {
     let parts: Vec<&str> = path.split('.').collect();
     let name = *parts.first().ok_or("a path needs a field name")?;
@@ -316,9 +404,16 @@ fn set(terrain: &mut TerrainSpec, path: &str, words: &[String]) -> Result<Value,
         return set_field(terrain, name, &parts[1..], words);
     }
 
-    let field = field_mut(terrain, name)?;
+    let field = terrain
+        .field(name)
+        .ok_or_else(|| format!("no field named `{name}`"))?;
     let id = node_id(&field.graph, parts[1])?;
     let property = parts[2];
+    if let Some(referenced) = field_ref_written(field, id, property, parts.get(3).copied(), words)?
+    {
+        check_field_ref(terrain, name, &referenced)?;
+    }
+    let field = field_mut(terrain, name)?;
     if property == "op" {
         return match parts.get(3) {
             None => {
@@ -884,7 +979,6 @@ mod tests {
     use super::*;
     use crate::terrain::WaterSpec;
     use bevy::math::UVec2;
-    use watershed::FieldId;
 
     fn document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(64, 64))
@@ -1504,5 +1598,90 @@ mod tests {
         };
         assert_eq!(add.slot(), Slot::Once);
         assert_eq!(connect.slot(), Slot::Once);
+    }
+    fn reference_node(terrain: &TerrainSpec, field: &str) -> NodeId {
+        terrain
+            .field(field)
+            .expect("the test document carries it")
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.op, NodeOp::FieldRef(_)))
+            .expect("the test document carries a reference")
+            .id
+    }
+
+    // A field cycle used to reach the next bake and fail there; this pins that the
+    // edit itself is refused, and that the refusal names the chain the way the plan
+    // error does. `height` already reads `base`, so `base` reading `height` closes it.
+    #[test]
+    fn adding_a_reference_that_closes_a_field_cycle_is_refused() {
+        let mut terrain = document();
+        let before = terrain.field("base").unwrap().graph.nodes.len();
+        let error = Edit::AddNode {
+            field: "base".to_owned(),
+            op: NodeOp::FieldRef(FieldId::from("height")),
+            position: None,
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("base -> height -> base"), "{error}");
+        assert_eq!(terrain.field("base").unwrap().graph.nodes.len(), before);
+    }
+
+    // The other fault the bake used to catch: a name the document does not carry. The
+    // document has to be left alone, because a refused edit that half-landed would put
+    // the panel and the graph out of step.
+    #[test]
+    fn adding_a_reference_to_a_field_that_is_not_there_is_refused() {
+        let mut terrain = document();
+        let before = terrain.field("base").unwrap().graph.nodes.len();
+        let error = Edit::AddNode {
+            field: "base".to_owned(),
+            op: NodeOp::FieldRef(FieldId::from("nowhere")),
+            position: None,
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("nowhere"), "{error}");
+        assert_eq!(terrain.field("base").unwrap().graph.nodes.len(), before);
+    }
+
+    // The shortest cycle there is, and it arrives by `set` rather than by `node add` —
+    // which is the path the panel's field menu takes, so this covers that too.
+    #[test]
+    fn pointing_a_reference_at_its_own_field_is_refused() {
+        let mut terrain = document();
+        let id = reference_node(&terrain, "height");
+        let line = format!("height.{}.field height", node_path(id));
+        let error = set_line(&mut terrain, &line).unwrap_err();
+        assert!(error.contains("height -> height"), "{error}");
+        assert!(matches!(
+            &terrain.field("height").unwrap().graph.node(id).unwrap().op,
+            NodeOp::FieldRef(held) if held.as_str() == "base"
+        ));
+    }
+
+    // Bypass is how a reference is turned off, and the bake reads a bypassed node as
+    // no dependency at all — so a cycle that runs only through one is not a cycle, and
+    // the guard has to accept the edge the bake would accept.
+    #[test]
+    fn a_cycle_that_runs_only_through_a_bypassed_reference_is_accepted() {
+        let mut terrain = document();
+        let id = reference_node(&terrain, "height");
+        Edit::Bypass {
+            field: "height".to_owned(),
+            node: node_path(id),
+            bypassed: Some(true),
+        }
+        .apply(&mut terrain)
+        .expect("bypassing a node is always allowed");
+        Edit::AddNode {
+            field: "base".to_owned(),
+            op: NodeOp::FieldRef(FieldId::from("height")),
+            position: None,
+        }
+        .apply(&mut terrain)
+        .expect("the only path back to `base` is bypassed");
     }
 }
