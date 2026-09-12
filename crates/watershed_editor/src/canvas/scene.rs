@@ -195,7 +195,7 @@ pub fn sync_canvas(
         transform.translation.y = node.position[1];
     }
     for (bar, mut sprite) in &mut bars {
-        sprite.color = title_colour(graph, &selection, library.as_deref(), bar.0);
+        sprite.color = title_colour(&document, graph, &selection, library.as_deref(), bar.0);
     }
     for (line, mut text) in &mut lines {
         let Some(node) = graph.node(line.node) else {
@@ -213,18 +213,26 @@ pub fn sync_canvas(
     }
     for (fault, mut text) in &mut faults {
         if let Some(node) = graph.node(fault.0) {
-            **text = fault_of(node, library.as_deref())
-                .map(fault_line)
+            **text = fault_of(&document, node, library.as_deref())
+                .map(|fault| fault_line(&fault))
                 .unwrap_or_default();
         }
     }
 }
 
-fn fault_of<'a>(node: &GraphNode, library: Option<&'a ShaderLibrary>) -> Option<&'a str> {
-    let NodeOp::Shader(shader) = &node.op else {
-        return None;
-    };
-    library?.entry(&shader.file)?.error.as_deref()
+fn fault_of(
+    document: &Document,
+    node: &GraphNode,
+    library: Option<&ShaderLibrary>,
+) -> Option<String> {
+    match &node.op {
+        NodeOp::Shader(shader) => library?.entry(&shader.file)?.error.clone(),
+        NodeOp::FieldRef(id) => document
+            .terrain()
+            .filter(|terrain| terrain.field(id.as_str()).is_none())
+            .map(|_| format!("no field named `{id}`")),
+        _ => None,
+    }
 }
 
 fn fault_line(fault: &str) -> String {
@@ -284,10 +292,12 @@ fn caption(node: &GraphNode) -> String {
 /// The colour of a card's title bar, which is where a card says what it is.
 ///
 /// The output node and the soloed one are marked here, and the mark is on the bar
-/// rather than on a label so it survives the zoom at which labels are dropped. A node
-/// whose shader will not compile outranks all three, so clicking the card to find out
-/// what is wrong with it does not take the mark away.
+/// rather than on a label so it survives the zoom at which labels are dropped. A broken
+/// node outranks all three, so clicking the card to find out what is wrong with it does
+/// not take the mark away — broken being a shader that will not compile or a reference
+/// to a field the document does not carry.
 fn title_colour(
+    document: &Document,
     graph: &FieldGraph,
     selection: &Selection,
     library: Option<&ShaderLibrary>,
@@ -295,7 +305,7 @@ fn title_colour(
 ) -> Color {
     if graph
         .node(node)
-        .is_some_and(|node| fault_of(node, library).is_some())
+        .is_some_and(|node| fault_of(document, node, library).is_some())
     {
         return BROKEN;
     }
@@ -441,7 +451,7 @@ fn spawn_card(
                 clip(&shader.file, FILE_CHARS),
             );
         }
-        if matches!(node.op, NodeOp::Shader(_)) {
+        if matches!(node.op, NodeOp::Shader(_) | NodeOp::FieldRef(_)) {
             parent.spawn((
                 Text2d::new(String::new()),
                 TextFont {
@@ -528,6 +538,7 @@ mod tests {
     use crate::terrain::graph::NodeOp;
     use crate::terrain::shader::ShaderLayer;
     use crate::terrain::{Field, TerrainSpec};
+    use watershed::FieldId;
 
     /// A world holding one field of one node, with that node's card on the canvas at
     /// `dragged_to`, and a drag holding that card when `held`.
@@ -623,6 +634,71 @@ mod tests {
             ))
             .id();
         (world, text, bar)
+    }
+
+    fn fieldref_world(target_exists: bool) -> (World, Entity, Entity) {
+        let mut terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
+        if target_exists {
+            terrain = terrain.with_field(Field::new("base").with_op(NodeOp::Constant(0.25)));
+        }
+        let mut document = Document::default();
+        document.adopt(terrain);
+        document.set_active("height").unwrap();
+        let node = document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .graph
+            .nodes[0]
+            .id;
+
+        let mut world = World::new();
+        world.insert_resource(document);
+        world.insert_resource(Selection::default());
+        world.insert_resource(Grab::Idle);
+        world.insert_resource(ShaderLibrary::default());
+        let text = world
+            .spawn((Text2d::new(String::new()), CardFault(node)))
+            .id();
+        for kind in [LineKind::Op, LineKind::Params, LineKind::File] {
+            world.spawn((Text2d::new(String::new()), CardLine { node, kind }));
+        }
+        let bar = world
+            .spawn((
+                Sprite {
+                    color: BODY,
+                    ..default()
+                },
+                CardTitleBar(node),
+            ))
+            .id();
+        (world, text, bar)
+    }
+
+    // Acceptance criterion six: a reference naming a field the document does not carry
+    // is broken the way a shader that will not compile is, rather than a blank card
+    // giving no sign that the graph cannot be baked.
+    #[test]
+    fn a_reference_to_a_missing_field_shows_a_fault_and_reddens_the_bar() {
+        let (mut world, text, bar) = fieldref_world(false);
+        world.run_system_once(sync_canvas).unwrap();
+        assert_eq!(
+            world.get::<Text2d>(text).unwrap().0,
+            "no field named `base`"
+        );
+        assert_eq!(world.get::<Sprite>(bar).unwrap().color, BROKEN);
+    }
+
+    // And a reference that resolves is an ordinary card: putting the field back has to
+    // clear the fault by itself, the way fixing a shader does.
+    #[test]
+    fn a_reference_to_a_field_that_is_there_carries_no_fault() {
+        let (mut world, text, bar) = fieldref_world(true);
+        world.run_system_once(sync_canvas).unwrap();
+        assert_eq!(world.get::<Text2d>(text).unwrap().0, "");
+        assert_ne!(world.get::<Sprite>(bar).unwrap().color, BROKEN);
     }
 
     // The defect this guards was the whole of "I drag a node and it jumps back": the

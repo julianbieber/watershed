@@ -464,6 +464,27 @@ pub fn readers_of(terrain: &TerrainSpec, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// The fields `field` declares a read of, in declaration order, each named once.
+///
+/// [`readers_of`] read from the other end, and the two answer about one relation: a
+/// field's own name is never in the list, and a bypassed node contributes nothing,
+/// because [`Field::declared_reads`](crate::terrain::Field::declared_reads) already
+/// leaves it out. Duplicates are dropped keeping the first occurrence — a graph may
+/// name the same field from several nodes, and a caller listing what a field reads
+/// wants the field once.
+pub fn reads_of(field: &Field) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for read in field.declared_reads() {
+        if read.as_str() == field.id.as_str() {
+            continue;
+        }
+        if !names.iter().any(|seen| seen == read.as_str()) {
+            names.push(read.to_string());
+        }
+    }
+    names
+}
+
 fn rename_field(terrain: &mut TerrainSpec, from: &str, to: &str) -> Result<Value, String> {
     if to.is_empty() {
         return Err("a field needs a name".to_owned());
@@ -1591,6 +1612,29 @@ mod tests {
         .apply(&mut terrain)
         .unwrap();
         assert!(readers_of(&terrain, "base").is_empty());
+    }
+
+    // The panel's `reads` row and `observe field`'s `reads` list are this one answer,
+    // and `ridges`/`height` names `base` from two nodes — so the dedup is the whole
+    // point: a field that reads another twice reads it once.
+    #[test]
+    fn reads_of_names_each_field_read_once() {
+        let mut terrain = document();
+        let height = terrain.field("height").unwrap();
+        assert_eq!(reads_of(height), vec!["base".to_owned()]);
+        assert!(reads_of(terrain.field("base").unwrap()).is_empty());
+
+        Edit::AddNode {
+            field: "height".to_owned(),
+            op: NodeOp::FieldRef(FieldId::from("base")),
+            position: None,
+        }
+        .apply(&mut terrain)
+        .expect("a second reference to `base` does not cycle");
+        assert_eq!(
+            reads_of(terrain.field("height").unwrap()),
+            vec!["base".to_owned()]
+        );
     }
 
     // The view has to follow the field it was on: a rename of the shown field keeps it
