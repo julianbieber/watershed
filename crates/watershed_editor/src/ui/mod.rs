@@ -43,6 +43,7 @@ impl Plugin for UiPlugin {
         app.init_resource::<NewDialog>()
             .init_resource::<FilePath>()
             .init_resource::<AddLayer>()
+            .init_resource::<NewField>()
             .init_resource::<Expanded>()
             .init_resource::<toolbar::FieldChoices>()
             .init_resource::<stack::Shape>()
@@ -56,6 +57,7 @@ impl Plugin for UiPlugin {
                     toolbar::seed_path,
                     stack::rebuild,
                     stack::sync,
+                    stack::seed_field_name,
                     stack::prune,
                     dialog::sync,
                     legend::sync,
@@ -128,6 +130,14 @@ impl Default for AddLayer {
         Self("noise".to_owned())
     }
 }
+
+/// The name the panel's "Add field" button will give a new field, as typed.
+///
+/// Held across frames because typing a name and pressing the button are two separate
+/// acts, and because the panel is rebuilt whenever the document changes shape — a name
+/// left only in the text input would be lost with it.
+#[derive(Resource, Default)]
+pub struct NewField(pub String);
 
 /// Which of the panel's collapsible sections are open.
 ///

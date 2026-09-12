@@ -14,11 +14,13 @@ use crate::terrain::noise::{NoiseKind, NoiseSpec};
 use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
 use bevy::feathers::containers::{group, group_body, group_header};
 use bevy::feathers::controls::{
-    ButtonVariant, FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersToolButton,
+    ButtonVariant, FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersTextInput,
+    FeathersTextInputContainer, FeathersToolButton,
 };
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
 use bevy::prelude::*;
+use bevy::text::{EditableText, TextEdit, TextEditChange};
 use bevy::ui::{Checked, InteractionDisabled};
 use bevy::ui_widgets::{Activate, ValueChange};
 use watershed::raster::Raster;
@@ -36,7 +38,7 @@ use crate::gpu::{STOCK, ShaderLibrary, shader_reference};
 use crate::terrain::graph::{Binary, Curve, GraphNode, NodeId, NodeOp};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
-use crate::ui::{ADDABLE, AddLayer, Expanded, PANEL_WIDTH, report};
+use crate::ui::{ADDABLE, AddLayer, Expanded, NewField, PANEL_WIDTH, report};
 
 /// What the panel was last built from, and which rebuild that was.
 ///
@@ -61,6 +63,10 @@ pub struct StackEntry(u64);
 /// The panel's scroll container, whose children are the panel's contents.
 #[derive(Component, Default, Clone)]
 pub struct StackBody;
+
+/// The text field holding the name the "Add field" button will use.
+#[derive(Component, Default, Clone)]
+pub struct NewFieldInput;
 
 /// The label that says whether what is on screen is the whole bake or a preview.
 #[derive(Component, Default, Clone)]
@@ -315,7 +321,56 @@ fn contents(
     }
 
     children.push(widgets::boxed(add_row(&active, &names, add)));
+    children.push(widgets::boxed(field_row()));
     children
+}
+
+fn field_row() -> impl Scene {
+    widgets::row(vec![
+        one(bsn! {
+            @FeathersTextInputContainer
+            Node { width: px(120) }
+            Children [
+                (
+                    @FeathersTextInput
+                    NewFieldInput
+                    on(|change: On<TextEditChange>,
+                        texts: Query<&EditableText>,
+                        mut name: ResMut<NewField>| {
+                        if let Ok(text) = texts.get(change.event_target()) {
+                            name.0 = text.value().to_string();
+                        }
+                    })
+                )
+            ]
+        }),
+        one(bsn! {
+            @FeathersButton {
+                @caption: bsn! { Text("Add field") ThemedText },
+            }
+            on(|_: On<Activate>, mut document: ResMut<Document>, mut name: ResMut<NewField>| {
+                let result = document
+                    .apply(&Edit::AddField { name: name.0.clone() })
+                    .map(|_| ());
+                if result.is_ok() {
+                    name.0.clear();
+                }
+                report(&mut document, result);
+            })
+        }),
+    ])
+}
+
+/// Puts the name held in [`NewField`] into the text field the frame it appears, so a
+/// half-typed name survives the panel being rebuilt under it.
+pub fn seed_field_name(
+    name: Res<NewField>,
+    mut inputs: Query<&mut EditableText, Added<NewFieldInput>>,
+) {
+    for mut text in inputs.iter_mut() {
+        text.queue_edit(TextEdit::SelectAll);
+        text.queue_edit(TextEdit::Insert(name.0.clone().into()));
+    }
 }
 
 fn properties(active: &str, field: &crate::terrain::Field, pinned: bool) -> impl Scene {

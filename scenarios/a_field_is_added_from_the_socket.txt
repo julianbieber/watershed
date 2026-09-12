@@ -1,0 +1,53 @@
+# Build a field from outside the process: add it, take it back, replay it, and carry it
+# through a save and a load — from `observe document` and `observe field` rather than
+# from a person typing a name into the panel and looking.
+#
+# Run with:  just drive run scenarios/a_field_is_added_from_the_socket.txt
+#
+# What makes this reproducible is that every verb below holds its reply until the
+# document has settled, so nothing here counts frames. The two refusals the task also
+# names — a name already taken, and a blank one — are not in this file: replay stops at
+# the first failure, so they are pinned by the unit tests in `edit.rs` instead, the way
+# `a_node_moves_the_bake.txt` leaves the cycle refusal there.
+
+observe log
+
+fixed-delta 1/60
+
+# 256 square and fitted, so a re-bake covers the whole document rather than the part
+# that happened to be on screen. `continents` builds `moisture` and `height`.
+new 256 256 7 continents
+wait bake
+zoom fit
+
+# The "before" the rest of this is measured against: two fields, `height` on screen,
+# and the bake whole. That last one is what the add below must not disturb.
+observe document
+
+# The add itself. The field list grows by one, the new field is on screen, the history
+# reaches one change back — and `baked` is still `whole`, because a field nothing reads
+# yet moves no texel of any field already baked.
+field add biomes
+observe document
+
+# It came in empty: no output node, so nothing has been baked into it.
+observe field
+
+# One undo step, not two: the field goes and `height` comes back on screen with it.
+undo
+observe document
+
+# And the redo puts both back.
+redo
+observe document
+
+# A round trip through the terrain directory. Saving bakes a copy, so the empty field
+# is written as zeros and read back as a field that is there and holds nothing.
+save /tmp/watershed-scenario/added-field
+load /tmp/watershed-scenario/added-field
+observe document
+field biomes
+observe field
+
+# And again at the end, for anything the saving and loading provoked.
+observe log
