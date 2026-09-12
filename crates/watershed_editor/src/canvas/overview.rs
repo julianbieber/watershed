@@ -17,10 +17,13 @@ use super::scene::CanvasOwned;
 use super::thumb::{CardThumb, ThumbSource};
 use super::{
     CANVAS_LAYER, CARD, CanvasCameraTag, CanvasFrame, CanvasLabel, CanvasShape, DETAIL_SIZE, Grab,
-    MAX_SCALE, MIN_SCALE, OpenField, PARAM_SIZE, THUMB, TITLE_BAR, TITLE_SIZE, edges, input, scene,
+    MAX_SCALE, MIN_SCALE, OpenField, PARAM_SIZE, Selection, THUMB, TITLE_BAR, TITLE_SIZE, edges,
+    input, scene,
 };
 use crate::document::Document;
+use crate::edit::{Edit, node_of_path};
 use crate::terrain::TerrainSpec;
+use crate::terrain::graph::NodeOp;
 use crate::ui::{pointer_over_ui, report, typing};
 
 /// The accent a field card carries, so a card standing for a whole field is not read
@@ -44,6 +47,26 @@ pub struct Overview {
     /// Whether the overview is on screen.
     pub showing: bool,
 }
+
+/// The dependency a finished drag asks for, as the field it will read and the field
+/// that will read it.
+///
+/// What the overview holds between the frame a drag is released on and the frame the
+/// edit it makes is applied, the way [`input::Finished`] does for the node graph. The
+/// pair is a request and not a decision: whether the two fields may read each other at
+/// all is answered by the edit.
+#[derive(Resource, Default)]
+pub(super) struct Wired(Option<(String, String)>);
+
+/// How many changes were behind the document when a drag landed one, so that undoing
+/// exactly that change can put the overview back.
+///
+/// The history carries the terrain and the field being looked at, not which of the two
+/// things the canvas draws was on screen — so the one change a drag makes is marked
+/// here instead. `None` once an undo would no longer be crossing that change, whether
+/// because it has been undone or because another change was made on top of it.
+#[derive(Resource, Default)]
+pub(super) struct WiredStep(Option<usize>);
 
 /// One field's card.
 ///
@@ -423,10 +446,13 @@ pub(super) fn route_field_ribbons(
     }
 }
 
-/// Opens a field on a double-click, and pans the overview otherwise.
+/// Opens a field on a double-click, wires one field into another on a drag between
+/// their cards, and pans the overview otherwise.
 ///
-/// Writes no edit and touches no document: card positions come from the layout and are
-/// not saved, so there is nothing here to drag.
+/// Decides the dependency a drag asks for and hands it to [`commit_field_wire`] rather
+/// than writing it, the way `input::canvas_drag` hands its edit on — so the one system
+/// that writes the document is the one that runs in the chain's commit slot. Card
+/// positions still come from the layout and are never written.
 pub(super) fn overview_drag(
     mouse: Res<ButtonInput<MouseButton>>,
     hover: Res<HoverMap>,
@@ -438,7 +464,9 @@ pub(super) fn overview_drag(
     time: Res<Time>,
     mut open: MessageWriter<OpenField>,
     mut grab: ResMut<Grab>,
+    mut wired: ResMut<Wired>,
     mut last_click: Local<Option<(f32, String)>>,
+    mut pressed_at: Local<Option<Vec2>>,
 ) {
     let (Some(window), Some(camera)) = (window, camera) else {
         return;
@@ -464,24 +492,110 @@ pub(super) fn overview_drag(
                 });
                 if again {
                     open.write(OpenField {
-                        field,
+                        field: field.clone(),
                         select: None,
                     });
                     *last_click = None;
                 } else {
-                    *last_click = Some((now, field));
+                    *last_click = Some((now, field.clone()));
                 }
-                *grab = Grab::Idle;
+                *pressed_at = Some(cursor);
+                *grab = Grab::FieldWire { from: field };
             }
             None => {
                 *last_click = None;
+                *pressed_at = None;
                 *grab = Grab::Pan { anchor: world };
             }
         }
     }
 
     if mouse.just_released(MouseButton::Left) {
-        *grab = Grab::Idle;
+        let held = std::mem::take(&mut *grab);
+        let travelled = pressed_at.take().map_or(0.0, |from| from.distance(cursor));
+        if let Grab::FieldWire { from } = held {
+            wired.0 = wired_by(
+                from,
+                travelled,
+                field_at(cards.iter(), world).map(|(name, _)| name),
+            );
+        }
+    }
+}
+
+fn wired_by(from: String, travelled: f32, landed: Option<String>) -> Option<(String, String)> {
+    if travelled <= input::CLICK_SLOP {
+        return None;
+    }
+    Some((from, landed?))
+}
+
+/// Adds the reference a finished drag asked for and opens the field that now holds it
+/// with that node selected.
+///
+/// The one system in the overview that writes the document, as `input::canvas_commit`
+/// is for the node graph. The node carries no edges, and sits where the panel's own
+/// Add node button puts one with nothing selected. A pair the reference guard refuses
+/// — one that would make the fields read each other in a circle, a card dragged onto
+/// itself included — is reported, and the view is left where it was.
+pub(super) fn commit_field_wire(
+    mut document: ResMut<Document>,
+    mut wired: ResMut<Wired>,
+    mut step: ResMut<WiredStep>,
+    mut open: MessageWriter<OpenField>,
+) {
+    let Some((source, target)) = wired.0.take() else {
+        return;
+    };
+    let position = document
+        .terrain()
+        .and_then(|terrain| terrain.field(target.as_str()))
+        .map(|field| field.graph.free_position_beside(None));
+    let before = document.history().undo;
+    let added = document.apply(&Edit::AddNode {
+        field: target.clone(),
+        op: NodeOp::FieldRef(watershed::FieldId::from(source.as_str())),
+        position,
+    });
+    if let Ok(reply) = &added {
+        let node = reply
+            .get("node")
+            .and_then(|node| node.as_str())
+            .and_then(node_of_path);
+        open.write(OpenField {
+            field: target,
+            select: node,
+        });
+        let now = document.history().undo;
+        if now > before {
+            step.0 = Some(now);
+        }
+    }
+    report(&mut document, added.map(|_| ()));
+}
+
+/// Puts the overview back when the one change a drag made is undone.
+///
+/// The drag is one step: it adds a node and opens the field it landed in, so undoing it
+/// has to take the view back as well as the node. Runs on every frame rather than only
+/// while the overview is showing, because the view it restores is off at the point the
+/// undo arrives.
+pub(super) fn overview_after_undo(
+    document: Res<Document>,
+    mut overview: ResMut<Overview>,
+    mut selection: ResMut<Selection>,
+    mut step: ResMut<WiredStep>,
+) {
+    let Some(marked) = step.0 else {
+        return;
+    };
+    let now = document.history().undo;
+    if now < marked {
+        overview.showing = true;
+        selection.select(None);
+        step.0 = None;
+    } else if now > marked {
+        step.0 = None;
     }
 }
 
@@ -797,5 +911,166 @@ mod tests {
             before,
             "a new reference left the key alone"
         );
+    }
+    fn wired_world(terrain: TerrainSpec, active: &str) -> World {
+        let mut document = Document::default();
+        document.adopt(terrain);
+        document.set_active(active).unwrap();
+
+        let mut world = World::new();
+        world.insert_resource(document);
+        world.init_resource::<Wired>();
+        world.init_resource::<WiredStep>();
+        world.insert_resource(Overview { showing: true });
+        world.init_resource::<Selection>();
+        world.init_resource::<Messages<OpenField>>();
+        world
+    }
+
+    fn with_temperature() -> TerrainSpec {
+        regions_shaped().with_field(Field::new("temperature"))
+    }
+
+    fn nodes_of(world: &World, field: &str) -> Vec<NodeOp> {
+        world
+            .resource::<Document>()
+            .terrain()
+            .and_then(|terrain| terrain.field(field))
+            .map(|field| {
+                field
+                    .graph
+                    .nodes
+                    .iter()
+                    .map(|node| node.op.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Acceptance criterion one, at the decision alone: a press that travelled and was
+    // released over another card asks for that field to read the one the drag left.
+    #[test]
+    fn a_drag_between_two_cards_asks_for_the_dependency_it_crossed() {
+        let asked = wired_by(
+            "moisture".to_owned(),
+            input::CLICK_SLOP * 4.0,
+            Some("temperature".to_owned()),
+        );
+        assert_eq!(
+            asked,
+            Some(("moisture".to_owned(), "temperature".to_owned()))
+        );
+    }
+
+    // A press that never travelled is how a card is opened, so it must ask for nothing —
+    // otherwise every click on a card would try to add a reference to it.
+    #[test]
+    fn a_press_that_did_not_travel_asks_for_nothing() {
+        assert_eq!(
+            wired_by("moisture".to_owned(), 0.0, Some("moisture".to_owned())),
+            None
+        );
+    }
+
+    // Acceptance criterion five: a release anywhere but on a card does nothing.
+    #[test]
+    fn a_release_between_cards_asks_for_nothing() {
+        assert_eq!(
+            wired_by("moisture".to_owned(), input::CLICK_SLOP * 4.0, None),
+            None
+        );
+    }
+
+    // Acceptance criterion one, end to end: the reference lands in the field the drag
+    // arrived at, and that field is opened with the new node selected.
+    #[test]
+    fn a_wired_pair_adds_the_reference_and_opens_the_field_it_landed_in() {
+        let mut world = wired_world(with_temperature(), "moisture");
+        world.resource_mut::<Wired>().0 = Some(("moisture".to_owned(), "temperature".to_owned()));
+        world.run_system_once(commit_field_wire).unwrap();
+        world
+            .run_system_once(super::super::apply_open_field)
+            .unwrap();
+
+        assert_eq!(world.resource::<Document>().error(), None);
+        let held = nodes_of(&world, "temperature");
+        assert!(
+            matches!(held.as_slice(), [NodeOp::FieldRef(read)] if read.as_str() == "moisture"),
+            "{held:?}"
+        );
+        let document = world.resource::<Document>();
+        assert_eq!(document.active(), "temperature");
+        assert_eq!(document.history().undo, 1, "the drag is one change");
+        let selected = world.resource::<Selection>().node;
+        assert_eq!(
+            selected,
+            Some(
+                world
+                    .resource::<Document>()
+                    .terrain()
+                    .unwrap()
+                    .field("temperature")
+                    .unwrap()
+                    .graph
+                    .nodes[0]
+                    .id
+            ),
+            "the node the drag added is not the selected one"
+        );
+        assert!(!world.resource::<Overview>().showing);
+    }
+
+    // Acceptance criterion six: the whole drag is one undo step, and undoing it puts
+    // back the view the drag was made from as well as taking the node out.
+    #[test]
+    fn undoing_the_drag_removes_the_node_and_returns_to_the_overview() {
+        let mut world = wired_world(with_temperature(), "moisture");
+        world.resource_mut::<Wired>().0 = Some(("moisture".to_owned(), "temperature".to_owned()));
+        world.run_system_once(commit_field_wire).unwrap();
+        world
+            .run_system_once(super::super::apply_open_field)
+            .unwrap();
+
+        world.resource_mut::<Document>().undo().unwrap();
+        world.run_system_once(overview_after_undo).unwrap();
+
+        assert!(nodes_of(&world, "temperature").is_empty());
+        assert_eq!(world.resource::<Document>().history().undo, 0);
+        assert!(world.resource::<Overview>().showing);
+        assert_eq!(world.resource::<Selection>().node, None);
+    }
+
+    // Acceptance criterion three: the drag goes through the same reference guard the
+    // panel and the socket do, so a pair that would make the two fields read each other
+    // in a circle is refused, named, and adds nothing.
+    #[test]
+    fn a_drag_that_would_close_a_cycle_is_refused_and_named() {
+        let mut world = wired_world(regions_shaped(), "moisture");
+        let before = nodes_of(&world, "base").len();
+        world.resource_mut::<Wired>().0 = Some(("height".to_owned(), "base".to_owned()));
+        world.run_system_once(commit_field_wire).unwrap();
+
+        let document = world.resource::<Document>();
+        let refusal = document.error().expect("a cycle is refused");
+        assert!(refusal.contains("base -> height -> base"), "{refusal}");
+        assert_eq!(nodes_of(&world, "base").len(), before);
+        assert_eq!(world.resource::<Document>().active(), "moisture");
+        assert_eq!(world.resource::<Document>().history().undo, 0);
+        assert!(world.resource::<Overview>().showing);
+    }
+
+    // Acceptance criterion four: a card dragged onto itself reaches the same guard, and
+    // the shortest cycle there is is refused like any other.
+    #[test]
+    fn a_card_dragged_onto_itself_is_refused() {
+        let mut world = wired_world(regions_shaped(), "moisture");
+        world.resource_mut::<Wired>().0 = Some(("moisture".to_owned(), "moisture".to_owned()));
+        world.run_system_once(commit_field_wire).unwrap();
+
+        let document = world.resource::<Document>();
+        let refusal = document.error().expect("a self-reference is refused");
+        assert!(refusal.contains("moisture -> moisture"), "{refusal}");
+        assert!(nodes_of(&world, "moisture").len() == 1, "a node was added");
+        assert_eq!(document.history().undo, 0);
     }
 }

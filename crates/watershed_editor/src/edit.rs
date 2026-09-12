@@ -358,6 +358,14 @@ pub fn node_path(id: NodeId) -> String {
     format!("n{}", id.0)
 }
 
+/// The node id a word spelled by [`node_path`] stands for.
+///
+/// Answers `None` for anything else, a node's own name included, and does not ask whether
+/// any graph holds that id.
+pub fn node_of_path(word: &str) -> Option<NodeId> {
+    word.strip_prefix('n')?.parse().ok().map(NodeId)
+}
+
 fn node_id(graph: &FieldGraph, word: &str) -> Result<NodeId, String> {
     if let Some(digits) = word.strip_prefix('n')
         && let Ok(value) = digits.parse::<u32>()
@@ -1167,6 +1175,16 @@ mod tests {
                 NodeOp::FieldRef(FieldId::from("base")),
                 NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
             ]))
+    }
+
+    // The overview's drag reads the new node's id back out of an `AddNode` reply, which
+    // spells it with `node_path` — so the two have to stay each other's inverse, and a
+    // node's own name must not be mistaken for a path.
+    #[test]
+    fn a_node_path_reads_back_as_the_id_that_spelled_it() {
+        assert_eq!(node_of_path(&node_path(NodeId(7))), Some(NodeId(7)));
+        assert_eq!(node_of_path("noise"), None);
+        assert_eq!(node_of_path("n"), None);
     }
 
     // `op_summary` is read by the control client, the inspector's collapsed row and

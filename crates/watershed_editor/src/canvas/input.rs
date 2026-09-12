@@ -24,7 +24,7 @@ use crate::ui::{pointer_over_ui, report, typing};
 /// Measured against where the press landed rather than against the frame before, so a
 /// slow drag is still a drag; and in viewport pixels rather than canvas units, so
 /// panning the camera under the pointer does not read as pointer movement.
-const CLICK_SLOP: f32 = 4.0;
+pub(super) const CLICK_SLOP: f32 = 4.0;
 
 /// How long after a click a second one on the same card still reads as a double-click,
 /// in seconds.
@@ -241,7 +241,7 @@ pub fn canvas_drag(
                     selection.select(None);
                 }
             }
-            Grab::Idle => {}
+            Grab::FieldWire { .. } | Grab::Idle => {}
         }
     }
 }
