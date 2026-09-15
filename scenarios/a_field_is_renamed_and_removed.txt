@@ -14,8 +14,8 @@ observe log
 
 fixed-delta 1/60
 
-# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` through
-# one reference node — which is what makes the rewrite below worth watching.
+# `ridges` builds `moisture`, `base` and `height`, with `height`'s shader file reading
+# `base` by name — which is what makes the rename below worth watching.
 new 256 256 7 ridges
 wait bake
 zoom fit
@@ -24,13 +24,13 @@ zoom fit
 observe document
 observe water
 
-# The quantiles the rename must not move. `height` is what reads the field about to be
-# renamed, so it is the field that would go wrong if a reference were left behind.
+# The quantiles before the rename. `height` is what reads the field about to be renamed,
+# so it is the field the rename leaves behind.
 field height
 observe field
 
-# The rename itself. `height`'s reference node now says `fieldref continent`,
-# and the field bakes to the numbers it did before, because only the name changed.
+# The rename itself. A rename cannot rewrite a file, so `height`'s file still names
+# `base`, which is gone: `height` is left unbaked with that fault, while the rest bakes.
 field rename base continent
 wait bake
 observe nodes
@@ -38,15 +38,20 @@ field height
 observe field
 observe document
 
-# One undo step: `base` comes back and the reference says `fieldref base` again.
+# One undo step: `base` comes back, and `height` bakes again.
 undo
 wait bake
 observe nodes
 
-# And the redo puts the new name back on it.
+# And the redo puts the new name back on it, faulting `height` again.
 redo
 wait bake
 observe nodes
+
+# Undo once more, so `base` is named again and `height` is baked before it is renamed
+# and water is solved over it.
+undo
+wait bake
 
 # A rename of the field the water spec solves over. The spec follows the name, so the
 # solve still has a field to read.
@@ -71,8 +76,8 @@ redo
 wait bake
 observe document
 
-# A round trip through the terrain directory. The new name and the reference rewritten
-# with it are what was written, so they are what comes back.
+# A round trip through the terrain directory. `base` and `elevation` are the names that
+# were written, so they are what comes back.
 save /tmp/watershed-scenario/renamed-field
 load /tmp/watershed-scenario/renamed-field
 observe document

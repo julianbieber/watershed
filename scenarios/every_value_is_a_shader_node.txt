@@ -1,5 +1,5 @@
 # Build both presets from outside the process and read back that every value in them is
-# made by a shader node or read from another field through a reference node — from
+# made by a shader node, which may read another field by naming it in its file — from
 # `observe nodes`, `observe fields` and `observe field` — and that a save and a load
 # re-bake the same values from the recipe and the shader files.
 #
@@ -22,9 +22,9 @@ zoom fit
 observe nodes
 observe field
 
-# `ridges`: `moisture` and `base` are one `fbm.wgsl` shader node each, and `height` is a
-# reference to `base` wired into the one pin of a `mountains.wgsl` shader node, which is
-# the output.
+# `ridges`: `moisture` is one `fbm.wgsl` shader node, `base` one `continents.wgsl`
+# shader node, and `height` one `mountains_over_base.wgsl` shader node whose file reads
+# `base` by name.
 new 256 256 7 ridges
 wait bake
 zoom fit

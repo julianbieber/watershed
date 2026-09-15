@@ -86,6 +86,7 @@ fn document(world: &World) -> Value {
         "settled": document.is_settled(),
         "job": document.job().map(|kind| kind.name()),
         "error": document.error(),
+        "bake_failed": document.bake_failed(),
         "baked": document.baked().name(),
         "baked_rect": match document.baked() {
             Baked::Rect(rect) => json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
@@ -226,6 +227,7 @@ fn fields(world: &World) -> Value {
             json!(error.to_string()),
         ),
     };
+    let faults = terrain.field_faults();
     let fields: Vec<Value> = names
         .iter()
         .filter_map(|name| terrain.field(name))
@@ -235,6 +237,10 @@ fn fields(world: &World) -> Value {
                 "role": field.role.as_str(),
                 "shift": field.shift,
                 "reads": crate::edit::reads_of(field),
+                "fault": faults
+                    .iter()
+                    .find(|(id, _)| *id == field.id)
+                    .map(|(_, fault)| fault),
             })
         })
         .collect();
@@ -365,6 +371,15 @@ fn shaders(world: &mut World) -> Value {
                         "binding": input.binding,
                     }))
                     .collect::<Vec<_>>(),
+                "layers": entry
+                    .layers
+                    .iter()
+                    .map(|read| json!({
+                        "name": read.name,
+                        "layer": read.layer,
+                        "binding": read.binding,
+                    }))
+                    .collect::<Vec<_>>(),
                 "reach": entry.reach,
                 "error": entry.error,
             })
@@ -457,5 +472,38 @@ mod tests {
         let listed = answer["fields"].as_array().expect("an array of fields");
         assert_eq!(listed[0]["name"], json!("here"));
         assert_eq!(listed[1]["name"], json!("there"));
+    }
+
+    // The socket's half of a read by name: a caller sees a file's `@layer` as a read of
+    // the field it names, and a name that is no field as the reader's fault, without
+    // opening the file.
+    #[test]
+    fn observing_the_fields_reports_a_layer_read_and_the_fault_of_a_name_that_is_no_field() {
+        let mut reads_base = crate::terrain::shader::ShaderLayer::new("reader.wgsl");
+        reads_base.layers = vec![FieldId::from("base")];
+        let mut reads_nowhere = crate::terrain::shader::ShaderLayer::new("lost.wgsl");
+        reads_nowhere.layers = vec![FieldId::from("nowhere")];
+        let terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+            .with_field(Field::new("height").with_op(NodeOp::Shader(reads_base)))
+            .with_field(Field::new("lost").with_op(NodeOp::Shader(reads_nowhere)));
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let answer = fields(&world);
+        let listed = answer["fields"].as_array().expect("an array of fields");
+        let named = |name: &str| {
+            listed
+                .iter()
+                .find(|field| field["name"] == json!(name))
+                .unwrap_or_else(|| panic!("{name} is not listed"))
+        };
+        assert_eq!(named("height")["reads"], json!(["base"]));
+        assert_eq!(named("height")["fault"], Value::Null);
+        let fault = named("lost")["fault"].as_str().expect("the fault, as text");
+        assert!(fault.contains("nowhere"), "{fault:?}");
     }
 }

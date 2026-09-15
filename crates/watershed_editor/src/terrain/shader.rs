@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use watershed::field::FieldId;
 use watershed::raster::Raster;
 
 /// The directory, inside a terrain, that a document's shaders live in.
@@ -525,6 +526,84 @@ pub fn parse_inputs(source: &str) -> Result<Vec<ShaderInput>, ParamError> {
     Ok(inputs)
 }
 
+/// Another field a shader reads by name: a texture binding the dispatch fills with
+/// that field's baked raster, at the field's own shift.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerRead {
+    /// The variable name the WGSL declaration spells.
+    pub name: String,
+    /// The field the annotation names, which need not exist in any document.
+    pub layer: String,
+    /// The binding the declaration takes. At least [`FIRST_INPUT_BINDING`].
+    pub binding: u32,
+}
+
+/// The fields a shader reads by name, in declaration order.
+///
+/// A layer read is a `var` of `texture_2d<f32>` annotated `@layer <field>`, at group
+/// 0 and a binding of [`FIRST_INPUT_BINDING`] or above — the same declaration an
+/// `@in` input takes. A line whose code half is empty declares nothing. One field may
+/// be named on two bindings; one binding or one variable may not be declared twice,
+/// and an annotation naming no field is a fault. Nothing here checks a binding
+/// against the file's `@in` inputs.
+///
+/// Fails on the first fault and reports the line it is on.
+pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
+    let mut layers: Vec<LayerRead> = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let number = index + 1;
+        let Some((declaration, annotation)) = line.split_once("//") else {
+            continue;
+        };
+        let declaration = declaration.trim();
+        if declaration.is_empty() {
+            continue;
+        }
+        let Some(rest) = annotation.trim().strip_prefix("@layer") else {
+            continue;
+        };
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let layer = rest.trim();
+        if layer.is_empty() {
+            return Err(fault(number, "`@layer` names no field"));
+        }
+
+        let read = parse_input_declaration(number, declaration)?;
+        if read.binding < FIRST_INPUT_BINDING {
+            return Err(fault(
+                number,
+                format!(
+                    "binding {} is reserved; a layer starts at {FIRST_INPUT_BINDING}",
+                    read.binding
+                ),
+            ));
+        }
+        if layers.iter().any(|held| held.binding == read.binding) {
+            return Err(fault(
+                number,
+                format!("binding {} is declared twice", read.binding),
+            ));
+        }
+        if layers.iter().any(|held| held.name == read.name) {
+            return Err(fault(number, format!("`{}` is declared twice", read.name)));
+        }
+        layers.push(LayerRead {
+            name: read.name,
+            layer: layer.to_owned(),
+            binding: read.binding,
+        });
+        if layers.len() > MAX_INPUTS {
+            return Err(fault(
+                number,
+                format!("a shader declares at most {MAX_INPUTS} layers"),
+            ));
+        }
+    }
+    Ok(layers)
+}
+
 /// How far, in document cells, the file declares it reads around the texel it
 /// writes, or `None` for a file that declares nothing.
 ///
@@ -633,6 +712,11 @@ pub struct ShaderLayer {
     /// read and the edges it saved still land on them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
+    /// The fields the file read by name when it was last read, in declaration order.
+    /// Serialized for the reason `inputs` is: a loaded document orders its bake
+    /// before the shader directory has been read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<FieldId>,
     /// How far, in document cells, the file says this shader reads around the texel
     /// it writes — the whole of what lets a re-bake stay inside a rectangle. `None`
     /// is a file that declared nothing, and a node of it with a wired pin re-bakes
@@ -659,6 +743,7 @@ impl ShaderLayer {
             file: file.into(),
             params: BTreeMap::new(),
             inputs: Vec::new(),
+            layers: Vec::new(),
             reach: None,
             values: Raster::default(),
             stamp: None,
@@ -764,6 +849,21 @@ impl ShaderLayer {
             return false;
         }
         self.inputs = names;
+        true
+    }
+
+    /// Takes the fields the file now reads by name, answering whether the list moved.
+    ///
+    /// `true` means the field's dependencies, and so its bake order, may have moved.
+    pub fn reconcile_layers(&mut self, declared: &[LayerRead]) -> bool {
+        let names: Vec<FieldId> = declared
+            .iter()
+            .map(|read| FieldId::from(read.layer.as_str()))
+            .collect();
+        if self.layers == names {
+            return false;
+        }
+        self.layers = names;
         true
     }
 
@@ -1096,6 +1196,64 @@ mod tests {
         assert!(layer.reconcile_inputs(&declared));
         assert_eq!(layer.inputs, vec!["a".to_owned()]);
         assert!(!layer.reconcile_inputs(&declared));
+    }
+
+    // The annotation is the whole of a dependency on another field, so the field it
+    // names and the binding its raster lands on both have to come out of the line.
+    #[test]
+    fn a_layer_read_gives_its_name_its_field_and_its_binding() {
+        let layers =
+            parse_layers("@group(0) @binding(4) var base: texture_2d<f32>; // @layer base\n")
+                .unwrap();
+        assert_eq!(
+            layers,
+            vec![LayerRead {
+                name: "base".to_owned(),
+                layer: "base".to_owned(),
+                binding: 4
+            }]
+        );
+    }
+
+    // The template carries a commented-out example, which must not make every file
+    // copied from it depend on a field called `base`.
+    #[test]
+    fn a_fully_commented_line_declares_no_layer() {
+        let layers =
+            parse_layers("// @group(0) @binding(4) var base: texture_2d<f32>; // @layer base\n")
+                .unwrap();
+        assert!(layers.is_empty());
+    }
+
+    // An annotation with no name gives no field to bind, and silently binding nothing
+    // would read as a zero layer instead of saying the line is unfinished.
+    #[test]
+    fn an_empty_layer_annotation_is_a_fault_on_its_line() {
+        let error = parse_layers("\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer\n")
+            .unwrap_err();
+        assert_eq!(error.line, 2);
+    }
+
+    // Bindings below 3 are the globals, the output and the parameters, which a layer
+    // raster must not replace.
+    #[test]
+    fn a_layer_at_a_reserved_binding_is_a_fault() {
+        let error =
+            parse_layers("@group(0) @binding(1) var base: texture_2d<f32>; // @layer base\n")
+                .unwrap_err();
+        assert_eq!(error.line, 1);
+    }
+
+    // The bake order is recomputed off this answer, so a list that did not move must
+    // not report that it did — the sweep runs every frame.
+    #[test]
+    fn reconciling_layers_reports_only_a_list_that_moved() {
+        let declared =
+            parse_layers("@group(0) @binding(3) var a: texture_2d<f32>; // @layer base\n").unwrap();
+        let mut layer = ShaderLayer::new("reader.wgsl");
+        assert!(layer.reconcile_layers(&declared));
+        assert_eq!(layer.layers, vec![FieldId::from("base")]);
+        assert!(!layer.reconcile_layers(&declared));
     }
 
     // The reach is what bounds a re-bake to a rectangle, and its unit is document

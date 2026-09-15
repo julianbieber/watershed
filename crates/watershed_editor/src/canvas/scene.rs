@@ -29,8 +29,10 @@ pub(super) const SELECTED: Color = Color::srgb(0.85, 0.87, 0.95);
 /// What an edge between two cards is painted.
 pub(super) const WIRE: Color = Color::srgb(0.48, 0.64, 0.86);
 const PIN: Color = Color::srgb(0.78, 0.81, 0.88);
-const BROKEN: Color = Color::srgb(0.72, 0.24, 0.24);
-const FAULT: Color = Color::srgb(1.0, 0.74, 0.72);
+/// What the title bar of a card that carries a fault is painted.
+pub(super) const BROKEN: Color = Color::srgb(0.72, 0.24, 0.24);
+/// What a card's fault row is painted.
+pub(super) const FAULT: Color = Color::srgb(1.0, 0.74, 0.72);
 
 /// What a card's first text row is painted.
 pub(super) const DETAIL: Color = Color::srgb(0.72, 0.76, 0.85);
@@ -235,7 +237,20 @@ fn fault_of(
     library: Option<&ShaderLibrary>,
 ) -> Option<String> {
     match &node.op {
-        NodeOp::Shader(shader) => library?.entry(&shader.file)?.error.clone(),
+        NodeOp::Shader(shader) => library
+            .and_then(|held| held.entry(&shader.file))
+            .and_then(|entry| entry.error.clone())
+            .or_else(|| {
+                if shader.layers.is_empty() {
+                    return None;
+                }
+                document
+                    .terrain()?
+                    .field_faults()
+                    .into_iter()
+                    .find(|(id, _)| id.as_str() == document.active())
+                    .map(|(_, fault)| fault)
+            }),
         NodeOp::FieldRef(id) => document
             .terrain()
             .filter(|terrain| terrain.field(id.as_str()).is_none())
@@ -243,7 +258,9 @@ fn fault_of(
     }
 }
 
-fn fault_line(fault: &str) -> String {
+/// The first line of `fault`, cut with an ellipsis to the width a card's fault row
+/// has room for.
+pub(super) fn fault_line(fault: &str) -> String {
     clip(fault, FAULT_CHARS)
 }
 

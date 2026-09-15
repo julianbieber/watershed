@@ -9,8 +9,8 @@ observe log
 
 fixed-delta 1/60
 
-# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` through
-# one reference node.
+# `ridges` builds `moisture`, `base` and `height`, with `height`'s shader file reading
+# `base` by name.
 new 256 256 1 ridges
 wait bake
 

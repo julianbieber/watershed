@@ -19,7 +19,7 @@ default:
 # Install system libraries used by CI (Ubuntu/Debian)
 deps:
 	@sudo apt-get update
-	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev clang
+	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev clang mesa-vulkan-drivers
 
 # Format check
 fmt:

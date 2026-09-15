@@ -233,8 +233,9 @@ impl Field {
         self.graph.dependencies().into_iter()
     }
 
-    /// Every field this one's graph names in a `FieldRef`, whether or not the node is
-    /// wired to anything, with duplicates kept.
+    /// Every field this one's graph reads — named in a `FieldRef` or in a shader's
+    /// `@layer` annotation — whether or not the node is wired to anything, with
+    /// duplicates kept.
     ///
     /// Wider than [`Field::dependencies`], which reports only what the output reaches:
     /// an unconnected reference reads nothing yet, but it is a declared read, and the
@@ -245,7 +246,7 @@ impl Field {
             .nodes
             .iter()
             .filter(|node| !node.bypassed)
-            .filter_map(|node| node.op.dependency())
+            .flat_map(|node| node.op.reads())
     }
 }
 
@@ -297,6 +298,19 @@ mod tests {
         assert_eq!(deps.len(), 2);
         assert!(deps.contains(&"relief") && deps.contains(&"ridge"));
         assert!(!deps.contains(&"hidden"));
+    }
+
+    // A shader's `@layer` names are the file's dependency on another field, so bake
+    // order and the editor's read checks have to see them as reads.
+    #[test]
+    fn a_shader_nodes_layers_are_declared_reads_and_dependencies() {
+        let mut shader = crate::terrain::shader::ShaderLayer::new("reader.wgsl");
+        shader.layers = vec![FieldId::from("base")];
+        let field = Field::new("height").with_op(NodeOp::Shader(shader));
+        let declared: Vec<_> = field.declared_reads().map(|id| id.as_str()).collect();
+        let deps: Vec<_> = field.dependencies().map(|id| id.as_str()).collect();
+        assert_eq!(declared, ["base"]);
+        assert_eq!(deps, ["base"]);
     }
 
     // A history snapshot is `authored()`, so a display property missing from it is a

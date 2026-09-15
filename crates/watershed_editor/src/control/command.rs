@@ -648,9 +648,13 @@ impl Condition {
         }
         match self {
             Self::Idle => true,
-            Self::Bake => document
-                .terrain()
-                .is_some_and(|terrain| terrain.fields.iter().all(|f| !f.baked().is_empty())),
+            Self::Bake => document.terrain().is_some_and(|terrain| {
+                let faults = terrain.field_faults();
+                terrain
+                    .fields
+                    .iter()
+                    .all(|f| !f.baked().is_empty() || faults.iter().any(|(id, _)| *id == f.id))
+            }),
             Self::Water => document
                 .terrain()
                 .is_some_and(|terrain| terrain.water().is_some()),
@@ -870,5 +874,28 @@ mod tests {
             panic!("the regions preset parsed");
         };
         assert!(error.contains("regions"), "{error}");
+    }
+
+    // A field whose file names no field is left unbaked on purpose, so a scenario
+    // waiting for the bake after such an edit has to be released rather than wait for a
+    // raster that never comes.
+    #[test]
+    fn waiting_for_the_bake_is_met_by_a_field_left_unbaked_by_its_fault() {
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::shader::ShaderLayer;
+        use crate::terrain::{Field, TerrainSpec};
+        let mut shader = ShaderLayer::new("lost.wgsl");
+        shader.layers = vec![watershed::FieldId::from("nowhere")];
+        let mut terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+            .with_field(Field::new("height").with_op(NodeOp::Shader(shader)));
+        terrain.bake_in_place().unwrap();
+        assert!(terrain.field("height").unwrap().baked().is_empty());
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        let mut world = World::new();
+        world.insert_resource(document);
+        assert!(Condition::Bake.met(&world));
     }
 }

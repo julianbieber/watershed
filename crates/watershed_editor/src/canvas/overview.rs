@@ -275,15 +275,21 @@ pub(super) fn rebuild_overview(
     };
     let (placed, cycle) = layout(terrain);
     let wires = edges_between(&placed, terrain);
-    let cards: Vec<(String, &'static str, u8, Vec2)> = placed
+    let faults = terrain.field_faults();
+    let cards: Vec<(String, &'static str, u8, Vec2, Option<String>)> = placed
         .iter()
         .filter_map(|card| {
             let field = terrain.field(&card.field)?;
+            let fault = faults
+                .iter()
+                .find(|(id, _)| *id == field.id)
+                .map(|(_, fault)| fault.clone());
             Some((
                 card.field.clone(),
                 field.role.as_str(),
                 field.shift,
                 card.at,
+                fault,
             ))
         })
         .collect();
@@ -293,9 +299,18 @@ pub(super) fn rebuild_overview(
     }
 
     let font = assets.load(fonts::REGULAR);
-    for (name, role, shift, at) in cards {
+    for (name, role, shift, at, fault) in cards {
         let selected = name == active;
-        spawn_field_card(&mut commands, &font, &name, role, shift, at, selected);
+        spawn_field_card(
+            &mut commands,
+            &font,
+            &name,
+            role,
+            shift,
+            at,
+            selected,
+            fault,
+        );
     }
 
     let wire_material = materials.add(scene::WIRE);
@@ -320,9 +335,14 @@ fn spawn_field_card(
     shift: u8,
     at: Vec2,
     selected: bool,
+    fault: Option<String>,
 ) {
     let title_y = (CARD.y - TITLE_BAR) * 0.5;
-    let accent = if selected { scene::SELECTED } else { FIELD };
+    let accent = match (&fault, selected) {
+        (Some(_), _) => scene::BROKEN,
+        (None, true) => scene::SELECTED,
+        (None, false) => FIELD,
+    };
     let entity = commands
         .spawn((
             Sprite {
@@ -391,6 +411,9 @@ fn spawn_field_card(
         };
         row(0, DETAIL_SIZE, scene::DETAIL, role.to_owned());
         row(1, PARAM_SIZE, scene::PARAM, format!("shift {shift}"));
+        if let Some(fault) = fault {
+            row(2, PARAM_SIZE, scene::FAULT, scene::fault_line(&fault));
+        }
     });
 }
 
@@ -595,6 +618,9 @@ fn fingerprint(document: &Document) -> String {
             field.shift,
             crate::edit::reads_of(field).join(","),
         ));
+    }
+    for (id, fault) in terrain.field_faults() {
+        key.push_str(&format!("|fault {id}:{fault}"));
     }
     key
 }
@@ -1049,5 +1075,28 @@ mod tests {
         assert!(refusal.contains("moisture -> moisture"), "{refusal}");
         assert!(nodes_of(&world, "moisture").len() == 1, "a node was added");
         assert_eq!(document.history().undo, 0);
+    }
+
+    // A field that cannot bake reads as zero, so its card has to say why, or the
+    // overview shows a document that looks whole while one field of it is empty.
+    #[test]
+    fn a_field_naming_no_field_carries_the_fault_on_its_card() {
+        let mut shader = crate::terrain::shader::ShaderLayer::new("lost.wgsl");
+        shader.layers = vec![FieldId::from("nowhere")];
+        let mut app = overview_app(
+            TerrainSpec::new(UVec2::splat(16))
+                .with_field(Field::new("height").with_op(NodeOp::Shader(shader))),
+        );
+        app.world_mut().run_system_once(rebuild_overview).unwrap();
+        let texts: Vec<String> = app
+            .world_mut()
+            .query::<&Text2d>()
+            .iter(app.world())
+            .map(|text| text.0.clone())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("nowhere")),
+            "{texts:?}"
+        );
     }
 }

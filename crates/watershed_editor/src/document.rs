@@ -193,6 +193,7 @@ pub struct Document {
     /// re-discovering the same cycle — and would never go idle for a caller waiting on the
     /// edit that introduced it.
     bake_failed: bool,
+    logged_faults: Vec<String>,
     /// A solve is waiting for the whole-document bake that has to precede it. One flag
     /// rather than a queue, because it is the only pairing of jobs there is.
     pending_solve: bool,
@@ -224,6 +225,7 @@ impl Default for Document {
             baked: Baked::Nothing,
             baking: Baked::Nothing,
             bake_failed: false,
+            logged_faults: Vec::new(),
             pending_solve: false,
             runtime: ShaderRuntime::default(),
             size: UVec2::splat(1024),
@@ -312,11 +314,38 @@ impl Document {
         self.terrain.as_mut()
     }
 
+    /// Whether the last bake of the document as it stands failed. While it holds,
+    /// nothing re-bakes the document automatically; an edit or an explicit bake
+    /// clears it.
+    pub fn bake_failed(&self) -> bool {
+        self.bake_failed
+    }
+
+    fn unlogged_faults(&mut self) -> Vec<String> {
+        let faults: Vec<String> = self
+            .terrain()
+            .map(|terrain| {
+                terrain
+                    .field_faults()
+                    .into_iter()
+                    .map(|(_, fault)| fault)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fresh = faults
+            .iter()
+            .filter(|fault| !self.logged_faults.contains(fault))
+            .cloned()
+            .collect();
+        self.logged_faults = faults;
+        fresh
+    }
+
     /// What a re-bake covering `rect` has to actually be asked for: the rectangle, or
     /// `None` — the whole document — when the document holds a shader with something
-    /// wired into it whose file declares no reach.
+    /// wired into it, or a field named in an `@layer`, whose file declares no reach.
     ///
-    /// Such a shader may read *any* texel of what is wired into it, so no rectangle
+    /// Such a shader may read *any* texel of what it is handed, so no rectangle
     /// bounds the ground an edit under it moves. One whose file declares
     /// `// @reach <cells>` is bounded by that, the bake widens the rectangle by it
     /// per hop, and the answer stays the rectangle.
@@ -830,6 +859,9 @@ fn finish_job(mut document: ResMut<Document>) {
 
     if outcome.error.is_none() {
         document.baked = document.baked.with(document.baking);
+        for fault in document.unlogged_faults() {
+            warn!("{fault}");
+        }
     } else if matches!(kind, JobKind::Bake | JobKind::New) {
         document.bake_failed = true;
     }
@@ -1790,5 +1822,25 @@ mod tests {
     #[test]
     fn a_view_that_holds_no_cells_asks_for_no_rebake() {
         assert_eq!(wanted_rebake(false, Baked::Nothing, CellRect::EMPTY), None);
+    }
+
+    // A rectangle re-bake lands every time the view pans, so a fault that has not
+    // changed has to reach the log once rather than once per bake that lands.
+    #[test]
+    fn a_field_fault_that_has_not_changed_is_logged_once() {
+        use crate::terrain::graph::NodeOp;
+        use crate::terrain::shader::ShaderLayer;
+        use crate::terrain::{Field, TerrainSpec};
+        let mut shader = ShaderLayer::new("lost.wgsl");
+        shader.layers = vec![watershed::FieldId::from("nowhere")];
+        let mut document = Document::default();
+        document.adopt(
+            TerrainSpec::new(UVec2::splat(16))
+                .with_field(Field::new("height").with_op(NodeOp::Shader(shader))),
+        );
+        let first = document.unlogged_faults();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("nowhere"), "{first:?}");
+        assert!(document.unlogged_faults().is_empty());
     }
 }
