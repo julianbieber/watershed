@@ -87,119 +87,112 @@ pub fn toolbar() -> impl Scene {
         }
         ThemeBackgroundColor(tokens::WINDOW_BG)
         Children [
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("New…") ThemedText },
-                }
-                NewButton
-                on(|_: On<Activate>, mut dialog: ResMut<NewDialog>| {
-                    dialog.open = true;
+            @FeathersButton {
+                @caption: bsn! { Text("New…") ThemedText },
+            }
+            NewButton
+            on(|_: On<Activate>, mut dialog: ResMut<NewDialog>| {
+                dialog.open = true;
+            })
+            --
+            @separator()
+            --
+            @FeathersTextInputContainer
+            Node { width: px(220) }
+            Children [
+                @FeathersTextInput
+                PathInput
+                on(|change: On<TextEditChange>,
+                    texts: Query<&EditableText>,
+                    mut path: ResMut<FilePath>| {
+                    if let Ok(text) = texts.get(change.event_target()) {
+                        path.0 = text.value().to_string();
+                    }
                 })
-            ),
-            separator(),
-            (
-                @FeathersTextInputContainer
-                Node { width: px(220) }
-                Children [
-                    (
-                        @FeathersTextInput
-                        PathInput
-                        on(|change: On<TextEditChange>,
-                            texts: Query<&EditableText>,
-                            mut path: ResMut<FilePath>| {
-                            if let Ok(text) = texts.get(change.event_target()) {
-                                path.0 = text.value().to_string();
-                            }
-                        })
-                    )
-                ]
-            ),
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Open") ThemedText },
+            ]
+            --
+            @FeathersButton {
+                @caption: bsn! { Text("Open") ThemedText },
+            }
+            OpenButton
+            on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
+                let result = document.start_load(path.0.clone().into());
+                report(&mut document, result);
+            })
+            --
+            @FeathersButton {
+                @caption: bsn! { Text("Save") ThemedText },
+            }
+            SaveButton
+            on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
+                let result =
+                    document.start_save(path.0.clone().into(), SaveOptions::document());
+                report(&mut document, result);
+            })
+            --
+            @separator()
+            --
+            @FeathersMenu
+            Node { min_width: px(120) }
+            Children [
+                @FeathersMenuButton {
+                    @caption: bsn! { Text("layer") ThemedText LayerMenuCaption },
                 }
-                OpenButton
-                on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
-                    let result = document.start_load(path.0.clone().into());
-                    report(&mut document, result);
-                })
-            ),
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Save") ThemedText },
-                }
-                SaveButton
-                on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
-                    let result =
-                        document.start_save(path.0.clone().into(), SaveOptions::document());
-                    report(&mut document, result);
-                })
-            ),
-            separator(),
-            (
-                @FeathersMenu
-                Node { min_width: px(120) }
-                Children [
-                    (
-                        @FeathersMenuButton {
-                            @caption: bsn! { Text("layer") ThemedText LayerMenuCaption },
-                        }
-                        Node { flex_grow: 1.0 }
-                    ),
-                    (@FeathersMenuPopup LayerMenuPopup),
-                ]
-            ),
-            separator(),
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Bake all") ThemedText },
-                }
-                BakeAllButton
-                on(|_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document.start_bake();
-                    report(&mut document, result);
-                })
-            ),
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Solve water") ThemedText },
-                }
-                SolveButton
-                on(|_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document.solve_with_bake();
-                    report(&mut document, result);
-                })
-            ),
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Reset water") ThemedText },
-                }
-                ResetWaterButton
-                on(|_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document.reset_water();
-                    report(&mut document, result);
-                })
-            ),
-            separator(),
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Fit") ThemedText },
-                    @variant: ButtonVariant::Plain,
-                }
-                on(|_: On<Activate>,
-                    document: Res<Document>,
-                    free: Res<FreeView>,
-                    camera: Single<(&mut Transform, &mut Projection), With<EditorCamera>>| {
-                    let Some(terrain) = document.terrain() else {
-                        return;
-                    };
-                    let size = terrain.size;
-                    let (mut transform, mut projection) = camera.into_inner();
-                    fit_camera(&mut transform, &mut projection, size, *free);
-                })
-            ),
-            separator(),
-            (widgets::text("no document") StatusLabel),
+                Node { flex_grow: 1.0 }
+                --
+                @FeathersMenuPopup LayerMenuPopup
+            ]
+            --
+            @separator()
+            --
+            @FeathersButton {
+                @caption: bsn! { Text("Bake all") ThemedText },
+            }
+            BakeAllButton
+            on(|_: On<Activate>, mut document: ResMut<Document>| {
+                let result = document.start_bake();
+                report(&mut document, result);
+            })
+            --
+            @FeathersButton {
+                @caption: bsn! { Text("Solve water") ThemedText },
+            }
+            SolveButton
+            on(|_: On<Activate>, mut document: ResMut<Document>| {
+                let result = document.solve_with_bake();
+                report(&mut document, result);
+            })
+            --
+            @FeathersButton {
+                @caption: bsn! { Text("Reset water") ThemedText },
+            }
+            ResetWaterButton
+            on(|_: On<Activate>, mut document: ResMut<Document>| {
+                let result = document.reset_water();
+                report(&mut document, result);
+            })
+            --
+            @separator()
+            --
+            @FeathersButton {
+                @caption: bsn! { Text("Fit") ThemedText },
+                @variant: ButtonVariant::Plain,
+            }
+            on(|_: On<Activate>,
+                document: Res<Document>,
+                free: Res<FreeView>,
+                camera: Single<(&mut Transform, &mut Projection), With<EditorCamera>>| {
+                let Some(terrain) = document.terrain() else {
+                    return;
+                };
+                let size = terrain.size;
+                let (mut transform, mut projection) = camera.into_inner();
+                fit_camera(&mut transform, &mut projection, size, *free);
+            })
+            --
+            @separator()
+            --
+            @widgets::text("no document") StatusLabel
         ]
     }
 }
@@ -211,7 +204,7 @@ fn separator() -> impl Scene {
             height: px(18),
             margin: UiRect::horizontal(px(2)),
         }
-        ThemeBackgroundColor(tokens::GROUP_HEADER_BORDER)
+        ThemeBackgroundColor(tokens::GROUP_BORDER)
     }
 }
 
@@ -318,7 +311,7 @@ pub fn rebuild_layer_menu(
         .map(|name| {
             let chosen = name.clone();
             one(bsn! {
-                widgets::item_caption(name)
+                @widgets::item_caption(name)
                 on(move |_: On<Activate>, mut document: ResMut<Document>| {
                     let result = document.set_active(&chosen);
                     report(&mut document, result);

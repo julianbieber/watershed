@@ -952,7 +952,9 @@ pub fn dispatch(
         _ => return Err("the shader output could not be read back".to_owned()),
     }
 
-    let view = slice.get_mapped_range();
+    let view = slice
+        .get_mapped_range()
+        .map_err(|error| format!("the shader output could not be mapped: {error}"))?;
     let values: Vec<f32> = view
         .chunks_exact(4)
         .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))

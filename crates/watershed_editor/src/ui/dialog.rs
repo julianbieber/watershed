@@ -37,7 +37,7 @@ pub fn dialog() -> impl Scene {
         .into_iter()
         .map(|preset| {
             one(bsn! {
-                widgets::item_caption(preset.name())
+                @widgets::item_caption(preset.name())
                 on(move |_: On<Activate>, mut dialog: ResMut<NewDialog>| {
                     dialog.preset = preset;
                 })
@@ -59,98 +59,88 @@ pub fn dialog() -> impl Scene {
         GlobalZIndex(50)
         DialogRoot
         Children [
-            (
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Stretch,
+                row_gap: px(8),
+                padding: px(12),
+                min_width: px(300),
+                border: px(1),
+            }
+            ThemeBackgroundColor(tokens::WINDOW_BG)
+            ThemeBorderColor(tokens::GROUP_BORDER)
+            Children [
+                @widgets::text("New terrain")
+                --
+                @widgets::number_row("width", NumberBinding::DialogWidth)
+                --
+                @widgets::number_row("height", NumberBinding::DialogHeight)
+                --
+                @widgets::number_row("seed", NumberBinding::DialogSeed)
+                --
                 Node {
                     display: Display::Flex,
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::Stretch,
-                    row_gap: px(8),
-                    padding: px(12),
-                    min_width: px(300),
-                    border: px(1),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::SpaceBetween,
+                    column_gap: px(6),
                 }
-                ThemeBackgroundColor(tokens::WINDOW_BG)
-                ThemeBorderColor(tokens::GROUP_HEADER_BORDER)
                 Children [
-                    widgets::text("New terrain"),
-                    widgets::number_row("width", NumberBinding::DialogWidth),
-                    widgets::number_row("height", NumberBinding::DialogHeight),
-                    widgets::number_row("seed", NumberBinding::DialogSeed),
-                    (
-                        Node {
-                            display: Display::Flex,
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            justify_content: JustifyContent::SpaceBetween,
-                            column_gap: px(6),
-                        }
+                    Node { min_width: px(84) } Children [ @widgets::small("preset") ]
+                    --
+                    Node { flex_grow: 1.0, max_width: px(150) }
+                    Children [
+                        @bevy::feathers::controls::FeathersMenu
+                        Node { flex_grow: 1.0 }
                         Children [
-                            (Node { min_width: px(84) } Children [ widgets::small("preset") ]),
-                            (
-                                Node { flex_grow: 1.0, max_width: px(150) }
-                                Children [
-                                    (
-                                        @bevy::feathers::controls::FeathersMenu
-                                        Node { flex_grow: 1.0 }
-                                        Children [
-                                            (
-                                                @bevy::feathers::controls::FeathersMenuButton {
-                                                    @caption: bsn! {
-                                                        Text("continents")
-                                                        ThemedText
-                                                        PresetCaption
-                                                    },
-                                                }
-                                                Node { flex_grow: 1.0 }
-                                            ),
-                                            (
-                                                @bevy::feathers::controls::FeathersMenuPopup
-                                                Children [ {presets} ]
-                                            ),
-                                        ]
-                                    )
-                                ]
-                            ),
+                            @bevy::feathers::controls::FeathersMenuButton {
+                                @caption: bsn! {
+                                    Text("continents")
+                                    ThemedText
+                                    PresetCaption
+                                },
+                            }
+                            Node { flex_grow: 1.0 }
+                            --
+                            @bevy::feathers::controls::FeathersMenuPopup
+                            Children [ {presets} ]
                         ]
-                    ),
-                    (
-                        Node {
-                            display: Display::Flex,
-                            flex_direction: FlexDirection::Row,
-                            justify_content: JustifyContent::End,
-                            column_gap: px(6),
-                        }
-                        Children [
-                            (
-                                @FeathersButton {
-                                    @caption: bsn! { Text("Create") ThemedText },
-                                    @variant: ButtonVariant::Primary,
-                                }
-                                CreateButton
-                                on(|_: On<Activate>,
-                                    mut document: ResMut<Document>,
-                                    mut dialog: ResMut<NewDialog>| {
-                                    let result = document.start_new(
-                                        UVec2::new(dialog.width, dialog.height),
-                                        dialog.seed,
-                                        dialog.preset,
-                                    );
-                                    report(&mut document, result);
-                                    dialog.open = false;
-                                })
-                            ),
-                            (
-                                @FeathersButton {
-                                    @caption: bsn! { Text("Cancel") ThemedText },
-                                }
-                                on(|_: On<Activate>, mut dialog: ResMut<NewDialog>| {
-                                    dialog.open = false;
-                                })
-                            ),
-                        ]
-                    ),
+                    ]
                 ]
-            )
+                --
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::End,
+                    column_gap: px(6),
+                }
+                Children [
+                    @FeathersButton {
+                        @caption: bsn! { Text("Create") ThemedText },
+                        @variant: ButtonVariant::Primary,
+                    }
+                    CreateButton
+                    on(|_: On<Activate>,
+                        mut document: ResMut<Document>,
+                        mut dialog: ResMut<NewDialog>| {
+                        let result = document.start_new(
+                            UVec2::new(dialog.width, dialog.height),
+                            dialog.seed,
+                            dialog.preset,
+                        );
+                        report(&mut document, result);
+                        dialog.open = false;
+                    })
+                    --
+                    @FeathersButton {
+                        @caption: bsn! { Text("Cancel") ThemedText },
+                    }
+                    on(|_: On<Activate>, mut dialog: ResMut<NewDialog>| {
+                        dialog.open = false;
+                    })
+                ]
+            ]
         ]
     }
 }

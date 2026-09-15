@@ -1,7 +1,7 @@
 //! Turning a layer's texels into a picture: the material the viewport quad is drawn
 //! with, and the colour ramps that decide what a value looks like.
 //!
-//! This module and `layer.wgsl` beside it are two halves of one thing. The uniform
+//! This module and `layer.wesl` beside it are two halves of one thing. The uniform
 //! is declared in both and the ramps are written out in both, because the shader
 //! cannot call into Rust and the legend cannot run the shader. A change on either
 //! side is a change on both.
@@ -11,7 +11,7 @@ use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{Material2d, Material2dPlugin};
 
-const SHADER: &str = "embedded://watershed_editor/layer.wgsl";
+const SHADER: &str = "embedded://watershed_editor/layer.wesl";
 
 /// Registers the layer material and embeds its shader into the binary.
 ///
@@ -22,7 +22,7 @@ pub struct LayerMaterialPlugin;
 
 impl Plugin for LayerMaterialPlugin {
     fn build(&self, app: &mut App) {
-        bevy::asset::embedded_asset!(app, "layer.wgsl");
+        bevy::asset::embedded_asset!(app, "layer.wesl");
         app.add_plugins(Material2dPlugin::<LayerMaterial>::default());
     }
 }
@@ -48,7 +48,7 @@ pub struct LayerMaterial {
 
 /// The uniform the fragment function reads.
 ///
-/// The same thing as `LayerUniform` in `layer.wgsl`, written twice: the layer order
+/// The same thing as `LayerUniform` in `layer.wesl`, written twice: the layer order
 /// here *is* the binding layout, and the vectors are declared before the scalars so
 /// the padding agrees on both sides. Adding, removing or reordering a layer means
 /// doing the same in the shader.
@@ -113,7 +113,7 @@ const DIVERGING_WARM: Vec3 = Vec3::new(0.439, 0.075, 0.071);
 /// The sequential ramp, `t` on 0..1, clamped. Monotone in lightness from light to
 /// dark, so a larger value always reads as darker.
 ///
-/// The same ramp `layer.wgsl` draws with. Used by the legend, which cannot run the
+/// The same ramp `layer.wesl` draws with. Used by the legend, which cannot run the
 /// shader.
 pub fn sequential(t: f32) -> Vec3 {
     SEQUENTIAL_LIGHT.lerp(SEQUENTIAL_DARK, t.clamp(0.0, 1.0))
@@ -122,7 +122,7 @@ pub fn sequential(t: f32) -> Vec3 {
 /// The diverging ramp, `t` on -1..1 with the neutral at zero, clamped.
 ///
 /// The two arms reach equally far from the neutral, so a view lying wholly on one
-/// side of zero draws wholly in that side's hue. The same ramp `layer.wgsl` draws
+/// side of zero draws wholly in that side's hue. The same ramp `layer.wesl` draws
 /// with.
 pub fn diverging(t: f32) -> Vec3 {
     let t = t.clamp(-1.0, 1.0);
@@ -137,7 +137,7 @@ pub fn diverging(t: f32) -> Vec3 {
 mod tests {
     use super::*;
 
-    // The ramps are transcribed into `layer.wgsl` by hand, and this is what holds the
+    // The ramps are transcribed into `layer.wesl` by hand, and this is what holds the
     // two copies together. Only the ends and the midpoint are pinned: both sides
     // interpolate linearly between exactly those, so a transcription can only drift at
     // an endpoint.

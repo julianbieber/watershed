@@ -5,7 +5,7 @@
 // legend has to draw the same colours and cannot run a shader. A change here is a
 // change there.
 
-#import bevy_sprite::mesh2d_vertex_output::VertexOutput
+import bevy_sprite_render::mesh2d::vertex_output::VertexOutput;
 
 // Layer order is the binding layout: vectors before scalars, so the padding agrees
 // with `LayerSettings`.
@@ -21,9 +21,9 @@ struct LayerUniform {
     contour_interval: f32,
 }
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> settings: LayerUniform;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var layer_map: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var water_map: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> settings: LayerUniform;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var layer_map: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var water_map: texture_2d<f32>;
 
 const SEQUENTIAL_LIGHT: vec3<f32> = vec3<f32>(0.933, 0.949, 0.961);
 const SEQUENTIAL_DARK: vec3<f32> = vec3<f32>(0.063, 0.157, 0.227);
