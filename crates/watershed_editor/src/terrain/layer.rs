@@ -133,7 +133,7 @@ impl Layer {
     /// The shader file this layer's values come from: a plain name inside the
     /// document's `shaders` directory, never a path.
     pub fn file(&self) -> String {
-        format!("{}.wgsl", self.id)
+        format!("{}.wesl", self.id)
     }
 
     /// A copy of everything a person authored and nothing that was derived from it:

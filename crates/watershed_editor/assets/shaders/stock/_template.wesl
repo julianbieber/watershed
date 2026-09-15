@@ -1,6 +1,8 @@
+import package::lib::fbm_unit;
+
 // A layer's shader: one compute shader that produces every value of one layer. The
 // file is the layer — it lives in the document's `shaders` directory as
-// `<layer>.wgsl`, and a file whose name begins with `_` is not a layer. The editor
+// `<layer>.wesl`, and a file whose name begins with `_` is not a layer. The editor
 // appends the entry point, which calls `value(p)` once per texel of the layer's
 // raster. `value` takes a position and returns one number, and what lands, clamped to
 // the layer's range, is the layer.
@@ -11,6 +13,8 @@
 // thing at every raster shift. For the 0..1 reading, `uv(p)` divides by
 // `document_extent()`, the cells the document spans; on a document wider than it is
 // tall that stretches, because it runs 0..1 on both axes.
+//
+//   import package::lib::{fbm_unit, uv};
 //
 //   fn value(p: vec2<f32>) -> f32 {
 //       return fbm_unit(uv(p) * 4.0, 4u, 0.5, 2.0);
@@ -32,7 +36,19 @@
 //
 // THE LIBRARY
 //
-// From `layer_lib.wgsl`, compiled ahead of this file.
+// `lib.wesl`, which the editor writes beside this file and overwrites whenever a
+// document is opened or created. Nothing in it is available without an import, at the
+// top of the file and before any declaration. Import the items a file calls:
+//
+//   import package::lib::{fbm_unit, uv};
+//
+// or the module, and name each item through it:
+//
+//   import package::lib;
+//
+//   ... lib::uv(p) ...
+//
+// What it holds:
 //
 //   gradient_noise(p: vec2<f32>) -> f32
 //       one octave, roughly -1..1, exactly zero at every integer lattice point
@@ -80,8 +96,8 @@
 //
 //   @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 //
-// The binding holds that layer's baked raster, at the layer's own shift. Read it with
-// `layer_value(base, p)`, or one texel at a time with
+// The binding holds that layer's baked raster, at the layer's own shift. Import
+// `layer_value` and read it with `layer_value(base, p)`, or one texel at a time with
 // `input_texel(base, layer_texel(p))` when both layers share a shift. The layer named
 // is baked first. A name that is no layer, or one that makes layers read each other in
 // a circle, leaves this layer unbaked with the reason on its card.
@@ -93,7 +109,7 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 // Uncomment, and name a layer of the document, to read that layer with
-// `layer_value(base, p)`. Bindings start at 3.
+// `layer_value(base, p)` — add `layer_value` to the import. Bindings start at 3.
 // @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 
 fn value(p: vec2<f32>) -> f32 {

@@ -1,3 +1,5 @@
+import package::lib::{fbm_unit, seed_offset};
+
 struct Params {
     // @group Shape
     scale: f32,   // @ui 0.004 [0.0005, 0.2]

@@ -24,7 +24,7 @@ zoom fit
 observe document
 
 # The add itself. The layer list grows by one and the new layer is on screen. It copies
-# the template into `shaders/biomes.wgsl`, which is a file operation, so the history
+# the template into `shaders/biomes.wesl`, which is a file operation, so the history
 # does not grow.
 layer add biomes
 observe document

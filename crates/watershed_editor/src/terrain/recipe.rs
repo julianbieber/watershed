@@ -106,7 +106,7 @@ impl SaveOptions {
     }
 }
 /// The recipe for one layer: everything needed to bake it again beside its shader
-/// file, which is the layer's `shaders/<name>.wgsl`.
+/// file, which is the layer's `shaders/<name>.wesl`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerRecipe {
     /// The layer's name, and the stem of its shader file.

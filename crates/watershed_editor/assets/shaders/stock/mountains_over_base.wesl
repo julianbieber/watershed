@@ -1,3 +1,5 @@
+import package::lib::{fbm_unit, layer_value, ridged_fbm, seed_offset};
+
 struct Params {
     // @group Ridges
     ridge_scale: f32,  // @ui "Ridge scale" 0.006 [0.001, 0.05]

@@ -154,7 +154,7 @@ fn layer_mut<'a>(terrain: &'a mut TerrainSpec, name: &str) -> Result<&'a mut Lay
 ///
 /// Refused when the name is blank, already taken by a layer of the document, or
 /// could not stand as the stem of a shader file that is read back as the same layer:
-/// one containing `/` or `\`, or starting with `.` or `_`.
+/// one containing `/` or `\`, starting with `.` or `_`, or `lib`, the library's file.
 pub fn check_add(terrain: &TerrainSpec, name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -164,6 +164,9 @@ pub fn check_add(terrain: &TerrainSpec, name: &str) -> Result<String, String> {
         return Err(format!(
             "`{name}` cannot name a shader file: no `/` or `\\`, and no leading `.` or `_`"
         ));
+    }
+    if name == "lib" {
+        return Err("`lib` is the library's file, lib.wesl".to_owned());
     }
     if terrain.layer(name).is_some() {
         return Err(format!("this document already has a layer named `{name}`"));
@@ -499,12 +502,13 @@ mod tests {
         }
         assert_eq!(terrain.layers.len(), 2);
     }
-    // A layer is its file `shaders/<name>.wgsl`, so a name that is a path, a hidden
-    // file or a template would write somewhere else or never be read back as a layer.
+    // A layer is its file `shaders/<name>.wesl`, so a name that is a path, a hidden
+    // file, a template or the library would write somewhere else or never be read back
+    // as a layer.
     #[test]
     fn a_layer_name_that_cannot_be_a_file_stem_is_refused() {
         let terrain = document();
-        for name in ["a/b", "a\\b", ".hidden", "_x"] {
+        for name in ["a/b", "a\\b", ".hidden", "_x", "lib"] {
             assert!(check_add(&terrain, name).is_err(), "{name} was accepted");
         }
         assert_eq!(check_add(&terrain, " biomes ").unwrap(), "biomes");

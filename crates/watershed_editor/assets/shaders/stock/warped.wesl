@@ -1,3 +1,5 @@
+import package::lib::{fbm_unit, gradient_noise};
+
 struct Params {
     // @group Shape
     scale: f32,     // @ui 0.015 [0.001, 0.2]

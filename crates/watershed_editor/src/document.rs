@@ -373,7 +373,7 @@ impl Document {
     ///
     /// A file operation — see [`Edit::is_file_operation`] — is different on three
     /// counts. It is refused rather than held while a job runs. Adding a layer **writes
-    /// `<name>.wgsl`** into [`Document::shader_root`] as a copy of the template, and is
+    /// `<name>.wesl`** into [`Document::shader_root`] as a copy of the template, and is
     /// refused when that file already exists; removing one **deletes that file** after
     /// the edit's own refusals have passed. And neither is recorded in the history, so
     /// neither can be undone.
@@ -418,7 +418,7 @@ impl Document {
         match edit {
             Edit::AddLayer { name } => {
                 let name = check_add(terrain, name)?;
-                let file = root.join(format!("{name}.wgsl"));
+                let file = root.join(format!("{name}.wesl"));
                 if file.exists() {
                     return Err(format!("{} already exists", file.display()));
                 }
@@ -428,7 +428,7 @@ impl Document {
             }
             Edit::RemoveLayer { name } => {
                 let name = check_remove(terrain, name)?;
-                let file = root.join(format!("{name}.wgsl"));
+                let file = root.join(format!("{name}.wesl"));
                 match std::fs::remove_file(&file) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                         return Err(format!("{}: {error}", file.display()));
@@ -729,7 +729,7 @@ impl Document {
     /// Starts building a preset and baking it whole, dropping whatever was open.
     ///
     /// The preset's layer files are written into the scratch shader directory first,
-    /// **deleting every other `.wgsl` file there**, and the bake dispatches them through
+    /// **deleting every other `.wesl` file there**, and the bake dispatches them through
     /// programs built from those sources on the device the document last had.
     ///
     /// Refused while a job is running, or when the directory cannot be written. The
@@ -741,7 +741,7 @@ impl Document {
         let runtime = self.runtime.with_sources(
             seed,
             preset.files().iter().filter_map(|(layer, stock)| {
-                gpu::stock_source(stock).map(|source| (format!("{layer}.wgsl"), source.to_owned()))
+                gpu::stock_source(stock).map(|source| (format!("{layer}.wesl"), source.to_owned()))
             }),
         );
         self.size = size;
@@ -845,8 +845,14 @@ impl Document {
     ///
     /// The bake dispatches each layer's shader through programs built from the
     /// document's own `shaders` directory, on the device the document last had.
+    ///
+    /// Before the read starts, **overwrites that directory's `lib.wesl` and `wesl.toml`**
+    /// with this build's library. A write that fails is logged and the load goes on.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
         self.busy_check()?;
+        if let Err(error) = gpu::write_library(&path.join(SHADER_DIR)) {
+            warn!("{error}");
+        }
         let base = self.runtime.clone();
         self.path = Some(path.clone());
         self.terrain = None;
@@ -1016,8 +1022,8 @@ mod tests {
         document.path = Some(scratch(name));
         let root = document.shader_root();
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("base.wgsl"), "base").unwrap();
-        std::fs::write(root.join("height.wgsl"), "height").unwrap();
+        std::fs::write(root.join("base.wesl"), "base").unwrap();
+        std::fs::write(root.join("height.wesl"), "height").unwrap();
         document
     }
 
@@ -1047,7 +1053,7 @@ mod tests {
         let mut document = two_layer_document("add");
         add(&mut document, "temperature").unwrap();
 
-        let file = document.shader_root().join("temperature.wgsl");
+        let file = document.shader_root().join("temperature.wesl");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             gpu::template_source()
@@ -1068,7 +1074,7 @@ mod tests {
         document.start_bake().unwrap();
 
         assert!(add(&mut document, "temperature").is_err());
-        assert!(!document.shader_root().join("temperature.wgsl").exists());
+        assert!(!document.shader_root().join("temperature.wesl").exists());
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
@@ -1098,7 +1104,7 @@ mod tests {
 
         let error = remove(&mut document, "base").unwrap_err();
         assert!(error.contains("height"), "{error}");
-        assert!(document.shader_root().join("base.wgsl").is_file());
+        assert!(document.shader_root().join("base.wesl").is_file());
         assert_eq!(document.layer_names(), ["base", "height"]);
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
@@ -1112,7 +1118,7 @@ mod tests {
         document.set_active("height").unwrap();
 
         remove(&mut document, "height").unwrap();
-        assert!(!document.shader_root().join("height.wgsl").exists());
+        assert!(!document.shader_root().join("height.wesl").exists());
         assert_eq!(document.layer_names(), ["base"]);
         assert_eq!(document.active(), "base");
         assert_eq!(document.history().undo, 0);
@@ -1536,5 +1542,24 @@ mod tests {
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(first[0].contains("nowhere"), "{first:?}");
         assert!(document.unlogged_faults().is_empty());
+    }
+
+    // An IDE resolves a layer's import against `shaders/lib.wesl`, so opening a document
+    // has to put this build's library there whatever the file held before.
+    #[test]
+    fn opening_a_document_overwrites_its_library_file() {
+        let path = scratch("library");
+        let shaders = path.join(SHADER_DIR);
+        std::fs::create_dir_all(&shaders).unwrap();
+        std::fs::write(shaders.join(gpu::LIBRARY_FILE), "edited").unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+
+        let mut document = Document::default();
+        document.start_load(path.clone()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(shaders.join(gpu::LIBRARY_FILE)).unwrap(),
+            gpu::library_source()
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

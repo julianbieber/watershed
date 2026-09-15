@@ -510,7 +510,7 @@ fn queue_layer_pipelines(
     }
 }
 
-fn status_of(state: &CachedPipelineState) -> PipelineStatus {
+fn status_of(file: &str, state: &CachedPipelineState) -> PipelineStatus {
     match state {
         CachedPipelineState::Ok(_) => PipelineStatus::Ready,
         CachedPipelineState::Queued
@@ -521,7 +521,7 @@ fn status_of(state: &CachedPipelineState) -> PipelineStatus {
         CachedPipelineState::Err(
             ShaderCacheError::CreateShaderModule(description)
             | ShaderCacheError::ProcessShaderError(description),
-        ) => PipelineStatus::Failed(compile_fault(description)),
+        ) => PipelineStatus::Failed(compile_fault(file, description)),
     }
 }
 
@@ -537,7 +537,7 @@ fn dispatch_layers(
     let mut shared = shared.lock();
     let mut statuses = HashMap::with_capacity(pipelines.0.len());
     for (file, pipeline) in &pipelines.0 {
-        let status = status_of(cache.get_compute_pipeline_state(pipeline.id));
+        let status = status_of(file, cache.get_compute_pipeline_state(pipeline.id));
         shared
             .states
             .insert(file.clone(), (pipeline.key, status.clone()));
@@ -640,7 +640,7 @@ mod tests {
 
     use super::*;
 
-    // The layout has to be exactly the bindings `layer_lib.wgsl` and a file's `@layer`s declare, or the pipeline is refused.
+    // The layout has to be exactly the bindings `lib.wesl` and a file's `@layer`s declare, or the pipeline is refused.
     #[test]
     fn the_layout_binds_the_globals_output_params_and_each_layer_as_a_texture() {
         let descriptor = layout(&[3, 5]);
