@@ -1,14 +1,13 @@
-//! Documents to start from: a small fixed set of worked examples, each exercising a
-//! different way of building a height field.
+//! Documents to start from: a small fixed set of worked examples, each field of them
+//! produced by a shader node.
 //!
 //! A preset is a starting point for editing and a fixture for testing, not a terrain
 //! anyone is meant to ship. The set stays small for that reason — it is chosen to
-//! cover the ways a stack can be put together, not to be a library of landscapes.
+//! cover the ways a graph can be put together, not to be a library of landscapes.
 
-use crate::terrain::graph::Remap;
-use crate::terrain::graph::{Binary, FieldGraph, NodeId, NodeOp};
-use crate::terrain::noise::{NoiseKind, NoiseSpec, WarpSpec, sub_seed};
-use crate::terrain::regions::{Region, RegionOutput, RegionSpec};
+use crate::gpu;
+use crate::terrain::graph::{FieldGraph, NodeOp};
+use crate::terrain::shader::{ShaderLayer, parse_inputs, parse_params, parse_reach};
 use crate::terrain::{Field, TerrainSpec, WaterSpec};
 use bevy::prelude::*;
 use watershed::FieldRole;
@@ -16,22 +15,19 @@ use watershed::FieldRole;
 /// Which starting document to build.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
-    /// Land masses at one scale with bumps at another, both in one field. The
-    /// simplest stack, and the default.
+    /// Land masses at one scale with bumps at another, from one shader node. The
+    /// simplest document, and the default.
     #[default]
     Continents,
-    /// A ridged field masked by the continent it sits on, which needs the continent
-    /// to be a field of its own.
+    /// Ridged relief laid over a continent, which needs the continent to be a field of
+    /// its own read into the shader node that lifts it.
     Ridges,
-    /// A region tiling feeding two blended columns, one used as a height and one as a
-    /// mask on the relief laid over it.
-    Regions,
 }
 
 impl Preset {
     /// Every preset. The fixed-size array is what keeps this from drifting: adding a
     /// variant will not compile until the length and the list are both updated.
-    pub const ALL: [Self; 3] = [Self::Continents, Self::Ridges, Self::Regions];
+    pub const ALL: [Self; 2] = [Self::Continents, Self::Ridges];
 
     /// The word this preset is named by on the command line, and the only spelling
     /// [`Preset::parse`] accepts.
@@ -39,13 +35,22 @@ impl Preset {
         match self {
             Self::Continents => "continents",
             Self::Ridges => "ridges",
-            Self::Regions => "regions",
         }
     }
 
     /// The preset of that exact name, or `None`. Case-sensitive, and does not trim.
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|preset| preset.name() == word)
+    }
+
+    /// The stock shader files the nodes of this preset name, every one of them in
+    /// [`gpu::STOCK`]. A document built from the preset reads `0.0` from any of them
+    /// its shader directory does not hold.
+    pub fn stock_files(self) -> &'static [&'static str] {
+        match self {
+            Self::Continents => &["fbm.wgsl", "continents.wgsl"],
+            Self::Ridges => &["fbm.wgsl", "mountains.wgsl"],
+        }
     }
 
     /// The document, unbaked and unsolved.
@@ -56,13 +61,13 @@ impl Preset {
     /// and the role lookups, and none of them opens on an editor with half its
     /// display inert.
     ///
-    /// `seed` is the document's whole source of variation: two calls with the same
-    /// arguments give equal documents.
+    /// Every shader node carries a value for every parameter its file declares, its
+    /// hidden `seed` drawn from `seed`. Two calls with the same arguments give equal
+    /// documents.
     pub fn build(self, size: UVec2, seed: u32) -> TerrainSpec {
         let mut terrain = match self {
             Self::Continents => continents(size, seed),
             Self::Ridges => ridges(size, seed),
-            Self::Regions => regions(size, seed),
         };
         for field in &mut terrain.fields {
             field.role = match field.id.as_str() {
@@ -76,171 +81,79 @@ impl Preset {
     }
 }
 
-fn built(build: impl FnOnce(&mut FieldGraph) -> NodeId) -> FieldGraph {
-    let mut graph = FieldGraph::new();
-    let output = build(&mut graph);
-    graph
-        .set_output(Some(output))
-        .expect("the output node was just added to this graph");
-    graph
-}
-
-fn wire(graph: &mut FieldGraph, from: NodeId, to: NodeId, pin: usize) {
-    graph
-        .connect(from, to, pin)
-        .expect("a preset graph is acyclic and wires only pins its ops carry");
-}
-
 fn at(column: i32, row: i32) -> [f32; 2] {
     [column as f32 * 260.0, row as f32 * 150.0]
 }
 
-fn noise(seed: u32, kind: NoiseKind, scale: f32, octaves: u32) -> NodeOp {
-    NodeOp::Noise(NoiseSpec::new(seed, kind, scale).with_octaves(octaves))
+fn salted(seed: u32, salt: u32) -> u32 {
+    let mut hash = seed.wrapping_mul(0x9e37_79b9) ^ salt.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x2c1b_3c6d);
+    hash ^= hash >> 12;
+    hash & 0x00ff_ffff
+}
+
+fn layer(file: &str, seed: u32, values: &[(&str, f32)]) -> ShaderLayer {
+    let source = gpu::stock_source(file).expect("a preset names only shaders this build ships");
+    let mut layer = ShaderLayer::new(file);
+    layer.reconcile(&parse_params(source).expect("a stock shader declares readable parameters"));
+    layer.reconcile_inputs(&parse_inputs(source).expect("a stock shader declares readable inputs"));
+    layer.reconcile_reach(parse_reach(source).expect("a stock shader declares a readable reach"));
+    layer.params.insert("seed".to_owned(), vec![seed as f32]);
+    for (name, value) in values {
+        layer.params.insert((*name).to_owned(), vec![*value]);
+    }
+    layer
+}
+
+fn single(layer: ShaderLayer) -> FieldGraph {
+    let mut graph = FieldGraph::new();
+    graph.add_node(NodeOp::Shader(layer), at(0, 0));
+    graph
 }
 
 fn moisture(seed: u32) -> Field {
     Field::new("moisture")
         .with_shift(4)
-        .with_graph(built(|graph| {
-            graph.add_node(
-                noise(sub_seed(seed, 11), NoiseKind::Fbm, 0.004, 4),
-                at(0, 0),
-            )
-        }))
+        .with_graph(single(layer(
+            "fbm.wgsl",
+            salted(seed, 11),
+            &[("scale", 0.004), ("octaves", 4.0)],
+        )))
 }
-
-const CONTINENT_SCALE: f32 = 0.0015;
-const RELIEF_SCALE: f32 = 0.04;
 
 fn continents(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
         .with_field(moisture(seed))
-        .with_field(Field::new("height").with_graph(built(|graph| {
-            let base = graph.add_node(
-                noise(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE, 4),
-                at(0, 0),
-            );
-            let detail = graph.add_node(
-                noise(sub_seed(seed, 2), NoiseKind::Fbm, RELIEF_SCALE, 4),
-                at(0, 1),
-            );
-            let scaled = graph.add_node(NodeOp::Scale(0.18), at(1, 1));
-            let sum = graph.add_node(NodeOp::Binary(Binary::Add), at(2, 0));
-            wire(graph, detail, scaled, 0);
-            wire(graph, base, sum, 0);
-            wire(graph, scaled, sum, 1);
-            sum
-        })))
+        .with_field(Field::new("height").with_graph(single(layer(
+            "continents.wgsl",
+            salted(seed, 1),
+            &[],
+        ))))
 }
 
 fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
-    TerrainSpec::new(size)
-        .with_field(moisture(seed))
-        .with_field(Field::new("base").with_graph(built(|graph| {
-            graph.add_node(
-                noise(sub_seed(seed, 1), NoiseKind::Fbm, CONTINENT_SCALE, 4),
-                at(0, 0),
-            )
-        })))
-        .with_field(Field::new("height").with_graph(built(|graph| {
-            let under = graph.add_node(NodeOp::FieldRef("base".into()), at(0, 0));
-            let ridged = graph.add_node(
-                noise(sub_seed(seed, 3), NoiseKind::Ridged, 0.006, 5),
-                at(0, 1),
-            );
-            let scaled = graph.add_node(NodeOp::Scale(0.55), at(1, 1));
-            let sum = graph.add_node(NodeOp::Binary(Binary::Add), at(2, 1));
-            let weight_of = graph.add_node(NodeOp::FieldRef("base".into()), at(0, 2));
-            let weight = graph.add_node(
-                NodeOp::Remap(Remap::new((0.45, 0.75), (0.0, 1.0))),
-                at(1, 2),
-            );
-            let masked = graph.add_node(NodeOp::Lerp, at(3, 1));
-            let relief = graph.add_node(
-                noise(sub_seed(seed, 4), NoiseKind::Fbm, RELIEF_SCALE, 3),
-                at(0, 3),
-            );
-            let smaller = graph.add_node(NodeOp::Scale(0.08), at(1, 3));
-            let total = graph.add_node(NodeOp::Binary(Binary::Add), at(4, 2));
-            wire(graph, ridged, scaled, 0);
-            wire(graph, under, sum, 0);
-            wire(graph, scaled, sum, 1);
-            wire(graph, weight_of, weight, 0);
-            wire(graph, under, masked, 0);
-            wire(graph, sum, masked, 1);
-            wire(graph, weight, masked, 2);
-            wire(graph, relief, smaller, 0);
-            wire(graph, masked, total, 0);
-            wire(graph, smaller, total, 1);
-            total
-        })))
-}
-
-const REGION_CELL_TILES: u32 = 384;
-const REGION_BLEND_TILES: u32 = 48;
-
-fn regions(size: UVec2, seed: u32) -> TerrainSpec {
-    let spec = RegionSpec::new(
-        sub_seed(seed, 7),
-        REGION_CELL_TILES,
-        REGION_BLEND_TILES,
-        vec!["base".to_owned(), "relief".to_owned()],
-    )
-    .with_warp(WarpSpec {
-        seed: sub_seed(seed, 8),
-        amplitude: 160.0,
-        scale: 1.0 / 288.0,
-        octaves: 3,
-        salts: None,
-    })
-    .with_region(Region::new(3, [0.22, 0.04]))
-    .with_region(Region::new(3, [0.52, 0.10]))
-    .with_region(Region::new(2, [0.58, 0.16]))
-    .with_region(Region::new(2, [0.74, 0.42]))
-    .with_region(Region::new(2, [0.48, 0.06]));
-
-    let column = |spec: RegionSpec, name: &str| {
-        let name = name.to_owned();
-        built(move |graph| {
-            graph.add_node(
-                NodeOp::Regions {
-                    spec,
-                    output: RegionOutput::Blended(name),
-                },
-                at(0, 0),
-            )
-        })
-    };
+    let mut height = FieldGraph::new();
+    let base = height.add_node(NodeOp::FieldRef("base".into()), at(0, 0));
+    let lifted = height.add_node(
+        NodeOp::Shader(layer("mountains.wgsl", salted(seed, 3), &[])),
+        at(1, 0),
+    );
+    height
+        .connect(base, lifted, 0)
+        .expect("the mountains shader declares one input pin");
+    height
+        .set_output(Some(lifted))
+        .expect("the node was just added to this graph");
 
     TerrainSpec::new(size)
         .with_field(moisture(seed))
-        .with_field(
-            Field::new("base")
-                .with_shift(2)
-                .with_graph(column(spec.clone(), "base")),
-        )
-        .with_field(
-            Field::new("relief")
-                .with_shift(2)
-                .with_graph(column(spec, "relief")),
-        )
-        .with_field(Field::new("height").with_graph(built(|graph| {
-            let under = graph.add_node(NodeOp::FieldRef("base".into()), at(0, 0));
-            let detail = graph.add_node(
-                noise(sub_seed(seed, 9), NoiseKind::Fbm, RELIEF_SCALE, 4),
-                at(0, 1),
-            );
-            let sum = graph.add_node(NodeOp::Binary(Binary::Add), at(1, 0));
-            let weight = graph.add_node(NodeOp::FieldRef("relief".into()), at(0, 2));
-            let masked = graph.add_node(NodeOp::Lerp, at(2, 1));
-            wire(graph, under, sum, 0);
-            wire(graph, detail, sum, 1);
-            wire(graph, under, masked, 0);
-            wire(graph, sum, masked, 1);
-            wire(graph, weight, masked, 2);
-            masked
-        })))
+        .with_field(Field::new("base").with_graph(single(layer(
+            "fbm.wgsl",
+            salted(seed, 1),
+            &[("scale", 0.0015), ("octaves", 4.0)],
+        ))))
+        .with_field(Field::new("height").with_graph(height))
 }
 
 #[cfg(test)]
@@ -249,59 +162,34 @@ mod tests {
 
     const SIZE: UVec2 = UVec2::new(96, 96);
 
-    // Presets are the fixtures everything else in the editor is exercised against, so
-    // one that does not bake takes the whole editor's test coverage with it.
+    fn shaders(terrain: &TerrainSpec) -> Vec<&ShaderLayer> {
+        terrain
+            .fields
+            .iter()
+            .flat_map(|field| &field.graph.nodes)
+            .filter_map(|node| match &node.op {
+                NodeOp::Shader(shader) => Some(shader),
+                NodeOp::FieldRef(_) => None,
+            })
+            .collect()
+    }
+
+    // Every preset opens with the height and water displays live, and a water spec
+    // naming a field the document does not carry plans fine and fails at the water
+    // step, which is a long way from where the mistake is.
     #[test]
-    fn every_preset_bakes_and_names_a_height_field() {
+    fn every_preset_names_a_height_field_and_a_water_spec_over_fields_it_has() {
         for preset in Preset::ALL {
-            let mut terrain = preset.build(SIZE, 7);
-            terrain
-                .bake_in_place()
-                .unwrap_or_else(|error| panic!("{} did not bake: {error}", preset.name()));
+            let terrain = preset.build(SIZE, 7);
             assert!(
                 terrain.field("height").is_some(),
                 "{} has no height field",
                 preset.name()
             );
-        }
-    }
-
-    // Asserted per preset rather than once, because a flat height is a silent failure:
-    // it bakes, it solves, and it draws as a single colour that looks like a rendering
-    // fault rather than a stack that cancelled itself out.
-    #[test]
-    fn every_preset_produces_a_height_that_varies() {
-        for preset in Preset::ALL {
-            let mut terrain = preset.build(SIZE, 7);
-            terrain.bake_in_place().unwrap();
-
-            let baked = terrain.field("height").unwrap().baked();
-            let (low, high) = baked
-                .data()
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(low, high), &value| {
-                    (low.min(value), high.max(value))
-                });
-
-            assert!(
-                high - low > 0.05,
-                "{} spans only {low}..{high}",
-                preset.name()
-            );
-        }
-    }
-
-    // A water spec naming a field the document does not carry plans fine and fails at
-    // the water step, which is a long way from where the mistake is.
-    #[test]
-    fn every_preset_names_a_water_spec_over_fields_it_has() {
-        for preset in Preset::ALL {
-            let terrain = preset.build(SIZE, 7);
             let spec = terrain
                 .water_spec
                 .clone()
                 .unwrap_or_else(|| panic!("{} carries no water spec", preset.name()));
-
             assert!(terrain.field(spec.height.as_str()).is_some());
             if let Some(moisture) = &spec.moisture {
                 assert!(terrain.field(moisture.as_str()).is_some());
@@ -309,30 +197,84 @@ mod tests {
         }
     }
 
-    // The water overlay is only exercised if the presets actually pond; a height with
-    // no depressions would leave that whole display path untested.
+    // A `new` writes the preset's stock files before it bakes, so a node naming a file
+    // outside that list reads zero, and one this build does not ship cannot be written
+    // at all.
     #[test]
-    fn every_preset_solves_water_that_ponds_somewhere() {
+    fn every_shader_a_preset_names_is_in_its_stock_files_and_shipped() {
         for preset in Preset::ALL {
-            let mut terrain = preset.build(SIZE, 7);
-            terrain.bake_in_place().unwrap();
-            let spec = terrain.water_spec.clone().unwrap();
-            terrain
-                .solve_water(&spec)
-                .unwrap_or_else(|error| panic!("{} did not solve: {error}", preset.name()));
+            for file in preset.stock_files() {
+                assert!(gpu::stock_source(file).is_some(), "{file} is not shipped");
+            }
+            for shader in shaders(&preset.build(SIZE, 7)) {
+                assert!(
+                    preset.stock_files().contains(&shader.file.as_str()),
+                    "{} names {}, which it does not write",
+                    preset.name(),
+                    shader.file
+                );
+            }
+        }
+    }
 
-            assert!(terrain.water().is_some(), "{}", preset.name());
+    // The shape `observe nodes height` reports for each preset: one shader node for
+    // `continents`, and for `ridges` a reference to `base` wired into the one pin of
+    // the shader node the field is read from.
+    #[test]
+    fn continents_height_is_one_shader_node_and_ridges_height_reads_base_into_one() {
+        let continents = Preset::Continents.build(SIZE, 7);
+        let graph = &continents.field("height").unwrap().graph;
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(matches!(graph.nodes[0].op, NodeOp::Shader(_)));
+
+        let ridges = Preset::Ridges.build(SIZE, 7);
+        let graph = &ridges.field("height").unwrap().graph;
+        assert_eq!(graph.nodes.len(), 2);
+        let output = graph.node(graph.output.unwrap()).unwrap();
+        assert!(matches!(&output.op, NodeOp::Shader(shader) if shader.file == "mountains.wgsl"));
+        let read = graph
+            .node(output.inputs[0].expect("the pin is wired"))
+            .unwrap();
+        assert!(matches!(&read.op, NodeOp::FieldRef(id) if id.as_str() == "base"));
+    }
+
+    // `seed` is the whole of what varies a preset, so the same arguments have to build
+    // the same document and another seed a different one.
+    #[test]
+    fn equal_arguments_build_equal_documents_and_another_seed_builds_another() {
+        for preset in Preset::ALL {
+            assert_eq!(preset.build(SIZE, 7), preset.build(SIZE, 7));
+            assert_ne!(preset.build(SIZE, 7), preset.build(SIZE, 8));
+        }
+    }
+
+    // A parameter left for the first sweep to fill would make that sweep reconcile it
+    // and ask for a second bake of a document that has only just baked.
+    #[test]
+    fn every_node_already_carries_every_parameter_its_file_declares() {
+        for preset in Preset::ALL {
+            for shader in shaders(&preset.build(SIZE, 7)) {
+                let source = gpu::stock_source(&shader.file).unwrap();
+                let mut copy = shader.clone();
+                assert!(
+                    !copy.reconcile(&parse_params(source).unwrap()),
+                    "{} leaves {} to be reconciled",
+                    preset.name(),
+                    shader.file
+                );
+            }
         }
     }
 
     // The names are the command-line surface of the editor, so the two directions have
     // to agree — a name that does not parse back makes a preset unreachable from the
-    // control client.
+    // control client, and a preset that is gone must not parse at all.
     #[test]
     fn a_preset_is_named_by_the_word_that_parses_back_to_it() {
         for preset in Preset::ALL {
             assert_eq!(Preset::parse(preset.name()), Some(preset));
         }
+        assert_eq!(Preset::parse("regions"), None);
         assert_eq!(Preset::parse("nothing-like-this"), None);
     }
 }

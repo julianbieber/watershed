@@ -13,10 +13,10 @@ observe log
 
 fixed-delta 1/60
 
-# `regions` builds `moisture`, `base`, `relief` and `height`, with `height` reading
-# both `base` and `relief`. The order is the bake's: the two it reads come before it,
-# and `moisture`, which is at neither end of the relation, reads nothing.
-new 256 256 1 regions
+# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base`. The
+# order is the bake's: `base` comes before `height`, and `moisture`, which is at
+# neither end of the relation, reads nothing.
+new 256 256 1 ridges
 wait bake
 observe fields
 

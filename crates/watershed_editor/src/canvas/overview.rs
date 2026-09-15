@@ -26,14 +26,10 @@ use crate::terrain::TerrainSpec;
 use crate::terrain::graph::NodeOp;
 use crate::ui::{pointer_over_ui, report, typing};
 
-/// The accent a field card carries, so a card standing for a whole field is not read
-/// as one of the node cards the canvas draws the rest of the time.
 const FIELD: Color = Color::srgb(0.42, 0.33, 0.55);
 
-/// The gap between the centres of two columns of cards.
 const CARD_COLUMN: f32 = CARD.x * 1.6;
 
-/// The gap between the centres of two cards stacked in one column.
 const CARD_ROW: f32 = CARD.y * 1.3;
 
 /// Whether the canvas is showing the document's fields rather than the open field's
@@ -96,19 +92,6 @@ struct Placed {
     at: Vec2,
 }
 
-/// Where each field's card sits, and the cycle that stopped the fields from being
-/// ordered.
-///
-/// A field is one column right of the furthest-right field it reads, so nothing sits
-/// left of something it depends on; fields of equal depth stack downward, in bake
-/// order. A document that cannot be ordered falls back to declaration order, one card
-/// per column, and the cycle is the second half of the answer.
-///
-/// The columns are settled by repetition rather than by one pass over the bake order:
-/// a reference node wired into nothing is a read the bake does not have to order, so a
-/// field can read one the bake visits after it. The repetition is bounded by the number
-/// of fields, which is what keeps a relation looping through such a node from spinning
-/// here.
 fn layout(terrain: &TerrainSpec) -> (Vec<Placed>, Option<String>) {
     let (names, cycle) = match terrain.bake_order() {
         Ok(order) => (
@@ -171,8 +154,6 @@ fn layout(terrain: &TerrainSpec) -> (Vec<Placed>, Option<String>) {
     (placed, cycle)
 }
 
-/// One pair of anchor points per declared read: the read field's output edge to the
-/// reading field's input edge, which is the direction the ribbon is drawn in.
 fn edges_between(placed: &[Placed], terrain: &TerrainSpec) -> Vec<(Vec2, Vec2)> {
     let mut wires = Vec::new();
     for reader in placed {
@@ -599,10 +580,6 @@ pub(super) fn overview_after_undo(
     }
 }
 
-/// What the overview is drawn from, as one string.
-///
-/// Every field's name, role, shift and reads, which between them decide how many cards
-/// and ribbons there are and what each one says.
 fn fingerprint(document: &Document) -> String {
     let mut key = String::from("overview|");
     key.push_str(document.active());
@@ -631,11 +608,11 @@ mod tests {
     use crate::terrain::{Field, TerrainSpec};
     use watershed::FieldId;
 
-    fn regions_shaped() -> TerrainSpec {
+    fn height_reads_base_and_relief() -> TerrainSpec {
         TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("moisture").with_op(NodeOp::Constant(0.5)))
-            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
-            .with_field(Field::new("relief").with_op(NodeOp::Constant(0.75)))
+            .with_field(Field::new("moisture").with_op(NodeOp::held(0.5)))
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+            .with_field(Field::new("relief").with_op(NodeOp::held(0.75)))
             .with_field(
                 Field::new("height")
                     .with_op(NodeOp::FieldRef(FieldId::from("base")))
@@ -662,7 +639,7 @@ mod tests {
     // order it happens to be declared in.
     #[test]
     fn a_field_is_placed_right_of_everything_it_reads() {
-        let terrain = regions_shaped();
+        let terrain = height_reads_base_and_relief();
         let (placed, cycle) = layout(&terrain);
         assert!(cycle.is_none(), "a document that orders reported a cycle");
         assert!(at(&placed, "base").x < at(&placed, "height").x);
@@ -678,10 +655,10 @@ mod tests {
         let terrain = TerrainSpec::new(UVec2::splat(16))
             .with_field(
                 Field::new("moisture")
-                    .with_op(NodeOp::Constant(0.5))
+                    .with_op(NodeOp::held(0.5))
                     .with_op(NodeOp::FieldRef(FieldId::from("base"))),
             )
-            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)));
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)));
         let order: Vec<String> = terrain
             .bake_order()
             .expect("a dangling reference does not stop the order")
@@ -703,7 +680,7 @@ mod tests {
     // no ribbon at all, rather than a stub to nothing.
     #[test]
     fn a_field_nothing_reads_and_that_reads_nothing_has_no_ribbon() {
-        let terrain = regions_shaped();
+        let terrain = height_reads_base_and_relief();
         let (placed, _) = layout(&terrain);
         let moisture = at(&placed, "moisture");
         for (from, to) in edges_between(&placed, &terrain) {
@@ -716,7 +693,7 @@ mod tests {
     // reference nodes, so a double count here would draw two ribbons over each other.
     #[test]
     fn every_declared_read_is_joined_once() {
-        let terrain = regions_shaped();
+        let terrain = height_reads_base_and_relief();
         let (placed, _) = layout(&terrain);
         let wires = edges_between(&placed, &terrain);
         assert_eq!(wires.len(), 2);
@@ -780,7 +757,7 @@ mod tests {
             let field = match &previous {
                 Some(read) => Field::new(name.as_str())
                     .with_op(NodeOp::FieldRef(FieldId::from(read.as_str()))),
-                None => Field::new(name.as_str()).with_op(NodeOp::Constant(0.5)),
+                None => Field::new(name.as_str()).with_op(NodeOp::held(0.5)),
             };
             terrain = terrain.with_field(field);
             previous = Some(name);
@@ -805,7 +782,7 @@ mod tests {
         assert!(
             overview_fit(&TerrainSpec::new(UVec2::splat(16)), Vec2::new(800.0, 600.0)).is_none()
         );
-        assert!(overview_fit(&regions_shaped(), Vec2::ZERO).is_none());
+        assert!(overview_fit(&height_reads_base_and_relief(), Vec2::ZERO).is_none());
     }
 
     fn overview_app(terrain: TerrainSpec) -> App {
@@ -831,7 +808,7 @@ mod tests {
     // glancing at the document would be something that has to be saved.
     #[test]
     fn drawing_the_overview_makes_no_edit_and_starts_no_bake() {
-        let mut app = overview_app(regions_shaped());
+        let mut app = overview_app(height_reads_base_and_relief());
         let before = {
             let document = app.world().resource::<Document>();
             (
@@ -865,7 +842,7 @@ mod tests {
     // both address a field that survives the cards being rebuilt under them.
     #[test]
     fn every_field_gets_a_card_carrying_its_name() {
-        let mut app = overview_app(regions_shaped());
+        let mut app = overview_app(height_reads_base_and_relief());
         app.world_mut().run_system_once(rebuild_overview).unwrap();
         let mut names: Vec<String> = app
             .world_mut()
@@ -883,11 +860,11 @@ mod tests {
     #[test]
     fn the_fingerprint_moves_when_a_field_or_a_reference_is_added() {
         let mut document = Document::default();
-        document.adopt(regions_shaped());
+        document.adopt(height_reads_base_and_relief());
         let before = fingerprint(&document);
 
         let mut added = Document::default();
-        added.adopt(regions_shaped().with_field(Field::new("temperature")));
+        added.adopt(height_reads_base_and_relief().with_field(Field::new("temperature")));
         assert_ne!(
             fingerprint(&added),
             before,
@@ -898,8 +875,8 @@ mod tests {
         read.adopt(
             TerrainSpec::new(UVec2::splat(16))
                 .with_field(Field::new("moisture").with_op(NodeOp::FieldRef(FieldId::from("base"))))
-                .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
-                .with_field(Field::new("relief").with_op(NodeOp::Constant(0.75)))
+                .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+                .with_field(Field::new("relief").with_op(NodeOp::held(0.75)))
                 .with_field(
                     Field::new("height")
                         .with_op(NodeOp::FieldRef(FieldId::from("base")))
@@ -928,7 +905,7 @@ mod tests {
     }
 
     fn with_temperature() -> TerrainSpec {
-        regions_shaped().with_field(Field::new("temperature"))
+        height_reads_base_and_relief().with_field(Field::new("temperature"))
     }
 
     fn nodes_of(world: &World, field: &str) -> Vec<NodeOp> {
@@ -1045,7 +1022,7 @@ mod tests {
     // in a circle is refused, named, and adds nothing.
     #[test]
     fn a_drag_that_would_close_a_cycle_is_refused_and_named() {
-        let mut world = wired_world(regions_shaped(), "moisture");
+        let mut world = wired_world(height_reads_base_and_relief(), "moisture");
         let before = nodes_of(&world, "base").len();
         world.resource_mut::<Wired>().0 = Some(("height".to_owned(), "base".to_owned()));
         world.run_system_once(commit_field_wire).unwrap();
@@ -1063,7 +1040,7 @@ mod tests {
     // the shortest cycle there is is refused like any other.
     #[test]
     fn a_card_dragged_onto_itself_is_refused() {
-        let mut world = wired_world(regions_shaped(), "moisture");
+        let mut world = wired_world(height_reads_base_and_relief(), "moisture");
         world.resource_mut::<Wired>().0 = Some(("moisture".to_owned(), "moisture".to_owned()));
         world.run_system_once(commit_field_wire).unwrap();
 

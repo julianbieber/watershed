@@ -14,8 +14,8 @@ observe log
 
 fixed-delta 1/60
 
-# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` from two
-# separate reference nodes — which is what makes the rewrite below worth watching.
+# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` through
+# one reference node — which is what makes the rewrite below worth watching.
 new 256 256 7 ridges
 wait bake
 zoom fit
@@ -29,7 +29,7 @@ observe water
 field height
 observe field
 
-# The rename itself. Both of `height`'s reference nodes now say `fieldref continent`,
+# The rename itself. `height`'s reference node now says `fieldref continent`,
 # and the field bakes to the numbers it did before, because only the name changed.
 field rename base continent
 wait bake
@@ -38,13 +38,12 @@ field height
 observe field
 observe document
 
-# One undo step, not one per reference: `base` comes back and both references say
-# `fieldref base` again.
+# One undo step: `base` comes back and the reference says `fieldref base` again.
 undo
 wait bake
 observe nodes
 
-# And the redo puts the new name back on both.
+# And the redo puts the new name back on it.
 redo
 wait bake
 observe nodes
@@ -72,7 +71,7 @@ redo
 wait bake
 observe document
 
-# A round trip through the terrain directory. The new name and the references rewritten
+# A round trip through the terrain directory. The new name and the reference rewritten
 # with it are what was written, so they are what comes back.
 save /tmp/watershed-scenario/renamed-field
 load /tmp/watershed-scenario/renamed-field

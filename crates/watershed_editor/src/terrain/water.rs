@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn a_document_solves_water_over_the_field_it_names() {
         let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
         terrain.bake_in_place().unwrap();
         assert!(terrain.water().is_none());
         terrain.solve_water(&WaterSpec::default()).unwrap();
@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn invalidating_the_water_keeps_the_recipe_where_clearing_it_does_not() {
         let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
         terrain.bake_in_place().unwrap();
         terrain.solve_water(&WaterSpec::default()).unwrap();
 
@@ -955,10 +955,10 @@ mod tests {
     fn a_named_moisture_field_weights_what_the_sinks_deliver() {
         let size = UVec2::new(24, 24);
         let mut terrain = TerrainSpec::new(size)
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)))
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)))
             .with_field(
                 Field::new("moisture")
-                    .with_op(NodeOp::Constant(0.25))
+                    .with_op(NodeOp::held(0.25))
                     .with_range((0.0, 1.0)),
             );
         terrain.bake_in_place().unwrap();
@@ -987,7 +987,7 @@ mod tests {
     #[test]
     fn a_solve_refuses_a_field_it_cannot_read() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)))
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)))
             .with_field(Field::new("coarse").with_shift(2));
         terrain.bake_in_place().unwrap();
 
@@ -1011,7 +1011,7 @@ mod tests {
     #[test]
     fn a_solve_of_an_unbaked_document_is_refused() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::default()),
             Err(WaterError::UnbakedHeight(_))

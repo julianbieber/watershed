@@ -21,88 +21,56 @@ wait bake
 zoom fit
 
 # The graph as the preset built it, and the field it bakes. Both are the "before" the rest
-# of this scenario is measured against. `continents` builds height as n0 continent noise,
-# n1 relief noise, n2 a scale on n1, and n3 the sum it reads from.
+# of this scenario is measured against. `continents` builds height as one node, n0, a
+# `continents.wgsl` shader, and that node is the output.
 observe nodes
 observe field
 
-# A node added on its own changes nothing, which is the first thing a graph has to be able
-# to say that a stack could not: nothing reaches it, so it is evaluated never and allocates
-# nothing. The field below has to be identical to the one above.
-node add height constant 0.25
+# A stock shader copied into the document's shader directory, so a node can name it.
+shader adopt mountains.wgsl
+
+# A node added on its own changes nothing: nothing reaches it, so it is evaluated never.
+# The field below has to be identical to the one above.
+node add height shader mountains.wgsl
 observe field
 
-# Wiring it in is the edit that moves the bake. A constant summed onto the output raises
-# every cell, so the quantiles must all rise — and `baked` must have fallen from `whole` to
-# `rect`, because a live re-bake covers what is on screen and says so.
-node add height binary add
-node connect height n3 n5 0
-
-# Wiring the output into a node nothing reads carries the output onto it, from the socket
-# exactly as from a wire dragged on the canvas — so `output` has to read n5 here, before any
-# `node output` names it.
+# Wiring n0 into the one pin of n1 is the edit that moves the bake. Wiring the output into
+# a node nothing reads carries the output onto it, so `output` has to read n1 here, before
+# any `node output` names it — and `baked` has fallen from `whole` to `rect`, because a
+# live re-bake covers what is on screen and says so.
+node connect height n0 n1 0
 observe nodes
-
-node connect height n4 n5 1
-node output height n5
 observe field
 observe document
 
-# A node's parameters, one at a time, without rewriting the op around them.
-set height.n4.value 0.4
-set height.n5.mode mul
+# A shader node's parameter, one at a time, without rewriting the node around it.
+set height.n1.ridge 1.2
 observe field
-set height.n5.mode add
 
 # Bypassing passes the first input straight through, so the field has to come back exactly
-# to where it was before n5 was wired in — that is what makes bypass data rather than the
-# caller keeping a copy of the graph.
-node bypass height n5 on
+# to the numbers n0 baked before n1 was wired in.
+node bypass height n1 on
 observe field
 
-node bypass height n5 off
+node bypass height n1 off
 capture /tmp/watershed-scenario/node-added.png
 
 # A name is an address: once a node has one, every path that named it by id names it by
 # name too, and both reach the same node.
-node name height n5 total
-set height.total.mode max
-observe nodes
-observe field
-set height.total.mode add
-
-# Unwiring rather than deleting. Pointing the output back at n3 leaves n4 and n5 in the
-# document but out of the walk, so the field returns to the numbers at the top of this run
-# and the two nodes cost nothing while they sit there.
-node output height n3
-observe field
-
-# And removing them leaves the graph the preset built.
-node rm height n5
-node rm height n4
+node name height n1 peaks
+set height.peaks.ridge 0.3
 observe nodes
 observe field
 
-# The other half of what a graph can be told: a value that applies only where moisture is
-# high. This is what a masked layer was — a Lerp from what is under it towards what is
-# over it, by a weight read from another field through a Remap.
-node add height noise ridged 0.01 4 99
-node add height scale 0.3
-node connect height n6 n7 0
-node add height fieldref moisture
-node add height remap 0.5 0.8 0 1
-node connect height n8 n9 0
-node add height binary add
-node connect height n3 n10 0
-node connect height n7 n10 1
-node add height lerp
-node connect height n3 n11 0
-node connect height n10 n11 1
-node connect height n9 n11 2
-node output height n11
+# Unwiring rather than deleting. Pointing the output back at n0 leaves n1 in the document
+# but out of the walk, so the field returns to the numbers at the top of this run.
+node output height n0
+observe field
+
+# And removing it leaves the graph the preset built.
+node rm height n1
 observe nodes
 observe field
-capture /tmp/watershed-scenario/weighted-node.png
 
 # The edge that would make the graph feed itself is deliberately not tried here: a
 # scenario stops at its first refusal, and that one is expected. It is pinned instead by
@@ -111,8 +79,8 @@ capture /tmp/watershed-scenario/weighted-node.png
 
 # Dragging a card and naming a node are document edits that reach no bake, so neither may
 # re-bake anything: `baked` has to be what it was before these two lines.
-node place height n11 240 120
-node name height n11 weighted
+node place height n0 240 120
+node name height n0 ground
 observe document
 
 # A field property rather than a node's. A shift changes the raster the field is written
@@ -129,19 +97,17 @@ solve-water
 wait water
 observe water
 
-# Solve, edit, solve again. This is the sequence that was reported broken from the running
-# editor: an edit invalidates the water it produced, and used to take the water *spec* with
-# it — so the first edit after the first solve left a document that looked entirely ordinary
-# and could never be solved again. Both solves below have to answer with water, and with
-# *different* lake counts, since the height under them moved.
+# Solve, edit, solve again. An edit invalidates the water it produced but not the water
+# spec, so both solves below have to answer with water, and with *different* lake counts,
+# since the height under them moved. A named node is still addressable by its id.
 #
-# Note there is no `bake` here and none is needed: a solve bakes the whole document first
-# when it has to, which is what the button does and therefore what this verb does.
-set height.n1.op.scale 0.05
+# There is no `bake` here and none is needed: a solve bakes the whole document first when
+# it has to.
+set height.n0.land_scale 0.002
 solve-water
 observe water
 
-set height.n2.factor 0.4
+set height.n0.relief 0.3
 solve-water
 observe water
 

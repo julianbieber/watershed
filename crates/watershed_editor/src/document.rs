@@ -13,7 +13,7 @@
 //!
 //! What the bake on screen is worth is tracked apart from the terrain, because an
 //! edit invalidates a bake without touching it: see [`Baked`] for how much of the
-//! document currently matches its own layers.
+//! document currently matches its own graphs.
 
 use std::path::PathBuf;
 
@@ -24,10 +24,10 @@ use serde_json::Value;
 use watershed::CellRect;
 
 use crate::edit::{Edit, Slot};
-use crate::gpu::ShaderRuntime;
-use crate::history::{History, HistoryDepth, Restored, Snapshot, StrokePatch};
+use crate::gpu::{self, ShaderRuntime};
+use crate::history::{History, HistoryDepth, Restored, Snapshot};
 use crate::preset::Preset;
-use crate::terrain::graph::NodeId;
+use crate::terrain::shader::SHADER_DIR;
 use crate::view::VisibleCells;
 
 const REBAKE_MARGIN_CELLS: u32 = 64;
@@ -49,15 +49,11 @@ impl Plugin for DocumentPlugin {
 
 /// The order the editor's frame runs in.
 ///
-/// Explicit rather than left to the scheduler, because the three read and write the
-/// same document within one frame: a stroke made now has to be noted before the
-/// document decides what to bake, and the view has to upload what that decided after
-/// it. Unordered, a stroke would be answered a frame late and the picture would lag
-/// the bake by another.
+/// Explicit rather than left to the scheduler, because both read and write the same
+/// document within one frame: the view has to upload what the document decided to
+/// bake after it decided. Unordered, the picture would lag the bake by a frame.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EditorSystems {
-    /// Takes the pointer and turns it into strokes.
-    Brush,
     /// Lands finished jobs and starts the ones the frame has asked for.
     Document,
     /// Uploads what the document holds and follows the camera.
@@ -93,19 +89,18 @@ impl JobKind {
     }
 }
 
-/// How much of the document's bake still matches the layers it was cut from.
+/// How much of the document's bake still matches the graphs it was cut from.
 ///
-/// An edit to the stack drops this to [`Baked::Nothing`] rather than to the part it
+/// An edit to a graph drops this to [`Baked::Nothing`] rather than to the part it
 /// left alone: a node applies to a whole field, and nothing here knows the reach of
-/// the one that changed. A stroke is the exception — it names the ground it moved, so
-/// it leaves the extent where it was.
+/// the one that changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Baked {
     /// Nothing on screen can be trusted.
     Nothing,
     /// Only this rectangle of the document has been baked since the last edit.
     Rect(CellRect),
-    /// The whole document matches its layers. The only state a solve will run from.
+    /// The whole document matches its graphs. The only state a solve will run from.
     Whole,
 }
 
@@ -193,7 +188,7 @@ pub struct Document {
     /// the job because only the caller that started it knows whether it asked for all of
     /// the document or a rectangle of it.
     baking: Baked,
-    /// The stack as it stands does not bake. Nothing may re-bake it automatically until
+    /// The document as it stands does not bake. Nothing may re-bake it automatically until
     /// something about it changes, or a document holding a cycle would spend every frame
     /// re-discovering the same cycle — and would never go idle for a caller waiting on the
     /// edit that introduced it.
@@ -201,15 +196,13 @@ pub struct Document {
     /// A solve is waiting for the whole-document bake that has to precede it. One flag
     /// rather than a queue, because it is the only pairing of jobs there is.
     pending_solve: bool,
-    /// What a stroke has made stale since the last bake was opened. A rectangle rather than
-    /// a flag because that is the whole of what a stroke costs — see [`Document::note_stroke`].
-    stroke_rect: CellRect,
     /// Changes made while a job held the terrain, waiting for it to come back, in the
     /// order they were made. At most one per [`Slot`] other than [`Slot::Once`].
     held: Vec<Held>,
     /// What the document can go back to. Every change a person makes goes through
     /// [`Document::apply`] or [`Document::write`], which is what puts it here.
     history: History,
+    runtime: ShaderRuntime,
     pub size: UVec2,
     pub seed: u32,
     pub preset: Preset,
@@ -232,7 +225,7 @@ impl Default for Document {
             baking: Baked::Nothing,
             bake_failed: false,
             pending_solve: false,
-            stroke_rect: CellRect::EMPTY,
+            runtime: ShaderRuntime::default(),
             size: UVec2::splat(1024),
             seed: 1,
             preset: Preset::default(),
@@ -291,7 +284,7 @@ impl Document {
         matches!(self.job, Job::Running { .. })
     }
 
-    /// How much of the document currently matches its layers.
+    /// How much of the document currently matches its graphs.
     pub fn baked(&self) -> Baked {
         self.baked
     }
@@ -313,9 +306,8 @@ impl Document {
     /// Whatever is changed through this has to be followed by [`Document::note_edit`],
     /// and cannot be undone.
     ///
-    /// Anything a person authors goes through [`Document::apply`], [`Document::write`]
-    /// or — for a stroke, which paints through here and is recorded afterwards —
-    /// [`Document::record_stroke`]. That is what puts it in the history.
+    /// Anything a person authors goes through [`Document::apply`] or
+    /// [`Document::write`], which is what puts it in the history.
     pub fn terrain_mut(&mut self) -> Option<&mut TerrainSpec> {
         self.terrain.as_mut()
     }
@@ -333,20 +325,28 @@ impl Document {
         (!unbounded).then_some(rect)
     }
 
-    /// Installs what a shader node is dispatched through, when there is a document to
-    /// install it into.
+    /// Installs what a shader node is dispatched through: into the open terrain when
+    /// there is one, and into the document, so a document built or loaded later bakes
+    /// on the same device.
     ///
     /// Not an edit and not a revision: the runtime is derived from the shader
     /// directory and the render device, so noting it would ask for a bake on the
     /// frame the editor first sees a GPU and on every frame a file is saved.
     pub fn set_shader_runtime(&mut self, runtime: ShaderRuntime) {
         if let Some(terrain) = self.terrain.as_mut() {
-            terrain.set_shader_runtime(runtime);
+            terrain.set_shader_runtime(runtime.clone());
         }
+        self.runtime = runtime;
     }
 
-    /// Records that the stack has changed: the whole bake is stale, the last error no
-    /// longer applies, a stack that would not bake is worth trying again, and any
+    /// The runtime last installed with [`Document::set_shader_runtime`], whether or not
+    /// a terrain is open. A default one holds no device.
+    pub fn shader_runtime(&self) -> &ShaderRuntime {
+        &self.runtime
+    }
+
+    /// Records that a graph has changed: the whole bake is stale, the last error no
+    /// longer applies, a document that would not bake is worth trying again, and any
     /// solved water is invalidated — it was derived from a height that has just moved.
     ///
     /// The water's *spec* is kept, so the document can be solved again. Every caller
@@ -362,46 +362,6 @@ impl Document {
             terrain.invalidate_water();
             self.water_revision += 1;
         }
-    }
-
-    fn note_stroke(&mut self, reached: CellRect) {
-        self.dirty = true;
-        self.error = None;
-        self.bake_failed = false;
-        self.stroke_rect = self.stroke_rect.union(reached);
-        if let Some(terrain) = self.terrain.as_mut()
-            && terrain.water().is_some()
-        {
-            terrain.invalidate_water();
-            self.water_revision += 1;
-        }
-    }
-
-    /// Records a stroke that has just painted `painted` into `node` of `field`, `piece`
-    /// being what was under it beforehand, and arranges the re-bake it asks for. Answers
-    /// the rectangle the stroke *reaches* through the fields that read the painted one,
-    /// which is wider than the cells painted.
-    ///
-    /// `joins` asks for this to extend the entry the same drag opened rather than to make
-    /// one, so a drag is one undo step however many frames it took; a scripted stroke
-    /// passes `false` and is its own.
-    ///
-    /// The bake keeps the extent it had and the reached rectangle is added to what the
-    /// next one has to cover — so a stroke costs its own footprint rather than the whole
-    /// document, and a document that was wholly baked before one is wholly baked after.
-    pub fn record_stroke(
-        &mut self,
-        field: &str,
-        node: NodeId,
-        piece: StrokePatch,
-        painted: CellRect,
-        joins: bool,
-    ) -> CellRect {
-        self.history
-            .record_stroke(field, node, piece, painted, joins);
-        let reached = self.reach_of(field, painted);
-        self.note_stroke(reached);
-        reached
     }
 
     /// Applies a structural edit and notes it, which is why an edit goes through here
@@ -432,7 +392,7 @@ impl Document {
             .ok_or("there is no document to edit")?;
         let before = Snapshot::take(terrain, edit.reaches_the_bake(), &active);
         let reply = edit.apply(terrain)?;
-        self.history.record(before, terrain);
+        self.history.record(before);
         if let Some(shown) = edit.shows(terrain, &active) {
             self.active = shown;
         }
@@ -445,8 +405,7 @@ impl Document {
     }
 
     /// Writes one field in place through `write`, as one change in the history: the
-    /// path for a panel control whose value the [`Edit`] grammar cannot spell — a
-    /// shader parameter, a cell of a region table.
+    /// path for a panel control whose value the [`Edit`] grammar cannot spell.
     ///
     /// Answers whether the document has changed or will change: the field's authored
     /// state differs afterwards, and only then is the change recorded and noted — the
@@ -487,7 +446,7 @@ impl Document {
         if target.authored() == was {
             return false;
         }
-        self.history.record(before, terrain);
+        self.history.record(before);
         self.note_edit();
         true
     }
@@ -532,28 +491,10 @@ impl Document {
     }
 
     fn note_restored(&mut self, restored: Restored) {
-        match restored {
-            Restored::Fields {
-                reaches_bake,
-                active,
-            } => {
-                self.active = active;
-                self.revision += 1;
-                if reaches_bake {
-                    self.note_edit();
-                }
-            }
-            Restored::Stroke { field, cells } => {
-                let reached = self.reach_of(&field, cells);
-                self.note_stroke(reached);
-            }
-        }
-    }
-
-    fn reach_of(&self, field: &str, painted: CellRect) -> CellRect {
-        match self.terrain.as_ref() {
-            Some(terrain) => terrain.influence_of(field, painted),
-            None => painted,
+        self.active = restored.active;
+        self.revision += 1;
+        if restored.reaches_bake {
+            self.note_edit();
         }
     }
 
@@ -579,7 +520,7 @@ impl Document {
                     let before = Snapshot::take(terrain, edit.reaches_the_bake(), &active);
                     match edit.apply(terrain) {
                         Ok(_) => {
-                            self.history.record(before, terrain);
+                            self.history.record(before);
                             if let Some(shown) = edit.shows(terrain, &active) {
                                 active = shown;
                             }
@@ -600,7 +541,7 @@ impl Document {
                     if target.authored() == was {
                         continue;
                     }
-                    self.history.record(before, terrain);
+                    self.history.record(before);
                     landed = true;
                     reached_the_bake = true;
                 }
@@ -695,30 +636,40 @@ impl Document {
         self.start(JobKind::Bake, task);
         self.dirty = false;
         self.bake_failed = false;
-        self.stroke_rect = CellRect::EMPTY;
         self.baking = covered;
         Ok(())
     }
 
     /// Starts building a preset and baking it whole, dropping whatever was open.
     ///
-    /// Refused while a job is running. The document is emptied immediately, so the
-    /// view goes blank on the frame this is called rather than showing the old terrain
-    /// under the new size in the toolbar.
+    /// The preset's stock shaders are written into the scratch shader directory first,
+    /// overwriting files of the same names, and the bake dispatches them through
+    /// programs built from those sources on the device the document last had.
+    ///
+    /// Refused while a job is running, or when a stock shader cannot be written. The
+    /// document is emptied immediately, so the view goes blank on the frame this is
+    /// called rather than showing the old terrain under the new size in the toolbar.
     pub fn start_new(&mut self, size: UVec2, seed: u32, preset: Preset) -> Result<(), String> {
         self.busy_check()?;
+        gpu::write_stock(&gpu::scratch_root(), preset.stock_files())?;
+        let runtime = self.runtime.with_sources(
+            seed,
+            preset.stock_files().iter().filter_map(|file| {
+                gpu::stock_source(file).map(|source| ((*file).to_owned(), source.to_owned()))
+            }),
+        );
         self.size = size;
         self.seed = seed;
         self.preset = preset;
         self.path = None;
         self.terrain = None;
         self.baked = Baked::Nothing;
-        self.stroke_rect = CellRect::EMPTY;
         self.history.clear();
         self.held.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut terrain = preset.build(size, seed);
+            terrain.set_shader_runtime(runtime);
             let error = terrain.bake_in_place().err().map(|error| error.to_string());
             Outcome {
                 terrain: Some(terrain),
@@ -735,7 +686,7 @@ impl Document {
     ///
     /// Refused unless the whole document is baked and clean: water is derived from the
     /// height everywhere at once, and solving a document only part of which matches
-    /// its layers gives a drainage network for a landscape that no longer exists. Use
+    /// its graphs gives a drainage network for a landscape that no longer exists. Use
     /// [`Document::solve_with_bake`] to bake first.
     ///
     /// Also refused when the document carries no water spec, which is what a document
@@ -805,17 +756,22 @@ impl Document {
     /// Refused while a job is running. What lands is wholly baked whatever the file
     /// carried, because the reader re-derives what the file left out; on a failure the
     /// editor is left with no document rather than the old one.
+    ///
+    /// The bake dispatches the shader nodes through programs built from the document's
+    /// own `shaders` directory, on the device the document last had.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
         self.busy_check()?;
+        let base = self.runtime.clone();
+        let seed = self.seed;
         self.path = Some(path.clone());
         self.terrain = None;
         self.baked = Baked::Nothing;
-        self.stroke_rect = CellRect::EMPTY;
         self.history.clear();
         self.held.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            match TerrainSpec::load_from_dir(&path) {
+            let runtime = base.with_directory(seed, &path.join(SHADER_DIR));
+            match TerrainSpec::load_from_dir(&path, runtime) {
                 Ok(terrain) => Outcome {
                     terrain: Some(terrain),
                     error: None,
@@ -917,12 +873,7 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
         CellRect::EMPTY
     };
 
-    match wanted_rebake(
-        document.bake_failed,
-        document.baked,
-        wanted,
-        document.stroke_rect,
-    ) {
+    match wanted_rebake(document.bake_failed, document.baked, wanted) {
         None => document.dirty = false,
         Some(rect) => {
             let asked = document.bake_ask(rect);
@@ -933,22 +884,11 @@ fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>
     }
 }
 
-fn wanted_rebake(
-    bake_failed: bool,
-    baked: Baked,
-    wanted: CellRect,
-    stroke: CellRect,
-) -> Option<CellRect> {
-    if bake_failed {
+fn wanted_rebake(bake_failed: bool, baked: Baked, wanted: CellRect) -> Option<CellRect> {
+    if bake_failed || wanted.is_empty() || baked.covers(wanted) {
         return None;
     }
-    let view = if wanted.is_empty() || baked.covers(wanted) {
-        CellRect::EMPTY
-    } else {
-        wanted.expand(REBAKE_MARGIN_CELLS)
-    };
-    let ask = view.union(stroke);
-    (!ask.is_empty()).then_some(ask)
+    Some(wanted.expand(REBAKE_MARGIN_CELLS))
 }
 
 #[cfg(test)]
@@ -964,7 +904,7 @@ mod tests {
         use crate::terrain::{Field, TerrainSpec};
         let mut document = Document::default();
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
         terrain.bake_in_place().unwrap();
         document.adopt(terrain);
         document.dirty = false;
@@ -978,7 +918,7 @@ mod tests {
         use watershed::{FieldId, FieldRole};
         let mut document = Document::default();
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
@@ -999,7 +939,7 @@ mod tests {
         let mut layer = ShaderLayer::new("blur.wgsl");
         layer.inputs = vec!["source".to_owned()];
         layer.reach = reach;
-        let mut field = Field::new("height").with_op(NodeOp::Constant(0.5));
+        let mut field = Field::new("height").with_op(NodeOp::held(0.5));
         let upstream = field.graph.nodes[0].id;
         let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
         if wired {
@@ -1014,7 +954,7 @@ mod tests {
 
     // What a wired pin costs turns on the file's declaration, and this draws the
     // line: undeclared, a shader may read any texel of its input and the rectangle a
-    // stroke moved says nothing about the ground that bakes differently, so the whole
+    // edit moved says nothing about the ground that bakes differently, so the whole
     // document is re-baked; declared, the reach bounds it and the rectangle stands,
     // as it does with the pin unwired.
     #[test]
@@ -1360,17 +1300,19 @@ mod tests {
         assert_eq!(document.held.len(), 2);
     }
 
-    fn painted_texels(document: &Document) -> Vec<u8> {
-        let field = document.terrain().unwrap().field("height").unwrap();
-        field
-            .graph
-            .nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                crate::terrain::graph::NodeOp::Paint(raster) => Some(raster.data().to_vec()),
-                _ => None,
-            })
-            .unwrap_or_default()
+    fn scaled() -> crate::terrain::graph::NodeOp {
+        use crate::terrain::graph::NodeOp;
+        let NodeOp::Shader(mut layer) = NodeOp::piped(1) else {
+            unreachable!("a piped node is a shader node");
+        };
+        layer.params.insert("factor".to_owned(), vec![2.0]);
+        NodeOp::Shader(layer)
+    }
+
+    fn set_value(field: &mut crate::terrain::Field, value: f32) {
+        if let crate::terrain::graph::NodeOp::Shader(shader) = &mut field.graph.nodes[0].op {
+            shader.params.insert("value".to_owned(), vec![value]);
+        }
     }
 
     fn graph_of(document: &Document) -> crate::terrain::graph::FieldGraph {
@@ -1390,7 +1332,6 @@ mod tests {
     // re-bake to run, and three redos replay the edits.
     #[test]
     fn three_undos_return_the_graph_and_three_redos_replay_the_edits() {
-        use crate::terrain::graph::NodeOp;
         let mut document = one_node_document();
         let node = only_node(&document);
         let original = graph_of(&document);
@@ -1398,7 +1339,7 @@ mod tests {
         document
             .apply(&Edit::AddNode {
                 field: "height".to_owned(),
-                op: NodeOp::Scale(2.0),
+                op: scaled(),
                 position: None,
             })
             .unwrap();
@@ -1450,7 +1391,7 @@ mod tests {
         document
             .apply(&Edit::AddNode {
                 field: "height".to_owned(),
-                op: NodeOp::Scale(2.0),
+                op: NodeOp::piped(1),
                 position: None,
             })
             .unwrap();
@@ -1489,103 +1430,6 @@ mod tests {
         assert_eq!(document.baked, Baked::Whole);
         assert!(!document.dirty);
         assert_eq!(graph_of(&document).nodes[0].position, [0.0, 0.0]);
-    }
-
-    // The task's own acceptance, made where it can be made without a window: paint, take
-    // it back, and the paint is gone — with the document asking to re-bake the ground the
-    // stroke reached rather than dropping the extent it had.
-    #[test]
-    fn painting_and_undoing_leaves_the_document_as_it_was_and_asks_for_the_rebake() {
-        use crate::brush::apply_stroke;
-        use crate::terrain::brush::Brush;
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::{Field, TerrainSpec};
-        use watershed::raster::Raster;
-
-        let mut document = Document::default();
-        document.adopt(
-            TerrainSpec::new(UVec2::splat(64)).with_field(
-                Field::new("height")
-                    .with_sum([NodeOp::Constant(0.25), NodeOp::Paint(Raster::default())]),
-            ),
-        );
-        let brush = Brush {
-            radius_cells: 6.0,
-            strength: 0.9,
-            ..Brush::default()
-        };
-
-        let reply = apply_stroke(&mut document, &brush, &[Vec2::splat(32.0)], false).unwrap();
-        assert!(painted_texels(&document).iter().any(|byte| *byte > 0));
-        assert_eq!(document.history().undo, 1, "the stroke left no undo step");
-        let reached = &reply["reached"];
-        let reached = CellRect::new(
-            UVec2::new(
-                reached[0].as_u64().unwrap() as u32,
-                reached[1].as_u64().unwrap() as u32,
-            ),
-            UVec2::new(
-                reached[2].as_u64().unwrap() as u32,
-                reached[3].as_u64().unwrap() as u32,
-            ),
-        );
-
-        document.baked = Baked::Whole;
-        document.dirty = false;
-        document.stroke_rect = CellRect::EMPTY;
-        document.undo().unwrap();
-
-        assert!(
-            painted_texels(&document).iter().all(|byte| *byte == 0),
-            "the paint outlived the undo"
-        );
-        assert!(
-            document.is_dirty(),
-            "nothing would re-bake the undone stroke"
-        );
-        assert_eq!(
-            document.baked,
-            Baked::Whole,
-            "an undone stroke dropped the document's extent"
-        );
-        assert_eq!(
-            document.stroke_rect, reached,
-            "the undo asked for other ground than the stroke reached"
-        );
-    }
-
-    // An undo that restores a stroke needs the terrain exactly as one that restores a
-    // stack change does, so a job holding it refuses both alike.
-    #[test]
-    fn undoing_a_stroke_is_refused_while_a_job_holds_the_terrain() {
-        use crate::brush::apply_stroke;
-        use crate::terrain::brush::Brush;
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::{Field, TerrainSpec};
-        use watershed::raster::Raster;
-
-        let mut document = Document::default();
-        document.adopt(
-            TerrainSpec::new(UVec2::splat(64)).with_field(
-                Field::new("height")
-                    .with_sum([NodeOp::Constant(0.25), NodeOp::Paint(Raster::default())]),
-            ),
-        );
-        apply_stroke(
-            &mut document,
-            &Brush {
-                radius_cells: 6.0,
-                ..Brush::default()
-            },
-            &[Vec2::splat(32.0)],
-            false,
-        )
-        .unwrap();
-        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        document.start_bake(None).unwrap();
-
-        assert!(document.undo().is_err());
-        assert_eq!(document.history().undo, 1);
     }
 
     // A refusal leaves the document as it was, so there is nothing to go back to — an
@@ -1627,7 +1471,6 @@ mod tests {
     // already has is not a change, so it must neither re-bake nor cost a redo.
     #[test]
     fn a_write_that_changes_nothing_records_nothing() {
-        use crate::terrain::graph::NodeOp;
         let mut document = one_node_document();
         let node = only_node(&document);
         document
@@ -1639,15 +1482,11 @@ mod tests {
         document.undo().unwrap();
         assert_eq!(document.history().redo, 1);
 
-        let changed = document.write("height", Slot::Once, |field| {
-            field.graph.nodes[0].op = NodeOp::Constant(0.5);
-        });
+        let changed = document.write("height", Slot::Once, |field| set_value(field, 0.5));
         assert!(!changed);
         assert_eq!(document.history().redo, 1, "a no-op write forgot the redo");
 
-        let changed = document.write("height", Slot::Once, |field| {
-            field.graph.nodes[0].op = NodeOp::Constant(0.25);
-        });
+        let changed = document.write("height", Slot::Once, |field| set_value(field, 0.25));
         assert!(changed);
         assert_eq!(
             document.history(),
@@ -1702,9 +1541,9 @@ mod tests {
     }
 
     fn constant_of(document: &Document) -> f32 {
-        match graph_of(document).nodes[0].op {
-            crate::terrain::graph::NodeOp::Constant(value) => value,
-            _ => panic!("the one node is not a constant"),
+        match &graph_of(document).nodes[0].op {
+            crate::terrain::graph::NodeOp::Shader(shader) => shader.params["value"][0],
+            other => panic!("the one node is {other:?}"),
         }
     }
 
@@ -1792,7 +1631,7 @@ mod tests {
         document
             .apply(&Edit::AddNode {
                 field: "height".to_owned(),
-                op: NodeOp::Scale(2.0),
+                op: NodeOp::piped(1),
                 position: None,
             })
             .unwrap();
@@ -1816,7 +1655,6 @@ mod tests {
     // was raised about.
     #[test]
     fn a_write_held_while_a_job_runs_lands_when_the_job_does() {
-        use crate::terrain::graph::NodeOp;
         let (mut document, _) = bake_in_flight();
         let slot = Slot::Control {
             property: "constant",
@@ -1827,7 +1665,7 @@ mod tests {
         for value in [0.6, 0.8] {
             assert!(
                 document.write("height", slot.clone(), move |field| {
-                    field.graph.nodes[0].op = NodeOp::Constant(value);
+                    set_value(field, value);
                 }),
                 "a write during a bake is accepted"
             );
@@ -1845,12 +1683,9 @@ mod tests {
     // control committed at the value it already had would cost a re-bake and a redo.
     #[test]
     fn a_held_write_that_changes_nothing_records_nothing() {
-        use crate::terrain::graph::NodeOp;
         let (mut document, _) = bake_in_flight();
 
-        document.write("height", Slot::Once, |field| {
-            field.graph.nodes[0].op = NodeOp::Constant(0.5);
-        });
+        document.write("height", Slot::Once, |field| set_value(field, 0.5));
 
         let document = landed(document);
         assert_eq!(constant_of(&document), 0.5);
@@ -1929,74 +1764,15 @@ mod tests {
     #[test]
     fn an_edit_asks_for_the_view_and_a_covered_view_asks_for_nothing() {
         let view = rect(100, 200);
-        let asked = wanted_rebake(false, Baked::Nothing, view, CellRect::EMPTY)
-            .expect("an edit is answered");
+        let asked = wanted_rebake(false, Baked::Nothing, view).expect("an edit is answered");
         assert!(
             asked.union(view) == asked,
             "the rebake has to cover what is on screen"
         );
 
-        assert_eq!(
-            wanted_rebake(false, Baked::Whole, view, CellRect::EMPTY),
-            None
-        );
-        assert_eq!(
-            wanted_rebake(false, Baked::Rect(rect(0, 300)), view, CellRect::EMPTY),
-            None
-        );
-        assert!(wanted_rebake(false, Baked::Rect(rect(0, 150)), view, CellRect::EMPTY).is_some());
-    }
-
-    // The whole of what makes a brush usable: a stroke asks for the ground it moved and
-    // not for the screen it was drawn on, so a drag costs its own footprint per frame
-    // rather than a re-bake of the view sixty times a second.
-    #[test]
-    fn a_stroke_asks_for_the_ground_it_moved_and_not_for_the_whole_view() {
-        let view = rect(0, 1024);
-        let stroke = rect(100, 140);
-        let asked = wanted_rebake(false, Baked::Whole, view, stroke).expect("a stroke is answered");
-
-        assert_eq!(asked, stroke);
-        assert!(
-            asked.width() < view.width(),
-            "the stroke asked for the whole view"
-        );
-    }
-
-    // And it is what keeps the document solvable: a solve is refused unless the bake is
-    // whole, so a stroke that dropped the extent the way a structural edit does would make
-    // every stroke cost a whole-document bake before any water could be solved again.
-    #[test]
-    fn a_stroke_leaves_the_bake_the_extent_it_had() {
-        let mut document = Document {
-            baked: Baked::Whole,
-            ..Document::default()
-        };
-        document.note_stroke(rect(10, 20));
-
-        assert_eq!(document.baked(), Baked::Whole);
-        assert!(document.is_dirty(), "nothing would have baked the stroke");
-        assert!(!document.is_settled());
-    }
-
-    // A stroke made while a bake is in flight has to be asked for again, on exactly the
-    // terms `dirty` is: the job already running took its rectangle before the paint
-    // landed. The two assignments in the body are what `start_bake` does to both, spelled
-    // out because a test has no task pool to run a real one on.
-    #[test]
-    fn a_stroke_made_while_a_bake_runs_is_not_taken_for_answered() {
-        let mut document = Document {
-            stroke_rect: rect(10, 20),
-            dirty: true,
-            ..Document::default()
-        };
-
-        document.stroke_rect = CellRect::EMPTY;
-        document.dirty = false;
-        document.note_stroke(rect(30, 40));
-
-        assert_eq!(document.stroke_rect, rect(30, 40));
-        assert!(document.is_dirty());
+        assert_eq!(wanted_rebake(false, Baked::Whole, view), None);
+        assert_eq!(wanted_rebake(false, Baked::Rect(rect(0, 300)), view), None);
+        assert!(wanted_rebake(false, Baked::Rect(rect(0, 150)), view).is_some());
     }
 
     // The defect this guards cost a hang rather than a wrong picture: a stack holding a
@@ -2005,14 +1781,7 @@ mod tests {
     #[test]
     fn a_stack_that_will_not_bake_is_not_tried_again_until_something_changes() {
         let view = rect(100, 200);
-        assert_eq!(
-            wanted_rebake(true, Baked::Nothing, view, CellRect::EMPTY),
-            None
-        );
-        assert_eq!(
-            wanted_rebake(true, Baked::Nothing, view, rect(10, 20)),
-            None
-        );
+        assert_eq!(wanted_rebake(true, Baked::Nothing, view), None);
     }
 
     // A camera pointed away from the document leaves an empty view, and asking for a
@@ -2020,9 +1789,6 @@ mod tests {
     // less dirty.
     #[test]
     fn a_view_that_holds_no_cells_asks_for_no_rebake() {
-        assert_eq!(
-            wanted_rebake(false, Baked::Nothing, CellRect::EMPTY, CellRect::EMPTY),
-            None
-        );
+        assert_eq!(wanted_rebake(false, Baked::Nothing, CellRect::EMPTY), None);
     }
 }

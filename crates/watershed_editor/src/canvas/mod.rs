@@ -35,21 +35,10 @@ const ZOOM_PER_STEP: f32 = 1.2;
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 8.0;
 
-/// The zoom below which a card is drawn as a chip and its labels are dropped.
-///
-/// The floor the prototype stayed readable to. Below it a label costs a text layout
-/// nobody can read, so the labels come off rather than being drawn illegibly.
 const CHIP_ZOOM: f32 = 0.40;
 
-/// The render layer the canvas draws on, so the map's camera does not draw it and the
-/// canvas camera does not draw the map.
 const CANVAS_LAYER: usize = 1;
 
-/// What the canvas is drawn on.
-///
-/// Deliberately not the map's ground: the two sit one above the other in the same
-/// window, and a person has to be able to tell at a glance which of them the pointer
-/// is about to act on.
 const CANVAS_GROUND: Color = Color::srgb(0.115, 0.125, 0.165);
 
 /// Draws the open field's graph, and keeps it in step with the document.
@@ -99,7 +88,6 @@ impl Plugin for CanvasPlugin {
     }
 }
 
-/// Whether the canvas is showing the document's fields rather than one field's graph.
 fn overview_showing(overview: Res<Overview>) -> bool {
     overview.showing
 }
@@ -362,10 +350,6 @@ fn spawn_canvas_camera(mut commands: Commands) {
     ));
 }
 
-/// Gives the canvas camera the rectangle the layout reserved for it.
-///
-/// Two cameras with no viewports would each draw the whole window, so this is what
-/// keeps the map above the canvas rather than behind it.
 fn size_canvas_viewport(
     frame: Res<CanvasFrame>,
     window: Option<Single<&Window, With<bevy::window::PrimaryWindow>>>,
@@ -379,8 +363,6 @@ fn size_canvas_viewport(
         return;
     }
     let mut camera = camera.into_inner();
-    // A viewport that leaves the render target is a validation error the renderer
-    // quits on, so it is clamped here rather than trusted from the layout.
     let position = frame
         .position
         .max(Vec2::ZERO)
@@ -406,10 +388,6 @@ fn size_canvas_viewport(
     }
 }
 
-/// Bakes the soloed node onto the map, or puts the field's output back.
-///
-/// Runs only when the solo moves or the document changes under it: a preview is a
-/// whole field's bake, so doing it every frame would cost a bake a frame.
 fn solo_preview(
     document: Res<Document>,
     selection: Res<Selection>,
@@ -433,12 +411,6 @@ fn solo_preview(
     });
 }
 
-/// Puts the whole of whatever the canvas is showing in view, once per view.
-///
-/// Once, because after that the pan and the zoom are the person's: a frame on every
-/// edit would drag the view out from under someone adding a node at the far edge.
-/// Switching the overview on is another view, so it is framed once too. The on-demand
-/// path is [`frame_canvas`], which the canvas's Fit button and the key F both take.
 fn frame_graph(
     document: Res<Document>,
     overview: Res<Overview>,
@@ -522,13 +494,6 @@ pub fn frame_canvas(
     true
 }
 
-/// Where the canvas camera has to sit, and at what scale, for every one of a graph's
-/// cards to be inside a viewport that many logical pixels across.
-///
-/// The scale is already clamped to what the canvas allows, so a graph too large to fit
-/// is framed as closely as the zoom permits rather than not at all. `None` when the
-/// graph has no nodes or the viewport has no area — there is nothing to frame in either
-/// case.
 fn graph_fit(graph: &FieldGraph, viewport: Vec2) -> Option<(Vec2, f32)> {
     if graph.nodes.is_empty() || viewport.x <= 1.0 || viewport.y <= 1.0 {
         return None;
@@ -603,18 +568,15 @@ pub fn pointer_over_canvas(window: &Window, frame: &CanvasFrame) -> bool {
     at.x >= frame.position.x && at.x < high.x && at.y >= frame.position.y && at.y < high.y
 }
 
-/// The open field's graph, or `None` when there is no document.
 fn open_graph(document: &Document) -> Option<&crate::terrain::graph::FieldGraph> {
     let terrain = document.terrain()?;
     Some(&terrain.field(document.active())?.graph)
 }
 
-/// Where a card's single output pin sits, relative to the card's centre.
 fn output_offset(card: &NodeCard) -> Vec2 {
     Vec2::new(card.size.x * 0.5, 0.0)
 }
 
-/// Where one of a card's input pins sits, relative to the card's centre.
 fn input_offset(card: &NodeCard, index: usize) -> Vec2 {
     let step = card.size.y / (card.inputs.max(1) as f32 + 1.0);
     Vec2::new(
@@ -659,8 +621,8 @@ mod tests {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
-                .with_field(Field::new("height").with_op(NodeOp::Constant(0.5))),
+                .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+                .with_field(Field::new("height").with_op(NodeOp::held(0.5))),
         );
         document.set_active("height").unwrap();
 
@@ -711,7 +673,7 @@ mod tests {
         document
             .apply(&crate::edit::Edit::AddNode {
                 field: "height".to_owned(),
-                op: NodeOp::Scale(2.0),
+                op: NodeOp::piped(1),
                 position: None,
             })
             .unwrap();
@@ -820,7 +782,7 @@ mod tests {
         let mut graph = FieldGraph::new();
         let at = [[-1500.0, 0.0], [1500.0, 120.0], [0.0, -600.0]];
         for position in at {
-            let id = graph.node_with(NodeOp::Constant(0.0), &[]);
+            let id = graph.node_with(NodeOp::held(0.0), &[]);
             graph.place(id, position).unwrap();
         }
         let viewport = Vec2::new(800.0, 600.0);
@@ -842,7 +804,7 @@ mod tests {
         assert!(graph_fit(&empty, Vec2::new(800.0, 600.0)).is_none());
 
         let mut graph = FieldGraph::new();
-        graph.node_with(NodeOp::Constant(0.0), &[]);
+        graph.node_with(NodeOp::held(0.0), &[]);
         assert!(graph_fit(&graph, Vec2::ZERO).is_none());
     }
 
@@ -852,13 +814,9 @@ mod tests {
     #[test]
     fn previewing_a_node_reads_that_node_and_moves_nothing() {
         let mut graph = FieldGraph::new();
-        let under = graph.node_with(NodeOp::Constant(0.25), &[]);
-        let over = graph.node_with(NodeOp::Constant(0.75), &[]);
-        let sum = graph.node_with(
-            NodeOp::Binary(crate::terrain::graph::Binary::Add),
-            &[under, over],
-        );
-        graph.set_output(Some(sum)).unwrap();
+        let under = graph.node_with(NodeOp::held(0.25), &[]);
+        let over = graph.node_with(NodeOp::held(0.75), &[]);
+        graph.set_output(Some(over)).unwrap();
 
         let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(
             Field::new("height")
@@ -870,7 +828,7 @@ mod tests {
 
         let preview = terrain.preview_node("height", under).expect("a preview");
         assert!(preview.data().iter().all(|value| *value == 0.25));
-        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
+        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 0.75);
         assert_eq!(terrain, before, "a preview moved the document");
     }
 
@@ -923,7 +881,7 @@ mod tests {
     #[test]
     fn previewing_a_node_that_is_not_there_answers_with_nothing() {
         let terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
         assert!(terrain.preview_node("height", node(9)).is_none());
         assert!(terrain.preview_node("nowhere", node(0)).is_none());
     }

@@ -16,38 +16,33 @@ reads was settled when the directory was written, so `Terrain::load_from_dir` is
 only way to obtain one. It needs no GPU and no thread pool, and builds for the web.
 
 `watershed_editor` is the author side, and it carries the whole model a document is
-made of: the fields and their layer stacks, the noise, the region tiling, the brush,
-the water solve, the bake, and the shaders. A project that wants a terrain ships the
+made of: the fields and their node graphs, the water solve, the bake, and the shaders. A project that wants a terrain ships the
 directory the editor wrote; it does not build one at run time.
 
 ## The terrain model
 
-A terrain is an extent in cells and a set of named fields over it. A field is a stack
-of layers — noise, a compute shader, painted rasters, the slope of another field, a
-region tiling — each scaled, confined by a mask and blended onto what is under it,
-then clamped to the field's declared range. Layers may reference other fields, so
-baking is ordered: every field after the ones it reads.
+A terrain is an extent in cells and a set of named fields over it. A field is a graph
+of nodes whose values come from compute shaders, and from other fields through
+reference nodes, clamped to the field's declared range. Because a field may reference
+other fields, baking is ordered: every field after the ones it reads.
 
 A field is evaluated onto a raster of its own resolution, chosen as a *shift*: one
 texel per cell at 0, one per `2^shift` cells above that. A coarse field still answers
-at every cell of the document, interpolated between its texels — unless its values
-name a class rather than measure a quantity, in which case it is read to the nearest
-texel instead.
+at every cell of the document, interpolated between its texels.
 
 Two types carry all of this. `TerrainSpec` is the authored document: it holds the
-layers, it is what an editor mutates, and it lives in the editor. `Terrain` is what
+field graphs, it is what an editor mutates, and it lives in the editor. `Terrain` is what
 baking one produces, and it is what a consuming project holds.
 
-## Shader layers
+## Shader nodes
 
-A layer's values may come from a WGSL compute shader instead of from an op the editor
-has a name for. This is how a new way of making a field is added without touching
-Rust: write the file, and the editor reads what it declares and draws the panel for
-it.
+A node's values come from a WGSL compute shader. This is how a new way of making a
+field is added without touching Rust: write the file, and the editor reads what it
+declares and draws the panel for it.
 
 A shader lives in the document's own `shaders` directory, so a terrain stays portable,
-and it is hot-reloaded — save the file and the field re-bakes. Adding a shader layer
-copies one of the shipped shaders in under a fresh name, which is then yours to edit.
+and it is hot-reloaded — save the file and the field re-bakes. Adopting a stock shader
+copies one of the shipped shaders into that directory, where it is then yours to edit.
 
 ```wgsl
 // @shader Ridged
@@ -70,9 +65,7 @@ fn value(p: vec2<f32>) -> f32 {
 the same thing at every shift and a rectangle re-bake produces what a whole bake
 would. The entry point is appended by the editor; the bindings, the noise,
 `cell_position`, and `uv` and `document_extent` — the 0..1 coordinate across the
-document, and the cells it spans — come from `assets/shaders/field_lib.wgsl`, whose
-noise is the same algorithm the CPU noise layers use so one name does not mean two
-functions inside one stack.
+document, and the cells it spans — come from `assets/shaders/field_lib.wgsl`.
 
 A copied shader arrives with all of this in its own header: every library function,
 the bindings, the coordinate convention and the annotations below, so the file need
@@ -100,15 +93,13 @@ upstream edit, because nothing bounds how far the shader reads — unless the fi
 so with `@reach`, in which case the re-bake stays inside the visible rectangle and
 pads by the declared reach.
 
-A shader names no field, so it still adds no bake-order dependency. It composes with
-the rest of the stack through the layer's own amplitude, mask and blend, exactly as
-every other op does — the shader is dispatched to a raster first, and the stack is
-then walked on the CPU as it always was.
+A shader names no field, so it adds no bake-order dependency: another field reaches a
+shader through a reference node wired into one of its pins.
 
 ### `@ui` annotations
 
 One per field of the `Params` struct. A field without one is a parse error, reported in
-the status bar; the layer keeps the values it had, because a shader is edited in place
+the status bar; the node keeps the values it had, because a shader is edited in place
 and is expected to be broken for as long as it takes to type the next line.
 
 | Form | Field types | Widget |
@@ -124,7 +115,7 @@ and is expected to be broken for as long as it takes to type the next line.
 
 A parameter the document carries that the file no longer declares is dropped when the
 file is re-read; one the file declares that the document lacks takes the file's
-default. A file whose name begins with `_` is a template and is not offered as a layer.
+default. A file whose name begins with `_` is a template and is not offered as a shader.
 
 ### `@reach`
 
@@ -141,8 +132,7 @@ code declares nothing, and neither does a commented-out `// // @reach 2`. Declar
 twice, or declaring anything but a non-negative whole number, is a parse error.
 
 Without it, a wired shader re-bakes the whole field. With it, an edit upstream re-bakes
-only the visible rectangle, widened by the declared reach at each dependency hop the
-way a slope's sample distance already widens one. Nothing checks the number against
+only the visible rectangle, widened by the declared reach at each dependency hop. Nothing checks the number against
 what the shader actually samples: a shader that reads further than it declares leaves
 stale values inside the rectangle.
 
@@ -166,16 +156,15 @@ A terrain is a directory.
 |---|---|---|
 | `terrain.ron` | the extent, the fields, the images, the water | both |
 | `layer_<n>.png` | the values, eight bits to a channel | both |
-| `recipe.ron` | the layer stacks and the water spec | the editor |
-| `paint_<n>.png` | the painted rasters the stacks name | the editor |
-| `shaders/*.wgsl` | the shaders the stacks name | the editor |
+| `recipe.ron` | the field graphs and the water spec | the editor |
+| `shaders/*.wgsl` | the shaders the graphs name | the editor |
 
 The values are always written; the recipe only when the editor saves a *document*. An
 export writes the values alone, and removes a recipe already in the directory — one
 left behind would claim to describe values it no longer produced.
 
-The split is what makes the boundary real: a reader of values never parses a layer
-stack, so it never needs the types a layer stack is made of. A directory whose recipe
+The split is what makes the boundary real: a reader of values never parses a field
+graph, so it never needs the types a field graph is made of. A directory whose recipe
 has been deleted is still a terrain.
 
 ## Commands

@@ -129,7 +129,7 @@ pub struct AddLayer(pub String);
 
 impl Default for AddLayer {
     fn default() -> Self {
-        Self("noise".to_owned())
+        Self("shader:blank".to_owned())
     }
 }
 
@@ -147,12 +147,8 @@ pub struct NewField(pub String);
 /// Kept here rather than in the toggles themselves because the panel is rebuilt
 /// whenever the graph changes shape — adding a node despawns every toggle in it, and
 /// state left in one would be lost with it, closing every section on each edit.
-///
-/// Layers are held by index, so reordering a stack moves which layer is open.
 #[derive(Resource, Default)]
 pub struct Expanded {
-    /// Whether the brush section is open.
-    pub brush: bool,
     /// Whether the shader reference is open.
     pub reference: bool,
     /// The open nodes, in no particular order.
@@ -182,20 +178,11 @@ const PANEL_WIDTH: f32 = 320.0;
 /// control client's verb name the same thing. A `shader:` entry is not an op word: it
 /// names the stock shader to copy into the document, and the node it makes is a
 /// `shader` op over the copy.
-///
-/// A regions op is deliberately absent: a region table is not something a single
-/// button or a command line can write.
-pub const ADDABLE: [&str; 14] = [
-    "noise",
-    "constant",
+pub const ADDABLE: [&str; 8] = [
     "fieldref",
-    "slope",
-    "paint",
-    "binary",
-    "lerp",
-    "scale",
-    "remap",
-    "curve",
+    "shader:fbm",
+    "shader:continents",
+    "shader:mountains",
     "shader:ridged",
     "shader:warped",
     "shader:terrace",
@@ -209,11 +196,6 @@ fn shell() -> impl SceneList {
     bsn_list![chrome(), dialog::dialog()]
 }
 
-/// The line between the map and the canvas.
-///
-/// The two are separate views on separate cameras that happen to share a window, and
-/// without a seam a person reads them as one picture — and then cannot tell which of
-/// them a scroll is about to act on.
 fn canvas_divider() -> impl Scene {
     bsn! {
         Node {
@@ -226,11 +208,6 @@ fn canvas_divider() -> impl Scene {
     }
 }
 
-/// The strip along the top of the canvas, and what it offers.
-///
-/// Above the canvas rather than over it: the canvas is a second camera that clears the
-/// rectangle the layout gives it, and it draws after the camera the interface is on, so
-/// anything drawn inside that rectangle would be painted over.
 fn canvas_bar() -> impl Scene {
     bsn! {
         Node {
@@ -281,11 +258,6 @@ fn canvas_bar() -> impl Scene {
 #[derive(Component, Default, Clone)]
 pub struct OverviewToggle;
 
-/// Writes the overview's state onto the switch that reads it.
-///
-/// `Checked` is state the widget is given rather than state it holds, so nothing else
-/// that switches the overview — the key `O`, a double-click on a card — would move the
-/// switch without this.
 fn sync_overview_toggle(
     overview: Res<Overview>,
     toggle: Option<Single<(Entity, Has<Checked>), With<OverviewToggle>>>,
@@ -369,11 +341,6 @@ fn chrome() -> impl Scene {
     }
 }
 
-/// Publishes the rectangle the layout gave the canvas, in physical pixels.
-///
-/// Measured from the node the layout actually placed rather than from a fraction
-/// computed a second time, so the camera's viewport and the space reserved for it
-/// cannot drift apart.
 fn measure_canvas_frame(
     mut frame: ResMut<CanvasFrame>,
     window: Option<Single<&Window, With<PrimaryWindow>>>,
@@ -383,8 +350,6 @@ fn measure_canvas_frame(
         return;
     };
     let (node, transform) = viewport.into_inner();
-    // A computed node is already measured in physical pixels, as the window is — a
-    // second conversion by the scale factor is what put the viewport off the target.
     let size = node.size();
     let centre = Vec2::new(transform.translation.x, transform.translation.y);
     let target = Vec2::new(

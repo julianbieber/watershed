@@ -5212,7 +5212,6 @@ dependencies = [
  "glam",
  "log",
  "naga",
- "png",
  "rayon",
  "ron",
  "serde",

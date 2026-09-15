@@ -12,7 +12,6 @@ watershed.workspace = true
 bevy.workspace = true
 glam.workspace = true
 naga.workspace = true
-png.workspace = true
 rayon.workspace = true
 ron.workspace = true
 serde.workspace = true

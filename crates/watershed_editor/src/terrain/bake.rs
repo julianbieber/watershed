@@ -8,15 +8,12 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use watershed::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
+use watershed::channel::{ChannelError, ChannelMeta, plan_layers};
 use watershed::field::{FieldId, FieldRole};
 
 use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
 use crate::terrain::field::Field;
-use crate::terrain::graph::{Binary, Curve, GraphError, NodeId, NodeOp};
-use crate::terrain::graph::{Remap, SlopeMode};
-use crate::terrain::noise::Noise;
-use crate::terrain::regions::{CompiledOutput, RegionMap, RegionOutput};
+use crate::terrain::graph::{GraphError, NodeId, NodeOp};
 use crate::terrain::water::{WaterError, WaterSpec, WaterState};
 use watershed::meta::WaterInfo;
 use watershed::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
@@ -36,13 +33,13 @@ pub enum PlanError {
     /// Two fields carry the same id, so a reference to it is ambiguous.
     #[error("two fields share the id `{0}`")]
     DuplicateField(String),
-    /// A layer references a field the document does not carry. Names both, because
+    /// A reference node names a field the document does not carry. Names both, because
     /// the reference is in the reader and the mistake may be in either.
     #[error("field `{referenced}`, read by `{reader}`, is not in the document")]
     UnknownField {
         /// The name that could not be resolved.
         referenced: String,
-        /// The field whose layer names it.
+        /// The field whose graph names it.
         reader: String,
     },
     /// The fields cannot be ordered. Carries the cycle as a `->` chain of names.
@@ -65,14 +62,6 @@ pub enum PlanError {
         field: String,
         /// The node named.
         node: u32,
-    },
-    /// A `Regions` layer asks for a column its spec's table does not declare.
-    #[error("column `{column}`, read by `{reader}`, is not in the region table")]
-    UnknownRegionColumn {
-        /// The column name asked for.
-        column: String,
-        /// The field whose layer asks for it.
-        reader: String,
     },
     /// Two fields claim `Height` or two claim `Moisture`, so a role lookup would be
     /// ambiguous.
@@ -122,7 +111,6 @@ pub enum BakeError {
     #[error(transparent)]
     Plan(#[from] PlanError),
     /// A field's values could not be stored in the channel they were destined for.
-    /// In practice a categorical field holding something that is not a class index.
     /// See [`ChannelError`].
     #[error(transparent)]
     Channel(#[from] ChannelError),
@@ -183,8 +171,7 @@ impl TerrainSpec {
     /// Such a shader may read any texel of its input, so nothing bounds the ground an
     /// edit under it can move: a document this holds for is re-baked whole rather
     /// than by rectangle. A wired shader whose file declares a reach is bounded by
-    /// it, widens the re-bake by that much like a `Slope` does, and re-bakes by
-    /// rectangle.
+    /// it, widens the re-bake by that much, and re-bakes by rectangle.
     pub fn samples_unbounded(&self) -> bool {
         self.fields.iter().any(|field| {
             field
@@ -317,7 +304,6 @@ impl TerrainSpec {
         }
 
         let shifts: Vec<u8> = self.fields.iter().map(|field| field.shift).collect();
-        let categorical: Vec<bool> = self.fields.iter().map(Field::is_categorical).collect();
         let mut baked: Vec<Raster<f32>> = self
             .fields
             .iter_mut()
@@ -325,7 +311,7 @@ impl TerrainSpec {
             .collect();
 
         let rect = self.rect();
-        let result = self.evaluate(target, rect, &index_of, &shifts, &categorical, &mut baked);
+        let result = self.evaluate(target, rect, &index_of, &shifts, &mut baked);
 
         for (field, raster) in self.fields.iter_mut().zip(baked) {
             field.put_baked(raster);
@@ -335,7 +321,7 @@ impl TerrainSpec {
         Ok(())
     }
 
-    /// Drop a field's baked raster, keeping the layers that would rebuild it.
+    /// Drop a field's baked raster, keeping the graph that would rebuild it.
     ///
     /// **This is what makes a staged bake affordable rather than merely visible.** A
     /// document's fields do not all have to be resident at once: an intermediate is dead
@@ -358,10 +344,8 @@ impl TerrainSpec {
 
     /// How many bytes the baked rasters currently hold.
     ///
-    /// The bakes only. A painted layer's raster is authored data that lives as long
-    /// as the document does, so counting it would not tell a caller anything it can
-    /// act on; this number is the part that [`TerrainSpec::release`] moves and is
-    /// what a staged bake watches.
+    /// The bakes only: a shader node's held values are not counted. This number is
+    /// the part that [`TerrainSpec::release`] moves and is what a staged bake watches.
     pub fn baked_bytes(&self) -> usize {
         self.fields
             .iter()
@@ -378,7 +362,6 @@ impl TerrainSpec {
         rect: CellRect,
         index_of: &HashMap<String, usize>,
         shifts: &[u8],
-        categorical: &[bool],
         baked: &mut [Raster<f32>],
     ) -> Result<Vec<Dispatched>, PlanError> {
         let field = &self.fields[target];
@@ -386,19 +369,17 @@ impl TerrainSpec {
         if texels.is_empty() {
             return Ok(Vec::new());
         }
-        let mut graph = compile_graph(field, index_of, self.size)?;
-        let made = self.dispatch_shaders(&mut graph, field, shifts, categorical, baked)?;
+        let mut graph = compile_graph(field, index_of)?;
+        let made = self.dispatch_shaders(&mut graph, field, shifts, baked)?;
         let bounds = field.bounds();
         let shift = field.shift;
         let rows = {
             let context = Evaluator {
-                size: self.size,
                 baked,
                 shifts,
-                categorical,
                 made: &made,
             };
-            let scratch_len = graph.nodes.len() * graph.levels;
+            let scratch_len = graph.nodes.len();
             map_rows(texels.min.y, texels.max.y, |j| {
                 let mut scratch = vec![0.0f32; scratch_len];
                 (texels.min.x..texels.max.x)
@@ -421,7 +402,6 @@ impl TerrainSpec {
         graph: &mut CompiledGraph<'_>,
         field: &Field,
         shifts: &[u8],
-        categorical: &[bool],
         baked: &[Raster<f32>],
     ) -> Result<Vec<Dispatched>, PlanError> {
         let texels = resolution(self.size, field.shift);
@@ -452,7 +432,7 @@ impl TerrainSpec {
                 .iter()
                 .map(|pin| {
                     pin.map(|source| {
-                        self.evaluate_whole(graph, &made, source, field, shifts, categorical, baked)
+                        self.evaluate_whole(graph, &made, source, field, shifts, baked)
                     })
                 })
                 .collect();
@@ -490,25 +470,22 @@ impl TerrainSpec {
         upto: usize,
         field: &Field,
         shifts: &[u8],
-        categorical: &[bool],
         baked: &[Raster<f32>],
     ) -> Raster<f32> {
         let texels = resolution(self.size, field.shift);
         let shift = field.shift;
         let context = Evaluator {
-            size: self.size,
             baked,
             shifts,
-            categorical,
             made,
         };
-        let scratch_len = graph.nodes.len() * graph.levels;
+        let scratch_len = graph.nodes.len();
         let rows = map_rows(0, texels.y, |j| {
             let mut scratch = vec![0.0f32; scratch_len];
             (0..texels.x)
                 .map(|i| {
                     let position = Vec2::new(texel_center(i, shift), texel_center(j, shift));
-                    context.eval(graph, upto, position, &mut scratch, 0)
+                    context.eval(graph, upto, position, &mut scratch)
                 })
                 .collect()
         });
@@ -553,7 +530,6 @@ impl TerrainSpec {
         let required = self.required_rects(rect, &order, &dependencies);
 
         let shifts: Vec<u8> = self.fields.iter().map(|field| field.shift).collect();
-        let categorical: Vec<bool> = self.fields.iter().map(Field::is_categorical).collect();
         let mut baked: Vec<Raster<f32>> = self
             .fields
             .iter_mut()
@@ -563,14 +539,7 @@ impl TerrainSpec {
         let mut dispatched: Vec<(usize, Vec<Dispatched>)> = Vec::new();
         let mut result = Ok(());
         for &target in &order {
-            match self.evaluate(
-                target,
-                required[target],
-                &index_of,
-                &shifts,
-                &categorical,
-                &mut baked,
-            ) {
+            match self.evaluate(target, required[target], &index_of, &shifts, &mut baked) {
                 Ok(made) => dispatched.push((target, made)),
                 Err(error) => {
                     result = Err(error);
@@ -647,7 +616,7 @@ impl TerrainSpec {
 
     fn halo_between(&self, reader: usize, referenced: usize) -> u32 {
         let field = &self.fields[reader];
-        let reach = slope_reach_to(field, &self.fields[referenced].id);
+        let reach = reach_to(field, &self.fields[referenced].id);
         if !reach.is_finite() {
             return u32::MAX;
         }
@@ -661,11 +630,11 @@ impl TerrainSpec {
     /// over `rect` — the fields that read it, the fields that read those, and the halo each
     /// hop adds.
     ///
-    /// This, not the painted rectangle, is what an edit has to re-bake. A field that
+    /// This, not the changed rectangle, is what an edit has to re-bake. A field that
     /// reads the changed one samples a neighbourhood around each of its own texels,
-    /// so cells outside the painted rectangle bake differently too; re-baking only
-    /// what was painted leaves a fringe of stale values one hop downstream, and a
-    /// wider fringe two hops on.
+    /// so cells outside the changed rectangle bake differently too; re-baking only
+    /// what changed leaves a fringe of stale values one hop downstream, and a wider
+    /// fringe two hops on.
     ///
     /// `CellRect::EMPTY` if the document carries no such field or the rectangle is
     /// outside it. A document that cannot be planned answers with the whole
@@ -708,16 +677,7 @@ impl TerrainSpec {
     }
 }
 
-/// How far, in document cells, this field's graph reaches around a texel when it
-/// reads `referenced`.
-///
-/// A `Slope` node reads a neighbourhood of its input, and so does a shader node with
-/// a wired pin — by the reach its file declares, or without bound when it declares
-/// none, which answers `f32::INFINITY`. Every reference underneath one is read that
-/// much wider, and a chain of them *sums*, because each widens what the one below it
-/// already widened. Across fields the same quantity is a max, since two separate
-/// references do not compound.
-fn slope_reach_to(field: &Field, referenced: &FieldId) -> f32 {
+fn reach_to(field: &Field, referenced: &FieldId) -> f32 {
     let order = field.graph.evaluation_order().unwrap_or_default();
     let mut reach = vec![0.0f32; order.len()];
     let position: HashMap<NodeId, usize> =
@@ -727,7 +687,6 @@ fn slope_reach_to(field: &Field, referenced: &FieldId) -> f32 {
             continue;
         };
         let widens = match (&node.op, node.bypassed) {
-            (NodeOp::Slope { sample_tiles, .. }, false) => sample_tiles.abs(),
             (NodeOp::Shader(layer), false) => {
                 layer.reach.map_or(f32::INFINITY, |cells| cells as f32)
             }
@@ -834,19 +793,8 @@ enum Shaded<'a> {
 }
 
 enum CompiledOp<'a> {
-    Constant(f32),
-    Noise(Noise),
-    Painted(&'a Raster<u8>),
-    Raster(&'a Raster<f32>),
     Shaded(Shaded<'a>, u8),
     FieldRef(usize),
-    Regions(RegionMap, CompiledOutput),
-    Slope { sample_tiles: f32, mode: SlopeMode },
-    Binary(Binary),
-    Lerp,
-    Scale(f32),
-    Remap(Remap),
-    Curve(&'a Curve),
 }
 
 struct CompiledNode<'a> {
@@ -859,13 +807,11 @@ struct CompiledNode<'a> {
 struct CompiledGraph<'a> {
     nodes: Vec<CompiledNode<'a>>,
     output: Option<usize>,
-    levels: usize,
 }
 
 fn compile_graph<'a>(
     field: &'a Field,
     index_of: &HashMap<String, usize>,
-    size: UVec2,
 ) -> Result<CompiledGraph<'a>, PlanError> {
     let order = field
         .graph
@@ -893,38 +839,10 @@ fn compile_graph<'a>(
             node: id.0,
         })?;
         let op = match &node.op {
-            NodeOp::Constant(value) => CompiledOp::Constant(*value),
-            NodeOp::Noise(spec) => CompiledOp::Noise(Noise::new(spec)),
-            NodeOp::Paint(raster) => CompiledOp::Painted(raster),
-            NodeOp::External(raster) => CompiledOp::Raster(raster),
             NodeOp::Shader(shader) => {
                 CompiledOp::Shaded(Shaded::Held(shader.values()), field.shift)
             }
             NodeOp::FieldRef(id) => CompiledOp::FieldRef(lookup(index_of, id, &field.id)?),
-            NodeOp::Slope { sample_tiles, mode } => CompiledOp::Slope {
-                sample_tiles: *sample_tiles,
-                mode: *mode,
-            },
-            NodeOp::Binary(binary) => CompiledOp::Binary(*binary),
-            NodeOp::Lerp => CompiledOp::Lerp,
-            NodeOp::Scale(factor) => CompiledOp::Scale(*factor),
-            NodeOp::Remap(remap) => CompiledOp::Remap(*remap),
-            NodeOp::Curve(curve) => CompiledOp::Curve(curve),
-            NodeOp::Regions { spec, output } => {
-                let compiled = match output {
-                    RegionOutput::Blended(column) => {
-                        CompiledOutput::Blended(spec.column_index(column).ok_or_else(|| {
-                            PlanError::UnknownRegionColumn {
-                                column: column.clone(),
-                                reader: field.id.to_string(),
-                            }
-                        })?)
-                    }
-                    RegionOutput::RegionId => CompiledOutput::RegionId,
-                    RegionOutput::CoverClass => CompiledOutput::CoverClass,
-                };
-                CompiledOp::Regions(RegionMap::new(spec, size), compiled)
-            }
         };
         let inputs = node
             .inputs
@@ -938,34 +856,15 @@ fn compile_graph<'a>(
             bypassed: node.bypassed,
         });
     }
-    let mut depth = vec![0usize; nodes.len()];
-    for at in 0..nodes.len() {
-        let node = &nodes[at];
-        let first = node.inputs.first().copied().flatten();
-        depth[at] = match (&node.op, node.bypassed) {
-            (CompiledOp::Slope { .. }, false) => first.map_or(0, |source| depth[source] + 1),
-            _ => node
-                .inputs
-                .iter()
-                .flatten()
-                .map(|&source| depth[source])
-                .max()
-                .unwrap_or(0),
-        };
-    }
-    let levels = depth.iter().copied().max().unwrap_or(0) + 1;
     Ok(CompiledGraph {
         output: nodes.len().checked_sub(1),
         nodes,
-        levels,
     })
 }
 
 struct Evaluator<'a> {
-    size: UVec2,
     baked: &'a [Raster<f32>],
     shifts: &'a [u8],
-    categorical: &'a [bool],
     made: &'a [Dispatched],
 }
 
@@ -974,76 +873,7 @@ impl Evaluator<'_> {
         let shift = self.shifts[index];
         let u = raster_coord(position.x, shift);
         let v = raster_coord(position.y, shift);
-        if self.categorical[index] {
-            self.baked[index].sample_nearest(u, v)
-        } else {
-            self.baked[index].sample_bilinear(u, v)
-        }
-    }
-
-    fn slope(
-        &self,
-        graph: &CompiledGraph<'_>,
-        source: usize,
-        sample_tiles: f32,
-        mode: SlopeMode,
-        position: Vec2,
-        scratch: &mut [f32],
-        level: usize,
-    ) -> f32 {
-        let reach = sample_tiles.abs().max(f32::EPSILON);
-        match mode {
-            SlopeMode::Gradient => {
-                let east = self.eval(
-                    graph,
-                    source,
-                    position + Vec2::new(reach, 0.0),
-                    scratch,
-                    level,
-                );
-                let west = self.eval(
-                    graph,
-                    source,
-                    position - Vec2::new(reach, 0.0),
-                    scratch,
-                    level,
-                );
-                let north = self.eval(
-                    graph,
-                    source,
-                    position + Vec2::new(0.0, reach),
-                    scratch,
-                    level,
-                );
-                let south = self.eval(
-                    graph,
-                    source,
-                    position - Vec2::new(0.0, reach),
-                    scratch,
-                    level,
-                );
-                let scale = 2.0 * reach;
-                (((east - west) / scale).powi(2) + ((north - south) / scale).powi(2)).sqrt()
-            }
-            SlopeMode::SteepestAxis => {
-                let here = self.eval(graph, source, position, scratch, level);
-                let east = self.eval(
-                    graph,
-                    source,
-                    position + Vec2::new(reach, 0.0),
-                    scratch,
-                    level,
-                );
-                let north = self.eval(
-                    graph,
-                    source,
-                    position + Vec2::new(0.0, reach),
-                    scratch,
-                    level,
-                );
-                (east - here).abs().max((north - here).abs()) / reach
-            }
-        }
+        self.baked[index].sample_bilinear(u, v)
     }
 
     fn eval(
@@ -1052,50 +882,17 @@ impl Evaluator<'_> {
         upto: usize,
         position: Vec2,
         scratch: &mut [f32],
-        level: usize,
     ) -> f32 {
-        let width = graph.nodes.len();
-        let base = level * width;
         for at in 0..=upto {
             let node = &graph.nodes[at];
-            let first = node.inputs.first().copied().flatten();
-            let a = first.map_or(0.0, |source| scratch[base + source]);
-            let b = node
-                .inputs
-                .get(1)
-                .copied()
-                .flatten()
-                .map_or(0.0, |source| scratch[base + source]);
-            let c = node
-                .inputs
-                .get(2)
-                .copied()
-                .flatten()
-                .map_or(0.0, |source| scratch[base + source]);
             let value = if node.bypassed {
-                a
+                node.inputs
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map_or(0.0, |source| scratch[source])
             } else {
                 match &node.op {
-                    CompiledOp::Slope { sample_tiles, mode } => match first {
-                        Some(source) => self.slope(
-                            graph,
-                            source,
-                            *sample_tiles,
-                            *mode,
-                            position,
-                            scratch,
-                            level + 1,
-                        ),
-                        None => 0.0,
-                    },
-                    CompiledOp::Constant(value) => *value,
-                    CompiledOp::Noise(noise) => noise.sample(position.x, position.y),
-                    CompiledOp::Painted(raster) => {
-                        raster.sample_over(self.size, position.x, position.y)
-                    }
-                    CompiledOp::Raster(raster) => {
-                        raster.sample_over(self.size, position.x, position.y)
-                    }
                     CompiledOp::Shaded(shaded, shift) => {
                         let raster = match shaded {
                             Shaded::Held(raster) => *raster,
@@ -1107,17 +904,11 @@ impl Evaluator<'_> {
                         )
                     }
                     CompiledOp::FieldRef(index) => self.field(*index, position),
-                    CompiledOp::Regions(map, output) => map.sample(*output, position.x, position.y),
-                    CompiledOp::Binary(binary) => binary.apply(a, b),
-                    CompiledOp::Lerp => a + (b - a) * c.clamp(0.0, 1.0),
-                    CompiledOp::Scale(factor) => a * factor,
-                    CompiledOp::Remap(remap) => remap.apply(a),
-                    CompiledOp::Curve(curve) => curve.apply(a),
                 }
             };
-            scratch[base + at] = value;
+            scratch[at] = value;
         }
-        scratch[base + upto]
+        scratch[upto]
     }
 
     fn texel(
@@ -1133,7 +924,7 @@ impl Evaluator<'_> {
             return 0.0f32.clamp(bounds.0, bounds.1);
         };
         let position = Vec2::new(texel_center(i, shift), texel_center(j, shift));
-        self.eval(graph, output, position, scratch, 0)
+        self.eval(graph, output, position, scratch)
             .clamp(bounds.0, bounds.1)
     }
 }
@@ -1242,9 +1033,9 @@ pub struct BakeReport {
     pub total: u32,
     /// The field the last completed step baked; empty before the first has run.
     pub field: String,
-    /// How much the baked rasters currently hold. The bakes only — painted layers
-    /// and the solved water are not counted — so this is the number a staged bake
-    /// can actually move, and it falls when a field is released.
+    /// How much the baked rasters currently hold. The bakes only — shader nodes' held
+    /// values and the solved water are not counted — so this is the number a staged
+    /// bake can actually move, and it falls when a field is released.
     pub live_bytes: u64,
 }
 
@@ -1323,7 +1114,7 @@ impl Bake {
     }
 
     /// The finished [`Terrain`], dropping the document that produced it — the
-    /// layers, the noise specs, the paint.
+    /// graphs and the values their shader nodes hold.
     ///
     /// For a consumer that will only read. A caller that will edit and re-bake wants
     /// [`Bake::finish_keeping_spec`], since nothing rebuilds a document from a
@@ -1368,19 +1159,7 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
 
     let mut fields = Vec::with_capacity(readable.len());
     for (field, place) in readable.iter().zip(&placements) {
-        let categorical = field.is_categorical();
-        let meta = if categorical {
-            if let Some(value) = stray_class(field.baked().data()) {
-                return Err(ChannelError::StrayClass {
-                    field: field.id.to_string(),
-                    value,
-                }
-                .into());
-            }
-            ChannelMeta::categorical()
-        } else {
-            value_range(field.baked().data())
-        };
+        let meta = value_range(field.baked().data());
 
         let layer = &mut layers[place.layer as usize];
         layer.push(
@@ -1392,7 +1171,7 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
             name: field.id.to_string(),
             role: field.role,
             shift: field.shift,
-            categorical,
+            categorical: false,
             layer: place.layer,
             channel: place.channel,
         });
@@ -1621,54 +1400,44 @@ impl TerrainSpec {
 mod tests {
     use super::*;
     use crate::terrain::graph::FieldGraph;
-    use crate::terrain::noise::{NoiseKind, NoiseSpec};
+    use crate::terrain::shader::ShaderLayer;
 
-    /// The steepness of another field: a reference to it with a slope on it, which
-    /// is the whole of what the old `Slope { of }` op was.
-    fn slope_of(read: &str, sample_tiles: f32, mode: SlopeMode) -> FieldGraph {
+    fn ramp(size: UVec2) -> Raster<f32> {
+        let span = (size.x + size.y) as f32;
+        Raster::from_vec(
+            size,
+            (0..size.x * size.y)
+                .map(|n| ((n % size.x) + (n / size.x)) as f32 / span)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn reading(read: &str, values: Raster<f32>) -> FieldGraph {
+        let NodeOp::Shader(mut layer) = NodeOp::holding(values) else {
+            unreachable!("a held node is a shader node");
+        };
+        layer.inputs = vec!["in0".to_owned()];
+        layer.reach = Some(0);
         let mut graph = FieldGraph::new();
         let source = graph.node_with(NodeOp::FieldRef(FieldId::from(read)), &[]);
-        let slope = graph.node_with(NodeOp::Slope { sample_tiles, mode }, &[source]);
-        graph.set_output(Some(slope)).unwrap();
-        graph
-    }
-
-    /// A field that interpolates from one constant to another by a third.
-    fn lerp_of(from: f32, to: f32, weight: f32) -> FieldGraph {
-        let mut graph = FieldGraph::new();
-        let from = graph.node_with(NodeOp::Constant(from), &[]);
-        let to = graph.node_with(NodeOp::Constant(to), &[]);
-        let weight = graph.node_with(NodeOp::Constant(weight), &[]);
-        let lerp = graph.node_with(NodeOp::Lerp, &[from, to, weight]);
-        graph.set_output(Some(lerp)).unwrap();
-        graph
-    }
-
-    fn noise_op(seed: u32) -> NodeOp {
-        NodeOp::Noise(NoiseSpec::new(seed, NoiseKind::Fbm, 0.05))
-    }
-
-    /// A field reading `op` through a weight taken from `read`, which is what a
-    /// layer under a field mask came to.
-    fn weighted(op: NodeOp, read: &str, band: (f32, f32)) -> FieldGraph {
-        let mut graph = FieldGraph::new();
-        let zero = graph.node_with(NodeOp::Constant(0.0), &[]);
-        let value = graph.node_with(op, &[]);
-        let source = graph.node_with(NodeOp::FieldRef(FieldId::from(read)), &[]);
-        let weight = graph.node_with(NodeOp::Remap(Remap::new(band, (0.0, 1.0))), &[source]);
-        let lerp = graph.node_with(NodeOp::Lerp, &[zero, value, weight]);
-        graph.set_output(Some(lerp)).unwrap();
+        let shaded = graph.node_with(NodeOp::Shader(layer), &[source]);
+        graph.set_output(Some(shaded)).unwrap();
         graph
     }
 
     fn two_field_document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(96, 80))
-            .with_field(Field::new("moisture").with_shift(3).with_op(noise_op(7)))
-            .with_field(Field::new("height").with_shift(0).with_graph(weighted(
-                noise_op(11),
-                "moisture",
-                (0.3, 0.7),
-            )))
+            .with_field(
+                Field::new("moisture")
+                    .with_shift(3)
+                    .with_op(NodeOp::holding(ramp(UVec2::new(12, 10)))),
+            )
+            .with_field(
+                Field::new("height")
+                    .with_shift(0)
+                    .with_graph(reading("moisture", ramp(UVec2::new(96, 80)))),
+            )
     }
 
     // The whole point of the staged bake: a caller that walks the order one field at a
@@ -1679,7 +1448,7 @@ mod tests {
         let mut whole = two_field_document().with_field(
             Field::new("relief")
                 .with_range((-1.0, 1.0))
-                .with_graph(slope_of("height", 5.0, SlopeMode::SteepestAxis)),
+                .with_graph(reading("height", ramp(UVec2::new(96, 80)))),
         );
         let mut staged = whole.clone();
 
@@ -1793,10 +1562,10 @@ mod tests {
     }
 
     // The baseline the rest of the rect and staging tests compare against: two fields
-    // at different shifts, one masked by the other, each allocated at its own
-    // resolution and filled with finite values that actually vary.
+    // at different shifts, one reading the other, each allocated at its own resolution
+    // and filled with finite values that actually vary.
     #[test]
-    fn a_two_field_document_with_a_field_masked_layer_bakes() {
+    fn a_two_field_document_bakes_each_field_at_its_own_resolution() {
         let mut terrain = two_field_document();
         terrain.bake_in_place().unwrap();
 
@@ -1878,10 +1647,9 @@ mod tests {
     // exactly as an undispatched one already does, rather than failing the bake.
     #[test]
     fn a_shader_with_no_runtime_bakes_as_zero_rather_than_failing() {
-        use crate::terrain::shader::ShaderLayer;
         let mut layer = ShaderLayer::new("blur.wgsl");
         layer.inputs = vec!["source".to_owned()];
-        let mut field = Field::new("height").with_op(NodeOp::Constant(0.5));
+        let mut field = Field::new("height").with_op(NodeOp::held(0.5));
         let source = field.graph.nodes[0].id;
         let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
         field.graph.connect(source, shaded, 0).unwrap();
@@ -1900,55 +1668,23 @@ mod tests {
         );
     }
 
-    // A ramp has a slope that is known in closed form, so this pins the units: the
-    // difference is taken in document cells, not in texels of the field being read,
-    // and a field at a coarse shift would otherwise report a different number for the
-    // same ground.
-    #[test]
-    fn a_slope_layer_reads_the_gradient_of_the_field_it_names() {
-        let size = UVec2::new(64, 64);
-        let ramp = Raster::from_vec(
-            size,
-            (0..size.x * size.y)
-                .map(|n| (n % size.x) as f32 / size.x as f32)
-                .collect(),
-        )
-        .unwrap();
-        let mut terrain = TerrainSpec::new(size)
-            .with_field(Field::new("height").with_op(NodeOp::External(ramp)))
-            .with_field(
-                Field::new("soil")
-                    .with_range((0.0, 10.0))
-                    .with_graph(slope_of("height", 2.0, SlopeMode::default())),
-            );
-        terrain.bake_in_place().unwrap();
-
-        let slope = terrain.sample("soil", 32.5, 32.5).unwrap();
-        assert!(
-            (slope - 1.0 / 64.0).abs() < 1e-4,
-            "expected the ramp's gradient, got {slope}"
-        );
-    }
-
     // The whole point of the ordering. A field baked before its dependency reads
     // zeros and produces a plausible wrong answer rather than an error.
     #[test]
     fn a_field_is_baked_before_the_field_that_reads_it() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("derived").with_range((0.0, 10.0)).with_graph({
-                let mut graph = FieldGraph::new();
-                let read = graph.node_with(NodeOp::FieldRef(FieldId::from("source")), &[]);
-                let scaled = graph.node_with(NodeOp::Scale(2.0), &[read]);
-                graph.set_output(Some(scaled)).unwrap();
-                graph
-            }))
+            .with_field(
+                Field::new("derived")
+                    .with_range((0.0, 10.0))
+                    .with_op(NodeOp::FieldRef(FieldId::from("source"))),
+            )
             .with_field(
                 Field::new("source")
                     .with_range((0.0, 10.0))
-                    .with_op(NodeOp::Constant(3.0)),
+                    .with_op(NodeOp::held(3.0)),
             );
         terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("derived", 4.5, 4.5).unwrap(), 6.0);
+        assert_eq!(terrain.sample("derived", 4.5, 4.5).unwrap(), 3.0);
     }
 
     // The failure mode a naive walk has here is non-termination, which is far worse
@@ -1972,7 +1708,7 @@ mod tests {
             .with_field(Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("b"))))
             .with_field(Field::new("b").with_graph({
                 let mut graph = FieldGraph::new();
-                let value = graph.node_with(NodeOp::Constant(1.0), &[]);
+                let value = graph.node_with(NodeOp::held(1.0), &[]);
                 graph.node_with(NodeOp::FieldRef(FieldId::from("a")), &[]);
                 graph.set_output(Some(value)).unwrap();
                 graph
@@ -2016,55 +1752,14 @@ mod tests {
         ));
     }
 
-    // A weight of zero has to read the value interpolated *from* exactly, with none of
-    // the value interpolated to — this is what a mask of zero meant, and it is the
-    // endpoint a lerp is most likely to get subtly wrong.
-    #[test]
-    fn a_lerp_at_zero_reads_the_value_it_interpolates_from() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height")
-                .with_range((-10.0, 10.0))
-                .with_graph(lerp_of(4.0, 9.0, 0.0)),
-        );
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 4.0);
-    }
-
-    // The other endpoint: at a weight of one the value interpolated *to* must land
-    // exactly, with no residue of the one it came from.
-    #[test]
-    fn a_lerp_at_one_reads_the_value_it_interpolates_to() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height")
-                .with_range((-20.0, 20.0))
-                .with_graph(lerp_of(4.0, 9.0, 1.0)),
-        );
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 9.0);
-    }
-
-    // Between the endpoints the weight has to interpolate between the two inputs and
-    // not towards zero or towards either one alone — only a partial weight tells the
-    // three apart.
-    #[test]
-    fn a_lerp_at_a_half_lands_midway_between_its_two_inputs() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height")
-                .with_range((-10.0, 10.0))
-                .with_graph(lerp_of(4.0, 8.0, 0.5)),
-        );
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 6.0);
-    }
-
-    // The clamp is applied once at the end of the stack rather than per layer, so this
-    // also pins that an intermediate may leave the range and come back.
+    // The clamp is applied once at the end of the graph rather than per node, so this
+    // also pins that a node's value may leave the range and still land inside it.
     #[test]
     fn a_field_is_clamped_to_the_range_it_declares() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height")
                 .with_range((0.0, 1.0))
-                .with_op(NodeOp::Constant(5.0)),
+                .with_op(NodeOp::held(5.0)),
         );
         terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
@@ -2077,340 +1772,14 @@ mod tests {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
             Field::new("height").with_range((-10.0, 10.0)).with_graph({
                 let mut graph = FieldGraph::new();
-                let kept = graph.node_with(NodeOp::Constant(4.0), &[]);
-                graph.node_with(NodeOp::Constant(9.0), &[]);
+                let kept = graph.node_with(NodeOp::held(4.0), &[]);
+                graph.node_with(NodeOp::held(9.0), &[]);
                 graph.set_output(Some(kept)).unwrap();
                 graph
             }),
         );
         terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 4.0);
-    }
-
-    // A painted mask is bytes stretched over the document while the field it masks is
-    // at its own resolution, so this pins the two coordinate systems agreeing —
-    // a mask sampled in texels rather than cells would land somewhere else entirely.
-    #[test]
-    fn a_painted_weight_lets_a_value_through_where_it_is_white() {
-        let mask = Raster::from_vec(UVec2::new(2, 1), vec![0u8, 255]).unwrap();
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height").with_range((-10.0, 10.0)).with_graph({
-                let mut graph = FieldGraph::new();
-                let under = graph.node_with(NodeOp::Constant(1.0), &[]);
-                let value = graph.node_with(NodeOp::Constant(5.0), &[]);
-                let weight = graph.node_with(NodeOp::Paint(mask), &[]);
-                let lerp = graph.node_with(NodeOp::Lerp, &[under, value, weight]);
-                graph.set_output(Some(lerp)).unwrap();
-                graph
-            }),
-        );
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("height", 0.5, 4.5).unwrap(), 1.0);
-        assert_eq!(terrain.sample("height", 7.5, 4.5).unwrap(), 5.0);
-    }
-
-    // Not a pass/fail test: it prints what a full bake and a small rect re-bake cost
-    // on a full-size document, which is the pair of figures that decides whether an
-    // edit can re-bake inside a frame. Ignored because it is a measurement, and the
-    // numbers only mean anything relative to each other on one machine.
-    // Run with `cargo test --release -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn a_full_size_document_measures_what_a_bake_costs() {
-        let size = UVec2::new(4096, 4096);
-        let mut terrain = TerrainSpec::new(size)
-            .with_field(Field::new("moisture").with_shift(4).with_op(noise_op(3)))
-            .with_field(Field::new("height").with_graph({
-                let mut graph = FieldGraph::new();
-                let base = graph.node_with(
-                    NodeOp::Noise(NoiseSpec::new(5, NoiseKind::Fbm, 0.0015)),
-                    &[],
-                );
-                let detail =
-                    graph.node_with(NodeOp::Noise(NoiseSpec::new(7, NoiseKind::Fbm, 0.04)), &[]);
-                let smaller = graph.node_with(NodeOp::Scale(0.25), &[detail]);
-                let sum = graph.node_with(NodeOp::Binary(Binary::Add), &[base, smaller]);
-                let ridged = graph.node_with(
-                    NodeOp::Noise(NoiseSpec::new(11, NoiseKind::Ridged, 0.01)),
-                    &[],
-                );
-                let scaled = graph.node_with(NodeOp::Scale(0.3), &[ridged]);
-                let source = graph.node_with(NodeOp::FieldRef(FieldId::from("moisture")), &[]);
-                let weight =
-                    graph.node_with(NodeOp::Remap(Remap::new((0.4, 0.7), (0.0, 1.0))), &[source]);
-                let total = graph.node_with(NodeOp::Binary(Binary::Add), &[sum, scaled]);
-                let masked = graph.node_with(NodeOp::Lerp, &[sum, total, weight]);
-                graph.set_output(Some(masked)).unwrap();
-                graph
-            }))
-            .with_field(Field::new("soil").with_graph({
-                let mut graph = slope_of("height", 2.0, SlopeMode::default());
-                let slope = graph.output.unwrap();
-                let scaled = graph.node_with(NodeOp::Scale(20.0), &[slope]);
-                graph.set_output(Some(scaled)).unwrap();
-                graph
-            }));
-
-        let started = std::time::Instant::now();
-        terrain.bake_in_place().unwrap();
-        let full = started.elapsed();
-
-        let rect = CellRect::new(UVec2::new(1024, 1024), UVec2::new(1088, 1088));
-        let started = std::time::Instant::now();
-        terrain.bake_rect(rect).unwrap();
-        let patch = started.elapsed();
-
-        println!("full bake of {} by {}: {full:?}", size.x, size.y);
-        println!("64 by 64 rect re-bake: {patch:?}");
-        for field in &terrain.fields {
-            let data = field.baked().data();
-            let lowest = data.iter().copied().fold(f32::INFINITY, f32::min);
-            let highest = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            println!(
-                "{}: {} texels, {lowest:.3} to {highest:.3}",
-                field.id,
-                data.len()
-            );
-        }
-    }
-
-    fn region_spec() -> crate::terrain::regions::RegionSpec {
-        use crate::terrain::noise::WarpSpec;
-        use crate::terrain::regions::{Region, RegionSpec};
-        RegionSpec::new(0x5eed_0036, 128, 16, ["base", "ridge"])
-            .with_region(Region::new(6, [0.20, 0.0]))
-            .with_region(Region::new(4, [0.52, 0.0]))
-            .with_region(Region::new(3, [0.70, 0.34]))
-            .with_warp(WarpSpec {
-                seed: 0x7a1d_0b37,
-                amplitude: 48.0,
-                scale: 1.0 / (128.0 * 0.75),
-                octaves: 3,
-                salts: None,
-            })
-    }
-
-    fn region_document() -> TerrainSpec {
-        TerrainSpec::new(UVec2::new(512, 512))
-            .with_field(Field::new("ridge_weight").with_op(NodeOp::Regions {
-                spec: region_spec(),
-                output: RegionOutput::Blended("ridge".to_owned()),
-            }))
-            .with_field(Field::new("height").with_graph({
-                let mut graph = FieldGraph::new();
-                let base = graph.node_with(
-                    NodeOp::Regions {
-                        spec: region_spec(),
-                        output: RegionOutput::Blended("base".to_owned()),
-                    },
-                    &[],
-                );
-                let ridged = graph.node_with(
-                    NodeOp::Noise(NoiseSpec::new(11, NoiseKind::Ridged, 0.01)),
-                    &[],
-                );
-                let scaled = graph.node_with(NodeOp::Scale(0.4), &[ridged]);
-                let source = graph.node_with(NodeOp::FieldRef(FieldId::from("ridge_weight")), &[]);
-                let weight = graph.node_with(
-                    NodeOp::Remap(Remap::new((0.0, 0.34), (0.0, 1.0))),
-                    &[source],
-                );
-                let total = graph.node_with(NodeOp::Binary(Binary::Add), &[base, scaled]);
-                let masked = graph.node_with(NodeOp::Lerp, &[base, total, weight]);
-                graph.set_output(Some(masked)).unwrap();
-                graph
-            }))
-    }
-
-    // A regions node is the one op with no input at all, so this is where it is
-    // checked to produce a field that is finite and actually varies rather than
-    // collapsing to one region's value everywhere.
-    #[test]
-    fn a_regions_node_bakes_a_blended_column_into_a_field() {
-        let mut terrain = region_document();
-        terrain.bake_in_place().unwrap();
-
-        let values = terrain.field("height").unwrap().baked().data();
-        assert!(values.iter().all(|value| value.is_finite()));
-        let lowest = values.iter().copied().fold(f32::INFINITY, f32::min);
-        let highest = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        assert!(
-            highest - lowest > 0.2,
-            "a region-blended height spanning only {lowest} to {highest}"
-        );
-    }
-
-    // A regions layer reads no field, so it gets no halo from the dependency walk; if
-    // its own neighbourhood search were position-dependent in any way, a rect re-bake
-    // would differ at the rectangle's edges and nowhere else.
-    #[test]
-    fn a_rect_re_bake_of_a_regions_field_is_bit_identical_to_a_full_one() {
-        let mut terrain = region_document();
-        terrain.bake_in_place().unwrap();
-        let full: Vec<Vec<f32>> = terrain
-            .fields
-            .iter()
-            .map(|field| field.baked().data().to_vec())
-            .collect();
-
-        for field in &mut terrain.fields {
-            field.baked_mut().fill(f32::NAN);
-        }
-        let rect = CellRect::new(UVec2::new(97, 61), UVec2::new(300, 288));
-        terrain.bake_rect(rect).unwrap();
-
-        for (index, field) in terrain.fields.iter().enumerate() {
-            let texels = rect.to_texels(field.shift, field.baked().size());
-            let width = field.baked().width();
-            for j in texels.min.y..texels.max.y {
-                for i in texels.min.x..texels.max.x {
-                    let at = (j * width + i) as usize;
-                    assert_eq!(
-                        field.baked().data()[at].to_bits(),
-                        full[index][at].to_bits(),
-                        "field {} at {i},{j}",
-                        field.id
-                    );
-                }
-            }
-        }
-    }
-
-    // A region id is an index carried as an `f32`. At shift 0 every texel is a cell,
-    // so any fractional value means something interpolated an id somewhere it should
-    // not have.
-    #[test]
-    fn a_categorical_region_field_at_shift_zero_reads_back_a_whole_index() {
-        let mut terrain = TerrainSpec::new(UVec2::new(256, 256)).with_field(
-            Field::new("region")
-                .with_range((0.0, 8.0))
-                .with_op(NodeOp::Regions {
-                    spec: region_spec(),
-                    output: RegionOutput::RegionId,
-                }),
-        );
-        terrain.bake_in_place().unwrap();
-
-        let baked = terrain.field("region").unwrap().baked();
-        assert_eq!(baked.size(), UVec2::new(256, 256));
-        for value in baked.data() {
-            assert_eq!(*value, value.round(), "a region id baked as {value}");
-            assert!((0.0..3.0).contains(value), "a region id of {value}");
-        }
-    }
-
-    // The defect this guards: a value standing for a class has no midpoint, so a read
-    // between region 1 and region 3 must be one of the two rather than the region 2 that
-    // interpolating them invents.
-    #[test]
-    fn a_categorical_field_is_never_read_between_two_of_its_classes() {
-        let mut terrain = TerrainSpec::new(UVec2::new(256, 256))
-            .with_field(
-                Field::new("region")
-                    .with_range((0.0, 8.0))
-                    .with_op(NodeOp::Regions {
-                        spec: region_spec(),
-                        output: RegionOutput::RegionId,
-                    }),
-            )
-            .with_field(
-                Field::new("copy")
-                    .with_range((0.0, 8.0))
-                    .with_op(NodeOp::FieldRef(FieldId::from("region"))),
-            );
-        terrain.bake_in_place().unwrap();
-
-        let region = terrain.field("region").unwrap();
-        assert!(region.is_categorical());
-        for value in terrain.field("copy").unwrap().baked().data() {
-            assert_eq!(*value, value.round(), "a region id read as {value}");
-        }
-
-        for step in 0..64 {
-            let at = 4.0 * step as f32 + 2.5;
-            let value = region.sample(at, at);
-            assert_eq!(value, value.round(), "a region id sampled as {value}");
-        }
-    }
-
-    // Categoricalness is decided by the region layer's *output*, not by the presence
-    // of a region layer; a blended column is a quantity and must keep its
-    // interpolation.
-    #[test]
-    fn a_field_of_blended_region_columns_is_still_read_smoothly() {
-        let terrain = region_document();
-        assert!(
-            !terrain.field("height").unwrap().is_categorical(),
-            "a blended column is a number, not a class"
-        );
-    }
-
-    // Derived rather than declared, and from the node the field is actually read
-    // from: a `Regions` node buried under arithmetic is a number by the time it
-    // reaches the output, and reading the field to the nearest texel would come out
-    // blocky for no reason.
-    #[test]
-    fn a_regions_node_under_an_arithmetic_node_does_not_make_the_field_categorical() {
-        let classes = Field::new("region").with_op(NodeOp::Regions {
-            spec: region_spec(),
-            output: RegionOutput::CoverClass,
-        });
-        assert!(classes.is_categorical());
-
-        let scaled = Field::new("region").with_graph({
-            let mut graph = FieldGraph::new();
-            let regions = graph.node_with(
-                NodeOp::Regions {
-                    spec: region_spec(),
-                    output: RegionOutput::CoverClass,
-                },
-                &[],
-            );
-            let scaled = graph.node_with(NodeOp::Scale(2.0), &[regions]);
-            graph.set_output(Some(scaled)).unwrap();
-            graph
-        });
-        assert!(!scaled.is_categorical());
-    }
-
-    // A spurious dependency here would order the bake around a field the node never
-    // reads, and could invent a cycle in a document that has none.
-    #[test]
-    fn a_regions_node_reports_no_field_dependency() {
-        let field = Field::new("region").with_op(NodeOp::Regions {
-            spec: region_spec(),
-            output: RegionOutput::CoverClass,
-        });
-        assert_eq!(field.dependencies().count(), 0);
-    }
-
-    // Column names are resolved once at plan time; an unresolved one has to fail there
-    // rather than reading as zero for every texel of the field.
-    #[test]
-    fn a_region_column_that_is_not_in_the_table_is_an_error() {
-        let mut terrain = TerrainSpec::new(UVec2::new(64, 64)).with_field(
-            Field::new("height").with_op(NodeOp::Regions {
-                spec: region_spec(),
-                output: RegionOutput::Blended("humidity".to_owned()),
-            }),
-        );
-        let error = terrain.bake_in_place().unwrap_err();
-        assert!(
-            matches!(&error, PlanError::UnknownRegionColumn { column, reader }
-                if column == "humidity" && reader == "height"),
-            "{error}"
-        );
-    }
-
-    // A region spec is the largest thing a layer carries — a table, column names and
-    // an optional warp — and all of it has to survive a save, since none of it can be
-    // re-derived.
-    #[test]
-    fn a_document_carrying_a_regions_layer_round_trips_through_serde() {
-        let terrain = region_document();
-        let encoded = serde_json::to_string(&terrain).unwrap();
-        let decoded: TerrainSpec = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, terrain);
     }
 
     // An extent that is not a multiple of the shift rounds up to a raster whose last
@@ -2421,7 +1790,7 @@ mod tests {
         let mut terrain = TerrainSpec::new(UVec2::new(37, 23)).with_field(
             Field::new("height")
                 .with_shift(2)
-                .with_op(NodeOp::Constant(0.5)),
+                .with_op(NodeOp::held(0.5)),
         );
         terrain.bake_in_place().unwrap();
         let field = terrain.field("height").unwrap();
@@ -2429,167 +1798,64 @@ mod tests {
         assert!(field.baked().data().iter().all(|value| *value == 0.5));
     }
 
-    // The baked rasters are skipped by serde, so this pins that everything else
-    // survives and that a decoded document is unbaked rather than half-baked.
+    // The baked rasters, a shader node's values and its declared reach are skipped by
+    // serde, so this pins that everything else survives and that a decoded document is
+    // unbaked rather than half-baked.
     #[test]
     fn a_document_round_trips_through_serde_without_its_bakes() {
         let terrain = two_field_document();
         let encoded = serde_json::to_string(&terrain).unwrap();
         let decoded: TerrainSpec = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, terrain);
+
+        let mut expected = terrain.clone();
+        for field in &mut expected.fields {
+            *field = field.authored();
+            for node in &mut field.graph.nodes {
+                if let NodeOp::Shader(shader) = &mut node.op {
+                    shader.reach = None;
+                }
+            }
+        }
+        assert_eq!(decoded, expected);
         assert!(decoded.field("height").unwrap().baked().is_empty());
     }
 
-    // The property an incremental edit rests on: the answer must contain the painted
-    // rectangle and be strictly larger, because a field reading the painted one
+    // The property an incremental edit rests on: the answer must contain the changed
+    // rectangle and be strictly larger, because a field reading the changed one
     // samples a neighbourhood around each of its own texels.
     #[test]
     fn a_change_reaches_further_than_the_rectangle_it_was_made_in() {
         let terrain = two_field_document();
-        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        let reached = terrain.influence_of("moisture", painted);
+        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        let reached = terrain.influence_of("moisture", changed);
 
         assert!(!reached.is_empty());
-        assert_eq!(reached.union(painted), reached, "{reached:?}");
-        assert!(reached.width() > painted.width());
-    }
-
-    // The two slope modes answer different questions, and on a plane tilted along one
-    // axis the difference is arithmetic rather than a matter of degree: a gradient of a
-    // pure x-slope is that slope, and so is the steepest axis, so a plane cannot tell
-    // them apart. A plane tilted along *both* can — the gradient takes the hypotenuse
-    // where the steepest axis takes the longer leg.
-    #[test]
-    fn the_two_slope_modes_differ_by_the_hypotenuse_on_a_tilted_plane() {
-        let rise = 0.001_f32;
-        let plane = |mode| {
-            let mut terrain = TerrainSpec::new(UVec2::splat(64))
-                .with_field(
-                    Field::new("ground")
-                        .with_range((-10.0, 10.0))
-                        .with_op(NodeOp::Constant(0.0)),
-                )
-                .with_field(
-                    Field::new("tilt")
-                        .with_range((-10.0, 10.0))
-                        .with_graph(slope_of("ground", 4.0, mode)),
-                );
-            let size = terrain.size;
-            let mut raster = Raster::new(size, 0.0);
-            for y in 0..size.y {
-                for x in 0..size.x {
-                    raster.set(x, y, (x as f32 + y as f32) * rise);
-                }
-            }
-            *terrain.field_mut("ground").unwrap() = Field::new("ground")
-                .with_range((-10.0, 10.0))
-                .with_op(NodeOp::External(raster));
-            terrain.bake_in_place().unwrap();
-            terrain.sample("tilt", 32.5, 32.5).unwrap()
-        };
-
-        let gradient = plane(SlopeMode::Gradient);
-        let steepest = plane(SlopeMode::SteepestAxis);
-        assert!(
-            (gradient - rise * 2.0_f32.sqrt()).abs() < 1e-6,
-            "a gradient of a doubly tilted plane is {gradient}, not the hypotenuse"
-        );
-        assert!(
-            (steepest - rise).abs() < 1e-6,
-            "the steepest axis of a doubly tilted plane is {steepest}, not one leg"
-        );
-    }
-
-    // The rectangle a stroke re-bakes is what keeps the document solvable, so it has
-    // to cover every cell a full bake would have written differently. The fixture
-    // paints into the one field nothing else paints — `height` masks by it and
-    // `relief` reads the slope of `height` — so most of what has to be covered is in
-    // fields the paint never touched.
-    #[test]
-    fn the_rectangle_a_stroke_reaches_covers_every_cell_a_full_bake_would_move() {
-        let mut terrain = two_field_document().with_field(
-            Field::new("relief").with_graph(slope_of("height", 6.0, SlopeMode::default())),
-        );
-        let paint = Raster::new(
-            terrain.field("moisture").unwrap().resolution(terrain.size),
-            0u8,
-        );
-        let brushed = {
-            let field = terrain.field_mut("moisture").unwrap();
-            let noise = field.graph.output.expect("the fixture reads a node");
-            let painted = field.graph.node_with(NodeOp::Paint(paint), &[]);
-            let total = field
-                .graph
-                .node_with(NodeOp::Binary(Binary::Add), &[noise, painted]);
-            field.graph.set_output(Some(total)).unwrap();
-            painted
-        };
-        terrain.bake_in_place().unwrap();
-
-        let before: Vec<Vec<f32>> = terrain
-            .fields
-            .iter()
-            .map(|field| field.baked().data().to_vec())
-            .collect();
-
-        let brush = crate::terrain::brush::Brush {
-            radius_cells: 14.0,
-            falloff: 0.5,
-            strength: 0.8,
-            ..crate::terrain::brush::Brush::default()
-        };
-        let size = terrain.size;
-        let NodeOp::Paint(raster) = &mut terrain
-            .field_mut("moisture")
-            .unwrap()
-            .graph
-            .node_mut(brushed)
-            .unwrap()
-            .op
-        else {
-            panic!("the paint node stopped being paint");
-        };
-        let painted = brush.stroke(raster, size, &[glam::Vec2::new(44.0, 34.0)]);
-        assert!(!painted.is_empty());
-
-        let reached = terrain.influence_of("moisture", painted);
-        terrain.bake_in_place().unwrap();
-
-        let mut moved = 0;
-        for (index, field) in terrain.fields.iter().enumerate() {
-            let resolution = field.baked().size();
-            for (texel, (was, now)) in before[index].iter().zip(field.baked().data()).enumerate() {
-                if was == now {
-                    continue;
-                }
-                moved += 1;
-                let x = texel_center(texel as u32 % resolution.x, field.shift) as u32;
-                let y = texel_center(texel as u32 / resolution.x, field.shift) as u32;
-                assert!(
-                    reached.contains(x, y),
-                    "{}: cell {x},{y} moved outside {reached:?}",
-                    field.id
-                );
-            }
-        }
-        assert!(moved > 0, "the stroke moved nothing at all");
+        assert_eq!(reached.union(changed), reached, "{reached:?}");
+        assert!(reached.width() > changed.width());
     }
 
     fn shader_over_a_field(wired: bool, reach: Option<u32>) -> TerrainSpec {
-        use crate::terrain::shader::ShaderLayer;
         let mut layer = ShaderLayer::new("blur.wgsl");
         layer.inputs = vec!["source".to_owned()];
         layer.reach = reach;
+        let NodeOp::Shader(mut joined) = NodeOp::piped(2) else {
+            unreachable!("a piped node is a shader node");
+        };
+        joined.reach = Some(0);
 
         let mut graph = FieldGraph::new();
         let source = graph.node_with(NodeOp::FieldRef(FieldId::from("base")), &[]);
         let pins: Vec<NodeId> = if wired { vec![source] } else { Vec::new() };
         let shaded = graph.node_with(NodeOp::Shader(layer), &pins);
-        let out = graph.node_with(NodeOp::Binary(Binary::Add), &[source, shaded]);
+        let out = graph.node_with(NodeOp::Shader(joined), &[source, shaded]);
         graph.set_output(Some(out)).unwrap();
 
         TerrainSpec::new(UVec2::new(96, 80))
-            .with_field(Field::new("base").with_shift(0).with_op(noise_op(7)))
+            .with_field(
+                Field::new("base")
+                    .with_shift(0)
+                    .with_op(NodeOp::holding(ramp(UVec2::new(96, 80)))),
+            )
             .with_field(Field::new("height").with_shift(0).with_graph(graph))
     }
 
@@ -2600,9 +1866,9 @@ mod tests {
     // it a dependency whatever the shader pin does and makes the two halos comparable.
     #[test]
     fn a_declared_reach_widens_the_influence_by_that_many_cells_a_side() {
-        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        let none = shader_over_a_field(true, Some(0)).influence_of("base", painted);
-        let two = shader_over_a_field(true, Some(2)).influence_of("base", painted);
+        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        let none = shader_over_a_field(true, Some(0)).influence_of("base", changed);
+        let two = shader_over_a_field(true, Some(2)).influence_of("base", changed);
 
         assert!(!two.is_empty());
         assert_eq!(two.union(none), two, "{two:?} does not contain {none:?}");
@@ -2616,8 +1882,8 @@ mod tests {
     #[test]
     fn a_wired_shader_declaring_no_reach_influences_the_whole_document() {
         let terrain = shader_over_a_field(true, None);
-        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        assert_eq!(terrain.influence_of("base", painted), terrain.rect());
+        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        assert_eq!(terrain.influence_of("base", changed), terrain.rect());
     }
 
     // An unwired pin reads `0.0` and so reads nothing of the document, which means a
@@ -2626,12 +1892,12 @@ mod tests {
     // alongside the shader is what leaves a halo to compare at all.
     #[test]
     fn an_unwired_shader_pin_widens_nothing() {
-        let painted = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
+        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
         let unwired = shader_over_a_field(false, None);
         assert!(!unwired.samples_unbounded());
         assert_eq!(
-            unwired.influence_of("base", painted),
-            shader_over_a_field(true, Some(0)).influence_of("base", painted)
+            unwired.influence_of("base", changed),
+            shader_over_a_field(true, Some(0)).influence_of("base", changed)
         );
     }
 
@@ -2664,12 +1930,12 @@ mod tests {
                 Field::new("moisture")
                     .with_role(FieldRole::Moisture)
                     .with_shift(3)
-                    .with_op(noise_op(7)),
+                    .with_op(NodeOp::holding(ramp(UVec2::new(8, 8)))),
             )
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
-                    .with_op(noise_op(11)),
+                    .with_op(NodeOp::holding(ramp(UVec2::new(64, 64)))),
             )
     }
 
@@ -2808,7 +2074,7 @@ mod tests {
     #[test]
     fn a_document_that_carries_no_roles_refuses_to_plan_its_water() {
         let mut spec = TerrainSpec::new(UVec2::new(32, 32))
-            .with_field(Field::new("height").with_op(NodeOp::Constant(0.5)));
+            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
         spec.water_spec = Some(WaterSpec::new("height"));
 
         assert!(matches!(

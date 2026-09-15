@@ -15,9 +15,8 @@ use bevy::{
 use serde_json::{Value, json};
 
 use super::observe::{self, Topic};
-use crate::brush::{BrushSettings, apply_stroke};
 use crate::document::Document;
-use crate::edit::{BrushChange, Edit, brush_summary, parse_op};
+use crate::edit::{Edit, parse_op};
 use crate::preset::Preset;
 use crate::ui::report;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
@@ -71,7 +70,7 @@ pub(super) enum Command {
     Field(String),
     /// An edit and the re-bake that answers it, held together: the reply says the
     /// effect has happened, and for an edit the effect is the bake rather than the
-    /// changed number. A stack that no longer bakes — a cycle a toggle uncovered —
+    /// changed number. A document that no longer bakes — a cycle a toggle uncovered —
     /// reports that error here rather than answering with a success nothing followed.
     /// A refused edit also reaches the status bar and the log panel, so a person at the
     /// editor sees why a command driven from elsewhere changed nothing.
@@ -79,19 +78,6 @@ pub(super) enum Command {
         /// The change to make.
         edit: Edit,
         /// The reply from the edit itself, once it has been applied.
-        applied: Option<Value>,
-    },
-    /// Several of the brush's settings at once, where a node's are set one at a time:
-    /// a brush is one tool with a handful of knobs, and a caller usually means to state
-    /// a whole configuration rather than nudge a number.
-    Brush(Vec<BrushChange>),
-    /// A stroke and the re-bake that answers it, on the same terms as
-    /// [`Command::Edit`] — except that what it waits for is the rectangle the stroke
-    /// made stale rather than the whole view.
-    Stroke {
-        /// The polyline, in document cells.
-        points: Vec<Vec2>,
-        /// The reply from the stroke itself, once it has been applied.
         applied: Option<Value>,
     },
     /// Bakes the whole document and waits for it.
@@ -109,7 +95,7 @@ pub(super) enum Command {
     /// Drops the water and its spec. Synchronous.
     ResetWater,
     /// Copies a stock shader into the document's shader directory. Synchronous, and
-    /// answers the name the copy was given — which is what a `layer add` names.
+    /// answers the name the copy was given — which is what a `node add … shader` names.
     AdoptShader(String),
     /// Writes the document and waits for it.
     Save {
@@ -197,8 +183,6 @@ impl Command {
                 }
                 _ => "node",
             },
-            Self::Brush(_) => "brush",
-            Self::Stroke { .. } => "stroke",
             Self::Bake { .. } => "bake",
             Self::SolveWater { .. } => "solve-water",
             Self::ResetWater => "reset-water",
@@ -285,30 +269,6 @@ impl Command {
                         path: (*path).to_owned(),
                         words: owned(&rest[1..]),
                     },
-                    applied: None,
-                })
-            }
-            "brush" => {
-                if rest.is_empty() || !rest.len().is_multiple_of(2) {
-                    return Err(
-                        "brush takes a name and a value, and as many pairs as you like".to_owned(),
-                    );
-                }
-                rest.chunks(2)
-                    .map(|pair| BrushChange::parse(pair[0], pair[1]))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(Self::Brush)
-            }
-            "stroke" => {
-                let points = rest
-                    .iter()
-                    .map(|word| point(word))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if points.is_empty() {
-                    return Err("stroke needs at least one cell to paint at".to_owned());
-                }
-                Ok(Self::Stroke {
-                    points,
                     applied: None,
                 })
             }
@@ -453,27 +413,6 @@ impl Command {
                     }
                     let depth = document.history();
                     *applied = Some(json!({ "undo": depth.undo, "redo": depth.redo }));
-                    return Poll::Running;
-                }
-                answered(world, applied)
-            }
-
-            Self::Brush(changes) => {
-                let mut settings = world.resource_mut::<BrushSettings>();
-                for change in changes.iter() {
-                    change.apply(&mut settings.0);
-                }
-                Poll::Done(brush_summary(&settings.0))
-            }
-
-            Self::Stroke { points, applied } => {
-                if applied.is_none() {
-                    let brush = world.resource::<BrushSettings>().0;
-                    let mut document = world.resource_mut::<Document>();
-                    match apply_stroke(&mut document, &brush, points, false) {
-                        Ok(value) => *applied = Some(value),
-                        Err(error) => return Poll::Failed(error),
-                    }
                     return Poll::Running;
                 }
                 answered(world, applied)
@@ -795,13 +734,6 @@ fn number<T: std::str::FromStr>(word: &str) -> Result<T, String> {
     word.parse().map_err(|_| format!("not a number: {word}"))
 }
 
-fn point(word: &str) -> Result<Vec2, String> {
-    let (x, y) = word
-        .split_once(',')
-        .ok_or_else(|| format!("a point is written x,y, not `{word}`"))?;
-    Ok(Vec2::new(number(x)?, number(y)?))
-}
-
 fn optional_number<T: std::str::FromStr>(word: Option<&&str>, fallback: T) -> Result<T, String> {
     match word {
         Some(word) => number(word),
@@ -857,9 +789,8 @@ mod tests {
             ("field add biomes", "field"),
             ("field rename base continent", "field"),
             ("field rm base", "field"),
-            ("node add height noise fbm 0.01", "node"),
-            ("node add height constant 0.25", "node"),
-            ("node add height slope 4", "node"),
+            ("node add height fieldref base", "node"),
+            ("node add height shader ridged.wgsl", "node"),
             ("node rm height n2", "node"),
             ("node connect height n2 n0 0", "node"),
             ("node disconnect height n0 0", "node"),
@@ -873,14 +804,6 @@ mod tests {
             ("set height.1.mask field moisture 0.4 0.6 0 1", "set"),
             ("set height.1.op.scale 0.004", "set"),
             ("set height.shift 2", "set"),
-            ("node add height paint", "node"),
-            ("brush radius 24", "brush"),
-            (
-                "brush mode smooth radius 8 falloff 0.2 strength 0.5 value 0.3",
-                "brush",
-            ),
-            ("stroke 10,20", "stroke"),
-            ("stroke 10,20 30,40 50,60", "stroke"),
             ("bake", "bake"),
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),
@@ -922,24 +845,30 @@ mod tests {
         assert!(Command::parse("node bypass height n1 maybe").is_err());
         assert!(Command::parse("node rm height").is_err());
         assert!(Command::parse("set").is_err());
-        assert!(Command::parse("brush").is_err());
-        assert!(Command::parse("brush radius").is_err());
-        assert!(Command::parse("brush sideways 2").is_err());
-        assert!(Command::parse("brush mode sideways").is_err());
-        assert!(Command::parse("brush radius wide").is_err());
-        assert!(Command::parse("stroke").is_err());
-        assert!(Command::parse("stroke 10").is_err());
-        assert!(Command::parse("stroke 10,20 sideways").is_err());
     }
 
-    // Points are written `x,y` so a stroke's arguments cannot be miscounted into pairs:
-    // a flat list with a number dropped would still parse and would paint a different
-    // line. Also pins that a coordinate keeps its fraction.
+    // The brush and the CPU ops are gone rather than hidden: a script still written
+    // against them has to be told the verb, the topic or the op does not exist, naming
+    // the word it used, rather than have any of it half happen.
     #[test]
-    fn a_stroke_reads_its_points_as_cells_rather_than_as_a_flat_list_of_numbers() {
-        let Ok(Command::Stroke { points, .. }) = Command::parse("stroke 10,20 30.5,40") else {
-            panic!("a stroke did not parse to a stroke");
+    fn the_brush_verbs_its_topic_and_a_removed_op_are_refused_by_name() {
+        for (line, refusal) in [
+            ("brush radius 24", "no such command: brush"),
+            ("stroke 10,20", "no such command: stroke"),
+            ("observe brush", "nothing to observe called brush"),
+        ] {
+            let Err(error) = Command::parse(line) else {
+                panic!("`{line}` parsed");
+            };
+            assert_eq!(error, refusal);
+        }
+        let Err(error) = Command::parse("node add height noise") else {
+            panic!("a noise op parsed");
         };
-        assert_eq!(points, vec![Vec2::new(10.0, 20.0), Vec2::new(30.5, 40.0)]);
+        assert!(error.contains("noise"), "{error}");
+        let Err(error) = Command::parse("new 256 256 7 regions") else {
+            panic!("the regions preset parsed");
+        };
+        assert!(error.contains("regions"), "{error}");
     }
 }

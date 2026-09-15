@@ -49,12 +49,11 @@ impl CardThumb {
 
 /// Redraws each card's picture from the raster behind it.
 ///
-/// A node holding a raster of its own — a shader, a painted or an imported one — is
-/// drawn from that, and a reference is drawn from the bake of the field it names. Every
-/// other op keeps the flat accent square, because drawing one would mean a preview bake
-/// of a whole field per card per edit; a reference costs nothing extra, since the field
-/// it names is already baked. A field card is drawn from that field's own bake, and so
-/// keeps the flat square until the field has been baked once.
+/// A shader node is drawn from the raster it holds, and a reference is drawn from the
+/// bake of the field it names — which costs nothing extra, since that field is already
+/// baked. A shader node holding no values yet keeps the flat accent square. A field
+/// card is drawn from that field's own bake, and so keeps the flat square until the
+/// field has been baked once.
 pub fn sync_thumbnails(
     document: Res<Document>,
     shape: Res<CanvasShape>,
@@ -104,12 +103,9 @@ fn source_picture(terrain: &TerrainSpec, active: &str, source: &ThumbSource) -> 
 fn node_picture(terrain: &TerrainSpec, node: &GraphNode) -> Option<Vec<u8>> {
     match &node.op {
         NodeOp::Shader(shader) => picture(shader.values()),
-        NodeOp::External(raster) => picture(raster),
-        NodeOp::Paint(raster) => picture(raster),
         NodeOp::FieldRef(id) => terrain
             .field(id.as_str())
             .and_then(|field| picture(field.baked())),
-        _ => None,
     }
 }
 
@@ -178,7 +174,7 @@ fn hash(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::terrain::Field;
-    use crate::terrain::noise::{NoiseKind, NoiseSpec};
+    use crate::terrain::shader::ShaderLayer;
     use watershed::FieldId;
 
     fn ramp(size: u32) -> Raster<f32> {
@@ -212,7 +208,7 @@ mod tests {
         );
     }
 
-    // A node that has not varied yet — a constant shader, a fresh paint layer — has a
+    // A node that has not varied yet — a shader holding one value — has a
     // zero span, and normalising against it would divide by zero.
     #[test]
     fn a_flat_raster_draws_one_colour_and_does_not_divide_by_zero() {
@@ -221,36 +217,28 @@ mod tests {
         assert!(bytes.chunks(4).all(|pixel| pixel == &bytes[..4]));
     }
 
-    // A paint layer is bytes, not floats, so it reaches the picture through `Texel`
-    // and its two ends have to land at the two ends of the ramp.
-    #[test]
-    fn a_byte_raster_is_read_through_texel() {
-        let mut raster = Raster::new(UVec2::splat(4), 0u8);
-        for x in 0..4 {
-            raster.set(x, 3, 255);
-        }
-        let bytes = picture(&raster).expect("a picture");
-        assert_ne!(row(&bytes, 0), row(&bytes, TEXELS - 1));
-    }
-
     fn two_field_terrain() -> TerrainSpec {
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
             .with_field(
                 Field::new("base")
                     .with_range((0.0, 1.0))
-                    .with_op(NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.05))),
+                    .with_op(NodeOp::holding(ramp(16))),
             )
             .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
         terrain.bake_in_place().expect("a bake");
         terrain
     }
 
-    // A node with no raster of its own keeps the flat accent square rather than
-    // drawing a picture of nothing.
+    // A shader node that has never been dispatched holds no values yet, so it keeps
+    // the flat accent square rather than drawing a picture of nothing.
     #[test]
     fn an_op_with_no_raster_has_no_picture() {
         let terrain = two_field_terrain();
-        let node = GraphNode::new(NodeId(0), NodeOp::Constant(0.5), [0.0, 0.0]);
+        let node = GraphNode::new(
+            NodeId(0),
+            NodeOp::Shader(ShaderLayer::new("x.wgsl")),
+            [0.0, 0.0],
+        );
         assert!(node_picture(&terrain, &node).is_none());
     }
 

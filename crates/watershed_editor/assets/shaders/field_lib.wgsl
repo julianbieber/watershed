@@ -1,10 +1,9 @@
-// What every shader layer is compiled against: the bindings a dispatch supplies, and
+// What every shader node is compiled against: the bindings a dispatch supplies, and
 // the noise primitives a shader is expected to reach for.
 //
 // The Rust half of this file is `gpu.rs`, which writes `Globals` out as
-// `DispatchGlobals` and prepends this source to every shader; and `terrain/noise.rs`,
-// which is where the noise below has to keep agreeing with the CPU layers a stack
-// mixes it with. A change here is a change there.
+// `DispatchGlobals` and prepends this source to every shader. A change here is a
+// change there.
 
 // Everything a shader is told about where it is being evaluated. Positions are in
 // document cells, not in a normalised coordinate, so a scale means the same thing at
@@ -29,8 +28,7 @@ const TAU: f32 = 6.2831853;
 const RIDGE_GAIN: f32 = 2.0;
 const NOISE_GAIN: f32 = 2.6;
 
-// The one hash, and the same one the CPU layers use. Its exact output is part of what
-// a saved document means.
+// The one hash. Its exact output is part of what a saved document means.
 fn hash2(x: i32, y: i32) -> u32 {
     var h: u32 = u32(x) * 0x27d4eb2du;
     h = h ^ (u32(y) * 0x165667b1u);
@@ -72,7 +70,7 @@ fn gradient_noise(p: vec2<f32>) -> f32 {
 // Octaves of `gradient_noise` summed, each at `lacunarity` times the frequency and
 // `persistence` times the amplitude of the one before, divided by the total
 // amplitude — so changing the octave count refines the field rather than rescaling
-// it. Zero octaves gives a NaN, exactly as the CPU reading does.
+// it. Zero octaves gives a NaN.
 fn fbm(p: vec2<f32>, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
     var total = 0.0;
     var amplitude = 1.0;
@@ -105,10 +103,18 @@ fn ridged_fbm(p: vec2<f32>, octaves: u32, persistence: f32, lacunarity: f32) -> 
     return total / max_amplitude;
 }
 
-// `fbm` stretched around its midpoint onto 0..1, which is the reading the noise
-// layers take and the one a height field's range expects.
+// `fbm` stretched around its midpoint onto 0..1, which is the reading a height field's
+// range expects.
 fn fbm_unit(p: vec2<f32>, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
     return clamp(fbm(p, octaves, persistence, lacunarity) * NOISE_GAIN * 0.5 + 0.5, 0.0, 1.0);
+}
+
+// A displacement in lattice units drawn from `seed` and `salt`, added to a noise
+// position so two seeds, or two noises under one seed, read different stretches of the
+// same lattice. Up to about a thousand lattice cells on each axis.
+fn seed_offset(seed: u32, salt: u32) -> vec2<f32> {
+    let h = hash2(i32(seed), i32(salt));
+    return vec2<f32>(f32(h & 0xffffu), f32(h >> 16u)) / 64.0;
 }
 
 // The document position, in cells, of the texel this invocation writes.

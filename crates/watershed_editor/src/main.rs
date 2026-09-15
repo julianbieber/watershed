@@ -1,5 +1,5 @@
-//! A graphical editor for a watershed document: authoring the fields and their layer
-//! stacks, painting into them, and previewing the baked terrain.
+//! A graphical editor for a watershed document: authoring the fields and the shader
+//! graphs that produce them, and previewing the baked terrain.
 //!
 //! Every capability the editor has is reachable from `watershed-ctl` as well as from
 //! the window. That is a standing rule rather than a convenience: a change that can
@@ -11,7 +11,6 @@ use bevy::feathers::dark_theme::create_dark_theme;
 use bevy::feathers::theme::UiTheme;
 use bevy::prelude::*;
 
-mod brush;
 mod canvas;
 mod control;
 mod document;
@@ -34,7 +33,6 @@ fn main() {
         .insert_resource(UiTheme(create_dark_theme()))
         .add_plugins((
             document::DocumentPlugin,
-            brush::BrushPlugin,
             view::ViewPlugin,
             canvas::CanvasPlugin,
             gpu::ShaderPlugin,
