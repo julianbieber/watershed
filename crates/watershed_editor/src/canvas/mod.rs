@@ -1,13 +1,10 @@
-//! The node graph as a thing on screen: what the open field's graph is drawn as, how
-//! it is panned, zoomed and rewired, and how one node's values are put on the map.
+//! The document's fields as a thing on screen: one card per field with ribbons for what
+//! each reads, and how that canvas is panned, zoomed and framed.
 
 mod edges;
 mod input;
 mod overview;
-mod scene;
 mod thumb;
-
-pub use overview::Overview;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Camera, ClearColorConfig, Viewport};
@@ -15,12 +12,8 @@ use bevy::prelude::*;
 use bevy::ui::UiSystems;
 
 use crate::document::{Document, EditorSystems};
-use crate::terrain::graph::{FieldGraph, NodeId};
 
 /// The width and height of a card, in canvas units.
-///
-/// Stays under the `NODE_STEP` an auto-placed graph is laid out on, or every
-/// control-built graph is a stack of overlapping cards.
 pub const CARD: Vec2 = Vec2::new(240.0, 140.0);
 const TITLE_BAR: f32 = 30.0;
 const THUMB: f32 = 78.0;
@@ -29,8 +22,6 @@ const ROW_STEP: f32 = 19.0;
 const TITLE_SIZE: f32 = 17.0;
 const DETAIL_SIZE: f32 = 12.0;
 const PARAM_SIZE: f32 = 11.0;
-const PIN_RADIUS: f32 = 7.0;
-const FLAG: f32 = 14.0;
 const ZOOM_PER_STEP: f32 = 1.2;
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 8.0;
@@ -41,20 +32,14 @@ const CANVAS_LAYER: usize = 1;
 
 const CANVAS_GROUND: Color = Color::srgb(0.115, 0.125, 0.165);
 
-/// Draws the open field's graph, and keeps it in step with the document.
+/// Draws the document's fields, and keeps the drawing in step with the document.
 pub struct CanvasPlugin;
 
 impl Plugin for CanvasPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Selection>()
-            .init_resource::<Overview>()
-            .init_resource::<Grab>()
+        app.init_resource::<Grab>()
             .init_resource::<CanvasFrame>()
             .init_resource::<CanvasShape>()
-            .init_resource::<Solo>()
-            .init_resource::<input::Finished>()
-            .init_resource::<overview::Wired>()
-            .init_resource::<overview::WiredStep>()
             .add_message::<OpenField>()
             .add_systems(Startup, spawn_canvas_camera)
             .add_systems(
@@ -62,23 +47,13 @@ impl Plugin for CanvasPlugin {
                 (
                     apply_open_field,
                     input::undo_keys,
-                    overview::overview_after_undo,
-                    scene::rebuild_canvas.run_if(not(overview_showing)),
-                    overview::rebuild_overview.run_if(overview_showing),
-                    frame_graph,
-                    scene::sync_canvas.run_if(not(overview_showing)),
+                    overview::rebuild_overview,
+                    frame_overview,
                     thumb::sync_thumbnails,
                     input::canvas_camera,
                     input::fit_key,
-                    overview::overview_key,
-                    input::canvas_solo,
-                    input::canvas_drag.run_if(not(overview_showing)),
-                    overview::overview_drag.run_if(overview_showing),
-                    input::canvas_commit,
-                    overview::commit_field_wire,
-                    solo_preview,
-                    edges::route_edges,
-                    overview::route_field_ribbons.run_if(overview_showing),
+                    overview::overview_drag,
+                    overview::route_field_ribbons,
                     scale_canvas_labels,
                 )
                     .chain()
@@ -88,58 +63,10 @@ impl Plugin for CanvasPlugin {
     }
 }
 
-fn overview_showing(overview: Res<Overview>) -> bool {
-    overview.showing
-}
-
-/// Which of the two things the canvas draws is on screen.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum CanvasView {
-    /// One field's node graph, by the field's name.
-    Graph(String),
-    /// The whole document, as one card per field.
-    Overview,
-}
-
 /// The camera the canvas is drawn through. Orthographic, and the only camera that
 /// draws [`CANVAS_LAYER`].
 #[derive(Component)]
 pub struct CanvasCameraTag;
-
-/// One node's card. Carries what the pins are placed from, so a pin's position is
-/// derived rather than stored twice.
-#[derive(Component, Clone, Copy)]
-pub struct NodeCard {
-    /// The node this card stands for.
-    pub node: NodeId,
-    /// Width and height in canvas units.
-    pub size: Vec2,
-    /// How many input pins run down its left edge.
-    pub inputs: usize,
-}
-
-/// One pin of one card: the output when `input` is `None`, otherwise that input.
-#[derive(Component, Clone, Copy)]
-pub struct NodePin {
-    /// The node the pin belongs to.
-    pub node: NodeId,
-    /// Which input pin, or `None` for the single output.
-    pub input: Option<usize>,
-}
-
-/// One edge, as the two card entities it joins.
-///
-/// Entities rather than ids because the routing reads their transforms every frame,
-/// and looking each up by id would be a scan per edge per frame.
-#[derive(Component)]
-pub struct NodeEdge {
-    /// The card the value comes from.
-    pub from: Entity,
-    /// The card it is written into.
-    pub to: Entity,
-    /// Which input pin of `to`.
-    pub pin: usize,
-}
 
 /// A world-space label, and the height it is meant to read at.
 ///
@@ -149,45 +76,7 @@ pub struct NodeEdge {
 #[derive(Component)]
 pub struct CanvasLabel(pub f32);
 
-/// The mark at the right end of a card's title bar: filled on the field's output,
-/// hollow on every other card, and pressed to make that card's node the output.
-#[derive(Component)]
-pub struct OutputFlag;
-
-/// Which node the panel is showing and which one the map is showing.
-#[derive(Resource, Default)]
-pub struct Selection {
-    /// The node the inspector is built for.
-    pub node: Option<NodeId>,
-    /// The node the map is showing instead of the field's output.
-    ///
-    /// Never set while `node` is `None`: a solo is an inspection that ends with the
-    /// selection that made it, so the map at rest is what the field bakes.
-    pub soloed: Option<NodeId>,
-}
-
-impl Selection {
-    /// Selects a node, or clears the selection — which clears any solo with it.
-    pub fn select(&mut self, node: Option<NodeId>) {
-        self.node = node;
-        if node.is_none() {
-            self.soloed = None;
-        }
-    }
-
-    /// Drops a node that is no longer in the document from both the selection and the
-    /// solo, so neither can name something that is gone.
-    pub fn forget(&mut self, gone: NodeId) {
-        if self.node == Some(gone) {
-            self.select(None);
-        }
-        if self.soloed == Some(gone) {
-            self.soloed = None;
-        }
-    }
-}
-
-/// Asks for another field of the open document to be put on screen.
+/// Asks for another field of the open document to be the active one.
 ///
 /// The one way anything asks for a field change: the canvas's double-click, the
 /// panel's `reads` and `read by` buttons, and whatever else comes to want it all write
@@ -195,71 +84,27 @@ impl Selection {
 /// an edit — nothing is written to the terrain, no history entry is made, and no bake
 /// is started — so a field opened this way can be shut again by opening the first one.
 ///
-/// Opening a field leaves the overview, because the field's graph is what was asked
-/// for. A name no field of the document carries is refused the way any other bad
-/// reference is, and the view stays where it was — overview and all.
+/// A name no field of the document carries is refused the way any other bad reference
+/// is: the refusal is reported and the active field stays where it was.
 #[derive(Message)]
 pub struct OpenField {
     /// The field to open. Must be one the document carries.
     pub field: String,
-    /// A node of the field being opened to select once it is up, or `None` to leave
-    /// nothing selected.
-    pub select: Option<NodeId>,
 }
 
-fn apply_open_field(
-    mut open: MessageReader<OpenField>,
-    mut document: ResMut<Document>,
-    mut selection: ResMut<Selection>,
-    mut overview: ResMut<Overview>,
-) {
+fn apply_open_field(mut open: MessageReader<OpenField>, mut document: ResMut<Document>) {
     for message in open.read() {
         let opened = document.set_active(&message.field);
-        if opened.is_ok() {
-            selection.select(message.select);
-            overview.showing = false;
-        }
         crate::ui::report(&mut document, opened);
     }
 }
 
 /// What the pointer is currently doing on the canvas.
-///
-/// An enum rather than a set of flags because dragging a card, dragging a wire, wiring
-/// two fields together and panning are four things the pointer cannot be doing at once,
-/// and a shape that admitted several would need a rule for what to do when it held them.
 #[derive(Resource, Default)]
 pub enum Grab {
     /// Nothing is held.
     #[default]
     Idle,
-    /// A card is being moved. The offset keeps the point under the cursor under it.
-    ///
-    /// While this is held the drag owns the card's position, not the document: `at` is
-    /// where the card has been pulled to, and it is what the release writes. Reading it
-    /// back off the transform instead would read whatever ran last that frame.
-    Card {
-        /// The card entity.
-        entity: Entity,
-        /// The node it stands for.
-        node: NodeId,
-        /// Where the card sat relative to the cursor when it was taken.
-        offset: Vec2,
-        /// Where the card has been dragged to.
-        at: Vec2,
-    },
-    /// A wire is being dragged from a pin.
-    Wire {
-        /// The node the wire comes from.
-        node: NodeId,
-        /// Which pin it left, so releasing over another can tell which end is which.
-        pin: Option<usize>,
-    },
-    /// A dependency is being dragged from one field's card to another's.
-    FieldWire {
-        /// The field the drag left, which the reference it makes will read.
-        from: String,
-    },
     /// The canvas is being panned. The anchor is the canvas point held under the
     /// cursor.
     Pan {
@@ -268,7 +113,7 @@ pub enum Grab {
     },
 }
 
-/// The strip of the window the node canvas is drawn into.
+/// The strip of the window the canvas is drawn into.
 ///
 /// A UI node with nothing in it: it exists so the layout reserves the space and the
 /// canvas camera's viewport can be measured from something the layout agrees with,
@@ -303,34 +148,15 @@ impl Default for CanvasFrame {
     }
 }
 
-/// The raster the map is showing instead of the field's output, if any.
-///
-/// Held here rather than on the document because it is a way of looking at the
-/// document, not a part of it: nothing about a solo is saved, and clearing one puts
-/// the map back without anything having been edited.
-#[derive(Resource, Default)]
-pub struct Solo {
-    /// Which field and node the raster was baked for.
-    pub node: Option<(String, NodeId)>,
-    /// The values, at the field's own resolution.
-    pub raster: Option<watershed::raster::Raster<f32>>,
-    /// Bumped whenever the raster changes, so the map knows to upload it again.
-    pub generation: u64,
-}
-
-/// What the canvas was last built from.
-///
-/// The graph's shape only: which nodes there are, what op each carries, how many pins
-/// it has and what is wired into them. A position or a name is deliberately absent, so
-/// dragging a card or naming a node writes onto the cards that are already there
-/// rather than despawning every one of them.
+/// What the canvas was last built from, and whether it has been framed since fields
+/// appeared.
 #[derive(Resource, Default)]
 pub struct CanvasShape {
-    /// The shape the cards on screen were built from.
+    /// The fingerprint the cards on screen were built from.
     pub key: String,
-    /// The view the camera was last framed for, so switching to another one frames it
-    /// once rather than fighting a pan the person made afterwards.
-    pub framed: Option<CanvasView>,
+    /// Whether the camera has framed the cards since the document last had fields, so
+    /// it frames them once rather than fighting a pan the person made afterwards.
+    pub framed: bool,
 }
 
 fn spawn_canvas_camera(mut commands: Commands) {
@@ -388,83 +214,47 @@ fn size_canvas_viewport(
     }
 }
 
-fn solo_preview(
+fn frame_overview(
     document: Res<Document>,
-    selection: Res<Selection>,
-    mut solo: ResMut<Solo>,
-    mut baked_at: Local<Option<u64>>,
-) {
-    let wanted = selection
-        .soloed
-        .map(|node| (document.active().to_owned(), node));
-    let revision = document.revision();
-    if solo.node == wanted && *baked_at == Some(revision) {
-        return;
-    }
-    *baked_at = Some(revision);
-    solo.node = wanted.clone();
-    solo.generation = solo.generation.wrapping_add(1);
-    solo.raster = wanted.and_then(|(field, node)| {
-        document
-            .terrain()
-            .and_then(|terrain| terrain.preview_node(&field, node))
-    });
-}
-
-fn frame_graph(
-    document: Res<Document>,
-    overview: Res<Overview>,
     frame: Res<CanvasFrame>,
     window: Option<Single<&Window, With<bevy::window::PrimaryWindow>>>,
     mut shape: ResMut<CanvasShape>,
     camera: Option<Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>>,
 ) {
-    let wanted = if overview.showing {
-        CanvasView::Overview
-    } else {
-        CanvasView::Graph(document.active().to_owned())
-    };
-    if shape.framed.as_ref() == Some(&wanted) {
+    let has_fields = document
+        .terrain()
+        .is_some_and(|terrain| !terrain.fields.is_empty());
+    if !has_fields {
+        if shape.framed {
+            shape.framed = false;
+        }
+        return;
+    }
+    if shape.framed {
         return;
     }
     let (Some(camera), Some(window)) = (camera, window) else {
         return;
     };
-    let empty = if overview.showing {
-        document.terrain().map(|terrain| terrain.fields.is_empty())
-    } else {
-        open_graph(&document).map(|graph| graph.nodes.is_empty())
-    };
-    match empty {
-        None => return,
-        Some(true) => {
-            shape.framed = Some(wanted);
-            return;
-        }
-        Some(false) => {}
-    }
     let (mut transform, mut projection) = camera.into_inner();
     if frame_canvas(
         &document,
-        &overview,
         &frame,
         window.into_inner(),
         &mut transform,
         &mut projection,
     ) {
-        shape.framed = Some(wanted);
+        shape.framed = true;
     }
 }
 
-/// Puts the whole of whatever the canvas is showing in view on the canvas camera.
+/// Puts every field card in view on the canvas camera.
 ///
-/// What the canvas's Fit button and the key F both do, for the open field's graph and
-/// for the document's fields alike. Answers whether the camera was moved: `false` when
-/// there is no document, when the view has nothing in it to frame, and when the canvas
-/// has not been measured yet.
+/// What the canvas's Fit button and the key F both do. Answers whether the camera was
+/// moved: `false` when there is no document, when the document has no fields, and when
+/// the canvas has not been measured yet.
 pub fn frame_canvas(
     document: &Document,
-    overview: &Overview,
     frame: &CanvasFrame,
     window: &Window,
     transform: &mut Transform,
@@ -478,14 +268,10 @@ pub fn frame_canvas(
         return false;
     };
     let viewport = frame.size / scale_factor;
-    let fitted = if overview.showing {
-        document
-            .terrain()
-            .and_then(|terrain| overview::overview_fit(terrain, viewport))
-    } else {
-        open_graph(document).and_then(|graph| graph_fit(graph, viewport))
-    };
-    let Some((centre, scale)) = fitted else {
+    let Some((centre, scale)) = document
+        .terrain()
+        .and_then(|terrain| overview::overview_fit(terrain, viewport))
+    else {
         return false;
     };
     ortho.scale = scale;
@@ -494,30 +280,10 @@ pub fn frame_canvas(
     true
 }
 
-fn graph_fit(graph: &FieldGraph, viewport: Vec2) -> Option<(Vec2, f32)> {
-    if graph.nodes.is_empty() || viewport.x <= 1.0 || viewport.y <= 1.0 {
-        return None;
-    }
-    let mut low = Vec2::splat(f32::INFINITY);
-    let mut high = Vec2::splat(f32::NEG_INFINITY);
-    for node in &graph.nodes {
-        let at = Vec2::new(node.position[0], node.position[1]);
-        low = low.min(at - CARD * 0.5);
-        high = high.max(at + CARD * 0.5);
-    }
-    if !low.is_finite() || !high.is_finite() {
-        return None;
-    }
-    let span = (high - low).max(Vec2::splat(1.0)) + Vec2::splat(CARD.x * 0.4);
-    let scale = (span / viewport).max_element().clamp(MIN_SCALE, MAX_SCALE);
-    Some(((low + high) * 0.5, scale))
-}
-
 fn scale_canvas_labels(
     camera: Option<Single<&Projection, With<CanvasCameraTag>>>,
     mut labels: Query<(&CanvasLabel, &mut TextFont, &mut Transform, &mut Visibility)>,
-    mut flags: Query<&mut Visibility, (With<OutputFlag>, Without<CanvasLabel>)>,
-    added: Query<(), Or<(Added<CanvasLabel>, Added<OutputFlag>)>>,
+    added: Query<(), Added<CanvasLabel>>,
     mut applied: Local<Option<f32>>,
 ) {
     let Some(camera) = camera else {
@@ -537,9 +303,6 @@ fn scale_canvas_labels(
     } else {
         Visibility::Hidden
     };
-    for mut visibility in &mut flags {
-        *visibility = shown;
-    }
     for (label, mut font, mut transform, mut visibility) in &mut labels {
         *visibility = shown;
         if !readable {
@@ -568,41 +331,8 @@ pub fn pointer_over_canvas(window: &Window, frame: &CanvasFrame) -> bool {
     at.x >= frame.position.x && at.x < high.x && at.y >= frame.position.y && at.y < high.y
 }
 
-fn open_graph(document: &Document) -> Option<&crate::terrain::graph::FieldGraph> {
-    let terrain = document.terrain()?;
-    Some(&terrain.field(document.active())?.graph)
-}
-
-fn output_offset(card: &NodeCard) -> Vec2 {
-    Vec2::new(card.size.x * 0.5, 0.0)
-}
-
-fn input_offset(card: &NodeCard, index: usize) -> Vec2 {
-    let step = card.size.y / (card.inputs.max(1) as f32 + 1.0);
-    Vec2::new(
-        -card.size.x * 0.5,
-        card.size.y * 0.5 - step * (index as f32 + 1.0),
-    )
-}
-
 fn labels_readable(scale: f32) -> bool {
     1.0 / scale >= CHIP_ZOOM
-}
-
-fn flag_offset() -> Vec2 {
-    Vec2::new((CARD.x - TITLE_BAR) * 0.5, (CARD.y - TITLE_BAR) * 0.5)
-}
-
-fn flag_area(card_centre: Vec2) -> Rect {
-    Rect::from_center_size(card_centre + flag_offset(), Vec2::splat(TITLE_BAR))
-}
-
-fn flag_press(document: &Document, node: NodeId) -> Option<crate::edit::Edit> {
-    let graph = open_graph(document)?;
-    (graph.output != Some(node)).then(|| crate::edit::Edit::SetOutput {
-        field: document.active().to_owned(),
-        node: Some(node.to_string()),
-    })
 }
 
 #[cfg(test)]
@@ -610,85 +340,27 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use super::*;
-    use crate::terrain::graph::{FieldGraph, NodeOp};
     use crate::terrain::{Field, TerrainSpec};
-
-    fn node(id: u32) -> NodeId {
-        NodeId(id)
-    }
 
     fn open_field_world() -> World {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
-                .with_field(Field::new("height").with_op(NodeOp::held(0.5))),
+                .with_field(Field::new("base").held(0.25))
+                .with_field(Field::new("height").held(0.5)),
         );
         document.set_active("height").unwrap();
 
         let mut world = World::new();
         world.insert_resource(document);
-        world.insert_resource(Selection::default());
-        world.insert_resource(Overview { showing: true });
         world.init_resource::<Messages<OpenField>>();
         world
     }
 
-    // The flag is tested before the pins, so a flag covering a pin's press zone would
-    // take the press that should start a wire.
+    // A card rebuilt while zoomed out must not put its labels back on screen until the
+    // next zoom.
     #[test]
-    fn the_flag_is_on_the_title_bar_and_clear_of_every_pin() {
-        let area = flag_area(Vec2::ZERO);
-        let bar = Rect::from_center_size(
-            Vec2::new(0.0, (CARD.y - TITLE_BAR) * 0.5),
-            Vec2::new(CARD.x, TITLE_BAR),
-        );
-        assert!(bar.contains(area.min) && bar.contains(area.max));
-        for inputs in 0..=4 {
-            let card = NodeCard {
-                node: node(0),
-                size: CARD,
-                inputs,
-            };
-            let pins = (0..inputs)
-                .map(|index| input_offset(&card, index))
-                .chain([output_offset(&card)]);
-            for pin in pins {
-                let reach = Rect::from_center_size(pin, Vec2::splat(PIN_RADIUS * 4.0));
-                assert!(
-                    area.intersect(reach).is_empty(),
-                    "the flag covers the pin at {pin}"
-                );
-            }
-        }
-    }
-
-    // Pressing the output's own flag changes nothing, and any other node's flag names
-    // that node.
-    #[test]
-    fn a_flag_press_names_its_node_unless_it_is_already_the_output() {
-        let mut world = open_field_world();
-        let mut document = world.remove_resource::<Document>().unwrap();
-        let output = open_graph(&document).unwrap().output.unwrap();
-        document
-            .apply(&crate::edit::Edit::AddNode {
-                field: "height".to_owned(),
-                op: NodeOp::piped(1),
-                position: None,
-            })
-            .unwrap();
-        let added = open_graph(&document).unwrap().nodes.last().unwrap().id;
-        assert!(flag_press(&document, output).is_none());
-        assert!(matches!(
-            flag_press(&document, added),
-            Some(crate::edit::Edit::SetOutput { node: Some(named), .. }) if named == added.to_string()
-        ));
-    }
-
-    // A card rebuilt while zoomed out must not put its flag or labels back on screen
-    // until the next zoom.
-    #[test]
-    fn a_flag_and_a_label_spawned_below_the_chip_zoom_are_hidden() {
+    fn a_label_spawned_below_the_chip_zoom_is_hidden() {
         let mut world = World::new();
         world.spawn((
             CanvasCameraTag,
@@ -700,7 +372,6 @@ mod tests {
         let system = world.register_system(scale_canvas_labels);
         world.run_system(system).unwrap();
 
-        let flag = world.spawn((OutputFlag, Visibility::Inherited)).id();
         let label = world
             .spawn((
                 CanvasLabel(TITLE_SIZE),
@@ -711,138 +382,18 @@ mod tests {
             .id();
         world.run_system(system).unwrap();
 
-        assert_eq!(world.get::<Visibility>(flag), Some(&Visibility::Hidden));
         assert_eq!(world.get::<Visibility>(label), Some(&Visibility::Hidden));
     }
 
-    // A solo is an inspection that ends with the selection that made it, so every path
-    // that clears a selection has to clear the solo with it — otherwise the map keeps
-    // showing a node nothing on the canvas is marking.
-    #[test]
-    fn deselecting_clears_the_solo_with_it() {
-        let mut selection = Selection::default();
-        selection.select(Some(node(3)));
-        selection.soloed = Some(node(3));
-        selection.select(None);
-        assert_eq!(selection.node, None);
-        assert_eq!(selection.soloed, None);
-    }
-
-    // A node removed from the document must not be left named by either, or the panel
-    // builds against a node that is gone and the map previews one that cannot be baked.
-    #[test]
-    fn a_removed_node_is_forgotten_by_the_selection_and_the_solo() {
-        let mut selection = Selection::default();
-        selection.select(Some(node(1)));
-        selection.soloed = Some(node(1));
-        selection.forget(node(1));
-        assert_eq!(selection.node, None);
-        assert_eq!(selection.soloed, None);
-    }
-
-    // Selecting another node leaves the first node's solo behind, which would put the
-    // map and the canvas out of step: what the map shows is always marked on the card
-    // that is selected.
-    #[test]
-    fn selecting_another_node_does_not_carry_the_solo_over() {
-        let mut selection = Selection::default();
-        selection.select(Some(node(1)));
-        selection.soloed = Some(node(1));
-        selection.select(Some(node(2)));
-        assert_eq!(selection.soloed, Some(node(1)));
-        selection.forget(node(1));
-        assert_eq!(selection.node, Some(node(2)));
-        assert_eq!(selection.soloed, None);
-    }
-
-    // The pins have to be where the routing thinks they are: an output on the right
-    // edge and one input per arity evenly down the left, or every wire lands beside the
-    // card rather than on it.
-    #[test]
-    fn the_pins_sit_on_the_edges_of_the_card_they_belong_to() {
-        let card = NodeCard {
-            node: node(0),
-            size: CARD,
-            inputs: 3,
-        };
-        assert_eq!(output_offset(&card).x, CARD.x * 0.5);
-        assert_eq!(output_offset(&card).y, 0.0);
-        for index in 0..3 {
-            let at = input_offset(&card, index);
-            assert_eq!(at.x, -CARD.x * 0.5);
-            assert!(at.y.abs() <= CARD.y * 0.5, "pin {index} left the card");
-        }
-        assert!(input_offset(&card, 0).y > input_offset(&card, 2).y);
-    }
-
-    // The acceptance, pinned at the arithmetic: whatever a fit answers has to put every
-    // card of a graph spread wider than the viewport inside the framed rectangle.
-    #[test]
-    fn a_fit_puts_every_card_of_a_spread_out_graph_in_view() {
-        let mut graph = FieldGraph::new();
-        let at = [[-1500.0, 0.0], [1500.0, 120.0], [0.0, -600.0]];
-        for position in at {
-            let id = graph.node_with(NodeOp::held(0.0), &[]);
-            graph.place(id, position).unwrap();
-        }
-        let viewport = Vec2::new(800.0, 600.0);
-        let (centre, scale) = graph_fit(&graph, viewport).expect("a fit");
-        let framed = Rect::from_center_size(centre, viewport * scale);
-        for position in at {
-            let card = Rect::from_center_size(Vec2::new(position[0], position[1]), CARD);
-            assert!(framed.contains(card.min), "a card's corner left the frame");
-            assert!(framed.contains(card.max), "a card's corner left the frame");
-        }
-    }
-
-    // Fitting has to answer with nothing rather than a centre and a scale when there is
-    // nothing to frame, or the Fit button would throw the camera at whatever the empty
-    // bounds came out as.
-    #[test]
-    fn there_is_nothing_to_fit_without_nodes_or_without_a_viewport() {
-        let empty = FieldGraph::new();
-        assert!(graph_fit(&empty, Vec2::new(800.0, 600.0)).is_none());
-
-        let mut graph = FieldGraph::new();
-        graph.node_with(NodeOp::held(0.0), &[]);
-        assert!(graph_fit(&graph, Vec2::ZERO).is_none());
-    }
-
-    // A preview is what the map shows while a node is soloed, so it has to be that
-    // node's values and not the field's — and it must leave the document exactly as it
-    // was, since nothing about looking at a node is an edit.
-    #[test]
-    fn previewing_a_node_reads_that_node_and_moves_nothing() {
-        let mut graph = FieldGraph::new();
-        let under = graph.node_with(NodeOp::held(0.25), &[]);
-        let over = graph.node_with(NodeOp::held(0.75), &[]);
-        graph.set_output(Some(over)).unwrap();
-
-        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(
-            Field::new("height")
-                .with_range((0.0, 4.0))
-                .with_graph(graph),
-        );
-        terrain.bake_in_place().unwrap();
-        let before = terrain.clone();
-
-        let preview = terrain.preview_node("height", under).expect("a preview");
-        assert!(preview.data().iter().all(|value| *value == 0.25));
-        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 0.75);
-        assert_eq!(terrain, before, "a preview moved the document");
-    }
-
-    // Opening a field is a view change, so the field on screen moves while the history
-    // and the dirty flag stand still — otherwise following a `reads` link would make a
-    // document that has to be saved. It also leaves the overview, which is what makes
-    // the canvas bar's toggle read as off after a double-click on a card.
+    // Opening a field is a view change, so the active field moves while the history and
+    // the dirty flag stand still — otherwise following a `reads` link would make a
+    // document that has to be saved.
     #[test]
     fn opening_a_field_moves_the_view_without_making_an_edit() {
         let mut world = open_field_world();
         let before = world.resource::<Document>().history();
         world.write_message(OpenField {
             field: "base".to_owned(),
-            select: Some(node(4)),
         });
         world.run_system_once(apply_open_field).unwrap();
 
@@ -851,38 +402,21 @@ mod tests {
         assert_eq!(document.history().undo, before.undo);
         assert_eq!(document.history().redo, before.redo);
         assert!(!document.is_dirty());
-        assert_eq!(world.resource::<Selection>().node, Some(node(4)));
-        assert!(!world.resource::<Overview>().showing);
     }
 
-    // A name no field carries has to leave the view where it was and say so, because
-    // the panel and the canvas both write this message from names they read off a
-    // document that may have moved under them.
+    // A name no field carries has to leave the active field where it was and say so,
+    // because the panel and the canvas both write this message from names they read off
+    // a document that may have moved under them.
     #[test]
     fn opening_a_field_that_is_not_there_leaves_the_view_alone() {
         let mut world = open_field_world();
         world.write_message(OpenField {
             field: "nowhere".to_owned(),
-            select: None,
         });
         world.run_system_once(apply_open_field).unwrap();
 
         let document = world.resource::<Document>();
         assert_eq!(document.active(), "height");
         assert!(document.error().is_some(), "the refusal was not reported");
-        assert!(
-            world.resource::<Overview>().showing,
-            "a refusal moved the view"
-        );
-    }
-
-    // A node the document does not carry has to answer with nothing rather than baking
-    // whatever the id happens to land on.
-    #[test]
-    fn previewing_a_node_that_is_not_there_answers_with_nothing() {
-        let terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
-        assert!(terrain.preview_node("height", node(9)).is_none());
-        assert!(terrain.preview_node("nowhere", node(0)).is_none());
     }
 }

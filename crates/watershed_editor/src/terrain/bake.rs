@@ -13,10 +13,9 @@ use watershed::field::{FieldId, FieldRole};
 
 use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
 use crate::terrain::field::Field;
-use crate::terrain::graph::{GraphError, NodeId, NodeOp};
 use crate::terrain::water::{WaterError, WaterSpec, WaterState};
 use watershed::meta::WaterInfo;
-use watershed::raster::{CellRect, Raster, raster_coord, resolution, step, texel_center};
+use watershed::raster::{Raster, raster_coord, resolution, texel_center};
 use watershed::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 
 /// Everything structurally wrong with a document, and the one fault that is not.
@@ -33,37 +32,18 @@ pub enum PlanError {
     /// Two fields carry the same id, so a reference to it is ambiguous.
     #[error("two fields share the id `{0}`")]
     DuplicateField(String),
-    /// A reference node or a shader's `@layer` names a field the document does not
-    /// carry. Names both, because the read is in the reader and the mistake may be in
-    /// either.
+    /// A shader's `@layer` names a field the document does not carry. Names both,
+    /// because the read is in the reader and the mistake may be in either.
     #[error("field `{referenced}`, read by `{reader}`, is not in the document")]
     UnknownField {
         /// The name that could not be resolved.
         referenced: String,
-        /// The field whose graph names it.
+        /// The field whose shader names it.
         reader: String,
     },
     /// The fields cannot be ordered. Carries the cycle as a `->` chain of names.
     #[error("fields depend on each other in a cycle: {0}")]
     Cycle(String),
-    /// Nodes inside one field's graph feed each other in a cycle. Reachable only
-    /// from a loaded or hand-edited document: an edit made in the editor refuses the
-    /// edge that would close it.
-    #[error("the graph of field `{field}` feeds itself at node n{node}")]
-    NodeCycle {
-        /// The field whose graph it is.
-        field: String,
-        /// The node the walk re-entered.
-        node: u32,
-    },
-    /// A field's graph names a node it does not carry.
-    #[error("the graph of field `{field}` names node n{node}, which it does not have")]
-    UnknownNode {
-        /// The field whose graph it is.
-        field: String,
-        /// The node named.
-        node: u32,
-    },
     /// Two fields claim `Height` or two claim `Moisture`, so a role lookup would be
     /// ambiguous.
     #[error("two fields claim the role `{0}`")]
@@ -75,14 +55,12 @@ pub enum PlanError {
     /// texel per cell and will not resample.
     #[error("field `{0}` holds the role `height` at shift {1}")]
     CoarseHeight(String, u8),
-    /// A shader node could not be dispatched. The one fault here that is raised
+    /// A field's shader could not be dispatched. The one fault here that is raised
     /// during evaluation rather than before it.
-    #[error("the shader at node n{node} of field `{field}` did not run: {reason}")]
+    #[error("the shader of field `{field}` did not run: {reason}")]
     ShaderDispatch {
-        /// The field whose graph it is.
+        /// The field whose shader it is.
         field: String,
-        /// The node that could not be dispatched.
-        node: u32,
         /// What the dispatch answered.
         reason: String,
     },
@@ -135,6 +113,10 @@ pub struct TerrainSpec {
     /// without its solved water can solve it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub water_spec: Option<WaterSpec>,
+    /// The seed every shader of this document is told about. Serialized, so a
+    /// reloaded document dispatches to the same values.
+    #[serde(default)]
+    pub seed: u32,
     #[serde(skip)]
     pub(crate) water: Option<WaterState>,
     #[serde(skip)]
@@ -148,55 +130,30 @@ impl TerrainSpec {
             size,
             fields: Vec::new(),
             water_spec: None,
+            seed: 0,
             water: None,
             runtime: ShaderRuntime::default(),
         }
     }
 
-    /// Installs what a shader node is dispatched through. Derived state: it is not
+    /// Installs what a field's shader is dispatched through. Derived state: it is not
     /// part of what the document is, it is not saved, and installing it is not an
     /// edit.
     pub fn set_shader_runtime(&mut self, runtime: ShaderRuntime) {
         self.runtime = runtime;
     }
 
-    /// What a shader node is currently dispatched through. A default runtime holds no
-    /// device, and every shader node under it reads `0.0`.
+    /// What a field's shader is currently dispatched through. A default runtime holds
+    /// no device, and every field under it reads the values its shader already holds.
     pub fn shader_runtime(&self) -> &ShaderRuntime {
         &self.runtime
-    }
-
-    /// Whether any field's evaluation order reaches a shader node that has something
-    /// wired into it or reads a field by name, and whose file declares no reach.
-    ///
-    /// Such a shader may read any texel of what it is handed, so nothing bounds the
-    /// ground an edit under it can move: a document this holds for is re-baked whole
-    /// rather than by rectangle. One whose file declares a reach is bounded by it,
-    /// widens the re-bake by that much, and re-bakes by rectangle.
-    pub fn samples_unbounded(&self) -> bool {
-        self.fields.iter().any(|field| {
-            field
-                .graph
-                .evaluation_order()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|&id| field.graph.node(id))
-                .any(|node| match &node.op {
-                    NodeOp::Shader(shader) => {
-                        shader.reach.is_none()
-                            && (node.inputs.iter().any(Option::is_some)
-                                || !shader.layers.is_empty())
-                    }
-                    _ => false,
-                })
-        })
     }
 
     /// Every field that cannot bake, with the reason, in declaration order.
     ///
     /// A field reading a name the document does not carry, a field reading one of
     /// those, and every field of a cycle between fields that could otherwise bake. The
-    /// first two are left unbaked by [`TerrainSpec::bake_rect`] while the rest of the
+    /// first two are left unbaked by [`TerrainSpec::bake_in_place`] while the rest of
     /// document bakes; a cycle still fails the bake, and its fields' reason is
     /// `cycle: ` followed by the chain. Derived from the document each
     /// call, never stored. A document with two fields of one id answers no faults.
@@ -252,18 +209,60 @@ impl TerrainSpec {
         self.field(id).map(|field| field.sample(x, y))
     }
 
-    /// The rectangle covering the whole document.
-    pub fn rect(&self) -> CellRect {
-        CellRect::from_size(self.size)
-    }
-
     /// Bakes every field over the whole document, in dependency order, leaving the
     /// results on the fields. Does not solve water.
     ///
     /// Fields are reallocated to their declared resolutions first, so this also
     /// fixes a document whose shifts have been edited.
+    ///
+    /// A field reading a name the document does not carry, and every field reading
+    /// one of those, is left unbaked — sampling as `0.0` — while the rest bakes;
+    /// [`TerrainSpec::field_faults`] says which and why. A cycle between fields, a
+    /// duplicate id, a zero extent and a shader that fails to dispatch still fail the
+    /// whole bake.
     pub fn bake_in_place(&mut self) -> Result<(), PlanError> {
-        self.bake_rect(self.rect())
+        if self.size.x == 0 || self.size.y == 0 {
+            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
+        }
+
+        let index_of = self.index_fields()?;
+        let blocked: Vec<bool> = self
+            .unreadable(&index_of)
+            .iter()
+            .map(Option::is_some)
+            .collect();
+        let dependencies = self.resolve_readable(&index_of, &blocked);
+        let order: Vec<usize> = topological_order(&dependencies, &self.fields)?
+            .into_iter()
+            .filter(|&index| !blocked[index])
+            .collect();
+        self.reallocate_rasters(&blocked);
+
+        let mut baked: Vec<Raster<f32>> = self
+            .fields
+            .iter_mut()
+            .map(|field| field.take_baked())
+            .collect();
+
+        let mut dispatched: Vec<(usize, (Raster<f32>, u64))> = Vec::new();
+        let mut result = Ok(());
+        for &target in &order {
+            match self.evaluate(target, &index_of, &mut baked) {
+                Ok(made) => dispatched.extend(made.map(|made| (target, made))),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+
+        for (field, raster) in self.fields.iter_mut().zip(baked) {
+            field.put_baked(raster);
+        }
+        for (target, (values, key)) in dispatched {
+            self.fields[target].shader.put_dispatch(values, key);
+        }
+        result
     }
 
     /// The order a bake visits the fields in: every field after the ones it reads.
@@ -289,29 +288,6 @@ impl TerrainSpec {
             .map(|index| self.fields[index].id.clone())
             .collect())
     }
-
-    /// The values one node of a field's graph produces, as if the field were read from
-    /// it.
-    ///
-    /// Baked on a clone, so nothing about the document moves: the field's output, its
-    /// other nodes and every other field are exactly as they were. What the other
-    /// fields currently hold is what it is evaluated against, which is the same
-    /// fallback every partly baked document is read under.
-    ///
-    /// `None` if the document carries no such field or node, or if the graph rooted at
-    /// that node does not plan.
-    pub fn preview_node(&self, field: &str, node: NodeId) -> Option<Raster<f32>> {
-        self.field(field)?.graph.node(node)?;
-        let mut scratch = self.clone();
-        scratch
-            .field_mut(field)?
-            .graph
-            .set_output(Some(node))
-            .ok()?;
-        scratch.bake_field(field).ok()?;
-        Some(scratch.field(field)?.baked().clone())
-    }
-
     /// Bake one field over the whole document, assuming everything it reads is baked.
     ///
     /// **The assumption is the caller's to keep**, and [`TerrainSpec::bake_order`] is how:
@@ -321,10 +297,11 @@ impl TerrainSpec {
     /// bake at all, and it is what makes a partially baked document *displayable* rather
     /// than an error state.
     ///
-    /// Only the named field is allocated, where [`TerrainSpec::bake_rect`] allocates
-    /// every field. That is what makes [`TerrainSpec::release`] worth anything: a
-    /// released field stays released across the stages that follow it, so a staged
-    /// bake peaks at its widest live set rather than at the sum of the document.
+    /// Only the named field is allocated, where [`TerrainSpec::bake_in_place`]
+    /// allocates every field. That is what makes [`TerrainSpec::release`] worth
+    /// anything: a released field stays released across the stages that follow it, so
+    /// a staged bake peaks at its widest live set rather than at the sum of the
+    /// document.
     pub fn bake_field(&mut self, id: &str) -> Result<(), PlanError> {
         if self.size.x == 0 || self.size.y == 0 {
             return Err(PlanError::ZeroSize(self.size.x, self.size.y));
@@ -336,26 +313,24 @@ impl TerrainSpec {
         if self.fields[target].baked().size() != wanted {
             *self.fields[target].baked_mut() = Raster::new(wanted, 0.0);
         }
-
-        let shifts: Vec<u8> = self.fields.iter().map(|field| field.shift).collect();
         let mut baked: Vec<Raster<f32>> = self
             .fields
             .iter_mut()
             .map(|field| field.take_baked())
             .collect();
 
-        let rect = self.rect();
-        let result = self.evaluate(target, rect, &index_of, &shifts, &mut baked);
+        let result = self.evaluate(target, &index_of, &mut baked);
 
         for (field, raster) in self.fields.iter_mut().zip(baked) {
             field.put_baked(raster);
         }
-        let made = result?;
-        self.install_dispatched(target, made);
+        if let Some((values, key)) = result? {
+            self.fields[target].shader.put_dispatch(values, key);
+        }
         Ok(())
     }
 
-    /// Drop a field's baked raster, keeping the graph that would rebuild it.
+    /// Drop a field's baked raster, keeping the shader values that would rebuild it.
     ///
     /// **This is what makes a staged bake affordable rather than merely visible.** A
     /// document's fields do not all have to be resident at once: an intermediate is dead
@@ -378,7 +353,7 @@ impl TerrainSpec {
 
     /// How many bytes the baked rasters currently hold.
     ///
-    /// The bakes only: a shader node's held values are not counted. This number is
+    /// The bakes only: a field's shader values are not counted. This number is
     /// the part that [`TerrainSpec::release`] moves and is what a staged bake watches.
     pub fn baked_bytes(&self) -> usize {
         self.fields
@@ -393,225 +368,62 @@ impl TerrainSpec {
     fn evaluate(
         &self,
         target: usize,
-        rect: CellRect,
         index_of: &HashMap<String, usize>,
-        shifts: &[u8],
         baked: &mut [Raster<f32>],
-    ) -> Result<Vec<Dispatched>, PlanError> {
+    ) -> Result<Option<(Raster<f32>, u64)>, PlanError> {
         let field = &self.fields[target];
-        let texels = rect.to_texels(field.shift, baked[target].size());
-        if texels.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut graph = compile_graph(field, index_of)?;
-        let made = self.dispatch_shaders(&mut graph, field, index_of, shifts, baked)?;
-        let bounds = field.bounds();
-        let shift = field.shift;
-        let rows = {
-            let context = Evaluator {
-                baked,
-                shifts,
-                made: &made,
-            };
-            let scratch_len = graph.nodes.len();
-            map_rows(texels.min.y, texels.max.y, |j| {
-                let mut scratch = vec![0.0f32; scratch_len];
-                (texels.min.x..texels.max.x)
-                    .map(|i| context.texel(&graph, shift, bounds, i, j, &mut scratch))
-                    .collect()
-            })
-        };
-        let target_raster = &mut baked[target];
-        for (offset, row) in rows.into_iter().enumerate() {
-            let j = texels.min.y + offset as u32;
-            for (n, value) in row.into_iter().enumerate() {
-                target_raster.set(texels.min.x + n as u32, j, value);
-            }
-        }
-        Ok(made)
-    }
-
-    fn dispatch_shaders(
-        &self,
-        graph: &mut CompiledGraph<'_>,
-        field: &Field,
-        index_of: &HashMap<String, usize>,
-        shifts: &[u8],
-        baked: &[Raster<f32>],
-    ) -> Result<Vec<Dispatched>, PlanError> {
         let texels = resolution(self.size, field.shift);
-        let mut made: Vec<Dispatched> = Vec::new();
-        for at in 0..graph.nodes.len() {
-            let CompiledOp::Shaded(Shaded::Held(held), _) = graph.nodes[at].op else {
-                continue;
-            };
-            if graph.nodes[at].bypassed {
-                continue;
-            }
-            let id = graph.nodes[at].id;
-            let Some(NodeOp::Shader(shader)) = field.graph.node(id).map(|node| &node.op) else {
-                continue;
-            };
-            let Some(program) = self.runtime.program(&shader.file) else {
-                continue;
-            };
-            let params = program.layout.pack(&shader.params);
+        let mut fresh = None;
+        if let Some(program) = self.runtime.program(&field.file()) {
+            let params = program.layout.pack(&field.shader.params);
             let key = dispatch_key(&program.source, &params, texels);
-            let pins = graph.nodes[at].inputs.clone();
-            let wired = pins.iter().any(Option::is_some);
-            if !wired
-                && program.layers.is_empty()
-                && shader.stamp() == Some(key)
-                && held.size() == texels
-            {
-                continue;
+            let reusable = program.layers.is_empty()
+                && field.shader.stamp() == Some(key)
+                && field.shader.values().size() == texels;
+            if !reusable {
+                let layers: Vec<Option<&Raster<f32>>> = program
+                    .layers
+                    .iter()
+                    .map(|read| index_of.get(&read.layer).map(|&at| &baked[at]))
+                    .collect();
+                let globals = DispatchGlobals {
+                    document: self.size,
+                    texels,
+                    origin: UVec2::ZERO,
+                    shift: field.shift as u32,
+                    seed: self.runtime.seed().unwrap_or_default(),
+                };
+                let values = self
+                    .runtime
+                    .run(program, &params, globals, &layers)
+                    .and_then(|values| {
+                        Raster::from_vec(texels, values).ok_or_else(|| {
+                            "the dispatch produced the wrong number of texels".to_owned()
+                        })
+                    })
+                    .map_err(|reason| PlanError::ShaderDispatch {
+                        field: field.id.to_string(),
+                        reason,
+                    })?;
+                fresh = Some((values, key));
             }
-
-            let sources: Vec<Option<Raster<f32>>> = pins
-                .iter()
-                .map(|pin| {
-                    pin.map(|source| {
-                        self.evaluate_whole(graph, &made, source, field, shifts, baked)
-                    })
-                })
-                .collect();
-            let inputs: Vec<Option<&Raster<f32>>> = sources.iter().map(Option::as_ref).collect();
-            let layers: Vec<Option<&Raster<f32>>> = program
-                .layers
-                .iter()
-                .map(|read| index_of.get(&read.layer).map(|&at| &baked[at]))
-                .collect();
-            let globals = DispatchGlobals {
-                document: self.size,
-                texels,
-                origin: UVec2::ZERO,
-                shift: field.shift as u32,
-                seed: self.runtime.seed().unwrap_or_default(),
-            };
-            let values = self
-                .runtime
-                .run(program, &params, globals, &inputs, &layers)
-                .and_then(|values| {
-                    Raster::from_vec(texels, values).ok_or_else(|| {
-                        "the dispatch produced the wrong number of texels".to_owned()
-                    })
-                })
-                .map_err(|reason| PlanError::ShaderDispatch {
-                    field: field.id.to_string(),
-                    node: id.0,
-                    reason,
-                })?;
-            graph.nodes[at].op = CompiledOp::Shaded(Shaded::Made(made.len()), field.shift);
-            made.push((id, values, key));
         }
-        Ok(made)
-    }
 
-    fn evaluate_whole(
-        &self,
-        graph: &CompiledGraph<'_>,
-        made: &[Dispatched],
-        upto: usize,
-        field: &Field,
-        shifts: &[u8],
-        baked: &[Raster<f32>],
-    ) -> Raster<f32> {
-        let texels = resolution(self.size, field.shift);
+        let source = fresh
+            .as_ref()
+            .map_or(field.shader.values(), |(values, _)| values);
+        let (low, high) = field.bounds();
         let shift = field.shift;
-        let context = Evaluator {
-            baked,
-            shifts,
-            made,
-        };
-        let scratch_len = graph.nodes.len();
-        let rows = map_rows(0, texels.y, |j| {
-            let mut scratch = vec![0.0f32; scratch_len];
-            (0..texels.x)
-                .map(|i| {
-                    let position = Vec2::new(texel_center(i, shift), texel_center(j, shift));
-                    context.eval(graph, upto, position, &mut scratch)
-                })
-                .collect()
-        });
-        let values: Vec<f32> = rows.into_iter().flatten().collect();
-        Raster::from_vec(texels, values).unwrap_or_default()
-    }
-
-    fn install_dispatched(&mut self, target: usize, made: Vec<Dispatched>) {
-        for (id, raster, key) in made {
-            if let Some(node) = self.fields[target].graph.node_mut(id)
-                && let NodeOp::Shader(shader) = &mut node.op
-            {
-                shader.put_dispatch(raster, key);
+        let target_raster = &mut baked[target];
+        let size = target_raster.size();
+        for j in 0..size.y {
+            let v = raster_coord(texel_center(j, shift), shift);
+            for i in 0..size.x {
+                let u = raster_coord(texel_center(i, shift), shift);
+                target_raster.set(i, j, source.sample_bilinear(u, v).clamp(low, high));
             }
         }
-    }
-
-    /// Re-bakes every field, but only over the cells a change inside `rect` can
-    /// reach.
-    ///
-    /// **Assumes the document is already baked.** Given that, what ends up inside
-    /// `rect` is bit-identical to what a full bake would have written — each field
-    /// is widened by the halo its readers need, so nothing is evaluated against a
-    /// stale neighbour. Outside the widened rectangles the old values stand.
-    ///
-    /// A rectangle is clipped to the document, and an empty one does nothing. On an
-    /// unbaked document this is a full bake, since every field is reallocated first.
-    ///
-    /// A field reading a name the document does not carry, and every field reading
-    /// one of those, is left unbaked — sampling as `0.0` — while the rest bakes;
-    /// [`TerrainSpec::field_faults`] says which and why. A cycle between fields, a
-    /// duplicate id and a zero extent still fail the whole bake.
-    pub fn bake_rect(&mut self, rect: CellRect) -> Result<(), PlanError> {
-        if self.size.x == 0 || self.size.y == 0 {
-            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
-        }
-
-        let index_of = self.index_fields()?;
-        let blocked: Vec<bool> = self
-            .unreadable(&index_of)
-            .iter()
-            .map(Option::is_some)
-            .collect();
-        let dependencies = self.resolve_readable(&index_of, &blocked);
-        let order: Vec<usize> = topological_order(&dependencies, &self.fields)?
-            .into_iter()
-            .filter(|&index| !blocked[index])
-            .collect();
-        self.reallocate_rasters(&blocked);
-
-        let rect = rect.intersect(self.rect());
-        if rect.is_empty() {
-            return Ok(());
-        }
-        let required = self.required_rects(rect, &order, &dependencies);
-
-        let shifts: Vec<u8> = self.fields.iter().map(|field| field.shift).collect();
-        let mut baked: Vec<Raster<f32>> = self
-            .fields
-            .iter_mut()
-            .map(|field| field.take_baked())
-            .collect();
-
-        let mut dispatched: Vec<(usize, Vec<Dispatched>)> = Vec::new();
-        let mut result = Ok(());
-        for &target in &order {
-            match self.evaluate(target, required[target], &index_of, &shifts, &mut baked) {
-                Ok(made) => dispatched.push((target, made)),
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
-
-        for (field, raster) in self.fields.iter_mut().zip(baked) {
-            field.put_baked(raster);
-        }
-        for (target, made) in dispatched {
-            self.install_dispatched(target, made);
-        }
-        result
+        Ok(fresh)
     }
 
     fn index_fields(&self) -> Result<HashMap<String, usize>, PlanError> {
@@ -709,131 +521,6 @@ impl TerrainSpec {
             }
         }
     }
-
-    fn required_rects(
-        &self,
-        rect: CellRect,
-        order: &[usize],
-        dependencies: &[Vec<usize>],
-    ) -> Vec<CellRect> {
-        let document = self.rect();
-        let mut required = vec![rect; self.fields.len()];
-        for &index in order.iter().rev() {
-            if required[index].is_empty() || dependencies[index].is_empty() {
-                continue;
-            }
-            for &referenced in &dependencies[index] {
-                let halo = self.halo_between(index, referenced);
-                let widened = required[index].expand(halo).intersect(document);
-                required[referenced] = required[referenced].union(widened);
-            }
-        }
-        required
-    }
-
-    fn halo_between(&self, reader: usize, referenced: usize) -> u32 {
-        let field = &self.fields[reader];
-        let reach = reach_to(field, &self.fields[referenced].id);
-        if !reach.is_finite() {
-            return u32::MAX;
-        }
-        step(field.shift)
-            .saturating_add(reach.ceil() as u32)
-            .saturating_add(2 * step(self.fields[referenced].shift))
-            .saturating_add(2)
-    }
-
-    /// Which cells of the *whole document* could bake differently because one field changed
-    /// over `rect` — the fields that read it, the fields that read those, and the halo each
-    /// hop adds.
-    ///
-    /// This, not the changed rectangle, is what an edit has to re-bake. A field that
-    /// reads the changed one samples a neighbourhood around each of its own texels,
-    /// so cells outside the changed rectangle bake differently too; re-baking only
-    /// what changed leaves a fringe of stale values one hop downstream, and a wider
-    /// fringe two hops on.
-    ///
-    /// `CellRect::EMPTY` if the document carries no such field or the rectangle is
-    /// outside it. A document that cannot be planned answers with the whole
-    /// document: no ordering can be computed, so nothing can be ruled out. So does
-    /// one holding a hop that reads without bound — a wired shader whose file
-    /// declares no reach — since under-reporting such a hop leaves stale cells on
-    /// the map.
-    pub fn influence_of(&self, changed: &str, rect: CellRect) -> CellRect {
-        let document = self.rect();
-        let rect = rect.intersect(document);
-        if rect.is_empty() {
-            return CellRect::EMPTY;
-        }
-        let Ok(index_of) = self.index_fields() else {
-            return document;
-        };
-        let Some(&start) = index_of.get(changed) else {
-            return CellRect::EMPTY;
-        };
-        let Ok(dependencies) = self.resolve_dependencies(&index_of) else {
-            return document;
-        };
-        let Ok(order) = topological_order(&dependencies, &self.fields) else {
-            return document;
-        };
-
-        let mut affected = vec![CellRect::EMPTY; self.fields.len()];
-        affected[start] = rect;
-        for &index in &order {
-            for &referenced in &dependencies[index] {
-                if affected[referenced].is_empty() {
-                    continue;
-                }
-                let halo = self.halo_between(index, referenced);
-                let widened = affected[referenced].expand(halo).intersect(document);
-                affected[index] = affected[index].union(widened);
-            }
-        }
-        affected.into_iter().fold(CellRect::EMPTY, CellRect::union)
-    }
-}
-
-fn reach_to(field: &Field, referenced: &FieldId) -> f32 {
-    let order = field.graph.evaluation_order().unwrap_or_default();
-    let mut reach = vec![0.0f32; order.len()];
-    let position: HashMap<NodeId, usize> =
-        order.iter().enumerate().map(|(at, &id)| (id, at)).collect();
-    for at in (0..order.len()).rev() {
-        let Some(node) = field.graph.node(order[at]) else {
-            continue;
-        };
-        let widens = match (&node.op, node.bypassed) {
-            (NodeOp::Shader(layer), false) => {
-                layer.reach.map_or(f32::INFINITY, |cells| cells as f32)
-            }
-            _ => 0.0,
-        };
-        for source in field.graph.effective_sources(order[at]) {
-            if let Some(&below) = position.get(&source) {
-                reach[below] = reach[below].max(reach[at] + widens);
-            }
-        }
-    }
-    order
-        .iter()
-        .enumerate()
-        .filter_map(|(at, &id)| {
-            let node = field.graph.node(id)?;
-            let direct = node
-                .op
-                .dependency()
-                .is_some_and(|read| read == referenced)
-                .then_some(reach[at]);
-            let named = match (&node.op, node.bypassed) {
-                (NodeOp::Shader(layer), false) if layer.layers.contains(referenced) => {
-                    Some(reach[at] + layer.reach.map_or(f32::INFINITY, |cells| cells as f32))
-                }
-                _ => None,
-            };
-            [direct, named].into_iter().flatten().reduce(f32::max)
-        })
-        .fold(0.0f32, f32::max)
 }
 
 fn lookup(
@@ -907,167 +594,6 @@ fn visit(
     marks[index] = Mark::Done;
     order.push(index);
     Ok(())
-}
-
-type Dispatched = (NodeId, Raster<f32>, u64);
-
-enum Shaded<'a> {
-    Held(&'a Raster<f32>),
-    Made(usize),
-}
-
-enum CompiledOp<'a> {
-    Shaded(Shaded<'a>, u8),
-    FieldRef(usize),
-}
-
-struct CompiledNode<'a> {
-    id: NodeId,
-    op: CompiledOp<'a>,
-    inputs: Vec<Option<usize>>,
-    bypassed: bool,
-}
-
-struct CompiledGraph<'a> {
-    nodes: Vec<CompiledNode<'a>>,
-    output: Option<usize>,
-}
-
-fn compile_graph<'a>(
-    field: &'a Field,
-    index_of: &HashMap<String, usize>,
-) -> Result<CompiledGraph<'a>, PlanError> {
-    let order = field
-        .graph
-        .evaluation_order()
-        .map_err(|error| match error {
-            GraphError::WouldCycle { from, .. } => PlanError::NodeCycle {
-                field: field.id.to_string(),
-                node: from.0,
-            },
-            GraphError::UnknownNode(NodeId(node)) => PlanError::UnknownNode {
-                field: field.id.to_string(),
-                node,
-            },
-            _ => PlanError::UnknownNode {
-                field: field.id.to_string(),
-                node: 0,
-            },
-        })?;
-    let position: HashMap<NodeId, usize> =
-        order.iter().enumerate().map(|(at, &id)| (id, at)).collect();
-    let mut nodes = Vec::with_capacity(order.len());
-    for &id in &order {
-        let node = field.graph.node(id).ok_or(PlanError::UnknownNode {
-            field: field.id.to_string(),
-            node: id.0,
-        })?;
-        let op = match &node.op {
-            NodeOp::Shader(shader) => {
-                CompiledOp::Shaded(Shaded::Held(shader.values()), field.shift)
-            }
-            NodeOp::FieldRef(id) => CompiledOp::FieldRef(lookup(index_of, id, &field.id)?),
-        };
-        let inputs = node
-            .inputs
-            .iter()
-            .map(|pin| pin.and_then(|source| position.get(&source).copied()))
-            .collect();
-        nodes.push(CompiledNode {
-            id,
-            op,
-            inputs,
-            bypassed: node.bypassed,
-        });
-    }
-    Ok(CompiledGraph {
-        output: nodes.len().checked_sub(1),
-        nodes,
-    })
-}
-
-struct Evaluator<'a> {
-    baked: &'a [Raster<f32>],
-    shifts: &'a [u8],
-    made: &'a [Dispatched],
-}
-
-impl Evaluator<'_> {
-    fn field(&self, index: usize, position: Vec2) -> f32 {
-        let shift = self.shifts[index];
-        let u = raster_coord(position.x, shift);
-        let v = raster_coord(position.y, shift);
-        self.baked[index].sample_bilinear(u, v)
-    }
-
-    fn eval(
-        &self,
-        graph: &CompiledGraph<'_>,
-        upto: usize,
-        position: Vec2,
-        scratch: &mut [f32],
-    ) -> f32 {
-        for at in 0..=upto {
-            let node = &graph.nodes[at];
-            let value = if node.bypassed {
-                node.inputs
-                    .first()
-                    .copied()
-                    .flatten()
-                    .map_or(0.0, |source| scratch[source])
-            } else {
-                match &node.op {
-                    CompiledOp::Shaded(shaded, shift) => {
-                        let raster = match shaded {
-                            Shaded::Held(raster) => *raster,
-                            Shaded::Made(index) => &self.made[*index].1,
-                        };
-                        raster.sample_bilinear(
-                            raster_coord(position.x, *shift),
-                            raster_coord(position.y, *shift),
-                        )
-                    }
-                    CompiledOp::FieldRef(index) => self.field(*index, position),
-                }
-            };
-            scratch[at] = value;
-        }
-        scratch[upto]
-    }
-
-    fn texel(
-        &self,
-        graph: &CompiledGraph<'_>,
-        shift: u8,
-        bounds: (f32, f32),
-        i: u32,
-        j: u32,
-        scratch: &mut [f32],
-    ) -> f32 {
-        let Some(output) = graph.output else {
-            return 0.0f32.clamp(bounds.0, bounds.1);
-        };
-        let position = Vec2::new(texel_center(i, shift), texel_center(j, shift));
-        self.eval(graph, output, position, scratch)
-            .clamp(bounds.0, bounds.1)
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn map_rows<F>(start: u32, end: u32, row: F) -> Vec<Vec<f32>>
-where
-    F: Fn(u32) -> Vec<f32> + Send + Sync,
-{
-    use rayon::prelude::*;
-    (start..end).into_par_iter().map(row).collect()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn map_rows<F>(start: u32, end: u32, row: F) -> Vec<Vec<f32>>
-where
-    F: Fn(u32) -> Vec<f32> + Send + Sync,
-{
-    (start..end).map(row).collect()
 }
 
 /// What one step of a plan does.
@@ -1157,7 +683,7 @@ pub struct BakeReport {
     pub total: u32,
     /// The field the last completed step baked; empty before the first has run.
     pub field: String,
-    /// How much the baked rasters currently hold. The bakes only — shader nodes' held
+    /// How much the baked rasters currently hold. The bakes only — fields' shader
     /// values and the solved water are not counted — so this is the number a staged
     /// bake can actually move, and it falls when a field is released.
     pub live_bytes: u64,
@@ -1238,7 +764,7 @@ impl Bake {
     }
 
     /// The finished [`Terrain`], dropping the document that produced it — the
-    /// graphs and the values their shader nodes hold.
+    /// parameter values and the values the fields' shaders hold.
     ///
     /// For a consumer that will only read. A caller that will edit and re-bake wants
     /// [`Bake::finish_keeping_spec`], since nothing rebuilds a document from a
@@ -1523,8 +1049,6 @@ impl TerrainSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::graph::FieldGraph;
-    use crate::terrain::shader::ShaderLayer;
 
     fn ramp(size: UVec2) -> Raster<f32> {
         let span = (size.x + size.y) as f32;
@@ -1537,30 +1061,18 @@ mod tests {
         .unwrap()
     }
 
-    fn reading(read: &str, values: Raster<f32>) -> FieldGraph {
-        let NodeOp::Shader(mut layer) = NodeOp::holding(values) else {
-            unreachable!("a held node is a shader node");
-        };
-        layer.inputs = vec!["in0".to_owned()];
-        layer.reach = Some(0);
-        let mut graph = FieldGraph::new();
-        let source = graph.node_with(NodeOp::FieldRef(FieldId::from(read)), &[]);
-        let shaded = graph.node_with(NodeOp::Shader(layer), &[source]);
-        graph.set_output(Some(shaded)).unwrap();
-        graph
-    }
-
     fn two_field_document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(96, 80))
             .with_field(
                 Field::new("moisture")
                     .with_shift(3)
-                    .with_op(NodeOp::holding(ramp(UVec2::new(12, 10)))),
+                    .holding(ramp(UVec2::new(12, 10))),
             )
             .with_field(
                 Field::new("height")
                     .with_shift(0)
-                    .with_graph(reading("moisture", ramp(UVec2::new(96, 80)))),
+                    .holding(ramp(UVec2::new(96, 80)))
+                    .reading(&["moisture"]),
             )
     }
 
@@ -1572,7 +1084,8 @@ mod tests {
         let mut whole = two_field_document().with_field(
             Field::new("relief")
                 .with_range((-1.0, 1.0))
-                .with_graph(reading("height", ramp(UVec2::new(96, 80)))),
+                .holding(ramp(UVec2::new(96, 80)))
+                .reading(&["height"]),
         );
         let mut staged = whole.clone();
 
@@ -1662,12 +1175,12 @@ mod tests {
     #[test]
     fn a_stage_list_refuses_a_document_a_bake_would_refuse() {
         let cyclic = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("a").with_op(NodeOp::FieldRef("b".into())))
-            .with_field(Field::new("b").with_op(NodeOp::FieldRef("a".into())));
+            .with_field(Field::new("a").reading(&["b"]))
+            .with_field(Field::new("b").reading(&["a"]));
         assert!(matches!(cyclic.bake_order(), Err(PlanError::Cycle(_))));
 
-        let dangling = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("a").with_op(NodeOp::FieldRef("gone".into())));
+        let dangling =
+            TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("a").reading(&["gone"]));
         assert!(matches!(
             dangling.bake_order(),
             Err(PlanError::UnknownField { .. })
@@ -1685,7 +1198,7 @@ mod tests {
         ));
     }
 
-    // The baseline the rest of the rect and staging tests compare against: two fields
+    // The baseline the staging tests compare against: two fields
     // at different shifts, one reading the other, each allocated at its own resolution
     // and filled with finite values that actually vary.
     #[test]
@@ -1704,82 +1217,12 @@ mod tests {
         let highest = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         assert!(highest - lowest > 0.05, "{lowest} to {highest}");
     }
-
-    // The premise of every incremental edit. Filling with NaN first means an
-    // untouched texel cannot pass by holding a plausible old value — it has to have
-    // been written, and written with the same bits a full bake produced.
-    #[test]
-    fn a_rect_re_bake_is_bit_identical_to_a_full_one() {
-        let mut terrain = two_field_document();
-        terrain.bake_in_place().unwrap();
-        let full: Vec<Vec<f32>> = terrain
-            .fields
-            .iter()
-            .map(|field| field.baked().data().to_vec())
-            .collect();
-
-        for field in &mut terrain.fields {
-            field.baked_mut().fill(f32::NAN);
-        }
-        let rect = CellRect::new(UVec2::new(33, 21), UVec2::new(70, 64));
-        terrain.bake_rect(rect).unwrap();
-
-        for (index, field) in terrain.fields.iter().enumerate() {
-            let texels = rect.to_texels(field.shift, field.baked().size());
-            let width = field.baked().width();
-            for j in texels.min.y..texels.max.y {
-                for i in texels.min.x..texels.max.x {
-                    let at = (j * width + i) as usize;
-                    assert_eq!(
-                        field.baked().data()[at].to_bits(),
-                        full[index][at].to_bits(),
-                        "field {} at {i},{j}",
-                        field.id
-                    );
-                }
-            }
-        }
-    }
-
-    // The degenerate rectangle, which is the one case where the halo arithmetic
-    // cannot save a shortfall: if the rect path leaves any texel unwritten it shows
-    // up here as a NaN.
-    #[test]
-    fn a_rect_re_bake_of_the_whole_document_reproduces_every_texel() {
-        let mut terrain = two_field_document();
-        terrain.bake_in_place().unwrap();
-        let full: Vec<Vec<f32>> = terrain
-            .fields
-            .iter()
-            .map(|field| field.baked().data().to_vec())
-            .collect();
-
-        for field in &mut terrain.fields {
-            field.baked_mut().fill(f32::NAN);
-        }
-        terrain.bake_rect(terrain.rect()).unwrap();
-
-        for (index, field) in terrain.fields.iter().enumerate() {
-            let bits: Vec<u32> = field.baked().data().iter().map(|v| v.to_bits()).collect();
-            let wanted: Vec<u32> = full[index].iter().map(|v| v.to_bits()).collect();
-            assert_eq!(bits, wanted, "field {}", field.id);
-        }
-    }
-
     // Every test here, and any document baked before the editor has seen a render
-    // device, bakes without a runtime: a shader node under one has to read as `0.0`,
-    // exactly as an undispatched one already does, rather than failing the bake.
+    // device, bakes without a runtime: a field whose shader has produced nothing has
+    // to read as `0.0` rather than failing the bake.
     #[test]
     fn a_shader_with_no_runtime_bakes_as_zero_rather_than_failing() {
-        let mut layer = ShaderLayer::new("blur.wgsl");
-        layer.inputs = vec!["source".to_owned()];
-        let mut field = Field::new("height").with_op(NodeOp::held(0.5));
-        let source = field.graph.nodes[0].id;
-        let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
-        field.graph.connect(source, shaded, 0).unwrap();
-        field.graph.set_output(Some(shaded)).unwrap();
-
-        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(field);
+        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(Field::new("height"));
         terrain.bake_in_place().expect("the bake was refused");
         assert!(
             terrain
@@ -1792,60 +1235,24 @@ mod tests {
         );
     }
 
-    // The whole point of the ordering. A field baked before its dependency reads
-    // zeros and produces a plausible wrong answer rather than an error.
-    #[test]
-    fn a_field_is_baked_before_the_field_that_reads_it() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(
-                Field::new("derived")
-                    .with_range((0.0, 10.0))
-                    .with_op(NodeOp::FieldRef(FieldId::from("source"))),
-            )
-            .with_field(
-                Field::new("source")
-                    .with_range((0.0, 10.0))
-                    .with_op(NodeOp::held(3.0)),
-            );
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("derived", 4.5, 4.5).unwrap(), 3.0);
-    }
-
     // The failure mode a naive walk has here is non-termination, which is far worse
     // than a wrong answer; the error also names the cycle, because a document with
     // several fields gives no other clue which reference to remove.
     #[test]
     fn a_dependency_cycle_is_an_error_rather_than_a_hang() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("b"))))
-            .with_field(Field::new("b").with_op(NodeOp::FieldRef(FieldId::from("a"))));
+            .with_field(Field::new("a").reading(&["b"]))
+            .with_field(Field::new("b").reading(&["a"]));
         let error = terrain.bake_in_place().unwrap_err();
         assert!(matches!(error, PlanError::Cycle(_)), "{error}");
-    }
-
-    // Unwiring a node is how a user gets out of a cycle they have just created, so
-    // ordering has to be computed from the nodes the output actually reaches —
-    // otherwise the document would be stuck refusing to bake with no visible cause.
-    #[test]
-    fn a_cycle_that_only_exists_through_an_unreachable_node_is_not_a_cycle() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("b"))))
-            .with_field(Field::new("b").with_graph({
-                let mut graph = FieldGraph::new();
-                let value = graph.node_with(NodeOp::held(1.0), &[]);
-                graph.node_with(NodeOp::FieldRef(FieldId::from("a")), &[]);
-                graph.set_output(Some(value)).unwrap();
-                graph
-            }));
-        terrain.bake_in_place().unwrap();
     }
 
     // Caught at plan time and named on both sides: the dangling reference lives in the
     // reader, so an error naming only the missing field would not say where to look.
     #[test]
     fn a_reference_to_a_field_that_is_not_there_is_an_error() {
-        let terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("a").with_op(NodeOp::FieldRef(FieldId::from("gone"))));
+        let terrain =
+            TerrainSpec::new(UVec2::new(8, 8)).with_field(Field::new("a").reading(&["gone"]));
         let error = terrain.plan_bake().unwrap_err();
         assert!(
             matches!(&error, PlanError::UnknownField { referenced, reader }
@@ -1875,35 +1282,14 @@ mod tests {
             PlanError::ZeroSize(0, 16)
         ));
     }
-
-    // The clamp is applied once at the end of the graph rather than per node, so this
-    // also pins that a node's value may leave the range and still land inside it.
+    // The clamp is applied once to what the shader produced, so a shader may leave the
+    // range and still land inside it.
     #[test]
     fn a_field_is_clamped_to_the_range_it_declares() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height")
-                .with_range((0.0, 1.0))
-                .with_op(NodeOp::held(5.0)),
-        );
+        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
+            .with_field(Field::new("height").with_range((0.0, 1.0)).held(5.0));
         terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
-    }
-
-    // A node the output cannot reach has to be exactly equivalent to no node at all,
-    // since parking one rather than deleting it is what a user means by unwiring it.
-    #[test]
-    fn a_node_the_output_cannot_reach_contributes_nothing() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8)).with_field(
-            Field::new("height").with_range((-10.0, 10.0)).with_graph({
-                let mut graph = FieldGraph::new();
-                let kept = graph.node_with(NodeOp::held(4.0), &[]);
-                graph.node_with(NodeOp::held(9.0), &[]);
-                graph.set_output(Some(kept)).unwrap();
-                graph
-            }),
-        );
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 4.0);
     }
 
     // An extent that is not a multiple of the shift rounds up to a raster whose last
@@ -1911,18 +1297,14 @@ mod tests {
     // to be written, or a sample near the far edge reads whatever the allocation held.
     #[test]
     fn a_bake_leaves_no_texel_of_a_field_untouched() {
-        let mut terrain = TerrainSpec::new(UVec2::new(37, 23)).with_field(
-            Field::new("height")
-                .with_shift(2)
-                .with_op(NodeOp::held(0.5)),
-        );
+        let mut terrain = TerrainSpec::new(UVec2::new(37, 23))
+            .with_field(Field::new("height").with_shift(2).held(0.5));
         terrain.bake_in_place().unwrap();
         let field = terrain.field("height").unwrap();
         assert_eq!(field.baked().size(), UVec2::new(10, 6));
         assert!(field.baked().data().iter().all(|value| *value == 0.5));
     }
-
-    // The baked rasters, a shader node's values and its declared reach are skipped by
+    // The baked rasters, a shader's values and the fields its file reads are skipped by
     // serde, so this pins that everything else survives and that a decoded document is
     // unbaked rather than half-baked.
     #[test]
@@ -1934,118 +1316,10 @@ mod tests {
         let mut expected = terrain.clone();
         for field in &mut expected.fields {
             *field = field.authored();
-            for node in &mut field.graph.nodes {
-                if let NodeOp::Shader(shader) = &mut node.op {
-                    shader.reach = None;
-                }
-            }
+            field.shader.layers.clear();
         }
         assert_eq!(decoded, expected);
         assert!(decoded.field("height").unwrap().baked().is_empty());
-    }
-
-    // The property an incremental edit rests on: the answer must contain the changed
-    // rectangle and be strictly larger, because a field reading the changed one
-    // samples a neighbourhood around each of its own texels.
-    #[test]
-    fn a_change_reaches_further_than_the_rectangle_it_was_made_in() {
-        let terrain = two_field_document();
-        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        let reached = terrain.influence_of("moisture", changed);
-
-        assert!(!reached.is_empty());
-        assert_eq!(reached.union(changed), reached, "{reached:?}");
-        assert!(reached.width() > changed.width());
-    }
-
-    fn shader_over_a_field(wired: bool, reach: Option<u32>) -> TerrainSpec {
-        let mut layer = ShaderLayer::new("blur.wgsl");
-        layer.inputs = vec!["source".to_owned()];
-        layer.reach = reach;
-        let NodeOp::Shader(mut joined) = NodeOp::piped(2) else {
-            unreachable!("a piped node is a shader node");
-        };
-        joined.reach = Some(0);
-
-        let mut graph = FieldGraph::new();
-        let source = graph.node_with(NodeOp::FieldRef(FieldId::from("base")), &[]);
-        let pins: Vec<NodeId> = if wired { vec![source] } else { Vec::new() };
-        let shaded = graph.node_with(NodeOp::Shader(layer), &pins);
-        let out = graph.node_with(NodeOp::Shader(joined), &[source, shaded]);
-        graph.set_output(Some(out)).unwrap();
-
-        TerrainSpec::new(UVec2::new(96, 80))
-            .with_field(
-                Field::new("base")
-                    .with_shift(0)
-                    .with_op(NodeOp::holding(ramp(UVec2::new(96, 80)))),
-            )
-            .with_field(Field::new("height").with_shift(0).with_graph(graph))
-    }
-
-    // The unit the annotation is written in, pinned against the only thing that can
-    // read it wrong: a reach of two cells widens what an edit reaches by two cells on
-    // each side, so the answer is four cells wider than the same document declaring
-    // nothing to reach. Both documents also read `base` directly, which is what keeps
-    // it a dependency whatever the shader pin does and makes the two halos comparable.
-    #[test]
-    fn a_declared_reach_widens_the_influence_by_that_many_cells_a_side() {
-        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        let none = shader_over_a_field(true, Some(0)).influence_of("base", changed);
-        let two = shader_over_a_field(true, Some(2)).influence_of("base", changed);
-
-        assert!(!two.is_empty());
-        assert_eq!(two.union(none), two, "{two:?} does not contain {none:?}");
-        assert_eq!(two.width(), none.width() + 4);
-        assert_eq!(two.height(), none.height() + 4);
-    }
-
-    // A wired shader that declares nothing may read any texel of its input, so the
-    // answer has to be the whole document rather than a halo that under-reports and
-    // leaves stale cells on the map.
-    #[test]
-    fn a_wired_shader_declaring_no_reach_influences_the_whole_document() {
-        let terrain = shader_over_a_field(true, None);
-        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        assert_eq!(terrain.influence_of("base", changed), terrain.rect());
-    }
-
-    // An unwired pin reads `0.0` and so reads nothing of the document, which means a
-    // shader with no input bounds nothing whatever its file declares — it must not
-    // widen a halo and must not force a whole re-bake. The direct read of `base`
-    // alongside the shader is what leaves a halo to compare at all.
-    #[test]
-    fn an_unwired_shader_pin_widens_nothing() {
-        let changed = CellRect::new(UVec2::new(40, 30), UVec2::new(50, 40));
-        let unwired = shader_over_a_field(false, None);
-        assert!(!unwired.samples_unbounded());
-        assert_eq!(
-            unwired.influence_of("base", changed),
-            shader_over_a_field(true, Some(0)).influence_of("base", changed)
-        );
-    }
-
-    // The question that decides rectangle against whole field: it is the missing
-    // declaration that forces the whole document, not the wiring on its own.
-    #[test]
-    fn only_a_wired_shader_without_a_declared_reach_samples_unbounded() {
-        assert!(shader_over_a_field(true, None).samples_unbounded());
-        assert!(!shader_over_a_field(true, Some(2)).samples_unbounded());
-        assert!(!shader_over_a_field(false, None).samples_unbounded());
-    }
-
-    // The two empty answers have to stay empty rather than falling back to the whole
-    // document, which is what an unplannable document gives — a caller cannot tell
-    // "nothing to do" from "redo everything" any other way.
-    #[test]
-    fn a_change_to_a_field_the_document_does_not_have_reaches_nothing() {
-        let terrain = two_field_document();
-        assert!(
-            terrain
-                .influence_of("nowhere", CellRect::new(UVec2::ZERO, UVec2::splat(8)))
-                .is_empty()
-        );
-        assert!(terrain.influence_of("moisture", CellRect::EMPTY).is_empty());
     }
 
     fn roled_document() -> TerrainSpec {
@@ -2054,12 +1328,12 @@ mod tests {
                 Field::new("moisture")
                     .with_role(FieldRole::Moisture)
                     .with_shift(3)
-                    .with_op(NodeOp::holding(ramp(UVec2::new(8, 8)))),
+                    .holding(ramp(UVec2::new(8, 8))),
             )
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
-                    .with_op(NodeOp::holding(ramp(UVec2::new(64, 64)))),
+                    .holding(ramp(UVec2::new(64, 64))),
             )
     }
 
@@ -2197,8 +1471,8 @@ mod tests {
     // so a water spec it carried names a height field the plan can no longer find.
     #[test]
     fn a_document_that_carries_no_roles_refuses_to_plan_its_water() {
-        let mut spec = TerrainSpec::new(UVec2::new(32, 32))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
+        let mut spec =
+            TerrainSpec::new(UVec2::new(32, 32)).with_field(Field::new("height").held(0.5));
         spec.water_spec = Some(WaterSpec::new("height"));
 
         assert!(matches!(
@@ -2207,21 +1481,17 @@ mod tests {
         ));
     }
 
-    fn naming(layers: &[&str], values: Raster<f32>) -> NodeOp {
-        let NodeOp::Shader(mut layer) = NodeOp::holding(values) else {
-            unreachable!("a held node is a shader node");
-        };
-        layer.layers = layers.iter().map(|name| FieldId::from(*name)).collect();
-        NodeOp::Shader(layer)
-    }
-
     // A file's `@layer` name is the only thing that says one field needs another, so
     // the order has to follow it even when the reader is declared first.
     #[test]
     fn a_field_whose_shader_names_another_is_baked_after_it() {
         let terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(Field::new("reader").with_op(naming(&["source"], ramp(UVec2::splat(8)))))
-            .with_field(Field::new("source").with_op(NodeOp::held(0.5)));
+            .with_field(
+                Field::new("reader")
+                    .holding(ramp(UVec2::splat(8)))
+                    .reading(&["source"]),
+            )
+            .with_field(Field::new("source").held(0.5));
         let order: Vec<_> = terrain
             .bake_order()
             .unwrap()
@@ -2247,10 +1517,12 @@ mod tests {
             .with_field(
                 Field::new("moisture")
                     .with_shift(3)
-                    .with_op(NodeOp::holding(ramp(UVec2::new(12, 10)))),
+                    .holding(ramp(UVec2::new(12, 10))),
             )
             .with_field(
-                Field::new("height").with_op(naming(&["nowhere"], ramp(UVec2::new(96, 80)))),
+                Field::new("height")
+                    .holding(ramp(UVec2::new(96, 80)))
+                    .reading(&["nowhere"]),
             );
         terrain.bake_in_place().expect("the bake was refused");
 
@@ -2270,8 +1542,8 @@ mod tests {
     #[test]
     fn two_shaders_naming_each_other_fail_the_bake_and_both_carry_the_chain() {
         let mut terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(Field::new("a").with_op(naming(&["b"], ramp(UVec2::splat(8)))))
-            .with_field(Field::new("b").with_op(naming(&["a"], ramp(UVec2::splat(8)))));
+            .with_field(Field::new("a").reading(&["b"]))
+            .with_field(Field::new("b").reading(&["a"]));
         let error = terrain.bake_in_place().unwrap_err();
         assert!(
             matches!(&error, PlanError::Cycle(chain) if chain == "a -> b -> a"),
@@ -2284,73 +1556,5 @@ mod tests {
                 .iter()
                 .all(|(_, fault)| fault.contains("a -> b -> a"))
         );
-    }
-
-    fn equivalence(runtime: &ShaderRuntime, size: UVec2, moisture: UVec2) -> f32 {
-        let values = Raster::from_vec(
-            moisture,
-            (0..moisture.y)
-                .flat_map(|y| (0..moisture.x).map(move |x| ((x * 7 + y * 13) % 16) as f32 / 15.0))
-                .collect(),
-        )
-        .unwrap();
-
-        let mut pin = ShaderLayer::new("pin.wgsl");
-        pin.inputs = vec!["source".to_owned()];
-        let mut through_pin = FieldGraph::new();
-        let source = through_pin.node_with(NodeOp::FieldRef(FieldId::from("moisture")), &[]);
-        let shaded = through_pin.node_with(NodeOp::Shader(pin), &[source]);
-        through_pin.set_output(Some(shaded)).unwrap();
-
-        let mut name = ShaderLayer::new("name.wgsl");
-        name.layers = vec![FieldId::from("moisture")];
-
-        let mut terrain = TerrainSpec::new(size)
-            .with_field(Field::new("by_name").with_op(NodeOp::Shader(name)))
-            .with_field(Field::new("through_pin").with_graph(through_pin))
-            .with_field(
-                Field::new("moisture")
-                    .with_shift(4)
-                    .with_op(NodeOp::holding(values)),
-            );
-        terrain.set_shader_runtime(runtime.with_sources(
-            0,
-            [
-                (
-                    "pin.wgsl".to_owned(),
-                    "@group(0) @binding(3) var source: texture_2d<f32>; // @in\n\nfn value(p: vec2<f32>) -> f32 {\n    return input_texel(source, field_texel(p));\n}\n".to_owned(),
-                ),
-                (
-                    "name.wgsl".to_owned(),
-                    "@group(0) @binding(3) var moisture: texture_2d<f32>; // @layer moisture\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(moisture, p);\n}\n".to_owned(),
-                ),
-            ],
-        ));
-        terrain.bake_in_place().unwrap();
-
-        let by_name = terrain.field("by_name").unwrap().baked();
-        let through_pin = terrain.field("through_pin").unwrap().baked();
-        assert_eq!(by_name.size(), through_pin.size());
-        let largest = by_name
-            .data()
-            .iter()
-            .zip(through_pin.data())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        eprintln!("equivalence at {size}: largest difference {largest}");
-        largest
-    }
-
-    // `layer_value` replaces a `fieldref` wired into an `@in` pin, so a coarse field
-    // read by name has to give the same picture that path gave — on a document that is
-    // a power of two and one that is not, which is where `layer_shift` can go wrong.
-    #[test]
-    fn reading_a_layer_by_name_gives_what_a_reference_into_a_pin_gave() {
-        let Some(runtime) = ShaderRuntime::headless(0) else {
-            eprintln!("skipped: no GPU adapter to dispatch a shader on");
-            return;
-        };
-        assert!(equivalence(&runtime, UVec2::new(256, 256), UVec2::new(16, 16)) < 1e-5);
-        assert!(equivalence(&runtime, UVec2::new(250, 90), UVec2::new(16, 6)) < 1e-5);
     }
 }

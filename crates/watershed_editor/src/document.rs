@@ -12,8 +12,12 @@
 //! the map lags but never falls further behind.
 //!
 //! What the bake on screen is worth is tracked apart from the terrain, because an
-//! edit invalidates a bake without touching it: see [`Baked`] for how much of the
-//! document currently matches its own graphs.
+//! edit invalidates a bake without touching it: see [`Baked`] for whether the
+//! document currently matches its own shaders.
+//!
+//! Which fields the document has follows the shader directory: adding or removing a
+//! field is a file operation, and a file added or deleted by hand adds or removes its
+//! field. Neither is recorded in the history.
 
 use std::path::PathBuf;
 
@@ -21,16 +25,13 @@ use crate::terrain::{SaveOptions, TerrainSpec};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use serde_json::Value;
-use watershed::CellRect;
 
-use crate::edit::{Edit, Slot};
+use crate::edit::{Edit, Slot, check_add, check_remove};
 use crate::gpu::{self, ShaderRuntime};
 use crate::history::{History, HistoryDepth, Restored, Snapshot};
 use crate::preset::Preset;
+use crate::terrain::Field;
 use crate::terrain::shader::SHADER_DIR;
-use crate::view::VisibleCells;
-
-const REBAKE_MARGIN_CELLS: u32 = 64;
 
 /// Holds the document and runs the two systems that land finished jobs and open the
 /// re-bakes an edit or a pan has asked for.
@@ -66,7 +67,7 @@ pub enum JobKind {
     /// Builds a preset and bakes it whole. Distinct from `Bake` because there is no
     /// terrain to take — it hands one back that did not exist before.
     New,
-    /// Bakes the document, or a rectangle of it.
+    /// Bakes the whole document.
     Bake,
     /// Solves the water. Refused unless the whole document is baked.
     Solve,
@@ -89,46 +90,23 @@ impl JobKind {
     }
 }
 
-/// How much of the document's bake still matches the graphs it was cut from.
+/// Whether the document's bake still matches the shaders and settings it was cut from.
 ///
-/// An edit to a graph drops this to [`Baked::Nothing`] rather than to the part it
-/// left alone: a node applies to a whole field, and nothing here knows the reach of
-/// the one that changed.
+/// An edit drops this to [`Baked::Nothing`]; every bake is of the whole document, so
+/// there is nothing in between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Baked {
     /// Nothing on screen can be trusted.
     Nothing,
-    /// Only this rectangle of the document has been baked since the last edit.
-    Rect(CellRect),
-    /// The whole document matches its graphs. The only state a solve will run from.
+    /// The whole document matches its shaders. The only state a solve will run from.
     Whole,
 }
 
 impl Baked {
-    /// Whether that rectangle of the document has been baked since the last edit. An
-    /// empty rectangle is covered by anything, including [`Baked::Nothing`].
-    pub fn covers(self, rect: CellRect) -> bool {
-        match self {
-            Self::Whole => true,
-            Self::Nothing => rect.is_empty(),
-            Self::Rect(have) => have.union(rect) == have,
-        }
-    }
-
-    fn with(self, added: Self) -> Self {
-        match (self, added) {
-            (Self::Whole, _) | (_, Self::Whole) => Self::Whole,
-            (Self::Nothing, other) | (other, Self::Nothing) => other,
-            (Self::Rect(have), Self::Rect(added)) => Self::Rect(have.union(added)),
-        }
-    }
-
-    /// The lowercase word the control client reports this by. A `Rect` does not carry
-    /// its rectangle into the name.
+    /// The lowercase word the control client reports this by.
     pub fn name(self) -> &'static str {
         match self {
             Self::Nothing => "nothing",
-            Self::Rect(_) => "rect",
             Self::Whole => "whole",
         }
     }
@@ -184,9 +162,8 @@ pub struct Document {
     /// has to set it again, or the job already running would be taken for its answer.
     dirty: bool,
     baked: Baked,
-    /// What the bake in flight will have covered when it lands, held here rather than in
-    /// the job because only the caller that started it knows whether it asked for all of
-    /// the document or a rectangle of it.
+    /// What the job in flight will have baked when it lands, held here rather than in
+    /// the job because only the caller that started it knows whether it bakes.
     baking: Baked,
     /// The document as it stands does not bake. Nothing may re-bake it automatically until
     /// something about it changes, or a document holding a cycle would spend every frame
@@ -286,7 +263,7 @@ impl Document {
         matches!(self.job, Job::Running { .. })
     }
 
-    /// How much of the document currently matches its graphs.
+    /// Whether the document currently matches its shaders.
     pub fn baked(&self) -> Baked {
         self.baked
     }
@@ -303,8 +280,8 @@ impl Document {
         !self.is_busy() && !self.dirty
     }
 
-    /// The terrain, to be edited in place, for a change the history does not own: a
-    /// shader's resolved values, the parameters a re-read shader file reconciled.
+    /// The terrain, to be edited in place, for a change the history does not own: the
+    /// parameters and the fields read that a re-read shader file reconciled.
     /// Whatever is changed through this has to be followed by [`Document::note_edit`],
     /// and cannot be undone.
     ///
@@ -341,20 +318,7 @@ impl Document {
         fresh
     }
 
-    /// What a re-bake covering `rect` has to actually be asked for: the rectangle, or
-    /// `None` — the whole document — when the document holds a shader with something
-    /// wired into it, or a field named in an `@layer`, whose file declares no reach.
-    ///
-    /// Such a shader may read *any* texel of what it is handed, so no rectangle
-    /// bounds the ground an edit under it moves. One whose file declares
-    /// `// @reach <cells>` is bounded by that, the bake widens the rectangle by it
-    /// per hop, and the answer stays the rectangle.
-    pub fn bake_ask(&self, rect: CellRect) -> Option<CellRect> {
-        let unbounded = self.terrain().is_some_and(TerrainSpec::samples_unbounded);
-        (!unbounded).then_some(rect)
-    }
-
-    /// Installs what a shader node is dispatched through: into the open terrain when
+    /// Installs what a field's shader is dispatched through: into the open terrain when
     /// there is one, and into the document, so a document built or loaded later bakes
     /// on the same device.
     ///
@@ -374,7 +338,7 @@ impl Document {
         &self.runtime
     }
 
-    /// Records that a graph has changed: the whole bake is stale, the last error no
+    /// Records that a field has changed: the whole bake is stale, the last error no
     /// longer applies, a document that would not bake is worth trying again, and any
     /// solved water is invalidated — it was derived from a height that has just moved.
     ///
@@ -406,7 +370,17 @@ impl Document {
     /// An edit that names a field to show — see [`Edit::shows`] — also puts that field
     /// on screen, as part of the same change: undoing it puts back both the document
     /// and the field that was being looked at.
+    ///
+    /// A file operation — see [`Edit::is_file_operation`] — is different on three
+    /// counts. It is refused rather than held while a job runs. Adding a field **writes
+    /// `<name>.wgsl`** into [`Document::shader_root`] as a copy of the template, and is
+    /// refused when that file already exists; removing one **deletes that file** after
+    /// the edit's own refusals have passed. And neither is recorded in the history, so
+    /// neither can be undone.
     pub fn apply(&mut self, edit: &Edit) -> Result<Value, String> {
+        if edit.is_file_operation() {
+            return self.apply_file_operation(edit);
+        }
         if self.is_busy() {
             self.hold(Held::Edit {
                 edit: edit.clone(),
@@ -431,6 +405,91 @@ impl Document {
             self.revision += 1;
         }
         Ok(reply)
+    }
+
+    fn apply_file_operation(&mut self, edit: &Edit) -> Result<Value, String> {
+        self.busy_check()?;
+        let root = self.shader_root();
+        let active = self.active.clone();
+        let terrain = self
+            .terrain
+            .as_mut()
+            .ok_or("there is no document to edit")?;
+        match edit {
+            Edit::AddField { name } => {
+                let name = check_add(terrain, name)?;
+                let file = root.join(format!("{name}.wgsl"));
+                if file.exists() {
+                    return Err(format!("{} already exists", file.display()));
+                }
+                std::fs::create_dir_all(&root)
+                    .and_then(|()| std::fs::write(&file, gpu::template_source()))
+                    .map_err(|error| format!("{}: {error}", file.display()))?;
+            }
+            Edit::RemoveField { name } => {
+                let name = check_remove(terrain, name)?;
+                let file = root.join(format!("{name}.wgsl"));
+                match std::fs::remove_file(&file) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(format!("{}: {error}", file.display()));
+                    }
+                    _ => {}
+                }
+            }
+            Edit::Set { .. } => return Err("not a file operation".to_owned()),
+        }
+        let reply = edit.apply(terrain)?;
+        if let Some(shown) = edit.shows(terrain, &active) {
+            self.active = shown;
+        }
+        self.revision += 1;
+        self.note_edit();
+        Ok(reply)
+    }
+
+    /// Makes the open document's fields the ones `names` lists: a field of each name
+    /// the document lacks is added with no parameter values, and a field no name lists
+    /// is removed. What a file added to or deleted from the shader directory by hand
+    /// does to the document.
+    ///
+    /// Not recorded in the history. When anything moved it is noted as an edit, and
+    /// a field on screen that is gone gives way to `height`, or to the first field.
+    /// Does nothing with no document open.
+    pub fn sync_fields(&mut self, names: &[String]) {
+        let Some(terrain) = self.terrain.as_mut() else {
+            return;
+        };
+        let before = terrain.fields.len();
+        terrain
+            .fields
+            .retain(|field| names.iter().any(|name| name == field.id.as_str()));
+        let mut moved = terrain.fields.len() != before;
+        for name in names {
+            if terrain.field(name).is_none() {
+                terrain.fields.push(Field::new(name.as_str()));
+                moved = true;
+            }
+        }
+        if !moved {
+            return;
+        }
+        if terrain.field(&self.active).is_none() {
+            if terrain.field("height").is_some() {
+                self.active = "height".to_owned();
+            } else if let Some(first) = terrain.fields.first() {
+                self.active = first.id.to_string();
+            }
+        }
+        self.revision += 1;
+        self.note_edit();
+    }
+
+    /// The directory the open document's shader files live in: `shaders` inside its
+    /// path once it has one, and the scratch directory before that.
+    pub fn shader_root(&self) -> PathBuf {
+        self.path
+            .as_ref()
+            .map_or_else(gpu::scratch_root, |path| path.join(SHADER_DIR))
     }
 
     /// Writes one field in place through `write`, as one change in the history: the
@@ -520,7 +579,13 @@ impl Document {
     }
 
     fn note_restored(&mut self, restored: Restored) {
-        self.active = restored.active;
+        if self
+            .terrain
+            .as_ref()
+            .is_some_and(|terrain| terrain.field(&restored.active).is_some())
+        {
+            self.active = restored.active;
+        }
         self.revision += 1;
         if restored.reaches_bake {
             self.note_edit();
@@ -637,26 +702,18 @@ impl Document {
         if self.baked == Baked::Whole && !self.dirty {
             return self.start_solve();
         }
-        self.start_bake(None)?;
+        self.start_bake()?;
         self.pending_solve = true;
         Ok(())
     }
 
-    /// A rectangle re-bakes only that much of the document and says so afterwards; `None`
-    /// is the whole of it, which is the only thing that makes a document solvable again.
-    ///
-    /// The rectangle is passed in rather than read off the camera, so a caller driving
-    /// the editor from outside can ask for ground nobody is looking at.
-    pub fn start_bake(&mut self, rect: Option<CellRect>) -> Result<(), String> {
+    /// Starts baking the whole document. Refused while a job is running or with no
+    /// document open.
+    pub fn start_bake(&mut self) -> Result<(), String> {
         let mut terrain = self.take_terrain()?;
-        let covered = match rect {
-            Some(rect) => Baked::Rect(rect.intersect(terrain.rect())),
-            None => Baked::Whole,
-        };
-        let rect = rect.unwrap_or_else(|| terrain.rect());
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            let error = terrain.bake_rect(rect).err().map(|error| error.to_string());
+            let error = terrain.bake_in_place().err().map(|error| error.to_string());
             Outcome {
                 terrain: Some(terrain),
                 error,
@@ -665,26 +722,26 @@ impl Document {
         self.start(JobKind::Bake, task);
         self.dirty = false;
         self.bake_failed = false;
-        self.baking = covered;
+        self.baking = Baked::Whole;
         Ok(())
     }
 
     /// Starts building a preset and baking it whole, dropping whatever was open.
     ///
-    /// The preset's stock shaders are written into the scratch shader directory first,
-    /// overwriting files of the same names, and the bake dispatches them through
+    /// The preset's field files are written into the scratch shader directory first,
+    /// **deleting every other `.wgsl` file there**, and the bake dispatches them through
     /// programs built from those sources on the device the document last had.
     ///
-    /// Refused while a job is running, or when a stock shader cannot be written. The
+    /// Refused while a job is running, or when the directory cannot be written. The
     /// document is emptied immediately, so the view goes blank on the frame this is
     /// called rather than showing the old terrain under the new size in the toolbar.
     pub fn start_new(&mut self, size: UVec2, seed: u32, preset: Preset) -> Result<(), String> {
         self.busy_check()?;
-        gpu::write_stock(&gpu::scratch_root(), preset.stock_files())?;
+        gpu::write_preset(&gpu::scratch_root(), preset)?;
         let runtime = self.runtime.with_sources(
             seed,
-            preset.stock_files().iter().filter_map(|file| {
-                gpu::stock_source(file).map(|source| ((*file).to_owned(), source.to_owned()))
+            preset.files().iter().filter_map(|(field, stock)| {
+                gpu::stock_source(stock).map(|source| (format!("{field}.wgsl"), source.to_owned()))
             }),
         );
         self.size = size;
@@ -715,7 +772,7 @@ impl Document {
     ///
     /// Refused unless the whole document is baked and clean: water is derived from the
     /// height everywhere at once, and solving a document only part of which matches
-    /// its graphs gives a drainage network for a landscape that no longer exists. Use
+    /// its shaders gives a drainage network for a landscape that no longer exists. Use
     /// [`Document::solve_with_bake`] to bake first.
     ///
     /// Also refused when the document carries no water spec, which is what a document
@@ -786,12 +843,11 @@ impl Document {
     /// carried, because the reader re-derives what the file left out; on a failure the
     /// editor is left with no document rather than the old one.
     ///
-    /// The bake dispatches the shader nodes through programs built from the document's
-    /// own `shaders` directory, on the device the document last had.
+    /// The bake dispatches each field's shader through programs built from the
+    /// document's own `shaders` directory, on the device the document last had.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
         self.busy_check()?;
         let base = self.runtime.clone();
-        let seed = self.seed;
         self.path = Some(path.clone());
         self.terrain = None;
         self.baked = Baked::Nothing;
@@ -799,8 +855,7 @@ impl Document {
         self.held.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            let runtime = base.with_directory(seed, &path.join(SHADER_DIR));
-            match TerrainSpec::load_from_dir(&path, runtime) {
+            match TerrainSpec::load_from_dir(&path, base) {
                 Ok(terrain) => Outcome {
                     terrain: Some(terrain),
                     error: None,
@@ -852,13 +907,16 @@ fn finish_job(mut document: ResMut<Document>) {
     document.job = Job::Idle;
     if let Some(terrain) = outcome.terrain {
         document.size = terrain.size;
+        document.seed = terrain.seed;
         document.terrain = Some(terrain);
     }
     document.revision += 1;
     document.water_revision += 1;
 
     if outcome.error.is_none() {
-        document.baked = document.baked.with(document.baking);
+        if document.baking == Baked::Whole {
+            document.baked = Baked::Whole;
+        }
         for fault in document.unlogged_faults() {
             warn!("{fault}");
         }
@@ -895,48 +953,44 @@ fn finish_job(mut document: ResMut<Document>) {
     }
 }
 
-fn start_pending_bake(mut document: ResMut<Document>, visible: Res<VisibleCells>) {
+fn start_pending_bake(mut document: ResMut<Document>) {
     if document.is_busy() {
         return;
     }
-    let wanted = if document.terrain().is_some() {
-        visible.0
-    } else {
-        CellRect::EMPTY
-    };
-
-    match wanted_rebake(document.bake_failed, document.baked, wanted) {
-        None => document.dirty = false,
-        Some(rect) => {
-            let asked = document.bake_ask(rect);
-            if let Err(error) = document.start_bake(asked) {
-                warn!("{error}");
-            }
+    if wants_bake(
+        document.bake_failed,
+        document.baked,
+        document.terrain().is_some(),
+    ) {
+        if let Err(error) = document.start_bake() {
+            warn!("{error}");
         }
+    } else {
+        document.dirty = false;
     }
 }
 
-fn wanted_rebake(bake_failed: bool, baked: Baked, wanted: CellRect) -> Option<CellRect> {
-    if bake_failed || wanted.is_empty() || baked.covers(wanted) {
-        return None;
-    }
-    Some(wanted.expand(REBAKE_MARGIN_CELLS))
+fn wants_bake(bake_failed: bool, baked: Baked, open: bool) -> bool {
+    open && !bake_failed && baked != Baked::Whole
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::{TerrainSpec, WaterSpec};
+    use watershed::FieldRole;
 
-    fn rect(min: u32, max: u32) -> CellRect {
-        CellRect::new(UVec2::splat(min), UVec2::splat(max))
+    fn scratch(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("watershed-document-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        path
     }
 
-    fn one_node_document() -> Document {
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::{Field, TerrainSpec};
+    fn one_field_document() -> Document {
         let mut document = Document::default();
-        let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
+        let mut terrain =
+            TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         document.adopt(terrain);
         document.dirty = false;
@@ -944,268 +998,148 @@ mod tests {
         document
     }
 
-    fn two_field_document() -> Document {
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::{Field, TerrainSpec, WaterSpec};
-        use watershed::{FieldId, FieldRole};
+    fn two_field_document(name: &str) -> Document {
         let mut document = Document::default();
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+            .with_field(Field::new("base").held(0.25))
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
-                    .with_op(NodeOp::FieldRef(FieldId::from("base"))),
+                    .held(0.5)
+                    .reading(&["base"]),
             );
         terrain.water_spec = Some(WaterSpec::new("height").with_moisture("base"));
         terrain.bake_in_place().unwrap();
         document.adopt(terrain);
         document.dirty = false;
         document.baked = Baked::Whole;
+        document.path = Some(scratch(name));
+        let root = document.shader_root();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("base.wgsl"), "base").unwrap();
+        std::fs::write(root.join("height.wgsl"), "height").unwrap();
         document
     }
 
-    fn shader_document(wired: bool, reach: Option<u32>) -> Document {
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::shader::ShaderLayer;
-        use crate::terrain::{Field, TerrainSpec};
-        let mut layer = ShaderLayer::new("blur.wgsl");
-        layer.inputs = vec!["source".to_owned()];
-        layer.reach = reach;
-        let mut field = Field::new("height").with_op(NodeOp::held(0.5));
-        let upstream = field.graph.nodes[0].id;
-        let shaded = field.graph.add_node(NodeOp::Shader(layer), [0.0, 0.0]);
-        if wired {
-            field.graph.connect(upstream, shaded, 0).unwrap();
-        }
-        field.graph.set_output(Some(shaded)).unwrap();
-
-        let mut document = Document::default();
-        document.adopt(TerrainSpec::new(UVec2::splat(16)).with_field(field));
-        document
+    fn add(document: &mut Document, name: &str) -> Result<Value, String> {
+        document.apply(&Edit::AddField {
+            name: name.to_owned(),
+        })
     }
 
-    // What a wired pin costs turns on the file's declaration, and this draws the
-    // line: undeclared, a shader may read any texel of its input and the rectangle a
-    // edit moved says nothing about the ground that bakes differently, so the whole
-    // document is re-baked; declared, the reach bounds it and the rectangle stands,
-    // as it does with the pin unwired.
+    fn remove(document: &mut Document, name: &str) -> Result<Value, String> {
+        document.apply(&Edit::RemoveField {
+            name: name.to_owned(),
+        })
+    }
+
+    fn set(document: &mut Document, path: &str, value: &str) -> Result<Value, String> {
+        document.apply(&Edit::Set {
+            path: path.to_owned(),
+            words: vec![value.to_owned()],
+        })
+    }
+
+    // What `field add` has to do: the file arrives as a copy of the template, the field
+    // is on screen, and — because it is a file operation — no undo step is spent on it.
     #[test]
-    fn only_an_undeclared_reach_turns_a_rectangle_re_bake_into_a_whole_one() {
-        let asked = rect(0, 8);
-        assert_eq!(shader_document(true, None).bake_ask(asked), None);
-        assert_eq!(shader_document(true, Some(2)).bake_ask(asked), Some(asked));
-        assert_eq!(shader_document(false, None).bake_ask(asked), Some(asked));
-    }
+    fn adding_a_field_writes_the_template_and_shows_it_without_an_undo_step() {
+        let mut document = two_field_document("add");
+        add(&mut document, "temperature").unwrap();
 
-    fn only_node(document: &Document) -> String {
-        document
-            .terrain()
-            .unwrap()
-            .field("height")
-            .unwrap()
-            .graph
-            .nodes[0]
-            .id
-            .to_string()
-    }
-
-    // Dragging a card writes the document but reaches no bake, so it must not throw the
-    // bake away — and `note_edit` also invalidates solved water, which would make moving
-    // a node cost a re-solve of the whole document.
-    #[test]
-    fn moving_a_node_does_not_make_the_bake_stale() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-
-        document
-            .apply(&Edit::PlaceNode {
-                field: "height".to_owned(),
-                node: node.clone(),
-                position: [40.0, -20.0],
-            })
-            .unwrap();
-
-        assert_eq!(document.baked, Baked::Whole, "a move invalidated the bake");
-        assert!(!document.dirty, "a move made the document dirty");
+        let file = document.shader_root().join("temperature.wgsl");
         assert_eq!(
-            document
-                .terrain()
-                .unwrap()
-                .field("height")
-                .unwrap()
-                .graph
-                .nodes[0]
-                .position,
-            [40.0, -20.0]
+            std::fs::read_to_string(&file).unwrap(),
+            gpu::template_source()
         );
+        assert_eq!(document.active(), "temperature");
+        assert_eq!(document.field_names(), ["base", "height", "temperature"]);
+        assert_eq!(document.history().undo, 0);
+        assert!(document.is_dirty());
+        std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    // The whole of what the panel's Add field button and `field add` have to do,
-    // including that it is one undo step rather than two: the field arrives, it is on
-    // screen, and going back takes both away together.
+    // A file operation cannot be held for later, because the directory and the document
+    // would disagree about which fields exist until the job landed.
     #[test]
-    fn adding_a_field_puts_it_on_screen_and_undo_puts_the_previous_one_back() {
-        let mut document = one_node_document();
-        let before = document.history().undo;
+    fn a_file_operation_is_refused_while_a_job_runs() {
+        let mut document = two_field_document("busy");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
 
-        document
-            .apply(&Edit::AddField {
-                name: "biomes".to_owned(),
-            })
-            .unwrap();
-        assert_eq!(document.active(), "biomes");
-        assert_eq!(document.field_names(), ["height", "biomes"]);
-        assert_eq!(document.history().undo, before + 1);
-
-        document.undo().unwrap();
-        assert_eq!(document.active(), "height");
-        assert_eq!(document.field_names(), ["height"]);
-
-        document.redo().unwrap();
-        assert_eq!(document.active(), "biomes");
-        assert_eq!(document.field_names(), ["height", "biomes"]);
+        assert!(add(&mut document, "temperature").is_err());
+        assert!(!document.shader_root().join("temperature.wgsl").exists());
+        std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    // Acceptance 7, first half: a rename is one entry on the undo stack, and crossing
-    // it has to put the old name back everywhere it was written — in the reader's
-    // reference and in the water spec, not only on the field itself.
+    // A removal refused because another field reads the name must leave the file, or the
+    // reader would be left naming a field that can never come back.
     #[test]
-    fn renaming_a_field_is_one_undo_step_that_restores_the_readers_and_the_water_spec() {
-        let mut document = two_field_document();
-        let before = document.history().undo;
-
-        document
-            .apply(&Edit::RenameField {
-                from: "base".to_owned(),
-                to: "continent".to_owned(),
-            })
-            .unwrap();
-        assert_eq!(document.history().undo, before + 1);
-        assert_eq!(document.field_names(), ["continent", "height"]);
-        assert_eq!(declared_reads(&document, "height"), ["continent"]);
-        assert_eq!(water_moisture(&document), Some("continent".to_owned()));
-
-        document.undo().unwrap();
-        assert_eq!(document.field_names(), ["base", "height"]);
-        assert_eq!(declared_reads(&document, "height"), ["base"]);
-        assert_eq!(water_moisture(&document), Some("base".to_owned()));
-    }
-
-    // Acceptance 7, second half: undoing a removal has to bring the field back with
-    // the graph it had, not an empty one, or the undo would lose the work silently.
-    #[test]
-    fn removing_a_field_is_one_undo_step_that_brings_it_back_with_its_graph() {
-        let mut document = two_field_document();
+    fn removing_a_read_field_is_refused_and_its_file_stays() {
+        let mut document = two_field_document("read");
         document.reset_water().unwrap();
-        document
-            .apply(&Edit::RemoveField {
-                name: "height".to_owned(),
-            })
-            .unwrap();
-        let before = document.history().undo;
 
-        document
-            .apply(&Edit::RemoveField {
-                name: "base".to_owned(),
-            })
-            .unwrap();
-        assert_eq!(document.history().undo, before + 1);
-        assert!(document.field_names().is_empty());
-
-        document.undo().unwrap();
-        assert_eq!(document.field_names(), ["base"]);
-        assert_eq!(
-            document
-                .terrain()
-                .unwrap()
-                .field("base")
-                .unwrap()
-                .graph
-                .nodes
-                .len(),
-            1
-        );
+        let error = remove(&mut document, "base").unwrap_err();
+        assert!(error.contains("height"), "{error}");
+        assert!(document.shader_root().join("base.wgsl").is_file());
+        assert_eq!(document.field_names(), ["base", "height"]);
+        std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    // Acceptance 6, the editor half: the panel is always about the field on screen, so
-    // removing that field has to leave some other field showing rather than a name the
-    // document no longer has.
+    // `field rm` of a field nothing reads takes the file with it, and the panel is left
+    // on a field that still exists.
     #[test]
-    fn removing_the_field_on_screen_puts_another_one_on_screen() {
-        let mut document = two_field_document();
+    fn removing_an_unread_field_deletes_its_file_and_moves_the_view() {
+        let mut document = two_field_document("unread");
         document.reset_water().unwrap();
         document.set_active("height").unwrap();
 
-        document
-            .apply(&Edit::RemoveField {
-                name: "height".to_owned(),
-            })
-            .unwrap();
+        remove(&mut document, "height").unwrap();
+        assert!(!document.shader_root().join("height.wgsl").exists());
+        assert_eq!(document.field_names(), ["base"]);
         assert_eq!(document.active(), "base");
+        assert_eq!(document.history().undo, 0);
+        std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    fn declared_reads(document: &Document, field: &str) -> Vec<String> {
-        document
-            .terrain()
-            .unwrap()
-            .field(field)
-            .unwrap()
-            .declared_reads()
-            .map(|id| id.to_string())
-            .collect()
-    }
-
-    fn water_moisture(document: &Document) -> Option<String> {
-        document
-            .terrain()
-            .unwrap()
-            .water_spec
-            .as_ref()
-            .and_then(|spec| spec.moisture.as_ref())
-            .map(|id| id.to_string())
-    }
-
-    // A field nothing reads yet moves no texel of any field already baked, so adding
-    // one must not throw the bake away — the same rule a card drag is held to, and
-    // what keeps `observe document` reporting the bake it reported before.
+    // A file dropped into or deleted from the directory by hand is a field added or
+    // removed, and like one added from the editor it is no undo step.
     #[test]
-    fn adding_a_field_leaves_the_bake_where_it_was() {
-        let mut document = one_node_document();
-        let baked = document.baked();
+    fn syncing_the_field_names_adds_and_removes_fields_without_history() {
+        let mut document = one_field_document();
+        document.sync_fields(&["dunes".to_owned(), "height".to_owned()]);
+        assert_eq!(document.field_names(), ["height", "dunes"]);
+        assert!(document.is_dirty());
 
-        document
-            .apply(&Edit::AddField {
-                name: "biomes".to_owned(),
-            })
-            .unwrap();
+        document.baked = Baked::Whole;
+        document.dirty = false;
+        document.sync_fields(&["height".to_owned()]);
+        assert_eq!(document.field_names(), ["height"]);
+        assert_eq!(document.history().undo, 0);
 
-        assert_eq!(
-            document.baked(),
-            baked,
-            "an added field invalidated the bake"
-        );
+        document.baked = Baked::Whole;
+        document.dirty = false;
+        document.sync_fields(&["height".to_owned()]);
         assert!(
             !document.is_dirty(),
-            "an added field made the document dirty"
+            "a sync that moved nothing asked for a bake"
         );
     }
 
-    // Naming a node is the same kind of edit and has to answer the same way.
+    // Ctrl+Z covers parameter values: the value comes back, and the document asks for
+    // the whole re-bake that shows it.
     #[test]
-    fn naming_a_node_does_not_make_the_bake_stale() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
+    fn undoing_a_parameter_restores_it_and_asks_for_a_bake() {
+        let mut document = one_field_document();
+        set(&mut document, "height.value", "0.75").unwrap();
+        assert_eq!(constant_of(&document), 0.75);
 
-        document
-            .apply(&Edit::RenameNode {
-                field: "height".to_owned(),
-                node,
-                name: Some("ground".to_owned()),
-            })
-            .unwrap();
-
-        assert_eq!(document.baked, Baked::Whole);
-        assert!(!document.dirty);
+        document.baked = Baked::Whole;
+        document.dirty = false;
+        document.undo().unwrap();
+        assert_eq!(constant_of(&document), 0.5);
+        assert_eq!(document.baked, Baked::Nothing);
+        assert!(document.is_dirty());
     }
 
     // A display property is saved with the document and undone like any other edit, but
@@ -1213,7 +1147,7 @@ mod tests {
     // card drag, it must cost neither a re-bake nor the solved water.
     #[test]
     fn toggling_hillshade_is_undoable_and_does_not_make_the_bake_stale() {
-        let mut document = one_node_document();
+        let mut document = one_field_document();
 
         document
             .apply(&Edit::Set {
@@ -1250,7 +1184,7 @@ mod tests {
     // hillshade one, and is under the same rule: undoable, and free of the bake.
     #[test]
     fn toggling_contours_is_undoable_and_does_not_make_the_bake_stale() {
-        let mut document = one_node_document();
+        let mut document = one_field_document();
 
         document
             .apply(&Edit::Set {
@@ -1283,114 +1217,56 @@ mod tests {
         assert_eq!(document.baked, Baked::Whole);
     }
 
-    // Changing what a node computes is the other half of the rule: that one does reach
-    // the bake, so it has to make it stale.
+    // A parameter is what the field holds, so changing one has to make the bake stale.
     #[test]
-    fn changing_what_a_node_computes_does_make_the_bake_stale() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-
-        document
-            .apply(&Edit::Set {
-                path: format!("height.{node}.value"),
-                words: vec!["0.75".to_owned()],
-            })
-            .unwrap();
-
+    fn changing_a_parameter_does_make_the_bake_stale() {
+        let mut document = one_field_document();
+        set(&mut document, "height.value", "0.75").unwrap();
         assert_eq!(document.baked, Baked::Nothing);
         assert!(document.dirty);
     }
 
-    // A job takes the terrain with it, so an edit made while one runs has nothing to
-    // write to — and is held rather than refused, whether or not a bake reads it. A
-    // card dropped mid-bake would otherwise spring back to where it was picked up, and
-    // a value committed mid-bake would be lost with a refusal in the status bar. The
-    // job is real and never polled, because the terrain has to be genuinely gone.
+    // A job takes the terrain with it, so a value made while one runs has nothing to
+    // write to — and is held rather than refused, so it is not lost with a refusal in
+    // the status bar. The job is real and never polled, because the terrain has to be
+    // genuinely gone.
     #[test]
-    fn a_move_made_while_a_job_holds_the_terrain_is_kept_rather_than_refused() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        document.start_bake(None).unwrap();
-        assert!(document.is_busy());
-        assert!(document.terrain().is_none(), "a job holds the terrain");
-
-        document
-            .apply(&Edit::PlaceNode {
-                field: "height".to_owned(),
-                node: node.clone(),
-                position: [12.0, 34.0],
-            })
-            .expect("a move is held, not refused");
-
-        document
-            .apply(&Edit::Set {
-                path: format!("height.{node}.value"),
-                words: vec!["0.75".to_owned()],
-            })
-            .expect("a value is held too, not refused");
+    fn a_value_made_while_a_job_holds_the_terrain_is_kept_rather_than_refused() {
+        let (mut document, _) = bake_in_flight();
+        set(&mut document, "height.value", "0.75").expect("a value is held, not refused");
+        set(&mut document, "height.range", "0").expect("a range is held, not refused");
         assert_eq!(document.held.len(), 2);
     }
 
-    fn scaled() -> crate::terrain::graph::NodeOp {
-        use crate::terrain::graph::NodeOp;
-        let NodeOp::Shader(mut layer) = NodeOp::piped(1) else {
-            unreachable!("a piped node is a shader node");
-        };
-        layer.params.insert("factor".to_owned(), vec![2.0]);
-        NodeOp::Shader(layer)
+    fn set_value(field: &mut Field, value: f32) {
+        field.shader.params.insert("value".to_owned(), vec![value]);
     }
 
-    fn set_value(field: &mut crate::terrain::Field, value: f32) {
-        if let crate::terrain::graph::NodeOp::Shader(shader) = &mut field.graph.nodes[0].op {
-            shader.params.insert("value".to_owned(), vec![value]);
-        }
-    }
-
-    fn graph_of(document: &Document) -> crate::terrain::graph::FieldGraph {
-        let mut graph = document
+    fn authored_of(document: &Document) -> Field {
+        document
             .terrain()
             .unwrap()
             .field("height")
             .unwrap()
-            .graph
-            .clone();
-        graph.next_id = 0;
-        graph
+            .authored()
     }
 
-    // The task's own acceptance, made where it can be made without a window: three
-    // undos return the graph to what it was, each one leaving the document with a
+    // Three undos return the field to what it was, each one leaving the document with a
     // re-bake to run, and three redos replay the edits.
     #[test]
-    fn three_undos_return_the_graph_and_three_redos_replay_the_edits() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        let original = graph_of(&document);
+    fn three_undos_return_the_field_and_three_redos_replay_the_edits() {
+        let mut document = one_field_document();
+        let original = authored_of(&document);
 
-        document
-            .apply(&Edit::AddNode {
-                field: "height".to_owned(),
-                op: scaled(),
-                position: None,
-            })
-            .unwrap();
-        let added = graph_of(&document).nodes.last().unwrap().id.to_string();
-        document
-            .apply(&Edit::Connect {
-                field: "height".to_owned(),
-                from: node.clone(),
-                to: added.clone(),
-                pin: 0,
-            })
-            .unwrap();
+        set(&mut document, "height.value", "0.6").unwrap();
+        set(&mut document, "height.value", "0.7").unwrap();
         document
             .apply(&Edit::Set {
-                path: format!("height.{added}.factor"),
-                words: vec!["3".to_owned()],
+                path: "height.range".to_owned(),
+                words: vec!["0".to_owned(), "2".to_owned()],
             })
             .unwrap();
-        let edited = graph_of(&document);
+        let edited = authored_of(&document);
         assert_ne!(edited, original);
         assert_eq!(document.history().undo, 3);
 
@@ -1402,81 +1278,22 @@ mod tests {
             assert!(document.dirty);
             assert_eq!(document.history().undo, remaining);
         }
-        assert_eq!(graph_of(&document), original);
+        assert_eq!(authored_of(&document), original);
         assert_eq!(document.undo(), Err("nothing to undo".to_owned()));
 
         for _ in 0..3 {
             document.redo().unwrap();
         }
-        assert_eq!(graph_of(&document), edited);
+        assert_eq!(authored_of(&document), edited);
         assert_eq!(document.history().redo, 0);
-    }
-
-    // A wire and the output it carried along are one change, so one undo takes both back.
-    #[test]
-    fn one_undo_takes_back_a_wire_and_the_output_it_moved() {
-        use crate::terrain::graph::NodeOp;
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        let original = graph_of(&document);
-
-        document
-            .apply(&Edit::AddNode {
-                field: "height".to_owned(),
-                op: NodeOp::piped(1),
-                position: None,
-            })
-            .unwrap();
-        let added = graph_of(&document).nodes.last().unwrap().id;
-        document
-            .apply(&Edit::Connect {
-                field: "height".to_owned(),
-                from: node,
-                to: added.to_string(),
-                pin: 0,
-            })
-            .unwrap();
-        assert_eq!(graph_of(&document).output, Some(added));
-
-        document.undo().unwrap();
-        let undone = graph_of(&document);
-        assert_eq!(undone.output, original.output);
-        assert_eq!(undone.node(added).unwrap().inputs, vec![None]);
-    }
-
-    // Undoing a move is the same kind of change as making one: the bake was never
-    // reached, so taking the move back must not throw it away either.
-    #[test]
-    fn undoing_a_move_does_not_make_the_bake_stale() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        document
-            .apply(&Edit::PlaceNode {
-                field: "height".to_owned(),
-                node,
-                position: [40.0, -20.0],
-            })
-            .unwrap();
-
-        document.undo().unwrap();
-        assert_eq!(document.baked, Baked::Whole);
-        assert!(!document.dirty);
-        assert_eq!(graph_of(&document).nodes[0].position, [0.0, 0.0]);
     }
 
     // A refusal leaves the document as it was, so there is nothing to go back to — an
     // entry for it would undo a change that never happened.
     #[test]
     fn a_refused_edit_leaves_no_history_entry() {
-        let mut document = one_node_document();
-        assert!(
-            document
-                .apply(&Edit::RemoveNode {
-                    field: "height".to_owned(),
-                    node: "n9".to_owned(),
-                })
-                .is_err()
-        );
+        let mut document = one_field_document();
+        assert!(set(&mut document, "nowhere.value", "1").is_err());
         assert_eq!(document.history().undo, 0);
     }
 
@@ -1484,16 +1301,10 @@ mod tests {
     // has it — so it is refused, and the entry stays where it was for the next try.
     #[test]
     fn undo_is_refused_while_a_job_holds_the_terrain_and_keeps_its_entry() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        document
-            .apply(&Edit::Set {
-                path: format!("height.{node}.value"),
-                words: vec!["0.75".to_owned()],
-            })
-            .unwrap();
+        let mut document = one_field_document();
+        set(&mut document, "height.value", "0.75").unwrap();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        document.start_bake(None).unwrap();
+        document.start_bake().unwrap();
 
         assert!(document.undo().is_err());
         assert_eq!(document.history().undo, 1);
@@ -1503,14 +1314,8 @@ mod tests {
     // already has is not a change, so it must neither re-bake nor cost a redo.
     #[test]
     fn a_write_that_changes_nothing_records_nothing() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        document
-            .apply(&Edit::Set {
-                path: format!("height.{node}.value"),
-                words: vec!["0.75".to_owned()],
-            })
-            .unwrap();
+        let mut document = one_field_document();
+        set(&mut document, "height.value", "0.75").unwrap();
         document.undo().unwrap();
         assert_eq!(document.history().redo, 1);
 
@@ -1527,33 +1332,30 @@ mod tests {
         assert_eq!(document.baked, Baked::Nothing);
     }
 
-    // A move made while a job held the terrain lands when the job does, and it is a
+    // A value held while a job held the terrain lands when the job does, and it is a
     // change like any other — so it has to be undoable from there too, and a held edit
     // the landed document refuses must not leave an entry.
     #[test]
-    fn a_held_move_is_recorded_when_it_lands_and_a_refused_one_is_not() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
+    fn a_held_value_is_recorded_when_it_lands_and_a_refused_one_is_not() {
+        let mut document = one_field_document();
         let held = |edit: Edit| Held::Edit {
             slot: edit.slot(),
             edit,
         };
-        document.hold(held(Edit::PlaceNode {
-            field: "height".to_owned(),
-            node,
-            position: [12.0, 34.0],
+        document.hold(held(Edit::Set {
+            path: "height.value".to_owned(),
+            words: vec!["0.75".to_owned()],
         }));
-        document.hold(held(Edit::PlaceNode {
-            field: "height".to_owned(),
-            node: "n9".to_owned(),
-            position: [1.0, 1.0],
+        document.hold(held(Edit::Set {
+            path: "nowhere.value".to_owned(),
+            words: vec!["1".to_owned()],
         }));
 
         document.land_held();
         assert_eq!(document.history().undo, 1);
-        assert_eq!(graph_of(&document).nodes[0].position, [12.0, 34.0]);
+        assert_eq!(constant_of(&document), 0.75);
         document.undo().unwrap();
-        assert_eq!(graph_of(&document).nodes[0].position, [0.0, 0.0]);
+        assert_eq!(constant_of(&document), 0.5);
     }
 
     fn landed(document: Document) -> Document {
@@ -1573,35 +1375,31 @@ mod tests {
     }
 
     fn constant_of(document: &Document) -> f32 {
-        match &graph_of(document).nodes[0].op {
-            crate::terrain::graph::NodeOp::Shader(shader) => shader.params["value"][0],
-            other => panic!("the one node is {other:?}"),
-        }
+        document
+            .terrain()
+            .unwrap()
+            .field("height")
+            .unwrap()
+            .shader
+            .params["value"][0]
     }
 
-    fn bake_in_flight() -> (Document, String) {
-        let mut document = one_node_document();
-        let node = only_node(&document);
+    fn bake_in_flight() -> (Document, ()) {
+        let mut document = one_field_document();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        document.start_bake(None).unwrap();
+        document.start_bake().unwrap();
         assert!(document.terrain().is_none(), "a job holds the terrain");
-        (document, node)
+        (document, ())
     }
 
-    // The task's own acceptance, made where it can be made without a window: a value
-    // committed while a bake holds the terrain is accepted rather than refused, lands
-    // when the bake does, and leaves the document asking for the re-bake that shows
-    // it — so the map follows the last value rather than dropping it.
+    // A value committed while a bake holds the terrain is accepted rather than refused,
+    // lands when the bake does, and leaves the document asking for the re-bake that
+    // shows it — so the map follows the last value rather than dropping it.
     #[test]
     fn an_edit_made_while_a_job_runs_lands_when_the_job_does_and_asks_for_the_rebake() {
-        let (mut document, node) = bake_in_flight();
+        let (mut document, _) = bake_in_flight();
 
-        document
-            .apply(&Edit::Set {
-                path: format!("height.{node}.value"),
-                words: vec!["0.75".to_owned()],
-            })
-            .expect("an edit made during a bake is accepted");
+        set(&mut document, "height.value", "0.75").expect("an edit made during a bake is accepted");
 
         let document = landed(document);
         assert_eq!(constant_of(&document), 0.75);
@@ -1618,15 +1416,10 @@ mod tests {
     // change and one undo step, not one of each per value it passed through.
     #[test]
     fn two_values_for_one_control_held_together_leave_only_the_last() {
-        let (mut document, node) = bake_in_flight();
+        let (mut document, _) = bake_in_flight();
 
         for value in ["0.6", "0.7", "0.8"] {
-            document
-                .apply(&Edit::Set {
-                    path: format!("height.{node}.value"),
-                    words: vec![value.to_owned()],
-                })
-                .unwrap();
+            set(&mut document, "height.value", value).unwrap();
         }
         assert_eq!(document.held.len(), 1, "one control, one held change");
 
@@ -1639,49 +1432,6 @@ mod tests {
         );
     }
 
-    // Dropping the earlier change is only safe because it is confined to changes that
-    // write one place: two structural edits pile up, and the second needs the first to
-    // have landed before it.
-    #[test]
-    fn a_node_added_and_wired_while_a_job_runs_both_land_in_order() {
-        use crate::terrain::graph::NodeOp;
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        let added = format!(
-            "n{}",
-            document
-                .terrain()
-                .unwrap()
-                .field("height")
-                .unwrap()
-                .graph
-                .next_id
-        );
-        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        document.start_bake(None).unwrap();
-
-        document
-            .apply(&Edit::AddNode {
-                field: "height".to_owned(),
-                op: NodeOp::piped(1),
-                position: None,
-            })
-            .unwrap();
-        document
-            .apply(&Edit::Connect {
-                field: "height".to_owned(),
-                from: node,
-                to: added,
-                pin: 0,
-            })
-            .unwrap();
-        assert_eq!(document.held.len(), 2, "neither drops the other");
-
-        let graph = graph_of(&landed(document));
-        assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.nodes[1].inputs[0], Some(graph.nodes[0].id));
-    }
-
     // The panel's own path is `write` rather than `apply`, so it has to be held on the
     // same terms — a shader parameter committed during a bake is the case the issue
     // was raised about.
@@ -1690,7 +1440,6 @@ mod tests {
         let (mut document, _) = bake_in_flight();
         let slot = Slot::Control {
             property: "constant",
-            node: None,
             index: [0, 0],
         };
 
@@ -1733,15 +1482,8 @@ mod tests {
     // restore fields that never belonged to it.
     #[test]
     fn a_new_document_starts_with_an_empty_history() {
-        let mut document = one_node_document();
-        let node = only_node(&document);
-        document
-            .apply(&Edit::PlaceNode {
-                field: "height".to_owned(),
-                node,
-                position: [1.0, 2.0],
-            })
-            .unwrap();
+        let mut document = one_field_document();
+        set(&mut document, "height.value", "0.75").unwrap();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         document
             .start_new(UVec2::splat(16), 1, Preset::default())
@@ -1753,90 +1495,25 @@ mod tests {
         );
     }
 
-    // `covers` is what decides whether a frame starts a job, so it has to be exact at
-    // the boundary: a rectangle that only overlaps the baked one is not covered by it,
-    // and treating it as covered would leave unbaked ground on screen.
+    // The decision the editor makes every frame: an open document that is not wholly
+    // baked asks for a bake, unless the last one failed — a document holding a cycle
+    // would otherwise re-discover it every frame and never go idle.
     #[test]
-    fn a_whole_bake_covers_every_rectangle_and_nothing_covers_one_a_rebake_has_not_reached() {
-        assert!(Baked::Whole.covers(rect(0, 4096)));
-        assert!(Baked::Rect(rect(0, 100)).covers(rect(10, 90)));
-        assert!(Baked::Rect(rect(0, 100)).covers(rect(0, 100)));
-        assert!(!Baked::Rect(rect(0, 100)).covers(rect(50, 150)));
-        assert!(!Baked::Nothing.covers(rect(0, 1)));
+    fn a_bake_is_wanted_only_for_an_open_unbaked_document_that_did_not_just_fail() {
+        assert!(wants_bake(false, Baked::Nothing, true));
+        assert!(!wants_bake(false, Baked::Whole, true));
+        assert!(!wants_bake(true, Baked::Nothing, true));
+        assert!(!wants_bake(false, Baked::Nothing, false));
     }
 
-    // An empty rectangle is covered by anything, including a document with no bake at
-    // all — which is what lets a camera that is nowhere near the document leave a
-    // pending edit answered rather than waiting for a bake with nothing to show.
-    #[test]
-    fn an_empty_rectangle_is_covered_by_a_document_with_no_bake() {
-        assert!(Baked::Nothing.covers(CellRect::EMPTY));
-        assert!(Baked::Rect(rect(0, 10)).covers(CellRect::EMPTY));
-    }
-
-    // Rect re-bakes accumulate, so panning across a document gradually makes the whole
-    // of it solvable again. The last two cases pin the absorbing and identity ends: a
-    // whole bake swallows any extent, and a job that baked nothing — a save, a solve —
-    // leaves the extent where it was.
-    #[test]
-    fn rebaked_rectangles_accumulate_and_a_whole_bake_swallows_them() {
-        let grown = Baked::Nothing
-            .with(Baked::Rect(rect(0, 10)))
-            .with(Baked::Rect(rect(20, 30)));
-        assert_eq!(grown, Baked::Rect(rect(0, 30)));
-        assert!(grown.covers(rect(5, 25)));
-
-        assert_eq!(grown.with(Baked::Whole), Baked::Whole);
-        assert_eq!(grown.with(Baked::Nothing), grown);
-    }
-
-    // The decision the editor makes every frame. The last case is the half that is not
-    // about editing at all: panning onto ground no bake has reached asks for a job with
-    // nothing dirty, which is what keeps the picture whole as the camera moves.
-    #[test]
-    fn an_edit_asks_for_the_view_and_a_covered_view_asks_for_nothing() {
-        let view = rect(100, 200);
-        let asked = wanted_rebake(false, Baked::Nothing, view).expect("an edit is answered");
-        assert!(
-            asked.union(view) == asked,
-            "the rebake has to cover what is on screen"
-        );
-
-        assert_eq!(wanted_rebake(false, Baked::Whole, view), None);
-        assert_eq!(wanted_rebake(false, Baked::Rect(rect(0, 300)), view), None);
-        assert!(wanted_rebake(false, Baked::Rect(rect(0, 150)), view).is_some());
-    }
-
-    // The defect this guards cost a hang rather than a wrong picture: a stack holding a
-    // cycle failed, was retried the next frame, and the document never went idle for the
-    // caller waiting on the edit that introduced it.
-    #[test]
-    fn a_stack_that_will_not_bake_is_not_tried_again_until_something_changes() {
-        let view = rect(100, 200);
-        assert_eq!(wanted_rebake(true, Baked::Nothing, view), None);
-    }
-
-    // A camera pointed away from the document leaves an empty view, and asking for a
-    // bake of nothing would start a job every frame that never made the document any
-    // less dirty.
-    #[test]
-    fn a_view_that_holds_no_cells_asks_for_no_rebake() {
-        assert_eq!(wanted_rebake(false, Baked::Nothing, CellRect::EMPTY), None);
-    }
-
-    // A rectangle re-bake lands every time the view pans, so a fault that has not
-    // changed has to reach the log once rather than once per bake that lands.
+    // A bake lands after every edit, so a fault that has not changed has to reach the
+    // log once rather than once per bake that lands.
     #[test]
     fn a_field_fault_that_has_not_changed_is_logged_once() {
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::shader::ShaderLayer;
-        use crate::terrain::{Field, TerrainSpec};
-        let mut shader = ShaderLayer::new("lost.wgsl");
-        shader.layers = vec![watershed::FieldId::from("nowhere")];
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("height").with_op(NodeOp::Shader(shader))),
+                .with_field(Field::new("height").reading(&["nowhere"])),
         );
         let first = document.unlogged_faults();
         assert_eq!(first.len(), 1, "{first:?}");

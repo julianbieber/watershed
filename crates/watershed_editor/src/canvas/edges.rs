@@ -1,74 +1,23 @@
-//! The curve between two pins, and the ribbon it is drawn as.
+//! The curve between two field cards, and the ribbon it is drawn as.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 
-use super::{CanvasCameraTag, NodeCard, NodeEdge, input_offset, output_offset};
-
 /// How thick an edge is on screen, in pixels, at every zoom.
 pub(super) const EDGE_PIXELS: f32 = 3.0;
-/// How many points the curve is sampled at before it is made into a ribbon.
 const EDGE_SAMPLES: usize = 48;
-/// The least an edge's control points are pushed out along x, so two edges into one
-/// card stay apart even when the cards nearly touch.
 const MIN_REACH: f32 = 70.0;
 
-/// Rebuilds each edge's ribbon from the pins it joins.
-///
-/// Only the edges that moved, and every edge when the zoom changed — the half-width is
-/// in screen pixels, so it depends on the camera's scale. Rebuilding all of them every
-/// frame would replace every mesh asset and re-upload every buffer while nothing moved.
-pub fn route_edges(
-    camera: Option<Single<&Projection, With<CanvasCameraTag>>>,
-    edges: Query<(&NodeEdge, &Mesh2d)>,
-    cards: Query<(&NodeCard, &Transform)>,
-    moved: Query<(), (With<NodeCard>, Changed<Transform>)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut applied: Local<Option<f32>>,
-) {
-    let Some(camera) = camera else {
-        return;
-    };
-    let Projection::Orthographic(ortho) = camera.into_inner() else {
-        return;
-    };
-    let zoomed = *applied != Some(ortho.scale);
-    if zoomed {
-        *applied = Some(ortho.scale);
-    }
-    if !zoomed && moved.is_empty() {
-        return;
-    }
-    let half_width = EDGE_PIXELS * 0.5 * ortho.scale;
-
-    for (edge, handle) in &edges {
-        let (Ok((from, from_at)), Ok((to, to_at))) = (cards.get(edge.from), cards.get(edge.to))
-        else {
-            continue;
-        };
-        let start = from_at.translation.truncate() + output_offset(from);
-        let end = to_at.translation.truncate() + input_offset(to, edge.pin);
-        if let Some(mut mesh) = meshes.get_mut(&handle.0) {
-            *mesh = ribbon_between(start, end, half_width);
-        }
-    }
-}
-
-/// The mesh an edge between two canvas points is drawn as, `half_width` canvas units
+/// The mesh a ribbon between two canvas points is drawn as, `half_width` canvas units
 /// either side of the curve joining them.
 ///
-/// The one shape an edge has, whether it joins two pins of a node graph or two field
-/// cards of the overview.
+/// The curve leaves `start` and arrives at `end` sideways, so a ribbon meets the
+/// right edge of the card it leaves and the left edge of the card it reaches square on.
 pub(super) fn ribbon_between(start: Vec2, end: Vec2, half_width: f32) -> Mesh {
     ribbon(&curve(start, end), half_width)
 }
 
-/// A cubic bezier from an output pin to an input pin, sampled.
-///
-/// The control points are pushed out along x by half the horizontal gap, so an edge
-/// leaves a card sideways rather than diagonally and two edges into one card stay
-/// apart.
 fn curve(start: Vec2, end: Vec2) -> Vec<Vec2> {
     let reach = ((end.x - start.x).abs() * 0.5).max(MIN_REACH);
     let first = start + Vec2::X * reach;
@@ -85,7 +34,7 @@ fn curve(start: Vec2, end: Vec2) -> Vec<Vec2> {
         .collect()
 }
 
-/// An empty ribbon, which is what an edge is spawned holding until it is first routed.
+/// An empty ribbon, which is what a ribbon is spawned holding until it is first routed.
 pub fn blank_ribbon() -> Mesh {
     Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -96,11 +45,6 @@ pub fn blank_ribbon() -> Mesh {
     .with_inserted_indices(Indices::U32(Vec::new()))
 }
 
-/// A strip of triangles `half_width` either side of the sampled curve.
-///
-/// The vertices are in canvas space under an identity transform, so the bounds the
-/// engine would compute for it are not the bounds it occupies — which is why an edge
-/// is drawn without frustum culling.
 fn ribbon(points: &[Vec2], half_width: f32) -> Mesh {
     if points.len() < 2 {
         return blank_ribbon();
@@ -141,8 +85,8 @@ fn ribbon(points: &[Vec2], half_width: f32) -> Mesh {
 mod tests {
     use super::*;
 
-    // Both ends have to land exactly on the pins the edge joins, or a wire and the card
-    // it leaves separate visibly at the one place a person is looking.
+    // Both ends have to land exactly on the card edges the ribbon joins, or a ribbon and
+    // the card it leaves separate visibly at the one place a person is looking.
     #[test]
     fn a_curve_starts_and_ends_on_the_points_it_joins() {
         let start = Vec2::new(-40.0, 12.0);
@@ -167,8 +111,8 @@ mod tests {
         assert!(indices.iter().all(|index| (*index as usize) < positions));
     }
 
-    // A degenerate edge reaches this whenever a card is dropped onto the one it reads,
-    // and a mesh with one vertex and no indices is what keeps it from panicking.
+    // One point has no span to widen, and a mesh with no vertices and no indices is
+    // what keeps a degenerate sampling from panicking.
     #[test]
     fn a_ribbon_of_one_point_is_empty_rather_than_a_panic() {
         let mesh = ribbon(&[Vec2::ZERO], 1.5);

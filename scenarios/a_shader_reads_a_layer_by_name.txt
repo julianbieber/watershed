@@ -1,7 +1,6 @@
 # Read another field from a shader by naming it in the file, from outside the process:
-# `ridges`' `height` is one shader node whose file binds `base` with `// @layer base`,
-# and the read is reported by `observe nodes`, `observe shaders` and `observe fields`
-# with no reference node in the graph.
+# `ridges`' `height` is the file `height.wgsl`, which binds `base` with
+# `// @layer base`, and the read is reported by `observe shaders` and `observe fields`.
 #
 # Run with:  just drive run scenarios/a_shader_reads_a_layer_by_name.txt
 #
@@ -16,11 +15,8 @@ fixed-delta 1/60
 new 256 256 7 ridges
 wait bake
 
-# `height` is one shader node on `mountains_over_base.wgsl`, and no node is a `fieldref`.
-observe nodes
-
-# Per file, the layers it reads by name: `mountains_over_base.wgsl` reads `base` at
-# binding 3, and no other file reads one.
+# Per file, the layers it reads by name: `height.wgsl` reads `base` at binding 3, and
+# no other file reads one.
 observe shaders
 
 # `height` reads `base`, so `base` is baked before it, and no field carries a fault.

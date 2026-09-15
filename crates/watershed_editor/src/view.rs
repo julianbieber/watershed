@@ -154,7 +154,7 @@ impl FreeView {
 
 #[derive(Component)]
 struct MapRevisions {
-    field: Option<(u64, u64)>,
+    field: Option<u64>,
     water: Option<u64>,
 }
 
@@ -218,7 +218,6 @@ fn spawn_view(
 
 fn sync_maps(
     document: Res<Document>,
-    solo: Res<crate::canvas::Solo>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FieldMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -239,13 +238,13 @@ fn sync_maps(
         material.settings.contour_interval = field.contour_interval;
     }
 
-    if revisions.field != Some((document.revision(), solo.generation)) {
-        revisions.field = Some((document.revision(), solo.generation));
+    if revisions.field != Some(document.revision()) {
+        revisions.field = Some(document.revision());
 
         let Some(field) = terrain.field(document.active()) else {
             return;
         };
-        let baked = solo.raster.as_ref().unwrap_or(field.baked());
+        let baked = field.baked();
 
         if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
             *mesh = Rectangle::new(terrain.size.x as f32, terrain.size.y as f32).into();

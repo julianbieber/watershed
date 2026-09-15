@@ -1,5 +1,3 @@
-// @shader Continents
-
 struct Params {
     // @group Land
     land_scale: f32,   // @ui "Land scale" 0.0015 [0.0002, 0.02]

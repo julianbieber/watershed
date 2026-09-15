@@ -1,5 +1,5 @@
-//! A node op written as WGSL: the file a node names, the parameters that file
-//! declares, and the values a document carries for them.
+//! A field's shader as the document sees it: the parameters its file declares, the
+//! fields it reads by name, and the values a document carries for them.
 //!
 //! Nothing here touches a GPU. This is the document's half of a shader layer — what
 //! is saved, what the panel is generated from, and what a dispatch is handed — so it
@@ -22,11 +22,10 @@ pub const PARAMS_STRUCT: &str = "Params";
 /// The largest uniform a shader's parameters may pack into.
 pub const MAX_PARAM_BYTES: usize = 1024;
 
-/// The most input textures one shader may declare, which is also the widest a shader
-/// node's pin row can get.
+/// The most layer textures one shader may declare.
 pub const MAX_INPUTS: usize = 8;
 
-/// The lowest binding an input may take: 0, 1 and 2 are the globals, the output and
+/// The lowest binding a layer may take: 0, 1 and 2 are the globals, the output and
 /// the parameters, and a shader that took one of those back would be handed the
 /// wrong buffer.
 pub const FIRST_INPUT_BINDING: u32 = 3;
@@ -454,78 +453,6 @@ fn parse_numbers(line: usize, text: &str) -> Result<Vec<f32>, ParamError> {
         .collect()
 }
 
-/// One input texture a shader declares: a pin on its node, read inside the shader as
-/// a texture of the upstream raster.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShaderInput {
-    /// The variable name the WGSL declaration spells.
-    pub name: String,
-    /// What the pin is called on the card. The variable name unless the annotation
-    /// overrode it.
-    pub label: String,
-    /// The binding the declaration takes, which is the slot a dispatch writes the
-    /// upstream raster into. At least [`FIRST_INPUT_BINDING`].
-    pub binding: u32,
-}
-
-/// The input textures a shader declares, in declaration order — which is pin order,
-/// whatever order the bindings are written in.
-///
-/// An input is a `var` of `texture_2d<f32>` annotated `@in`, at group 0 and a binding
-/// of [`FIRST_INPUT_BINDING`] or above. A line whose code half is empty is a comment
-/// and declares nothing, which is what lets a template carry a commented-out example.
-/// A source declaring no inputs is not a fault.
-///
-/// Fails on the first fault and reports the line it is on.
-pub fn parse_inputs(source: &str) -> Result<Vec<ShaderInput>, ParamError> {
-    let mut inputs: Vec<ShaderInput> = Vec::new();
-    for (index, line) in source.lines().enumerate() {
-        let number = index + 1;
-        let Some((declaration, annotation)) = line.split_once("//") else {
-            continue;
-        };
-        let declaration = declaration.trim();
-        if declaration.is_empty() {
-            continue;
-        }
-        let Some(annotation) = annotation.trim().strip_prefix("@in") else {
-            continue;
-        };
-        let (label, _) = split_label(annotation.trim());
-
-        let input = parse_input_declaration(number, declaration)?;
-        if input.binding < FIRST_INPUT_BINDING {
-            return Err(fault(
-                number,
-                format!(
-                    "binding {} is reserved; an input starts at {FIRST_INPUT_BINDING}",
-                    input.binding
-                ),
-            ));
-        }
-        if inputs.iter().any(|held| held.binding == input.binding) {
-            return Err(fault(
-                number,
-                format!("binding {} is declared twice", input.binding),
-            ));
-        }
-        if inputs.iter().any(|held| held.name == input.name) {
-            return Err(fault(number, format!("`{}` is declared twice", input.name)));
-        }
-        inputs.push(ShaderInput {
-            label: label.unwrap_or_else(|| input.name.clone()),
-            ..input
-        });
-        if inputs.len() > MAX_INPUTS {
-            return Err(fault(
-                number,
-                format!("a shader declares at most {MAX_INPUTS} inputs"),
-            ));
-        }
-    }
-    Ok(inputs)
-}
-
 /// Another field a shader reads by name: a texture binding the dispatch fills with
 /// that field's baked raster, at the field's own shift.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -541,11 +468,9 @@ pub struct LayerRead {
 /// The fields a shader reads by name, in declaration order.
 ///
 /// A layer read is a `var` of `texture_2d<f32>` annotated `@layer <field>`, at group
-/// 0 and a binding of [`FIRST_INPUT_BINDING`] or above — the same declaration an
-/// `@in` input takes. A line whose code half is empty declares nothing. One field may
-/// be named on two bindings; one binding or one variable may not be declared twice,
-/// and an annotation naming no field is a fault. Nothing here checks a binding
-/// against the file's `@in` inputs.
+/// 0 and a binding of [`FIRST_INPUT_BINDING`] or above. A line whose code half is
+/// empty declares nothing. One field may be named on two bindings; one binding or one
+/// variable may not be declared twice, and an annotation naming no field is a fault.
 ///
 /// Fails on the first fault and reports the line it is on.
 pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
@@ -570,29 +495,26 @@ pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
             return Err(fault(number, "`@layer` names no field"));
         }
 
-        let read = parse_input_declaration(number, declaration)?;
-        if read.binding < FIRST_INPUT_BINDING {
+        let (name, binding) = parse_input_declaration(number, declaration)?;
+        if binding < FIRST_INPUT_BINDING {
             return Err(fault(
                 number,
-                format!(
-                    "binding {} is reserved; a layer starts at {FIRST_INPUT_BINDING}",
-                    read.binding
-                ),
+                format!("binding {binding} is reserved; a layer starts at {FIRST_INPUT_BINDING}"),
             ));
         }
-        if layers.iter().any(|held| held.binding == read.binding) {
+        if layers.iter().any(|held| held.binding == binding) {
             return Err(fault(
                 number,
-                format!("binding {} is declared twice", read.binding),
+                format!("binding {binding} is declared twice"),
             ));
         }
-        if layers.iter().any(|held| held.name == read.name) {
-            return Err(fault(number, format!("`{}` is declared twice", read.name)));
+        if layers.iter().any(|held| held.name == name) {
+            return Err(fault(number, format!("`{name}` is declared twice")));
         }
         layers.push(LayerRead {
-            name: read.name,
+            name,
             layer: layer.to_owned(),
-            binding: read.binding,
+            binding,
         });
         if layers.len() > MAX_INPUTS {
             return Err(fault(
@@ -604,46 +526,39 @@ pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
     Ok(layers)
 }
 
-/// How far, in document cells, the file declares it reads around the texel it
-/// writes, or `None` for a file that declares nothing.
+/// The annotations a field's shader used to declare and no longer may, as a fault on
+/// the first line that still declares one.
 ///
-/// The annotation is a line of its own:
-///
-/// ```text
-/// // @reach <cells>
-/// ```
-///
-/// The whole line, trimmed, has to be it — a `// @reach 2` trailing a line of code
-/// declares nothing, and neither does a commented-out `// // @reach 2`, which is
-/// what lets a template carry an example. `<cells>` is a non-negative whole number
-/// of document cells, which is the unit `p` is measured in inside a shader; a
-/// shader offsetting in texels of its own field declares `offset << shift` cells.
-/// The line may sit anywhere in the file.
-///
-/// Declaring it twice is a fault, as is a value that is not a count.
-///
-/// Fails on the first fault and reports the line it is on.
-pub fn parse_reach(source: &str) -> Result<Option<u32>, ParamError> {
-    let mut reach = None;
+/// `@in` is a trailing annotation on a line of code, and `@reach` a line of its own;
+/// a fully commented-out form of either declares nothing. A source declaring neither
+/// is not a fault. The reason names the annotation.
+pub fn parse_retired(source: &str) -> Result<(), ParamError> {
     for (index, line) in source.lines().enumerate() {
         let number = index + 1;
-        let Some(rest) = line.trim().strip_prefix("// @reach") else {
-            continue;
-        };
-        if reach.is_some() {
-            return Err(fault(number, "a reach is declared twice"));
+        if let Some((code, annotation)) = line.split_once("//")
+            && !code.trim().is_empty()
+            && let Some(rest) = annotation.trim().strip_prefix("@in")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('"'))
+        {
+            return Err(fault(
+                number,
+                "`@in` is no longer read; read another field with `@layer <name>`",
+            ));
         }
-        let rest = rest.trim();
-        let cells = rest
-            .parse::<u32>()
-            .map_err(|_| fault(number, format!("`{rest}` is not a count of cells")))?;
-        reach = Some(cells);
+        if let Some(rest) = line.trim().strip_prefix("// @reach")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return Err(fault(
+                number,
+                "`@reach` is no longer read; every bake is whole",
+            ));
+        }
     }
-    Ok(reach)
+    Ok(())
 }
 
-fn parse_input_declaration(line: usize, declaration: &str) -> Result<ShaderInput, ParamError> {
-    let form = "an input is `@group(0) @binding(N) var <name>: texture_2d<f32>;`";
+fn parse_input_declaration(line: usize, declaration: &str) -> Result<(String, u32), ParamError> {
+    let form = "a layer is `@group(0) @binding(N) var <name>: texture_2d<f32>;`";
     let rest = declaration
         .strip_prefix("@group(")
         .ok_or_else(|| fault(line, form))?;
@@ -651,7 +566,7 @@ fn parse_input_declaration(line: usize, declaration: &str) -> Result<ShaderInput
     if group.trim() != "0" {
         return Err(fault(
             line,
-            format!("an input is declared at group 0, not {}", group.trim()),
+            format!("a layer is declared at group 0, not {}", group.trim()),
         ));
     }
     let rest = rest
@@ -682,53 +597,27 @@ fn parse_input_declaration(line: usize, declaration: &str) -> Result<ShaderInput
     if ty != "texture_2d<f32>" {
         return Err(fault(
             line,
-            format!("`{ty}` is not an input type; an input is a `texture_2d<f32>`"),
+            format!("`{ty}` is not a layer type; a layer is a `texture_2d<f32>`"),
         ));
     }
-    Ok(ShaderInput {
-        label: name.clone(),
-        name,
-        binding,
-    })
+    Ok((name, binding))
 }
 
-/// A layer whose values a WGSL shader produces.
+/// The values a field's WGSL shader produces, and what the document carries for it.
 ///
-/// Holds what a document carries — the file, the parameter values and the names of
-/// the inputs its pins stand for — and the raster the last dispatch left. The raster
-/// is derived, so it is not serialized and a loaded document reads the layer as zero
-/// until it has been dispatched.
+/// Holds the parameter values and the fields the file reads by name, and the raster
+/// the last dispatch left. Only the parameter values are serialized: the fields read
+/// are re-read from the file, and the raster is derived, so a loaded document reads
+/// the layer as zero until it has been dispatched.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShaderLayer {
-    /// The file, as a plain name inside the document's `shaders` directory. Never a
-    /// path.
-    pub file: String,
     /// A value per parameter the shader declares, keyed by the name the WGSL struct
     /// spells. A key the shader no longer declares is dropped when the file is
     /// parsed; one it declares that is missing here takes the shader's default.
     pub params: BTreeMap<String, Vec<f32>>,
-    /// The inputs the file declared when it was last read, in pin order. Serialized,
-    /// so a loaded document draws the right number of pins before the file has been
-    /// read and the edges it saved still land on them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inputs: Vec<String>,
     /// The fields the file read by name when it was last read, in declaration order.
-    /// Serialized for the reason `inputs` is: a loaded document orders its bake
-    /// before the shader directory has been read.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub layers: Vec<FieldId>,
-    /// How far, in document cells, the file says this shader reads around the texel
-    /// it writes — the whole of what lets a re-bake stay inside a rectangle. `None`
-    /// is a file that declared nothing, and a node of it with a wired pin re-bakes
-    /// the whole field. Nothing checks the declaration against what the shader
-    /// actually samples: one that reads further than it says leaves stale values
-    /// inside the re-baked rectangle.
-    ///
-    /// Derived from the file rather than authored here, so it is not serialized: a
-    /// loaded document re-bakes whole until the shader directory has been read,
-    /// which is the conservative answer and costs one sweep.
     #[serde(skip)]
-    pub reach: Option<u32>,
+    pub layers: Vec<FieldId>,
     #[serde(skip)]
     values: Raster<f32>,
     #[serde(skip)]
@@ -736,21 +625,7 @@ pub struct ShaderLayer {
 }
 
 impl ShaderLayer {
-    /// A layer naming `file` with no parameter values, so every parameter the shader
-    /// declares takes its default until the file has been parsed.
-    pub fn new(file: impl Into<String>) -> Self {
-        Self {
-            file: file.into(),
-            params: BTreeMap::new(),
-            inputs: Vec::new(),
-            layers: Vec::new(),
-            reach: None,
-            values: Raster::default(),
-            stamp: None,
-        }
-    }
-
-    /// The values from the last dispatch. Empty for a node that has never been
+    /// The values from the last dispatch. Empty for a layer that has never been
     /// resolved or that came from a loaded document, which reads as `0.0`.
     pub fn values(&self) -> &Raster<f32> {
         &self.values
@@ -791,39 +666,11 @@ impl ShaderLayer {
         self.stamp = None;
     }
 
-    /// The layer's parameter values as one line, for a place that has room for a
-    /// line and not for a panel.
-    ///
-    /// With a `layout`, the shader's own declaration order and labels, and a
-    /// parameter the layer carries no value for takes the declared default; a
-    /// [`Widget::Hidden`] parameter is left out, since nothing offers it. Without
-    /// one, whatever values the layer stores, in name order. A vector's components
-    /// are written comma-separated.
-    pub fn params_line(&self, layout: Option<&ParamsLayout>) -> String {
-        let written: Vec<String> = match layout.filter(|held| !held.fields.is_empty()) {
-            Some(layout) => layout
-                .fields
-                .iter()
-                .filter(|field| field.widget != Widget::Hidden)
-                .map(|field| {
-                    let value = self.params.get(&field.name).unwrap_or(&field.default);
-                    format!("{} {}", field.label, components(value))
-                })
-                .collect(),
-            None => self
-                .params
-                .iter()
-                .map(|(name, value)| format!("{name} {}", components(value)))
-                .collect(),
-        };
-        written.join("  ")
-    }
-
     /// Drops every value the layout does not declare and fills in every default it
     /// declares that is missing, which is what a shader edited under a document
     /// leaves behind.
     ///
-    /// Answers whether anything moved, so a caller sweeping every node each frame can
+    /// Answers whether anything moved, so a caller sweeping every field each frame can
     /// tell an edit from a frame in which nothing changed.
     pub fn reconcile(&mut self, layout: &ParamsLayout) -> bool {
         let before = self.params.len();
@@ -837,19 +684,6 @@ impl ShaderLayer {
             }
         }
         moved
-    }
-
-    /// Takes the inputs the file now declares, answering whether the list moved.
-    ///
-    /// `true` means the node's pins no longer match the layer and have to be resized;
-    /// the edges on the pins that survive are the caller's to keep.
-    pub fn reconcile_inputs(&mut self, declared: &[ShaderInput]) -> bool {
-        let names: Vec<String> = declared.iter().map(|input| input.name.clone()).collect();
-        if self.inputs == names {
-            return false;
-        }
-        self.inputs = names;
-        true
     }
 
     /// Takes the fields the file now reads by name, answering whether the list moved.
@@ -866,98 +700,11 @@ impl ShaderLayer {
         self.layers = names;
         true
     }
-
-    /// Takes the reach the file now declares, answering whether it moved.
-    ///
-    /// `true` means a re-bake under this node is bounded differently than it was, so
-    /// a caller sweeping every node each frame has to ask for one.
-    pub fn reconcile_reach(&mut self, declared: Option<u32>) -> bool {
-        if self.reach == declared {
-            return false;
-        }
-        self.reach = declared;
-        true
-    }
-}
-
-fn components(value: &[f32]) -> String {
-    value
-        .iter()
-        .map(|component| number(*component))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn number(value: f32) -> String {
-    if value == value.trunc() && value.is_finite() {
-        return format!("{value:.0}");
-    }
-    let written = format!("{value:.4}");
-    written
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn warped_layout() -> ParamsLayout {
-        parse_params(
-            "struct Params {\n  scale: f32, // @ui 8.0 [0.1, 64.0]\n  octaves: u32, // @ui 4 [1, 8] step 1\n  seed: u32, // @ui hidden\n}\n",
-        )
-        .unwrap()
-    }
-
-    // The line is read the way the shader's panel is read, so it has to follow the
-    // declaration order the panel draws in — a `BTreeMap` would put `octaves` first
-    // and the line would disagree with the panel above it.
-    #[test]
-    fn the_line_follows_declaration_order_and_not_the_name_order() {
-        let layer = ShaderLayer::new("warped.wgsl");
-        let line = layer.params_line(Some(&warped_layout()));
-        assert!(
-            line.find("scale").unwrap() < line.find("octaves").unwrap(),
-            "{line:?} is not in declaration order"
-        );
-    }
-
-    // A hidden parameter is one nothing offers, so putting it on the card would spend
-    // the card's one line on a value a person cannot change.
-    #[test]
-    fn a_hidden_parameter_is_left_off_the_line() {
-        let layer = ShaderLayer::new("warped.wgsl");
-        assert!(!layer.params_line(Some(&warped_layout())).contains("seed"));
-    }
-
-    // A value the layer does not carry takes the shader's declared default, which is
-    // what the dispatch is handed — so the line says what is actually being run.
-    #[test]
-    fn a_missing_value_is_written_as_the_declared_default() {
-        let layer = ShaderLayer::new("warped.wgsl");
-        let line = layer.params_line(Some(&warped_layout()));
-        assert!(line.contains("scale 8"), "{line:?}");
-        assert!(line.contains("octaves 4"), "{line:?}");
-    }
-
-    // A loaded document holds values before its file has been parsed, and the card is
-    // drawn on that frame too: with no layout the line is whatever is stored.
-    #[test]
-    fn a_layer_with_no_layout_still_writes_the_values_it_holds() {
-        let mut layer = ShaderLayer::new("warped.wgsl");
-        layer.params.insert("offset".to_owned(), vec![1.0, 2.0]);
-        assert_eq!(layer.params_line(None), "offset 1,2");
-    }
-
-    // A card is a few characters wide and a warp scale reaches down to 0.0005, so the
-    // written form has to be short without rounding a small value away to nothing.
-    #[test]
-    fn a_number_is_written_short_but_not_rounded_to_nothing() {
-        assert_eq!(number(8.0), "8");
-        assert_eq!(number(0.0005), "0.0005");
-        assert_eq!(number(0.25), "0.25");
-    }
 
     // The common case, and the one every stock shader is written in: a scalar with a
     // default and a range, read into a slider.
@@ -1064,7 +811,7 @@ mod tests {
     fn an_integer_parameter_packs_as_an_integer() {
         let layout =
             parse_params("struct Params {\n  octaves: u32, // @ui 4 [1, 8] step 1\n}\n").unwrap();
-        let mut layer = ShaderLayer::new("octaves.wgsl");
+        let mut layer = ShaderLayer::default();
         layer.reconcile(&layout);
         let bytes = layout.pack(&layer.params);
         assert_eq!(bytes[..4], 4u32.to_le_bytes());
@@ -1095,7 +842,7 @@ mod tests {
             "struct Params {\n  kept: f32, // @ui 1.0 [0.0, 2.0]\n  added: f32, // @ui 7.0 [0.0, 8.0]\n}\n",
         )
         .unwrap();
-        let mut layer = ShaderLayer::new("ridged.wgsl");
+        let mut layer = ShaderLayer::default();
         layer.params.insert("kept".to_owned(), vec![0.5]);
         layer.params.insert("gone".to_owned(), vec![9.0]);
         layer.reconcile(&layout);
@@ -1140,62 +887,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.line, 3);
-    }
-
-    // The declaration an input is written as, and the whole of what a pin is: the
-    // label the card prints and the binding the dispatch writes the raster into.
-    #[test]
-    fn an_input_is_read_with_its_label_and_its_binding() {
-        let inputs =
-            parse_inputs("@group(0) @binding(3) var height: texture_2d<f32>; // @in \"Height\"\n")
-                .unwrap();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].name, "height");
-        assert_eq!(inputs[0].label, "Height");
-        assert_eq!(inputs[0].binding, 3);
-    }
-
-    // The template carries a commented-out example so the acceptance path is
-    // uncommenting one line — which only works if a fully commented line declares
-    // nothing.
-    #[test]
-    fn a_fully_commented_line_declares_no_input() {
-        let inputs =
-            parse_inputs("// @group(0) @binding(3) var height: texture_2d<f32>; // @in\n").unwrap();
-        assert!(inputs.is_empty());
-    }
-
-    // Bindings 0, 1 and 2 are the globals, the output and the parameters. An input
-    // that took one back would be handed the wrong buffer at dispatch.
-    #[test]
-    fn an_input_at_a_reserved_binding_is_a_fault() {
-        let error = parse_inputs("@group(0) @binding(2) var height: texture_2d<f32>; // @in\n")
-            .unwrap_err();
-        assert_eq!(error.line, 1);
-    }
-
-    // Pin order is what a saved edge refers to, so it follows the order the file
-    // declares its inputs in rather than the order of the bindings.
-    #[test]
-    fn pin_order_follows_the_declaration_and_not_the_binding() {
-        let inputs = parse_inputs(
-            "@group(0) @binding(4) var second: texture_2d<f32>; // @in\n@group(0) @binding(3) var first: texture_2d<f32>; // @in\n",
-        )
-        .unwrap();
-        assert_eq!(inputs[0].name, "second");
-        assert_eq!(inputs[1].name, "first");
-    }
-
-    // The layer's pins are resized off this answer, so a list that did not move must
-    // not report that it did — a sweep runs every frame and would never settle.
-    #[test]
-    fn reconciling_inputs_reports_only_a_list_that_moved() {
-        let declared =
-            parse_inputs("@group(0) @binding(3) var a: texture_2d<f32>; // @in\n").unwrap();
-        let mut layer = ShaderLayer::new("blur.wgsl");
-        assert!(layer.reconcile_inputs(&declared));
-        assert_eq!(layer.inputs, vec!["a".to_owned()]);
-        assert!(!layer.reconcile_inputs(&declared));
     }
 
     // The annotation is the whole of a dependency on another field, so the field it
@@ -1250,62 +941,10 @@ mod tests {
     fn reconciling_layers_reports_only_a_list_that_moved() {
         let declared =
             parse_layers("@group(0) @binding(3) var a: texture_2d<f32>; // @layer base\n").unwrap();
-        let mut layer = ShaderLayer::new("reader.wgsl");
+        let mut layer = ShaderLayer::default();
         assert!(layer.reconcile_layers(&declared));
         assert_eq!(layer.layers, vec![FieldId::from("base")]);
         assert!(!layer.reconcile_layers(&declared));
-    }
-
-    // The reach is what bounds a re-bake to a rectangle, and its unit is document
-    // cells — the number read here is the number the halo is widened by.
-    #[test]
-    fn a_declared_reach_reads_as_a_count_of_cells() {
-        assert_eq!(
-            parse_reach("// @reach 2\nfn value() {}\n").unwrap(),
-            Some(2)
-        );
-    }
-
-    // Absent is the answer every shader written before this annotation existed gives,
-    // and it has to mean the whole-field re-bake rather than a reach of zero.
-    #[test]
-    fn a_file_without_the_annotation_declares_no_reach() {
-        assert_eq!(parse_reach("fn value() {}\n").unwrap(), None);
-    }
-
-    // Two declarations leave no way to say which one the bake trusts, so the file is
-    // faulted rather than one of them being picked.
-    #[test]
-    fn a_reach_declared_twice_is_a_fault() {
-        let error = parse_reach("// @reach 2\n// @reach 4\n").unwrap_err();
-        assert_eq!(error.line, 2);
-    }
-
-    // A reach the bake cannot read as a count would otherwise fall back to absent,
-    // silently costing a whole re-bake on a file that meant to declare one.
-    #[test]
-    fn a_reach_that_is_not_a_count_is_a_fault() {
-        assert_eq!(parse_reach("// @reach two\n").unwrap_err().line, 1);
-        assert_eq!(parse_reach("// @reach -1\n").unwrap_err().line, 1);
-        assert_eq!(parse_reach("// @reach\n").unwrap_err().line, 1);
-    }
-
-    // The annotation is the whole line, so a shader may write `// @reach 2` after a
-    // line of code as prose without narrowing anything.
-    #[test]
-    fn a_reach_trailing_a_line_of_code_declares_nothing() {
-        assert_eq!(
-            parse_reach("let at = field_texel(p); // @reach 2\n").unwrap(),
-            None
-        );
-    }
-
-    // The template carries a commented-out example, so the acceptance path is
-    // uncommenting one line — which only works if the commented form declares
-    // nothing.
-    #[test]
-    fn a_commented_out_reach_declares_nothing() {
-        assert_eq!(parse_reach("// // @reach 2\n").unwrap(), None);
     }
 
     // A hidden parameter still occupies its slot in the uniform, so leaving it out of
@@ -1318,5 +957,38 @@ mod tests {
         .unwrap();
         assert_eq!(layout.field("secret").unwrap().offset, 0);
         assert_eq!(layout.field("shown").unwrap().offset, 4);
+    }
+
+    // A file written for a node graph still declares its pins, and a field that
+    // silently ignored one would read zero where the author expected a raster.
+    #[test]
+    fn an_in_annotation_is_a_fault_on_its_line_naming_it() {
+        let error = parse_retired(
+            "fn a() {}\n@group(0) @binding(3) var height: texture_2d<f32>; // @in \"Height\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.reason.contains("@in"), "{}", error.reason);
+    }
+
+    // A reach bounded a rectangle re-bake that no longer exists, so a file still
+    // declaring one is told so rather than left believing it narrows anything.
+    #[test]
+    fn a_reach_annotation_is_a_fault_on_its_line_naming_it() {
+        let error = parse_retired("fn a() {}\n\n  // @reach 2\n").unwrap_err();
+        assert_eq!(error.line, 3);
+        assert!(error.reason.contains("@reach"), "{}", error.reason);
+    }
+
+    // The template may still carry commented-out examples, which must not fault
+    // every file copied from it.
+    #[test]
+    fn a_commented_out_retired_annotation_declares_nothing() {
+        assert!(
+            parse_retired(
+                "// // @reach 2\n// @group(0) @binding(3) var height: texture_2d<f32>; // @in\n"
+            )
+            .is_ok()
+        );
     }
 }

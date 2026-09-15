@@ -1,17 +1,14 @@
 //! The editor's whole vocabulary for naming and changing a document: the paths that
-//! address a field, a node and a property, the words every enum is spelled with, and
-//! the edits themselves.
+//! address a field and a property, the words every enum is spelled with, and the
+//! edits themselves.
 //!
 //! The panel and the control client both go through here rather than each writing
-//! their own. Two spellings of "multiply" would be two things to keep in step, and a
-//! path that worked from one and not the other would make the two disagree about what
-//! a document even contains.
+//! their own. Two spellings of one property would be two things to keep in step, and
+//! a path that worked from one and not the other would make the two disagree about
+//! what a document even contains.
 
-use crate::terrain::graph::{FieldGraph, NodeId, NodeOp};
-use crate::terrain::shader::ShaderLayer;
 use crate::terrain::{Field, TerrainSpec};
 use serde_json::{Value, json};
-use watershed::FieldId;
 use watershed::FieldRole;
 
 /// The place in a document a change writes, for deciding whether a later change
@@ -23,26 +20,22 @@ use watershed::FieldRole;
 /// particular is [`Slot::Once`] and is never dropped for another.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Slot {
-    /// Writes nothing a later change can make pointless — a node added, an edge
-    /// wired, a node removed. Never dropped, however many pile up.
+    /// Writes nothing a later change can make pointless — a field added or removed.
+    /// Never dropped, however many pile up.
     Once,
-    /// Writes the property at this dotted path: the one [`Edit::Set`] names, or one
-    /// built in the same shape for a change that always writes the same property of a
-    /// node.
+    /// Writes the property at this dotted path: the one [`Edit::Set`] names.
     Path(String),
     /// Writes a control in the field panel, named by the property it edits rather
     /// than by a path, because a panel binding does not build one.
     Control {
         /// What the control edits, distinct per binding.
         property: &'static str,
-        /// The node it belongs to, or `None` for a field-level control.
-        node: Option<NodeId>,
         /// Which of a property's several numbers, or `[0, 0]` when it has one.
         index: [usize; 2],
     },
 }
 
-/// A structural change to a document, as a value rather than a method.
+/// A change to a document, as a value rather than a method.
 ///
 /// Being a value is the point: a button builds one and a socket parses one, and both
 /// then take the identical path through [`Edit::apply`]. Neither side can acquire a
@@ -50,105 +43,23 @@ pub enum Slot {
 /// could not have.
 #[derive(Clone)]
 pub enum Edit {
-    /// Adds an unconnected node to a field's graph.
-    AddNode {
-        /// Field to add to. Must exist.
-        field: String,
-        /// What the node produces.
-        op: NodeOp,
-        /// Where its card sits on the canvas, or `None` to put it somewhere free —
-        /// which is what a caller that is not pointing at the canvas means.
-        position: Option<[f32; 2]>,
-    },
-    /// Takes a node out along with every edge touching it.
-    RemoveNode {
-        /// Field to remove from. Must exist.
-        field: String,
-        /// The node, as `n<id>` or its name.
-        node: String,
-    },
-    /// Writes one input pin, replacing whatever was on it.
-    Connect {
-        /// Field the two nodes are in. Must exist.
-        field: String,
-        /// The node the value comes from.
-        from: String,
-        /// The node it is written into.
-        to: String,
-        /// Which of that node's input pins.
-        pin: usize,
-    },
-    /// Clears one input pin, which then reads `0.0`.
-    Disconnect {
-        /// Field the node is in. Must exist.
-        field: String,
-        /// The node whose pin is cleared.
-        node: String,
-        /// Which pin.
-        pin: usize,
-    },
-    /// Sets or flips whether a node is bypassed.
-    Bypass {
-        /// Field the node is in. Must exist.
-        field: String,
-        /// The node.
-        node: String,
-        /// The state to set, or `None` to flip whatever it is.
-        bypassed: Option<bool>,
-    },
-    /// Writes a node's canvas position and nothing else, so it never re-bakes.
-    PlaceNode {
-        /// Field the node is in. Must exist.
-        field: String,
-        /// The node.
-        node: String,
-        /// Where to put it.
-        position: [f32; 2],
-    },
-    /// Names a node, or clears its name.
-    RenameNode {
-        /// Field the node is in. Must exist.
-        field: String,
-        /// The node.
-        node: String,
-        /// The new name, or `None` to clear it.
-        name: Option<String>,
-    },
-    /// Names the node the field's value is read from.
-    SetOutput {
-        /// Field to write. Must exist.
-        field: String,
-        /// The node, or `None` for no output — refused while the field has any node,
-        /// since only a field with no nodes is left without one.
-        node: Option<String>,
-    },
-    /// Adds an empty field to the document and leaves every other field alone.
+    /// Adds a field with no parameter values to the document and leaves every other
+    /// field alone. A file operation: see [`Edit::is_file_operation`].
     AddField {
-        /// The name the field is addressed by. Surrounding whitespace is trimmed.
-        /// Refused when what is left is blank, or when the document already has a
-        /// field of that name.
+        /// The name the field is addressed by. Surrounding whitespace is trimmed, and
+        /// what is left is refused by [`check_add`].
         name: String,
     },
-    /// Renames a field and rewrites everything that named the old name: every
-    /// [`NodeOp::FieldRef`] in the document, and the water spec's height or moisture
-    /// field.
-    RenameField {
-        /// The field to rename. Must exist. Surrounding whitespace is trimmed.
-        from: String,
-        /// What to call it. Trimmed too; refused when what is left is blank, or when
-        /// the document already has a field of that name.
-        to: String,
-    },
-    /// Takes a field out of the document, with its graph and its bake.
+    /// Takes a field out of the document, with its bake. A file operation: see
+    /// [`Edit::is_file_operation`].
     RemoveField {
-        /// The field to remove. Must exist, must be declared read by no other field,
-        /// and must not be named by the water spec.
+        /// The field to remove. Refused by [`check_remove`].
         name: String,
     },
     /// Writes one property, named by a dotted path. See the module's grammar.
     Set {
-        /// `field.property`, or `field.node.property`, where node is `n<id>` or the
-        /// node's name.
+        /// `field.property`, where property is a field setting or a parameter the
+        /// field's shader declares.
         path: String,
         /// The value, as words. Most properties take one; a range, or a shader
         /// parameter with several components, takes several.
@@ -157,184 +68,60 @@ pub enum Edit {
 }
 
 impl Edit {
-    /// The place this edit writes, for [`Slot`]'s purpose.
-    ///
-    /// Only the edits that write one place over and over name it: a property, a card's
-    /// position, a node's name. Everything else is [`Slot::Once`], so two of them held
-    /// together both land.
+    /// The place this edit writes, for [`Slot`]'s purpose: a `Set` names its path, and
+    /// everything else is [`Slot::Once`], so two of them held together both land.
     pub fn slot(&self) -> Slot {
         match self {
             Self::Set { path, .. } => Slot::Path(path.clone()),
-            Self::PlaceNode { field, node, .. } => Slot::Path(format!("{field}.{node}.position")),
-            Self::RenameNode { field, node, .. } => Slot::Path(format!("{field}.{node}.name")),
             _ => Slot::Once,
         }
     }
 
     /// Whether what this edit changes is read by a bake.
     ///
-    /// A node's position and its name are authoring data: they are written to the
-    /// document and saved with it, but nothing that evaluates a texel reads either. An
-    /// edit that touches only those must not make the bake stale, or dragging a card
-    /// would throw away the whole field — and the solved water with it.
-    ///
-    /// A field's display properties are the same kind of thing: they say how the map
-    /// draws the field, not what the field holds, so a `Set` on one of them is exempt
-    /// too. An overlay added later adds its properties to that list rather than
-    /// replacing it.
-    ///
-    /// A field that has just been added is exempt for a different reason: it holds no
-    /// raster and nothing reads it, so no texel of any field already baked changes
-    /// value. Were it not exempt, adding a field would discard every bake in the
-    /// document.
-    ///
-    /// A rename changes no value either, and is still not exempt.
-    /// [`Snapshot::restore`](crate::history::Snapshot::restore) matches a held field to
-    /// the live document by name, so undoing a rename puts the field back under its old
-    /// name with no bake to give it; the document has to be re-baked from both sides of
-    /// the change for that field to hold values again. A removal has the same hole.
+    /// A field's display properties say how the map draws the field, not what the
+    /// field holds, so a `Set` on one of them is exempt. An overlay added later adds
+    /// its properties to that list rather than replacing it. Every other edit reaches
+    /// the bake.
     pub fn reaches_the_bake(&self) -> bool {
         match self {
-            Self::PlaceNode { .. } | Self::RenameNode { .. } | Self::AddField { .. } => false,
             Self::Set { path, .. } => !is_display_property(path),
             _ => true,
         }
     }
 
+    /// Whether this edit adds or removes a field, which is a file in the document's
+    /// shader directory as well as an entry in the terrain.
+    ///
+    /// Applying one here changes only the terrain; the file is
+    /// [`Document::apply`](crate::document::Document::apply)'s to write or delete, and
+    /// neither is recorded in the history.
+    pub fn is_file_operation(&self) -> bool {
+        matches!(self, Self::AddField { .. } | Self::RemoveField { .. })
+    }
+
     /// Applies the edit and describes what it did, as the reply the control client
     /// sends back.
     ///
-    /// Refused, with a message fit to show, if the edit names a field or a node the
-    /// document does not have, a value it cannot read, or an edge that would close a
-    /// cycle. A refusal leaves the document exactly as it was.
+    /// Refused, with a message fit to show, if the edit names a field or a property
+    /// the document does not have, or a value it cannot read. A refusal leaves the
+    /// document exactly as it was.
     ///
     /// Nothing here notices that the bake is now stale — that is
     /// [`Document::apply`](crate::document::Document::apply)'s job, and why edits go
     /// through the document rather than through the terrain directly.
     pub fn apply(&self, terrain: &mut TerrainSpec) -> Result<Value, String> {
         match self {
-            Self::AddNode {
-                field,
-                op,
-                position,
-            } => {
-                let name = op_name(op);
-                if let Some(referenced) = op.dependency() {
-                    check_field_ref(terrain, field, referenced)?;
-                }
-                let field = field_mut(terrain, field)?;
-                let at = position.unwrap_or_else(|| field.graph.free_position());
-                let id = field.graph.add_node(op.clone(), at);
-                Ok(json!({
-                    "added": name,
-                    "node": node_path(id),
-                    "nodes": field.graph.nodes.len(),
-                }))
-            }
-
-            Self::RemoveNode { field: name, node } => {
-                let field = field_mut(terrain, name)?;
-                let id = node_id(&field.graph, node)?;
-                let removed = op_name(&field.graph.node(id).expect("resolved above").op);
-                field.graph.remove_node(id).map_err(refusal)?;
-                if field.graph.nodes.is_empty() {
-                    tracing::warn!(
-                        "`{name}` has no nodes left, so it has no output and bakes zero"
-                    );
-                }
-                Ok(json!({
-                    "removed": removed,
-                    "nodes": field.graph.nodes.len(),
-                    "output": field.graph.output.map(node_path),
-                }))
-            }
-
-            Self::Connect {
-                field,
-                from,
-                to,
-                pin,
-            } => {
-                let field = field_mut(terrain, field)?;
-                let from = node_id(&field.graph, from)?;
-                let to = node_id(&field.graph, to)?;
-                let follows =
-                    field.graph.output == Some(from) && field.graph.readers(to).next().is_none();
-                field.graph.connect(from, to, *pin).map_err(refusal)?;
-                if follows {
-                    field.graph.set_output(Some(to)).map_err(refusal)?;
-                }
-                Ok(json!({
-                    "from": node_path(from),
-                    "to": node_path(to),
-                    "pin": pin,
-                    "output": field.graph.output.map(node_path),
-                }))
-            }
-
-            Self::Disconnect { field, node, pin } => {
-                let field = field_mut(terrain, field)?;
-                let id = node_id(&field.graph, node)?;
-                field.graph.disconnect(id, *pin).map_err(refusal)?;
-                Ok(json!({ "node": node_path(id), "pin": pin }))
-            }
-
-            Self::Bypass {
-                field,
-                node,
-                bypassed,
-            } => {
-                let field = field_mut(terrain, field)?;
-                let id = node_id(&field.graph, node)?;
-                let now = bypassed
-                    .unwrap_or_else(|| !field.graph.node(id).expect("resolved above").bypassed);
-                field.graph.set_bypassed(id, now).map_err(refusal)?;
-                Ok(json!({ "node": node_path(id), "bypassed": now }))
-            }
-
-            Self::PlaceNode {
-                field,
-                node,
-                position,
-            } => {
-                let field = field_mut(terrain, field)?;
-                let id = node_id(&field.graph, node)?;
-                field.graph.place(id, *position).map_err(refusal)?;
-                Ok(json!({ "node": node_path(id), "position": position }))
-            }
-
-            Self::RenameNode { field, node, name } => {
-                let field = field_mut(terrain, field)?;
-                let id = node_id(&field.graph, node)?;
-                field.graph.rename(id, name.clone()).map_err(refusal)?;
-                Ok(json!({ "node": node_path(id), "name": name }))
-            }
-
-            Self::SetOutput { field, node } => {
-                let field = field_mut(terrain, field)?;
-                let id = match node {
-                    Some(node) => Some(node_id(&field.graph, node)?),
-                    None => None,
-                };
-                write_output(&mut field.graph, id)
-            }
-
             Self::AddField { name } => {
-                let name = name.trim();
-                if name.is_empty() {
-                    return Err("a field needs a name".to_owned());
-                }
-                if terrain.field(name).is_some() {
-                    return Err(format!("this document already has a field named `{name}`"));
-                }
-                terrain.fields.push(Field::new(name));
+                let name = check_add(terrain, name)?;
+                terrain.fields.push(Field::new(name.as_str()));
                 Ok(json!({ "added": name, "fields": terrain.fields.len() }))
             }
-
-            Self::RenameField { from, to } => rename_field(terrain, from.trim(), to.trim()),
-
-            Self::RemoveField { name } => remove_field(terrain, name.trim()),
-
+            Self::RemoveField { name } => {
+                let name = check_remove(terrain, name)?;
+                terrain.fields.retain(|field| field.id.as_str() != name);
+                Ok(json!({ "removed": name, "fields": terrain.fields.len() }))
+            }
             Self::Set { path, words } => set(terrain, path, words),
         }
     }
@@ -342,59 +129,19 @@ impl Edit {
     /// The field this edit leaves on screen, or `None` for an edit that leaves the
     /// view where it was.
     ///
-    /// [`Document::apply`](crate::document::Document::apply) reads this and puts the
-    /// field on screen as part of the same change, so undoing the edit puts the
-    /// previously shown field back in the same step.
-    ///
     /// `terrain` is the document *after* the edit applied and `active` the field that
-    /// was on screen before it. A rename and a removal answer only when it was the
-    /// shown field they changed; a removal then answers the first field left in the
-    /// document, and `None` when none is left.
+    /// was on screen before it. A removal answers only when it was the shown field it
+    /// removed, and then answers the first field left in the document, or `None` when
+    /// none is left.
     pub fn shows(&self, terrain: &TerrainSpec, active: &str) -> Option<String> {
         match self {
             Self::AddField { name } => Some(name.trim().to_owned()),
-            Self::RenameField { from, to } => (active == from.trim()).then(|| to.trim().to_owned()),
             Self::RemoveField { name } => (active == name.trim())
                 .then(|| terrain.fields.first().map(|field| field.id.to_string()))
                 .flatten(),
-            _ => None,
+            Self::Set { .. } => None,
         }
     }
-}
-
-fn refusal(error: crate::terrain::graph::GraphError) -> String {
-    error.to_string()
-}
-
-/// How a control path names this node when it has no name of its own.
-pub fn node_path(id: NodeId) -> String {
-    format!("n{}", id.0)
-}
-
-/// The node id a word spelled by [`node_path`] stands for.
-///
-/// Answers `None` for anything else, a node's own name included, and does not ask whether
-/// any graph holds that id.
-pub fn node_of_path(word: &str) -> Option<NodeId> {
-    word.strip_prefix('n')?.parse().ok().map(NodeId)
-}
-
-fn node_id(graph: &FieldGraph, word: &str) -> Result<NodeId, String> {
-    if let Some(digits) = word.strip_prefix('n')
-        && let Ok(value) = digits.parse::<u32>()
-    {
-        let id = NodeId(value);
-        return match graph.node(id) {
-            Some(_) => Ok(id),
-            None => Err(format!("this field has no node `{word}`")),
-        };
-    }
-    graph
-        .nodes
-        .iter()
-        .find(|node| node.name.as_deref() == Some(word))
-        .map(|node| node.id)
-        .ok_or_else(|| format!("this field has no node called `{word}`"))
 }
 
 fn field_mut<'a>(terrain: &'a mut TerrainSpec, name: &str) -> Result<&'a mut Field, String> {
@@ -403,151 +150,33 @@ fn field_mut<'a>(terrain: &'a mut TerrainSpec, name: &str) -> Result<&'a mut Fie
         .ok_or_else(|| format!("no field named `{name}`"))
 }
 
-/// Refuses a `FieldRef` in `owner`'s graph that names `referenced`, when the document
-/// has no such field or when reading it would make the fields read each other in a
-/// circle.
+/// The trimmed name a field may be added under, or why it may not.
 ///
-/// Every path that writes a reference's field name goes through here — the `node` and
-/// `set` verbs, the panel's op menu, the panel's add row — so a cycle or a dangling
-/// name cannot reach a bake from an edit made in the editor. A cycle is reported as the
-/// chain `owner -> ... -> owner`, the spelling
-/// [`PlanError::Cycle`](crate::terrain::bake::PlanError::Cycle) uses. A document loaded
-/// with a cycle already in it is not this function's business and still fails at the
-/// bake.
-pub fn check_field_ref(
-    terrain: &TerrainSpec,
-    owner: &str,
-    referenced: &FieldId,
-) -> Result<(), String> {
-    if terrain.field(referenced.as_str()).is_none() {
-        return Err(format!(
-            "field `{referenced}`, read by `{owner}`, is not in the document"
-        ));
-    }
-    let Some(chain) = field_cycle(terrain, owner, referenced) else {
-        return Ok(());
-    };
-    let chain = std::iter::once(owner.to_owned())
-        .chain(chain)
-        .collect::<Vec<_>>()
-        .join(" -> ");
-    Err(format!(
-        "reading `{referenced}` from `{owner}` makes the fields depend on each other in a cycle: {chain}"
-    ))
-}
-
-fn field_cycle(terrain: &TerrainSpec, owner: &str, referenced: &FieldId) -> Option<Vec<String>> {
-    let mut seen = Vec::new();
-    let mut path = Vec::new();
-    reaches(terrain, owner, referenced.as_str(), &mut seen, &mut path).then_some(path)
-}
-
-fn reaches(
-    terrain: &TerrainSpec,
-    owner: &str,
-    current: &str,
-    seen: &mut Vec<String>,
-    path: &mut Vec<String>,
-) -> bool {
-    if seen.iter().any(|name| name == current) {
-        return false;
-    }
-    seen.push(current.to_owned());
-    path.push(current.to_owned());
-    if current == owner {
-        return true;
-    }
-    if let Some(field) = terrain.field(current) {
-        for read in field.declared_reads() {
-            if reaches(terrain, owner, read.as_str(), seen, path) {
-                return true;
-            }
-        }
-    }
-    path.pop();
-    false
-}
-
-/// The fields that declare a read of `name`, in declaration order, each named once.
-///
-/// The same relation [`check_field_ref`] walks, read from the other end. A reference
-/// under a bypassed node does not count, which is the rule
-/// [`Field::declared_reads`](crate::terrain::Field::declared_reads) already applies.
-/// The answer is derived from the document on every call rather than cached, so it
-/// cannot fall out of step with an edit.
-pub fn readers_of(terrain: &TerrainSpec, name: &str) -> Vec<String> {
-    terrain
-        .fields
-        .iter()
-        .filter(|field| field.id.as_str() != name)
-        .filter(|field| field.declared_reads().any(|id| id.as_str() == name))
-        .map(|field| field.id.to_string())
-        .collect()
-}
-
-/// The fields `field` declares a read of, in declaration order, each named once.
-///
-/// [`readers_of`] read from the other end, and the two answer about one relation: a
-/// field's own name is never in the list, and a bypassed node contributes nothing,
-/// because [`Field::declared_reads`](crate::terrain::Field::declared_reads) already
-/// leaves it out. Duplicates are dropped keeping the first occurrence — a graph may
-/// name the same field from several nodes, and a caller listing what a field reads
-/// wants the field once.
-pub fn reads_of(field: &Field) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for read in field.declared_reads() {
-        if read.as_str() == field.id.as_str() {
-            continue;
-        }
-        if !names.iter().any(|seen| seen == read.as_str()) {
-            names.push(read.to_string());
-        }
-    }
-    names
-}
-
-fn rename_field(terrain: &mut TerrainSpec, from: &str, to: &str) -> Result<Value, String> {
-    if to.is_empty() {
+/// Refused when the name is blank, already taken by a field of the document, or
+/// could not stand as the stem of a shader file that is read back as the same field:
+/// one containing `/` or `\`, or starting with `.` or `_`.
+pub fn check_add(terrain: &TerrainSpec, name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
         return Err("a field needs a name".to_owned());
     }
-    if terrain.field(from).is_none() {
-        return Err(format!("no field named `{from}`"));
+    if name.contains(['/', '\\']) || name.starts_with(['.', '_']) {
+        return Err(format!(
+            "`{name}` cannot name a shader file: no `/` or `\\`, and no leading `.` or `_`"
+        ));
     }
-    if terrain.field(to).is_some() {
-        return Err(format!("this document already has a field named `{to}`"));
+    if terrain.field(name).is_some() {
+        return Err(format!("this document already has a field named `{name}`"));
     }
-
-    let mut references = 0usize;
-    for field in &mut terrain.fields {
-        if field.id.as_str() == from {
-            field.id = FieldId::from(to);
-        }
-        for node in &mut field.graph.nodes {
-            if let NodeOp::FieldRef(id) = &mut node.op
-                && id.as_str() == from
-            {
-                *id = FieldId::from(to);
-                references += 1;
-            }
-        }
-    }
-
-    let mut water = false;
-    if let Some(spec) = &mut terrain.water_spec {
-        if spec.height.as_str() == from {
-            spec.height = FieldId::from(to);
-            water = true;
-        }
-        if spec.moisture.as_ref().is_some_and(|id| id.as_str() == from) {
-            spec.moisture = Some(FieldId::from(to));
-            water = true;
-        }
-    }
-
-    Ok(json!({ "renamed": from, "to": to, "references": references, "water": water }))
+    Ok(name.to_owned())
 }
 
-fn remove_field(terrain: &mut TerrainSpec, name: &str) -> Result<Value, String> {
+/// The trimmed name of a field that may be removed, or why it may not.
+///
+/// Refused when the document has no such field, when another field's shader reads it
+/// — the message names every reader — or when the water spec names it.
+pub fn check_remove(terrain: &TerrainSpec, name: &str) -> Result<String, String> {
+    let name = name.trim();
     if terrain.field(name).is_none() {
         return Err(format!("no field named `{name}`"));
     }
@@ -560,7 +189,7 @@ fn remove_field(terrain: &mut TerrainSpec, name: &str) -> Result<Value, String> 
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "`{name}` is read by {list} — take those references out first"
+            "`{name}` is read by {list} — take the `@layer` out of those files first"
         ));
     }
 
@@ -571,94 +200,61 @@ fn remove_field(terrain: &mut TerrainSpec, name: &str) -> Result<Value, String> 
             "`{name}` is named by the water spec of this terrain — reset the water first"
         ));
     }
-
-    terrain.fields.retain(|field| field.id.as_str() != name);
-    Ok(json!({ "removed": name, "fields": terrain.fields.len() }))
+    Ok(name.to_owned())
 }
 
-fn field_ref_written(
-    field: &Field,
-    id: NodeId,
-    property: &str,
-    nested: Option<&str>,
-    words: &[String],
-) -> Result<Option<FieldId>, String> {
-    match (property, nested) {
-        ("op", None) => Ok(parse_op(words)?.dependency().cloned()),
-        ("op", Some("field")) | ("field", None) => {
-            match field.graph.node(id).map(|node| &node.op) {
-                Some(NodeOp::FieldRef(_)) => Ok(Some(first(words)?.as_str().into())),
-                _ => Ok(None),
-            }
+/// The fields whose shader reads `name`, in declaration order, each named once.
+///
+/// The answer is derived from the document on every call rather than cached, so it
+/// cannot fall out of step with an edit or a re-read file.
+pub fn readers_of(terrain: &TerrainSpec, name: &str) -> Vec<String> {
+    terrain
+        .fields
+        .iter()
+        .filter(|field| field.id.as_str() != name)
+        .filter(|field| field.dependencies().any(|id| id.as_str() == name))
+        .map(|field| field.id.to_string())
+        .collect()
+}
+
+/// The fields `field`'s shader reads, in declaration order, each named once.
+///
+/// [`readers_of`] read from the other end, and the two answer about one relation: a
+/// field's own name is never in the list, and a file naming one field on several
+/// bindings lists it once.
+pub fn reads_of(field: &Field) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for read in field.dependencies() {
+        if read.as_str() == field.id.as_str() {
+            continue;
         }
-        _ => Ok(None),
+        if !names.iter().any(|seen| seen == read.as_str()) {
+            names.push(read.to_string());
+        }
     }
+    names
 }
 
 fn set(terrain: &mut TerrainSpec, path: &str, words: &[String]) -> Result<Value, String> {
     let parts: Vec<&str> = path.split('.').collect();
     let name = *parts.first().ok_or("a path needs a field name")?;
-    if parts.len() < 2 {
-        return Err(format!("`{path}` names a field and nothing on it"));
-    }
-    if parts.len() == 2 {
-        return set_field(terrain, name, &parts[1..], words);
-    }
-
-    let field = terrain
-        .field(name)
-        .ok_or_else(|| format!("no field named `{name}`"))?;
-    let id = node_id(&field.graph, parts[1])?;
-    let property = parts[2];
-    if let Some(referenced) = field_ref_written(field, id, property, parts.get(3).copied(), words)?
-    {
-        check_field_ref(terrain, name, &referenced)?;
-    }
-    let field = field_mut(terrain, name)?;
-    if property == "op" {
-        return match parts.get(3) {
-            None => {
-                let op = parse_op(words)?;
-                let node = field.graph.node_mut(id).expect("resolved above");
-                node.inputs.resize(op.arity(), None);
-                node.op = op;
-                Ok(json!({ "op": op_summary(&node.op) }))
-            }
-            Some(property) => {
-                let node = field.graph.node_mut(id).expect("resolved above");
-                set_op(&mut node.op, property, words)?;
-                Ok(json!({ "op": op_summary(&node.op) }))
-            }
-        };
-    }
-    match property {
-        "bypassed" => {
-            let bypassed = boolean(first(words)?)?;
-            field.graph.set_bypassed(id, bypassed).map_err(refusal)?;
-            Ok(json!({ "bypassed": bypassed }))
-        }
-        "name" => {
-            let word = first(words)?;
-            let name = (word != "none").then(|| word.clone());
-            field.graph.rename(id, name.clone()).map_err(refusal)?;
-            Ok(json!({ "name": name }))
-        }
-        property => {
-            let node = field.graph.node_mut(id).expect("resolved above");
-            set_op(&mut node.op, property, words)?;
-            Ok(json!({ "op": op_summary(&node.op) }))
-        }
+    match parts.len() {
+        0 | 1 => Err(format!("`{path}` names a field and nothing on it")),
+        2 => set_field(terrain, name, parts[1], words),
+        _ => Err(format!(
+            "`{path}` names more than a field and a property — a path is `field.property`"
+        )),
     }
 }
 
 fn set_field(
     terrain: &mut TerrainSpec,
     name: &str,
-    parts: &[&str],
+    property: &str,
     words: &[String],
 ) -> Result<Value, String> {
-    match parts.first().copied() {
-        Some("shift") => {
+    match property {
+        "shift" => {
             let shift: u8 = number(first(words)?)?;
             if shift != 0 && is_solve_height(terrain, name) {
                 return Err(format!(
@@ -669,8 +265,8 @@ fn set_field(
             field.shift = shift;
             Ok(json!({ "shift": field.shift }))
         }
-        Some("role") => set_field_role(terrain, name, words),
-        _ => set_other_field_property(terrain, name, parts, words),
+        "role" => set_field_role(terrain, name, words),
+        _ => set_other_field_property(terrain, name, property, words),
     }
 }
 
@@ -733,52 +329,36 @@ pub fn is_solve_height(terrain: &TerrainSpec, name: &str) -> bool {
         .field_with_role(FieldRole::Height)
         .is_some_and(|field| field.id.as_str() == name)
 }
-
-fn write_output(graph: &mut FieldGraph, id: Option<NodeId>) -> Result<Value, String> {
-    if id.is_none() && !graph.nodes.is_empty() {
-        return Err("a field with nodes always has an output — name the node to read".to_owned());
-    }
-    graph.set_output(id).map_err(refusal)?;
-    Ok(json!({ "output": id.map(node_path) }))
-}
-
 fn set_other_field_property(
     terrain: &mut TerrainSpec,
     name: &str,
-    parts: &[&str],
+    property: &str,
     words: &[String],
 ) -> Result<Value, String> {
     let field = field_mut(terrain, name)?;
-    match parts.first().copied() {
-        Some("output") => {
-            let word = first(words)?;
-            let id = (word != "none")
-                .then(|| node_id(&field.graph, word))
-                .transpose()?;
-            write_output(&mut field.graph, id)
-        }
-        Some("range") => {
+    match property {
+        "range" => {
             let low: f32 = number(first(words)?)?;
             let high: f32 = number(words.get(1).ok_or("a range needs two numbers")?)?;
             field.range = (low, high);
             Ok(json!({ "range": [low, high] }))
         }
-        Some("hillshade") => {
+        "hillshade" => {
             let on = boolean(first(words)?)?;
             field.hillshade = on;
             Ok(json!({ "hillshade": on }))
         }
-        Some("light_azimuth") => {
+        "light_azimuth" => {
             let degrees: f32 = number(first(words)?)?;
             field.light_azimuth = degrees;
             Ok(json!({ "light_azimuth": degrees }))
         }
-        Some("contours") => {
+        "contours" => {
             let on = boolean(first(words)?)?;
             field.contours = on;
             Ok(json!({ "contours": on }))
         }
-        Some("contour_interval") => {
+        "contour_interval" => {
             let spacing: f32 = number(first(words)?)?;
             if !(spacing >= MIN_CONTOUR_INTERVAL) {
                 return Err(format!(
@@ -788,75 +368,23 @@ fn set_other_field_property(
             field.contour_interval = spacing;
             Ok(json!({ "contour_interval": spacing }))
         }
-        Some(other) => Err(format!("a field has nothing called `{other}`")),
-        None => Err("a path needs something after the field name".to_owned()),
-    }
-}
-
-fn set_op(op: &mut NodeOp, property: &str, words: &[String]) -> Result<(), String> {
-    match (op, property) {
-        (NodeOp::FieldRef(id), "field") => *id = first(words)?.as_str().into(),
-        (NodeOp::Shader(shader), name) if shader.params.contains_key(name) => {
+        param if field.shader.params.contains_key(param) => {
             let values = words
                 .iter()
                 .map(|word| number(word))
                 .collect::<Result<Vec<f32>, _>>()?;
-            let held = shader
+            let held = field
+                .shader
                 .params
-                .get_mut(name)
+                .get_mut(param)
                 .expect("the guard found the parameter");
             if values.len() != held.len() {
-                return Err(format!("`{name}` takes {} numbers", held.len()));
+                return Err(format!("`{param}` takes {} numbers", held.len()));
             }
-            *held = values;
+            *held = values.clone();
+            Ok(json!({ param: values }))
         }
-        (op, other) => {
-            return Err(format!(
-                "a {} node has nothing called `{other}`",
-                op_name(op)
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Reads an op from words: `fieldref <field>` or `shader <file>`. Refused, with a
-/// message naming the first word, for anything else.
-pub fn parse_op(words: &[String]) -> Result<NodeOp, String> {
-    let kind = first(words)?;
-    let rest = &words[1..];
-    match kind.as_str() {
-        "fieldref" => Ok(NodeOp::FieldRef(first(rest)?.as_str().into())),
-        "shader" => Ok(NodeOp::Shader(ShaderLayer::new(first(rest)?.as_str()))),
-        other => Err(format!("no node op called `{other}`")),
-    }
-}
-
-/// The word this op is named by, and the spelling [`parse_op`] takes.
-pub fn op_name(op: &NodeOp) -> &'static str {
-    match op {
-        NodeOp::FieldRef(_) => "fieldref",
-        NodeOp::Shader(_) => "shader",
-    }
-}
-
-/// What an op is set to, without the op's own name: the parameter half of
-/// [`op_summary`], and what a node's card shows on its own line under the op name.
-///
-/// Empty for an op that carries no parameters.
-pub fn op_params(op: &NodeOp) -> String {
-    match op {
-        NodeOp::FieldRef(id) => format!("{id}"),
-        NodeOp::Shader(shader) => shader.params_line(None),
-    }
-}
-
-/// One line describing an op and its parameters, for the inspector's collapsed row
-/// and the control client's listing. Not a path, and nothing reads it back.
-pub fn op_summary(op: &NodeOp) -> String {
-    match op {
-        NodeOp::Shader(shader) => format!("shader {}", shader.file),
-        NodeOp::FieldRef(_) => format!("{} {}", op_name(op), op_params(op)),
+        other => Err(format!("a field has nothing called `{other}`")),
     }
 }
 
@@ -888,7 +416,6 @@ fn boolean(word: &str) -> Result<bool, String> {
         other => Err(format!("not a yes or a no: {other}")),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,47 +424,13 @@ mod tests {
 
     fn document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(64, 64))
-            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+            .with_field(Field::new("base").held(0.25))
             .with_field(
                 Field::new("height")
                     .with_role(FieldRole::Height)
-                    .with_graph({
-                        let mut graph = FieldGraph::new();
-                        let read = graph.node_with(NodeOp::FieldRef(FieldId::from("base")), &[]);
-                        let piped = graph.node_with(NodeOp::piped(1), &[read]);
-                        graph.set_output(Some(piped)).unwrap();
-                        graph
-                    }),
+                    .held(0.5)
+                    .reading(&["base"]),
             )
-    }
-
-    // The overview's drag reads the new node's id back out of an `AddNode` reply, which
-    // spells it with `node_path` — so the two have to stay each other's inverse, and a
-    // node's own name must not be mistaken for a path.
-    #[test]
-    fn a_node_path_reads_back_as_the_id_that_spelled_it() {
-        assert_eq!(node_of_path(&node_path(NodeId(7))), Some(NodeId(7)));
-        assert_eq!(node_of_path("ground"), None);
-        assert_eq!(node_of_path("n"), None);
-    }
-
-    // `op_summary` is read by the control client, the inspector's collapsed row and
-    // this module's own JSON replies, and none of them parse it back — so a change to
-    // its wording is invisible until someone reads a listing and cannot find their
-    // node. Pinning one op of every variant is what holds the split into `op_params`
-    // to the spelling it replaced.
-    #[test]
-    fn every_op_summarises_to_the_words_it_always_did() {
-        let cases = [
-            (NodeOp::FieldRef(FieldId::from("base")), "fieldref base"),
-            (
-                NodeOp::Shader(ShaderLayer::new("warped.wgsl")),
-                "shader warped.wgsl",
-            ),
-        ];
-        for (op, expected) in cases {
-            assert_eq!(op_summary(&op), expected);
-        }
     }
 
     fn words(line: &str) -> Vec<String> {
@@ -952,191 +445,7 @@ mod tests {
         }
         .apply(terrain)
     }
-
-    // The structural verbs against one graph, in sequence, because each is addressed
-    // by an id the one before it may have changed — and an id that moved would send
-    // the panel's next edit to a different node.
-    #[test]
-    fn a_node_can_be_added_wired_bypassed_and_removed() {
-        let mut terrain = document();
-        let before = terrain.field("height").unwrap().graph.nodes.len();
-
-        Edit::AddNode {
-            field: "height".to_owned(),
-            op: NodeOp::piped(1),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        let graph = &terrain.field("height").unwrap().graph;
-        assert_eq!(graph.nodes.len(), before + 1);
-        let added = graph.nodes.last().unwrap().id;
-        let output = graph.output.unwrap();
-
-        Edit::Connect {
-            field: "height".to_owned(),
-            from: output.to_string(),
-            to: added.to_string(),
-            pin: 0,
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        assert_eq!(
-            terrain
-                .field("height")
-                .unwrap()
-                .graph
-                .node(added)
-                .unwrap()
-                .inputs,
-            vec![Some(output)]
-        );
-
-        Edit::Bypass {
-            field: "height".to_owned(),
-            node: added.to_string(),
-            bypassed: None,
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        assert!(
-            terrain
-                .field("height")
-                .unwrap()
-                .graph
-                .node(added)
-                .unwrap()
-                .bypassed
-        );
-
-        Edit::RemoveNode {
-            field: "height".to_owned(),
-            node: added.to_string(),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        assert_eq!(terrain.field("height").unwrap().graph.nodes.len(), before);
-    }
-
-    fn output_of(terrain: &TerrainSpec) -> Option<NodeId> {
-        terrain.field("height").unwrap().graph.output
-    }
-
-    fn add(terrain: &mut TerrainSpec, op: NodeOp) -> NodeId {
-        let reply = Edit::AddNode {
-            field: "height".to_owned(),
-            op,
-            position: None,
-        }
-        .apply(terrain)
-        .unwrap();
-        node_of_path(reply["node"].as_str().unwrap()).unwrap()
-    }
-
-    fn connect(terrain: &mut TerrainSpec, from: NodeId, to: NodeId) -> Value {
-        Edit::Connect {
-            field: "height".to_owned(),
-            from: from.to_string(),
-            to: to.to_string(),
-            pin: 0,
-        }
-        .apply(terrain)
-        .unwrap()
-    }
-
-    // Wiring the output onward is how a field is extended; without the move the nodes
-    // added after the output have no effect on the field.
-    #[test]
-    fn wiring_the_output_into_a_node_nothing_reads_makes_that_node_the_output() {
-        let mut terrain = document();
-        let output = output_of(&terrain).unwrap();
-        let added = add(&mut terrain, NodeOp::piped(1));
-        let reply = connect(&mut terrain, output, added);
-        assert_eq!(output_of(&terrain), Some(added));
-        assert_eq!(reply["output"], json!(node_path(added)));
-    }
-
-    // A node something already reads is not the end of the graph, so wiring the output
-    // into it leaves the output where it is.
-    #[test]
-    fn wiring_the_output_into_a_node_that_is_read_leaves_the_output() {
-        let mut terrain = document();
-        let output = output_of(&terrain).unwrap();
-        let middle = add(&mut terrain, NodeOp::piped(1));
-        let reader = add(&mut terrain, NodeOp::piped(1));
-        connect(&mut terrain, middle, reader);
-        connect(&mut terrain, output, middle);
-        assert_eq!(output_of(&terrain), Some(output));
-    }
-
-    // Only a wire leaving the output moves it.
-    #[test]
-    fn wiring_a_node_that_is_not_the_output_leaves_the_output() {
-        let mut terrain = document();
-        let output = output_of(&terrain).unwrap();
-        let source = add(&mut terrain, NodeOp::held(1.0));
-        let reader = add(&mut terrain, NodeOp::piped(1));
-        connect(&mut terrain, source, reader);
-        assert_eq!(output_of(&terrain), Some(output));
-    }
-
-    // A field with nodes always has an output, and both socket spellings of clearing it
-    // reach the same refusal.
-    #[test]
-    fn clearing_the_output_of_a_field_with_nodes_is_refused() {
-        let mut terrain = document();
-        let output = output_of(&terrain);
-        let cleared = Edit::SetOutput {
-            field: "height".to_owned(),
-            node: None,
-        }
-        .apply(&mut terrain);
-        assert!(cleared.is_err());
-        let set = Edit::Set {
-            path: "height.output".to_owned(),
-            words: vec!["none".to_owned()],
-        }
-        .apply(&mut terrain);
-        assert!(set.is_err());
-        assert_eq!(output_of(&terrain), output);
-    }
-
-    // A field with no nodes is the one field that may have no output.
-    #[test]
-    fn a_field_with_no_nodes_accepts_no_output() {
-        let mut terrain = document();
-        Edit::AddField {
-            name: "empty".to_owned(),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        let cleared = Edit::SetOutput {
-            field: "empty".to_owned(),
-            node: None,
-        }
-        .apply(&mut terrain);
-        assert!(cleared.is_ok());
-    }
-
-    // The verbs behave the same as the UI so an agent can debug from the socket, so the
-    // reply to removing the output names the node that took it over.
-    #[test]
-    fn removing_the_output_answers_where_it_went() {
-        let mut terrain = document();
-        let output = output_of(&terrain).unwrap();
-        let added = add(&mut terrain, NodeOp::piped(1));
-        connect(&mut terrain, output, added);
-        let reply = Edit::RemoveNode {
-            field: "height".to_owned(),
-            node: added.to_string(),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        assert_eq!(reply["output"], json!(node_path(output)));
-        assert_eq!(output_of(&terrain), Some(output));
-    }
-
-    // Every default the issue names: nothing in the graph, shift 0, the unit range,
+    // Every default a new field takes: no parameter values, shift 0, the unit range,
     // and last in declaration order so the field menu grows at the end.
     #[test]
     fn a_field_added_from_the_editor_is_empty_at_shift_zero_over_the_unit_range() {
@@ -1152,8 +461,7 @@ mod tests {
         assert_eq!(added.role, FieldRole::Custom);
         assert_eq!(added.shift, 0);
         assert_eq!(added.range, (0.0, 1.0));
-        assert!(added.graph.nodes.is_empty());
-        assert_eq!(added.graph.output, None);
+        assert!(added.shader.params.is_empty());
         assert_eq!(
             terrain.fields.last().map(|field| field.id.as_str()),
             Some("biomes")
@@ -1162,7 +470,7 @@ mod tests {
 
     // A second field of one name would make every path that addresses a field
     // ambiguous, so the name is refused — and the refusal has to leave the document
-    // alone, the same rule a refused node edit is held to.
+    // alone, the rule every refused edit is held to.
     #[test]
     fn a_field_whose_name_is_already_taken_is_refused_and_changes_nothing() {
         let mut terrain = document();
@@ -1191,168 +499,33 @@ mod tests {
         }
         assert_eq!(terrain.fields.len(), 2);
     }
-
-    // The two properties the acceptance criteria rest on: adding a field throws away
-    // no bake, and the field added is the one left on screen.
+    // A field is its file `shaders/<name>.wgsl`, so a name that is a path, a hidden
+    // file or a template would write somewhere else or never be read back as a field.
     #[test]
-    fn adding_a_field_reaches_no_bake_and_shows_the_field_it_added() {
+    fn a_field_name_that_cannot_be_a_file_stem_is_refused() {
+        let terrain = document();
+        for name in ["a/b", "a\\b", ".hidden", "_x"] {
+            assert!(check_add(&terrain, name).is_err(), "{name} was accepted");
+        }
+        assert_eq!(check_add(&terrain, " biomes ").unwrap(), "biomes");
+    }
+
+    // The field added is the one left on screen, which is what lets the panel open on
+    // it straight away.
+    #[test]
+    fn adding_a_field_shows_the_field_it_added() {
         let edit = Edit::AddField {
             name: " biomes ".to_owned(),
         };
-        assert!(!edit.reaches_the_bake());
+        assert!(edit.is_file_operation());
         assert_eq!(edit.shows(&document(), "height"), Some("biomes".to_owned()));
     }
 
-    // Acceptance 1: the rename that the issue names, from the document's side — the
-    // field answers to the new name and the reader's `FieldRef` was rewritten with it,
-    // so nothing is left naming a name no field carries.
+    // Removing a field something reads would leave that file naming a field that is
+    // not there, so it is refused — and the message names the readers, which is the
+    // whole of what tells someone which file to change first.
     #[test]
-    fn renaming_a_field_rewrites_the_references_that_read_it() {
-        let mut terrain = document();
-        let reply = Edit::RenameField {
-            from: "base".to_owned(),
-            to: " continent ".to_owned(),
-        }
-        .apply(&mut terrain)
-        .expect("a free name is accepted");
-
-        assert_eq!(reply["renamed"], "base");
-        assert_eq!(reply["to"], "continent");
-        assert_eq!(reply["references"], 1);
-        assert!(terrain.field("base").is_none());
-        assert!(terrain.field("continent").is_some());
-        let reads: Vec<String> = terrain
-            .field("height")
-            .unwrap()
-            .declared_reads()
-            .map(|id| id.to_string())
-            .collect();
-        assert_eq!(reads, vec!["continent".to_owned()]);
-    }
-
-    // Acceptance 2: the water spec names fields by name too, so a rename that left it
-    // behind would point the solve at a field the document no longer has.
-    #[test]
-    fn renaming_a_field_rewrites_the_water_spec_that_names_it() {
-        let mut terrain = document();
-        terrain.water_spec = Some(WaterSpec::new("height").with_moisture("base"));
-
-        Edit::RenameField {
-            from: "height".to_owned(),
-            to: "elevation".to_owned(),
-        }
-        .apply(&mut terrain)
-        .expect("a free name is accepted");
-        let reply = Edit::RenameField {
-            from: "base".to_owned(),
-            to: "continent".to_owned(),
-        }
-        .apply(&mut terrain)
-        .expect("a free name is accepted");
-
-        assert_eq!(reply["water"], true);
-        let spec = terrain.water_spec.clone().unwrap();
-        assert_eq!(spec.height.as_str(), "elevation");
-        assert_eq!(
-            spec.moisture.map(|id| id.to_string()),
-            Some("continent".to_owned())
-        );
-    }
-
-    // Acceptance 3: a name already taken would make every path that addresses a field
-    // ambiguous, and the refusal has to leave the document alone — the rule a refused
-    // `AddField` is held to.
-    #[test]
-    fn renaming_a_field_onto_a_taken_name_is_refused_and_changes_nothing() {
-        let mut terrain = document();
-        let before = terrain.clone();
-        let error = Edit::RenameField {
-            from: "base".to_owned(),
-            to: "height".to_owned(),
-        }
-        .apply(&mut terrain)
-        .unwrap_err();
-        assert!(error.contains("height"), "{error}");
-        assert_eq!(terrain, before);
-    }
-
-    // Acceptance 3, the other half: a blank name is what an empty name box sends, and
-    // a field nothing can address would be unreachable from either surface.
-    #[test]
-    fn renaming_a_field_to_a_blank_name_is_refused_and_changes_nothing() {
-        let mut terrain = document();
-        let before = terrain.clone();
-        for name in ["", "   "] {
-            let error = Edit::RenameField {
-                from: "base".to_owned(),
-                to: name.to_owned(),
-            }
-            .apply(&mut terrain)
-            .unwrap_err();
-            assert!(error.contains("name"), "{error}");
-        }
-        assert_eq!(terrain, before);
-    }
-
-    // A rename must not manufacture the dangling reference `check_field_ref` exists to
-    // refuse, so the document it leaves behind still plans a bake.
-    #[test]
-    fn a_renamed_document_still_bakes() {
-        let mut terrain = document();
-        Edit::RenameField {
-            from: "base".to_owned(),
-            to: "continent".to_owned(),
-        }
-        .apply(&mut terrain)
-        .expect("a free name is accepted");
-        assert!(terrain.bake_order().is_ok());
-    }
-
-    // Bypass turns a reference off, it does not unname it: a bypassed `FieldRef` left
-    // naming the old name would fail at the bake the moment it was un-bypassed.
-    #[test]
-    fn renaming_a_field_rewrites_a_reference_under_a_bypassed_node() {
-        let mut terrain = document();
-        let reference = terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .nodes
-            .iter()
-            .find(|node| matches!(node.op, NodeOp::FieldRef(_)))
-            .unwrap()
-            .id;
-        Edit::Bypass {
-            field: "height".to_owned(),
-            node: node_path(reference),
-            bypassed: Some(true),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-
-        let reply = Edit::RenameField {
-            from: "base".to_owned(),
-            to: "continent".to_owned(),
-        }
-        .apply(&mut terrain)
-        .expect("a free name is accepted");
-
-        assert_eq!(reply["references"], 1);
-        let op = &terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .node(reference)
-            .unwrap()
-            .op;
-        assert!(matches!(op, NodeOp::FieldRef(id) if id.as_str() == "continent"));
-    }
-
-    // Acceptance 4: removing a field something reads would orphan that reference, so
-    // it is refused — and the message names the readers, which is the whole of what
-    // tells someone what to take out first.
-    #[test]
-    fn removing_a_field_a_reference_reads_is_refused_and_names_the_reader() {
+    fn removing_a_field_a_shader_reads_is_refused_and_names_the_reader() {
         let mut terrain = document();
         let before = terrain.clone();
         let error = Edit::RemoveField {
@@ -1363,7 +536,6 @@ mod tests {
         assert!(error.contains("height"), "{error}");
         assert_eq!(terrain, before);
     }
-
     // Acceptance 5: the water spec names a field the same way a reference does, and
     // the refusal ends on the clause changing the height role already ends on.
     #[test]
@@ -1402,71 +574,36 @@ mod tests {
         assert!(terrain.field("height").is_none());
         assert_eq!(terrain.field("base"), Some(&base));
     }
-
-    // `readers_of` is the relation both the removal refusal and issue #41's panel read,
-    // so it has to answer the declared readers and only those: not the field itself,
-    // and not a reader whose reference is bypassed.
+    // `readers_of` is the relation both the removal refusal and the panel read, so it
+    // has to answer the readers and only those, and never the field itself.
     #[test]
-    fn readers_of_names_the_declared_readers_and_nothing_else() {
-        let mut terrain = document();
+    fn readers_of_names_the_readers_and_nothing_else() {
+        let terrain = document().with_field(Field::new("loop").reading(&["loop"]));
         assert_eq!(readers_of(&terrain, "base"), vec!["height".to_owned()]);
         assert!(readers_of(&terrain, "height").is_empty());
-
-        let reference = terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .nodes
-            .iter()
-            .find(|node| matches!(node.op, NodeOp::FieldRef(_)))
-            .unwrap()
-            .id;
-        Edit::Bypass {
-            field: "height".to_owned(),
-            node: node_path(reference),
-            bypassed: Some(true),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        assert!(readers_of(&terrain, "base").is_empty());
+        assert!(readers_of(&terrain, "loop").is_empty());
     }
 
     // The panel's `reads` row and `observe field`'s `reads` list are this one answer,
-    // and a graph may name one field from several nodes — so the dedup is the whole
+    // and a file may name one field on several bindings — so the dedup is the whole
     // point: a field that reads another twice reads it once.
     #[test]
     fn reads_of_names_each_field_read_once() {
-        let mut terrain = document();
-        let height = terrain.field("height").unwrap();
-        assert_eq!(reads_of(height), vec!["base".to_owned()]);
-        assert!(reads_of(terrain.field("base").unwrap()).is_empty());
-
-        Edit::AddNode {
-            field: "height".to_owned(),
-            op: NodeOp::FieldRef(FieldId::from("base")),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .expect("a second reference to `base` does not cycle");
+        let terrain = document();
         assert_eq!(
             reads_of(terrain.field("height").unwrap()),
             vec!["base".to_owned()]
         );
+        assert!(reads_of(terrain.field("base").unwrap()).is_empty());
+
+        let twice = Field::new("height").reading(&["base", "base"]);
+        assert_eq!(reads_of(&twice), vec!["base".to_owned()]);
     }
 
-    // The view has to follow the field it was on: a rename of the shown field keeps it
-    // on screen under its new name, a removal falls back to a field that still exists,
-    // and an edit to some other field leaves the view alone.
+    // The view has to follow the field it was on: a removal of the shown field falls
+    // back to a field that still exists, and a removal of another leaves the view alone.
     #[test]
-    fn a_rename_and_a_removal_move_the_view_only_when_it_was_on_that_field() {
-        let terrain = document();
-        let rename = Edit::RenameField {
-            from: "base".to_owned(),
-            to: "continent".to_owned(),
-        };
-        assert_eq!(rename.shows(&terrain, "base"), Some("continent".to_owned()));
-        assert_eq!(rename.shows(&terrain, "height"), None);
-
+    fn a_removal_moves_the_view_only_when_it_was_on_that_field() {
         let mut removed = document();
         let removal = Edit::RemoveField {
             name: "height".to_owned(),
@@ -1475,217 +612,54 @@ mod tests {
         assert_eq!(removal.shows(&removed, "height"), Some("base".to_owned()));
         assert_eq!(removal.shows(&removed, "base"), None);
     }
-
-    // The reference guard has to hold over a field this edit created just as it does
-    // over one that came out of a file: `biomes` may read `height`, and `height` may
-    // then not read `biomes` back.
-    #[test]
-    fn a_reference_may_name_a_field_that_was_added_from_the_editor() {
-        let mut terrain = document();
-        Edit::AddField {
-            name: "biomes".to_owned(),
-        }
-        .apply(&mut terrain)
-        .expect("a free name is accepted");
-
-        Edit::AddNode {
-            field: "biomes".to_owned(),
-            op: NodeOp::FieldRef(FieldId::from("height")),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .expect("reading an existing field is allowed");
-
-        let error = Edit::AddNode {
-            field: "height".to_owned(),
-            op: NodeOp::FieldRef(FieldId::from("biomes")),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .unwrap_err();
-        assert!(error.contains("height -> biomes -> height"), "{error}");
-    }
-
-    // An edge that would make the graph feed itself has to be refused where it is
-    // drawn, not left for the bake to reject — the document must never hold one.
-    #[test]
-    fn an_edge_that_would_close_a_cycle_is_refused() {
-        let mut terrain = document();
-        let output = terrain.field("height").unwrap().graph.output.unwrap();
-
-        let error = Edit::Connect {
-            field: "height".to_owned(),
-            from: output.to_string(),
-            to: output.to_string(),
-            pin: 0,
-        }
-        .apply(&mut terrain)
-        .unwrap_err();
-        assert!(error.contains("cycle"), "{error}");
-    }
-
-    // The assertion the scenario exists for, made where it can be made numerically: the
-    // editor's whole claim is that editing the graph changes the field it bakes.
-    #[test]
-    fn a_node_wired_into_the_output_moves_the_bake_it_produces() {
-        let mut terrain = document();
-        terrain.bake_in_place().unwrap();
-        let before = terrain.field("height").unwrap().baked().data().to_vec();
-
-        let previous = terrain.field("height").unwrap().graph.output.unwrap();
-        let added = {
-            let graph = &mut terrain.field_mut("height").unwrap().graph;
-            let value = graph.node_with(NodeOp::held(0.25), &[]);
-            graph.set_output(Some(value)).unwrap();
-            value
-        };
-        terrain.bake_in_place().unwrap();
-        let after = terrain.field("height").unwrap().baked().data().to_vec();
-
-        assert_ne!(before, after);
-        assert!(after.iter().all(|value| *value == 0.25));
-
-        Edit::SetOutput {
-            field: "height".to_owned(),
-            node: Some(previous.to_string()),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        terrain.bake_in_place().unwrap();
-        assert_eq!(terrain.field("height").unwrap().baked().data(), &before[..]);
-        assert!(terrain.field("height").unwrap().graph.node(added).is_some());
-    }
-
-    // Bypassing a node has to be exactly as if it passed its input straight through,
-    // since that is what the panel's checkbox promises.
-    #[test]
-    fn bypassing_a_node_reads_what_it_passes_through() {
-        let mut terrain = document();
-        let piped = {
-            let graph = &mut terrain.field_mut("height").unwrap().graph;
-            let value = graph.node_with(NodeOp::held(0.75), &[]);
-            let piped = graph.node_with(NodeOp::piped(1), &[value]);
-            graph.set_output(Some(piped)).unwrap();
-            piped
-        };
-        terrain.bake_in_place().unwrap();
-        let evaluated = terrain.field("height").unwrap().baked().data().to_vec();
-
-        Edit::Bypass {
-            field: "height".to_owned(),
-            node: piped.to_string(),
-            bypassed: Some(true),
-        }
-        .apply(&mut terrain)
-        .unwrap();
-        terrain.bake_in_place().unwrap();
-        let passed = terrain.field("height").unwrap().baked().data().to_vec();
-
-        assert!(evaluated.iter().all(|value| *value == 0.0));
-        assert!(passed.iter().all(|value| *value == 0.75));
-    }
-
     // Every one of these arrives from a caller working against a document that has
     // changed under it, so each has to be a message rather than a panic or a silent
     // no-op that looks like the edit was applied.
     #[test]
     fn an_edit_naming_something_the_document_does_not_have_is_refused() {
         let mut terrain = document();
-        assert!(
-            Edit::AddNode {
-                field: "nowhere".to_owned(),
-                op: NodeOp::held(0.5),
-                position: None,
-            }
-            .apply(&mut terrain)
-            .is_err()
-        );
-        assert!(
-            Edit::RemoveNode {
-                field: "height".to_owned(),
-                node: "n9".to_owned(),
-            }
-            .apply(&mut terrain)
-            .is_err()
-        );
-        assert!(set_line(&mut terrain, "height.n0.sideways 1").is_err());
-        assert!(set_line(&mut terrain, "height.n0.op.scale 1").is_err());
+        assert!(set_line(&mut terrain, "nowhere.value 1").is_err());
+        assert!(set_line(&mut terrain, "height.sideways 1").is_err());
         assert!(set_line(&mut terrain, "height").is_err());
+        assert!(
+            Edit::RemoveField {
+                name: "nowhere".to_owned(),
+            }
+            .apply(&mut terrain)
+            .is_err()
+        );
     }
 
-    // The path grammar is the whole surface the control client edits through, so a
-    // property nothing can address is a control the panel has and a script cannot use.
+    // A field's shader parameters are addressed as properties of the field, and one
+    // given a count of numbers it does not have is refused rather than stored.
     #[test]
-    fn every_node_property_is_reachable_by_its_path() {
+    fn a_parameter_is_written_by_the_field_and_its_name() {
         let mut terrain = document();
-        let id = terrain.field("base").unwrap().graph.output.unwrap();
+        let reply = set_line(&mut terrain, "height.value 0.75").unwrap();
+        assert_eq!(reply, json!({ "value": [0.75] }));
+        assert_eq!(
+            terrain.field("height").unwrap().shader.params.get("value"),
+            Some(&vec![0.75])
+        );
 
-        set_line(&mut terrain, &format!("base.{id}.bypassed on")).unwrap();
-        set_line(&mut terrain, &format!("base.{id}.name ground")).unwrap();
-        set_line(&mut terrain, "base.ground.value 0.75").unwrap();
-
-        let node = terrain.field("base").unwrap().graph.node(id).unwrap();
-        assert!(node.bypassed);
-        assert_eq!(node.name.as_deref(), Some("ground"));
-        assert_eq!(param(&node.op, "value"), vec![0.75]);
+        let refused = set_line(&mut terrain, "height.value 1 2").unwrap_err();
+        assert!(refused.contains("value"), "{refused}");
     }
 
-    fn param(op: &NodeOp, name: &str) -> Vec<f32> {
-        match op {
-            NodeOp::Shader(shader) => shader.params[name].clone(),
-            other => panic!("{other:?} carries no parameters"),
-        }
-    }
-
-    // A node is addressable by its id or by the name it was given, and the two have to
-    // reach the same node — otherwise a script and the panel would edit different ones.
+    // There is no node between a field and its parameters any more, so a path written
+    // for one is refused rather than read as something else.
     #[test]
-    fn a_node_is_reachable_by_its_id_and_by_its_name() {
+    fn a_path_through_a_node_is_refused() {
         let mut terrain = document();
-        let id = terrain.field("base").unwrap().graph.output.unwrap();
-
-        set_line(&mut terrain, &format!("base.{id}.name ground")).unwrap();
-        set_line(&mut terrain, "base.ground.value 0.75").unwrap();
-
-        let node = terrain.field("base").unwrap().graph.node(id).unwrap();
-        assert_eq!(param(&node.op, "value"), vec![0.75]);
+        let before = terrain.clone();
+        assert!(set_line(&mut terrain, "height.n0.value 1").is_err());
+        assert_eq!(terrain, before);
     }
 
-    // The reason op parameters are addressable one at a time: the seed here was written
-    // by none of the edits, where rewriting the op wholesale would have to restate every
-    // parameter and would silently reset the ones it forgot. A parameter given a count
-    // of numbers it does not have is refused rather than stored.
+    // The settings of a field are reachable by the same two-segment path the
+    // parameters are.
     #[test]
-    fn an_op_parameter_can_be_moved_without_rewriting_the_op_around_it() {
-        let mut terrain = document();
-        let mut layer = ShaderLayer::new("fbm.wgsl");
-        layer.params.insert("scale".to_owned(), vec![0.02]);
-        layer.params.insert("octaves".to_owned(), vec![4.0]);
-        layer.params.insert("seed".to_owned(), vec![1.0]);
-        let noise = add(&mut terrain, NodeOp::Shader(layer));
-
-        set_line(&mut terrain, &format!("height.{noise}.op.scale 0.004")).unwrap();
-        set_line(&mut terrain, &format!("height.{noise}.octaves 6")).unwrap();
-        let refused = set_line(&mut terrain, &format!("height.{noise}.scale 1 2")).unwrap_err();
-        assert!(refused.contains("scale"), "{refused}");
-
-        let op = &terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .node(noise)
-            .unwrap()
-            .op;
-        assert_eq!(param(op, "scale"), vec![0.004]);
-        assert_eq!(param(op, "octaves"), vec![6.0]);
-        assert_eq!(param(op, "seed"), vec![1.0]);
-    }
-
-    // `height.shift` and `height.1.blend` are one grammar with no marker segment
-    // between them, so the only thing separating a field property from a layer index is
-    // whether the segment parses as a number.
-    #[test]
-    fn a_field_property_is_told_apart_from_a_layer_index_by_being_unreadable_as_a_number() {
+    fn a_field_setting_is_written_by_its_path() {
         let mut terrain = document();
         set_line(&mut terrain, "base.shift 2").unwrap();
         set_line(&mut terrain, "base.range -1 1").unwrap();
@@ -1726,10 +700,8 @@ mod tests {
         terrain.bake_in_place().unwrap();
         let spec = terrain.water_spec.clone().unwrap();
         terrain.solve_water(&spec).unwrap();
-
-        let value = terrain.field("base").unwrap().graph.output.unwrap();
         Edit::Set {
-            path: format!("base.{value}.value"),
+            path: "base.value".to_owned(),
             words: vec!["0.5".to_owned()],
         }
         .apply(&mut terrain)
@@ -1814,30 +786,6 @@ mod tests {
         assert!(refused.contains("elevation"), "{refused}");
     }
 
-    // The add button and the control client build ops from the same words, so a
-    // spelling that parsed to the wrong op would give the two different documents from
-    // the same instruction — and every op this build no longer has is refused with a
-    // message naming it, so a script written against the old vocabulary is told which
-    // word it used.
-    #[test]
-    fn every_op_a_command_line_can_write_parses_to_the_op_it_names() {
-        for (line, name) in [
-            ("fieldref base", "fieldref"),
-            ("shader ridged.wgsl", "shader"),
-        ] {
-            let op = parse_op(&words(line)).unwrap_or_else(|error| panic!("{line}: {error}"));
-            assert_eq!(op_name(&op), name, "{line}");
-        }
-        for removed in [
-            "noise", "constant", "paint", "slope", "binary", "lerp", "scale", "remap", "curve",
-            "regions", "external",
-        ] {
-            let error = parse_op(&words(&format!("{removed} 1"))).unwrap_err();
-            assert!(error.contains(removed), "{removed}: {error}");
-        }
-        assert!(parse_op(&words("shader")).is_err());
-    }
-
     // The display properties are the only field properties the panel writes that a
     // bake never reads, so both the write and its reply are pinned here, along with the
     // one value an interval refuses.
@@ -1865,9 +813,8 @@ mod tests {
         assert!(set_line(&mut terrain, "height.contour_interval 0").is_err());
         assert_eq!(terrain.field("height").unwrap().contour_interval, 0.25);
     }
-
     // How the map draws a field is not what the field holds, so toggling an overlay must
-    // not throw the bake away; the length guard is what keeps a node property spelled the
+    // not throw the bake away; the length guard is what keeps a longer path spelled the
     // same from claiming the exemption.
     #[test]
     fn a_display_property_is_the_only_set_that_does_not_reach_the_bake() {
@@ -1886,116 +833,21 @@ mod tests {
         assert!(exempt("height.range"));
         assert!(exempt("height.n3.hillshade"));
     }
-
     // `hold` drops an earlier held change only when a later one writes the same place,
     // so the slot has to separate two values for one property from two values for two
-    // — and has to keep every structural edit apart from every other.
+    // — and has to keep every field added or removed apart from every other.
     #[test]
     fn an_edit_that_overwrites_a_value_names_the_slot_it_overwrites() {
         let set = |path: &str| Edit::Set {
             path: path.to_owned(),
             words: vec!["1".to_owned()],
         };
-        assert_eq!(set("base.n0.value").slot(), set("base.n0.value").slot());
-        assert_ne!(set("base.n0.value").slot(), set("base.n1.value").slot());
+        assert_eq!(set("base.value").slot(), set("base.value").slot());
+        assert_ne!(set("base.value").slot(), set("height.value").slot());
 
-        let add = Edit::AddNode {
-            field: "base".to_owned(),
-            op: NodeOp::held(0.5),
-            position: None,
-        };
-        let connect = Edit::Connect {
-            field: "base".to_owned(),
-            from: "n0".to_owned(),
-            to: "n1".to_owned(),
-            pin: 0,
+        let add = Edit::AddField {
+            name: "biomes".to_owned(),
         };
         assert_eq!(add.slot(), Slot::Once);
-        assert_eq!(connect.slot(), Slot::Once);
-    }
-    fn reference_node(terrain: &TerrainSpec, field: &str) -> NodeId {
-        terrain
-            .field(field)
-            .expect("the test document carries it")
-            .graph
-            .nodes
-            .iter()
-            .find(|node| matches!(node.op, NodeOp::FieldRef(_)))
-            .expect("the test document carries a reference")
-            .id
-    }
-
-    // A field cycle used to reach the next bake and fail there; this pins that the
-    // edit itself is refused, and that the refusal names the chain the way the plan
-    // error does. `height` already reads `base`, so `base` reading `height` closes it.
-    #[test]
-    fn adding_a_reference_that_closes_a_field_cycle_is_refused() {
-        let mut terrain = document();
-        let before = terrain.field("base").unwrap().graph.nodes.len();
-        let error = Edit::AddNode {
-            field: "base".to_owned(),
-            op: NodeOp::FieldRef(FieldId::from("height")),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .unwrap_err();
-        assert!(error.contains("base -> height -> base"), "{error}");
-        assert_eq!(terrain.field("base").unwrap().graph.nodes.len(), before);
-    }
-
-    // The other fault the bake used to catch: a name the document does not carry. The
-    // document has to be left alone, because a refused edit that half-landed would put
-    // the panel and the graph out of step.
-    #[test]
-    fn adding_a_reference_to_a_field_that_is_not_there_is_refused() {
-        let mut terrain = document();
-        let before = terrain.field("base").unwrap().graph.nodes.len();
-        let error = Edit::AddNode {
-            field: "base".to_owned(),
-            op: NodeOp::FieldRef(FieldId::from("nowhere")),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .unwrap_err();
-        assert!(error.contains("nowhere"), "{error}");
-        assert_eq!(terrain.field("base").unwrap().graph.nodes.len(), before);
-    }
-
-    // The shortest cycle there is, and it arrives by `set` rather than by `node add` —
-    // which is the path the panel's field menu takes, so this covers that too.
-    #[test]
-    fn pointing_a_reference_at_its_own_field_is_refused() {
-        let mut terrain = document();
-        let id = reference_node(&terrain, "height");
-        let line = format!("height.{}.field height", node_path(id));
-        let error = set_line(&mut terrain, &line).unwrap_err();
-        assert!(error.contains("height -> height"), "{error}");
-        assert!(matches!(
-            &terrain.field("height").unwrap().graph.node(id).unwrap().op,
-            NodeOp::FieldRef(held) if held.as_str() == "base"
-        ));
-    }
-
-    // Bypass is how a reference is turned off, and the bake reads a bypassed node as
-    // no dependency at all — so a cycle that runs only through one is not a cycle, and
-    // the guard has to accept the edge the bake would accept.
-    #[test]
-    fn a_cycle_that_runs_only_through_a_bypassed_reference_is_accepted() {
-        let mut terrain = document();
-        let id = reference_node(&terrain, "height");
-        Edit::Bypass {
-            field: "height".to_owned(),
-            node: node_path(id),
-            bypassed: Some(true),
-        }
-        .apply(&mut terrain)
-        .expect("bypassing a node is always allowed");
-        Edit::AddNode {
-            field: "base".to_owned(),
-            op: NodeOp::FieldRef(FieldId::from("height")),
-            position: None,
-        }
-        .apply(&mut terrain)
-        .expect("the only path back to `base` is bypassed");
     }
 }

@@ -1,5 +1,3 @@
-// @shader Fbm
-
 struct Params {
     // @group Shape
     scale: f32,   // @ui 0.004 [0.0005, 0.2]

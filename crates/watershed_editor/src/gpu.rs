@@ -1,12 +1,9 @@
-//! Running a shader node: what WGSL a document carries, what each file declares,
-//! and the dispatch that turns one into the raster its node reads.
+//! Running a field's shader: what WGSL a document carries, what each file declares,
+//! which fields the files in the document's directory stand for, and the dispatch
+//! that turns one file into the raster its field is baked from.
 //!
-//! A shader is dispatched to a whole raster *before* the field's graph is walked,
-//! because the walk is a per-texel CPU function and a dispatch cannot join it. What
-//! lands in the node is then sampled by the walk like any other raster.
-//!
-//! When a dispatch happens is the bake's business, not this module's: a shader's
-//! inputs exist only inside the bake, which is off the main thread. What is
+//! When a dispatch happens is the bake's business, not this module's: the layers a
+//! shader reads exist only inside the bake, which is off the main thread. What is
 //! answered for here is everything a dispatch needs before it can run.
 
 use std::collections::BTreeMap;
@@ -30,12 +27,9 @@ use glam::UVec2;
 use watershed::raster::Raster;
 
 use crate::document::{Document, EditorSystems, JobKind};
+use crate::preset::Preset;
 use crate::terrain::TerrainSpec;
-use crate::terrain::graph::NodeOp;
-use crate::terrain::shader::{
-    LayerRead, ParamsLayout, SHADER_DIR, ShaderInput, parse_inputs, parse_layers, parse_params,
-    parse_reach,
-};
+use crate::terrain::shader::{LayerRead, ParamsLayout, parse_layers, parse_params, parse_retired};
 
 const FIELD_LIB: &str = include_str!("../assets/shaders/field_lib.wgsl");
 
@@ -53,9 +47,9 @@ fn generate(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// The shaders the editor ships, as `(file name, source)`.
 ///
-/// A name beginning with `_` is a template: it is copied like any other but is not
-/// offered as something to add.
-pub const STOCK: [(&str, &str); 8] = [
+/// A name beginning with `_` is a template: it is what a new field is copied from, and a
+/// file of that name in a document's directory is not a field.
+pub const STOCK: [(&str, &str); 7] = [
     ("_template.wgsl", TEMPLATE_SOURCE),
     (
         "ridged.wgsl",
@@ -75,18 +69,14 @@ pub const STOCK: [(&str, &str); 8] = [
         include_str!("../assets/shaders/stock/continents.wgsl"),
     ),
     (
-        "mountains.wgsl",
-        include_str!("../assets/shaders/stock/mountains.wgsl"),
-    ),
-    (
         "mountains_over_base.wgsl",
         include_str!("../assets/shaders/stock/mountains_over_base.wgsl"),
     ),
 ];
 
 /// Everything a shader may call and everything a shader file may declare, as prose:
-/// the header of the template a new shader is copied from, with its comment markers
-/// taken off and the `@shader` line naming the node left out.
+/// the header of the template a new field's shader is copied from, with its comment
+/// markers taken off.
 ///
 /// This is literally the text a copied shader carries, so a panel rendering it and a
 /// reader scrolling that file cannot be told two different things.
@@ -106,9 +96,6 @@ fn strip_header(source: &str) -> String {
             break;
         };
         let text = text.strip_prefix(' ').unwrap_or(text);
-        if text.trim_start().starts_with("@shader ") {
-            continue;
-        }
         prose.push_str(text);
         prose.push('\n');
     }
@@ -153,41 +140,15 @@ fn validate(source: &str) -> Result<(), String> {
 
 struct Declared {
     layout: ParamsLayout,
-    inputs: Vec<ShaderInput>,
     layers: Vec<LayerRead>,
-    reach: Option<u32>,
 }
 
 fn declare(source: &str) -> Result<Declared, String> {
     let layout = parse_params(source).map_err(|error| error.to_string())?;
-    let inputs = parse_inputs(source).map_err(|error| error.to_string())?;
     let layers = parse_layers(source).map_err(|error| error.to_string())?;
-    let reach = parse_reach(source).map_err(|error| error.to_string())?;
-    if let Some(shared) = layers
-        .iter()
-        .find(|read| inputs.iter().any(|input| input.binding == read.binding))
-    {
-        let line = source
-            .lines()
-            .position(|line| {
-                line.split_once("//").is_some_and(|(code, note)| {
-                    note.trim().starts_with("@layer")
-                        && code.contains(&format!("@binding({})", shared.binding))
-                })
-            })
-            .map_or(0, |at| at + 1);
-        return Err(format!(
-            "line {line}: binding {} is declared twice",
-            shared.binding
-        ));
-    }
+    parse_retired(source).map_err(|error| error.to_string())?;
     validate(source)?;
-    Ok(Declared {
-        layout,
-        inputs,
-        layers,
-        reach,
-    })
+    Ok(Declared { layout, layers })
 }
 
 fn fault_at(line: usize, message: &str) -> String {
@@ -205,16 +166,9 @@ pub struct ShaderEntry {
     /// What the file declares. The last layout that parsed, so a file that is broken
     /// now still draws the panel it drew before.
     pub layout: ParamsLayout,
-    /// The input textures the file declares, in pin order. As with the layout, the
-    /// last list that parsed.
-    pub inputs: Vec<ShaderInput>,
     /// The fields the file reads by name, in declaration order. As with the layout,
     /// the last list that parsed.
     pub layers: Vec<LayerRead>,
-    /// How far, in document cells, the file declares it reads around the texel it
-    /// writes, or `None` for a file that declares nothing and so re-bakes whole. As
-    /// with the layout, the last reach that parsed.
-    pub reach: Option<u32>,
     /// Why the file did not parse or compile: `line N: message` against the file's own
     /// lines, or the bare message when the fault is not on a line the file owns.
     /// `None` when it is good.
@@ -266,13 +220,14 @@ impl DispatchGlobals {
 /// Every shader a document carries, and where they live.
 ///
 /// The root is the document's own `shaders` directory once it has been saved, and a
-/// scratch directory before that — so a shader node can be added to a document that
-/// has never been written, and the first save moves the directory in whole.
+/// scratch directory before that — so a field can be added to a document that has
+/// never been written, and the first save moves the directory in whole.
 #[derive(Resource, Debug)]
 pub struct ShaderLibrary {
     root: PathBuf,
     entries: BTreeMap<String, ShaderEntry>,
     generation: u64,
+    present: bool,
 }
 
 impl Default for ShaderLibrary {
@@ -281,6 +236,7 @@ impl Default for ShaderLibrary {
             root: scratch_root(),
             entries: BTreeMap::new(),
             generation: 0,
+            present: false,
         }
     }
 }
@@ -300,17 +256,33 @@ pub fn stock_source(name: &str) -> Option<&'static str> {
         .map(|(_, source)| *source)
 }
 
-/// Writes each named stock shader into `dir` under its own name, creating the
-/// directory and overwriting a file already there.
+/// The source a field added to a document starts as.
+pub fn template_source() -> &'static str {
+    TEMPLATE_SOURCE
+}
+
+/// Makes `dir` hold exactly the shader files of `preset`: creates the directory,
+/// **deletes every `.wgsl` file already in it**, then writes each field's
+/// `<field>.wgsl` from its stock file.
 ///
-/// Refused at the first name this build does not ship or the first write that fails,
-/// leaving the files written before it in place.
-pub fn write_stock(dir: &Path, files: &[&str]) -> Result<(), String> {
+/// Refused at the first removal or write that fails, leaving what was done before it.
+pub fn write_preset(dir: &Path, preset: Preset) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    for file in files {
-        let source = stock_source(file)
-            .ok_or_else(|| format!("`{file}` is not a shader this build ships"))?;
-        std::fs::write(dir.join(file), source).map_err(|error| format!("{file}: {error}"))?;
+    let entries = std::fs::read_dir(dir).map_err(|error| error.to_string())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "wgsl")
+        {
+            std::fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
+    for (field, stock) in preset.files() {
+        let source = stock_source(stock)
+            .ok_or_else(|| format!("`{stock}` is not a shader this build ships"))?;
+        let file = format!("{field}.wgsl");
+        std::fs::write(dir.join(&file), source).map_err(|error| format!("{file}: {error}"))?;
     }
     Ok(())
 }
@@ -342,26 +314,21 @@ impl ShaderLibrary {
         }
     }
 
-    /// Copies a stock shader into the document's directory under the first name not
-    /// already taken, and answers that name.
-    ///
-    /// The copy is the document's from that moment: editing it changes this document
-    /// and no other, which is the whole reason a shader lives beside the terrain it
-    /// belongs to.
-    pub fn adopt(&mut self, stock: &str) -> Result<String, String> {
-        let source = stock_source(stock)
-            .ok_or_else(|| format!("`{stock}` is not a shader this build ships"))?;
-        std::fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
+    /// Whether the last scan found the directory at all. A directory that does not
+    /// exist says nothing about which fields a document has.
+    pub fn present(&self) -> bool {
+        self.present
+    }
 
-        let stem = stock.trim_end_matches(".wgsl").trim_start_matches('_');
-        let mut file = format!("{stem}.wgsl");
-        let mut suffix = 1;
-        while self.root.join(&file).exists() {
-            suffix += 1;
-            file = format!("{stem}_{suffix}.wgsl");
-        }
-        std::fs::write(self.root.join(&file), source).map_err(|error| error.to_string())?;
-        Ok(file)
+    /// The fields the directory stands for: the stem of every `.wgsl` file not
+    /// beginning with `_`, in name order.
+    pub fn field_names(&self) -> Vec<String> {
+        self.entries
+            .keys()
+            .filter(|name| !name.starts_with('_'))
+            .filter_map(|name| name.strip_suffix(".wgsl"))
+            .map(str::to_owned)
+            .collect()
     }
 }
 
@@ -385,11 +352,9 @@ impl Plugin for ShaderPlugin {
 pub struct ShaderProgram {
     /// The file's own source, without the library or the entry point.
     pub source: String,
-    /// What its `Params` struct declares, and what a node's parameter values are packed
-    /// against.
+    /// What its `Params` struct declares, and what a field's parameter values are
+    /// packed against.
     pub layout: ParamsLayout,
-    /// The inputs it declares, in pin order.
-    pub inputs: Vec<ShaderInput>,
     /// The fields it reads by name, in declaration order.
     pub layers: Vec<LayerRead>,
 }
@@ -456,7 +421,6 @@ impl ShaderRuntime {
                     ShaderProgram {
                         source: entry.source.clone(),
                         layout: entry.layout.clone(),
-                        inputs: entry.inputs.clone(),
                         layers: entry.layers.clone(),
                     },
                 )
@@ -537,10 +501,9 @@ impl ShaderRuntime {
     /// Runs one program over the whole of `globals.texels` and answers its values,
     /// row-major.
     ///
-    /// `inputs` is one entry per declared input, in pin order; `None` is an unwired
-    /// pin and reads `0.0` everywhere. A shorter slice leaves the pins after it
-    /// unwired. `layers` is the same, one entry per [`ShaderProgram::layers`] in
-    /// order, with `None` for a field that has no raster to hand over.
+    /// `layers` is one entry per [`ShaderProgram::layers`], in order; `None` is a field
+    /// that has no raster to hand over and reads `0.0` everywhere. A shorter slice
+    /// leaves the layers after it reading `0.0`.
     ///
     /// Blocks until the GPU has finished and the result has been read back. Answers
     /// an error rather than panicking when the runtime holds no device.
@@ -549,24 +512,16 @@ impl ShaderRuntime {
         program: &ShaderProgram,
         params: &[u8],
         globals: DispatchGlobals,
-        inputs: &[Option<&Raster<f32>>],
         layers: &[Option<&Raster<f32>>],
     ) -> Result<Vec<f32>, String> {
         let Some(runtime) = &self.0 else {
             return Err("there is no render device to dispatch a shader on".to_owned());
         };
         let bound: Vec<(u32, Option<&Raster<f32>>)> = program
-            .inputs
+            .layers
             .iter()
             .enumerate()
-            .map(|(pin, input)| (input.binding, inputs.get(pin).copied().flatten()))
-            .chain(
-                program
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .map(|(at, read)| (read.binding, layers.get(at).copied().flatten())),
-            )
+            .map(|(at, read)| (read.binding, layers.get(at).copied().flatten()))
             .collect();
         dispatch(
             &runtime.device,
@@ -591,7 +546,6 @@ fn programs(
                 ShaderProgram {
                     source,
                     layout: declared.layout,
-                    inputs: declared.inputs,
                     layers: declared.layers,
                 },
             ))
@@ -603,10 +557,7 @@ fn follow_document(document: Res<Document>, mut library: ResMut<ShaderLibrary>) 
     if !document.is_changed() {
         return;
     }
-    let root = match &document.path {
-        Some(path) => path.join(SHADER_DIR),
-        None => scratch_root(),
-    };
+    let root = document.shader_root();
     if library.root() == root {
         return;
     }
@@ -638,12 +589,14 @@ fn carry_shaders(from: &Path, to: &Path, moving: bool) {
 fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
     let root = library.root.clone();
     let Ok(dir) = std::fs::read_dir(&root) else {
+        library.present = false;
         if !library.entries.is_empty() {
             library.entries.clear();
             library.generation += 1;
         }
         return;
     };
+    library.present = true;
 
     let mut seen: Vec<String> = Vec::new();
     for entry in dir.flatten() {
@@ -664,32 +617,24 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
             continue;
         };
         library.generation += 1;
-        let previous = library.entries.get(&name).map(|held| {
-            (
-                held.layout.clone(),
-                held.inputs.clone(),
-                held.layers.clone(),
-                held.reach,
-            )
-        });
+        let previous = library
+            .entries
+            .get(&name)
+            .map(|held| (held.layout.clone(), held.layers.clone()));
         let entry = match declare(&source) {
             Ok(declared) => ShaderEntry {
                 source,
                 layout: declared.layout,
-                inputs: declared.inputs,
                 layers: declared.layers,
-                reach: declared.reach,
                 error: None,
                 modified,
             },
             Err(reason) => {
-                let (layout, inputs, layers, reach) = previous.unwrap_or_default();
+                let (layout, layers) = previous.unwrap_or_default();
                 ShaderEntry {
                     source,
                     layout,
-                    inputs,
                     layers,
-                    reach,
                     error: Some(reason),
                     modified,
                 }
@@ -717,14 +662,10 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
 fn shaders_moved(terrain: &TerrainSpec, current: &ShaderRuntime, next: &ShaderRuntime) -> bool {
     let reseeded = current.seed() != next.seed();
     terrain.fields.iter().any(|field| {
-        field.graph.nodes.iter().any(|node| match &node.op {
-            NodeOp::Shader(shader) => {
-                reseeded
-                    || next.program(&shader.file).map(|held| &held.source)
-                        != current.program(&shader.file).map(|held| &held.source)
-            }
-            NodeOp::FieldRef(_) => false,
-        })
+        let file = field.file();
+        reseeded
+            || next.program(&file).map(|held| &held.source)
+                != current.program(&file).map(|held| &held.source)
     })
 }
 
@@ -750,27 +691,18 @@ fn attend_shaders(
         document.set_shader_runtime(next);
     }
 
+    if library.present() {
+        document.sync_fields(&library.field_names());
+    }
     let Some(terrain) = document.terrain_mut() else {
         return;
     };
     for field in &mut terrain.fields {
-        for node in &mut field.graph.nodes {
-            let NodeOp::Shader(shader) = &mut node.op else {
-                continue;
-            };
-            let Some(entry) = library.entry(&shader.file) else {
-                continue;
-            };
-            let mut moved = shader.reconcile(&entry.layout);
-            if shader.reconcile_inputs(&entry.inputs) {
-                let pins = shader.inputs.len();
-                node.inputs.resize(pins, None);
-                moved = true;
-            }
-            moved |= shader.reconcile_layers(&entry.layers);
-            moved |= shader.reconcile_reach(entry.reach);
-            touched |= moved;
-        }
+        let Some(entry) = library.entry(&field.file()) else {
+            continue;
+        };
+        touched |= field.shader.reconcile(&entry.layout);
+        touched |= field.shader.reconcile_layers(&entry.layers);
     }
     if touched {
         document.note_edit();
@@ -780,8 +712,8 @@ fn attend_shaders(
 /// A key over everything one dispatch's result depends on that a caller can cheaply
 /// re-derive: the source, the packed parameters and the extent.
 ///
-/// What a shader *reads* is not in it — a node with a wired pin is dispatched on
-/// every bake regardless, because the raster on that pin may have moved.
+/// What a shader *reads* is not in it — a field whose file reads a layer is
+/// dispatched on every bake regardless, because that layer may have moved.
 pub fn dispatch_key(source: &str, params: &[u8], texels: UVec2) -> u64 {
     let mut bytes = source.as_bytes().to_vec();
     bytes.extend_from_slice(params);
@@ -815,7 +747,7 @@ fn upload_input(
         depth_or_array_layers: 1,
     };
     let texture = device.create_texture(&TextureDescriptor {
-        label: Some("watershed shader input"),
+        label: Some("watershed shader layer"),
         size: extent,
         mip_level_count: 1,
         sample_count: 1,
@@ -843,15 +775,14 @@ fn upload_input(
     texture.create_view(&TextureViewDescriptor::default())
 }
 
-/// One shader run over one rectangle, read back as the values its node holds.
+/// One shader run over one rectangle, read back as the values its field holds.
 ///
-/// `inputs` is `(binding, raster)` per declared input. A `None` raster is bound as a
-/// single texel of `0.0`, which is what makes an unwired pin read `0.0` without a
-/// branch in the shader or a hole in the bind group.
+/// `inputs` is `(binding, raster)` per declared layer. A `None` raster is bound as a
+/// single texel of `0.0`, which is what makes a layer with no raster read `0.0`
+/// without a branch in the shader or a hole in the bind group.
 ///
-/// Blocks until the GPU has finished and the result has been mapped: a shader node
-/// has to be dispatched before the field's graph is walked, and the walk is
-/// synchronous.
+/// Blocks until the GPU has finished and the result has been mapped: the bake samples
+/// the result as soon as this returns, and the bake is synchronous.
 ///
 /// The shader is compiled from the library, the file's own source and the entry
 /// point, in that order, because WGSL has no forward declaration.
@@ -1042,9 +973,7 @@ impl ShaderLibrary {
             ShaderEntry {
                 source: String::new(),
                 layout: ParamsLayout::default(),
-                inputs: Vec::new(),
                 layers: Vec::new(),
-                reach: None,
                 error: Some(fault.to_owned()),
                 modified: None,
             },
@@ -1055,40 +984,11 @@ impl ShaderLibrary {
 }
 
 #[cfg(test)]
-impl ShaderRuntime {
-    /// A runtime on a device of its own, outside any app, holding the programs of an
-    /// empty library, or `None` on a machine with no adapter — hardware or software —
-    /// to run one on.
-    pub fn headless(seed: u32) -> Option<ShaderRuntime> {
-        use bevy::render::renderer::WgpuWrapper;
-        let instance = wgpu::Instance::default();
-        let adapter = [false, true].into_iter().find_map(|fallback| {
-            bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                force_fallback_adapter: fallback,
-                ..Default::default()
-            }))
-            .ok()
-        })?;
-        let (device, queue) =
-            bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .ok()?;
-        let device = RenderDevice::from(device);
-        let queue = RenderQueue(Arc::new(WgpuWrapper::new(queue)));
-        Some(ShaderRuntime::compile(
-            &device,
-            &queue,
-            &ShaderLibrary::default(),
-            seed,
-        ))
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    // The stock shaders are what a new shader layer is copied from, so one that does
-    // not parse would hand the user a broken layer on the first click.
+    // The stock shaders are what a preset's fields are copied from, so one that does
+    // not parse would hand the user a broken field on the first `new`.
     #[test]
     fn every_stock_shader_declares_readable_parameters() {
         for (name, source) in STOCK {
@@ -1121,21 +1021,6 @@ mod tests {
         }
     }
 
-    // The blur the acceptance path asks for, annotation and all, and the only thing
-    // short of a GPU that says it compiles: the binding, the library's two texel
-    // helpers and a neighbourhood read, validated as one source. The `@reach` line is
-    // a comment to WGSL and must stay one — a declared reach that broke the compile
-    // would make the narrowed re-bake unreachable.
-    #[test]
-    fn a_shader_that_declares_an_input_and_blurs_it_compiles() {
-        let source = "// @reach 2\n@group(0) @binding(3) var source: texture_2d<f32>; // @in \"Source\"\n\nfn value(p: vec2<f32>) -> f32 {\n    let at = field_texel(p);\n    var total = 0.0;\n    for (var dy = -1; dy <= 1; dy = dy + 1) {\n        for (var dx = -1; dx <= 1; dx = dx + 1) {\n            total = total + input_texel(source, at + vec2<i32>(dx, dy));\n        }\n    }\n    return total / 9.0;\n}\n";
-        assert_eq!(parse_inputs(source).unwrap().len(), 1);
-        assert_eq!(parse_reach(source).unwrap(), Some(2));
-        if let Err(error) = validate(source) {
-            panic!("a blur over a declared input does not compile: {error}");
-        }
-    }
-
     // The acceptance is that the header alone is enough to write a shader, so what the
     // panel renders has to be prose rather than a commented file, and it has to reach
     // every grammar a file may use.
@@ -1152,10 +1037,8 @@ mod tests {
             "uv(",
             "document_extent(",
             "@ui",
-            "@in",
             "@layer",
             "layer_value(",
-            "@reach",
             "@group",
         ] {
             assert!(
@@ -1187,9 +1070,8 @@ mod tests {
     }
 
     // The worked example the header gives, compiled: the acceptance observation short
-    // of a GPU. The header's own examples are shown indented so that none of them is
-    // read as this file's declaration — a `@reach` line at the start of a line would
-    // narrow the template's re-bake, and an input example would grow it a pin.
+    // of a GPU. The header's own examples must not be read as this file's declaration —
+    // a layer example would make every field copied from the template read `base`.
     #[test]
     fn the_headers_worked_example_compiles_and_its_examples_declare_nothing() {
         let source =
@@ -1197,9 +1079,11 @@ mod tests {
         if let Err(error) = validate(source) {
             panic!("the header's worked example does not compile: {error}");
         }
-        assert_eq!(parse_reach(TEMPLATE_SOURCE).unwrap(), None);
-        assert!(parse_inputs(TEMPLATE_SOURCE).unwrap().is_empty());
         assert!(parse_layers(TEMPLATE_SOURCE).unwrap().is_empty());
+        assert!(
+            declare(TEMPLATE_SOURCE).is_ok(),
+            "the template does not declare"
+        );
     }
 
     // What the `@layer` annotation is for: a file naming a field and reading it
@@ -1214,16 +1098,17 @@ mod tests {
         }
     }
 
-    // The dispatch binds a pin's raster and a layer's raster by binding number, so a
-    // file giving both one binding would have one of them silently replaced.
+    // A file written for a node graph still declares a pin or a reach, and a field
+    // that silently ignored either would not do what its author wrote.
     #[test]
-    fn an_input_and_a_layer_on_one_binding_are_refused() {
-        let source = "@group(0) @binding(3) var a: texture_2d<f32>; // @in\n@group(0) @binding(3) var b: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
-        let error = declare(source)
-            .err()
-            .expect("a binding shared by an input and a layer was accepted");
-        assert!(error.contains("binding 3 is declared twice"), "{error}");
-        assert!(error.starts_with("line 2:"), "{error}");
+    fn a_file_declaring_a_retired_annotation_is_refused_naming_it() {
+        let reach = "// @reach 2\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
+        let error = declare(reach).err().expect("a `@reach` was accepted");
+        assert!(error.contains("@reach"), "{error}");
+
+        let input = "@group(0) @binding(3) var a: texture_2d<f32>; // @in\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
+        let error = declare(input).err().expect("an `@in` was accepted");
+        assert!(error.contains("@in"), "{error}");
     }
 
     // The reason a shader is validated before the device sees it: wgpu reports a
@@ -1279,22 +1164,25 @@ mod tests {
         assert!(built.program("fbm.wgsl").is_none());
     }
 
-    // A preset's `new` has to leave its stock shaders on disk as this build ships them,
-    // over a copy an earlier document left, and a name this build does not ship is
-    // refused rather than written empty.
+    // A preset's `new` has to leave exactly its own fields' files on disk, as this
+    // build ships them: a file left from an earlier document would become a field of
+    // this one.
     #[test]
-    fn writing_stock_overwrites_an_existing_file_and_refuses_a_name_not_shipped() {
-        let dir = std::env::temp_dir().join(format!("watershed-stock-{}", std::process::id()));
+    fn writing_a_preset_removes_stale_files_and_writes_one_per_field() {
+        let dir = std::env::temp_dir().join(format!("watershed-preset-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("fbm.wgsl"), "edited").unwrap();
+        std::fs::write(dir.join("stale.wgsl"), "edited").unwrap();
+        std::fs::write(dir.join("notes.txt"), "kept").unwrap();
 
-        write_stock(&dir, &["fbm.wgsl"]).unwrap();
+        write_preset(&dir, Preset::Ridges).unwrap();
+        assert!(!dir.join("stale.wgsl").exists());
+        assert!(dir.join("notes.txt").is_file());
         assert_eq!(
-            std::fs::read_to_string(dir.join("fbm.wgsl")).unwrap(),
-            stock_source("fbm.wgsl").unwrap()
+            std::fs::read_to_string(dir.join("base.wgsl")).unwrap(),
+            stock_source("continents.wgsl").unwrap()
         );
-        assert!(write_stock(&dir, &["nonesuch.wgsl"]).is_err());
+        assert!(dir.join("height.wgsl").is_file() && dir.join("moisture.wgsl").is_file());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -1,5 +1,3 @@
-// @shader Terrace
-
 struct Params {
     // @group Shape
     scale: f32,   // @ui 0.02 [0.001, 0.2]

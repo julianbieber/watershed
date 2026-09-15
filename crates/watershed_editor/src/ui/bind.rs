@@ -6,7 +6,6 @@
 //! place, so they live side by side — a binding that read one number and wrote
 //! another would look like a field that will not take an edit.
 
-use crate::terrain::graph::{NodeId, NodeOp};
 use bevy::feathers::controls::{NumberFormat, NumberInputValue, UpdateNumberInput};
 use bevy::prelude::*;
 use bevy::ui_widgets::ValueChange;
@@ -15,12 +14,8 @@ use crate::document::Document;
 use crate::edit::{Edit, Slot};
 use crate::ui::{NewDialog, report};
 
-/// Which number a number field stands for.
-///
-/// Node-keyed variants carry a [`NodeId`] of the *active* field's graph. An id names
-/// its node for the life of the document, so a binding stays pointed at what it was
-/// built for across every edit that does not delete that node — and answers "not
-/// there" rather than guessing when one does.
+/// Which number a number field stands for. Every field-side variant reads and writes
+/// the *active* field.
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub enum NumberBinding {
     /// A field naming nothing. Never built by the panel — it is what the scene system
@@ -32,14 +27,14 @@ pub enum NumberBinding {
     RangeHigh,
     LightAzimuth,
     ContourInterval,
-    /// One component of one parameter of a shader node: the node, the parameter's
-    /// position in the node's own key order, and which component of it.
+    /// One component of one parameter of the active field's shader: the parameter's
+    /// position in the field's own key order, and which component of it.
     ///
     /// The parameter is positional because a binding has to be `Copy`, and safe to be
     /// positional because the panel is rebuilt whenever the shader's parameters change
     /// — a binding left over from before answers "not there" rather than writing into
     /// whatever moved into that position.
-    ShaderParam(NodeId, usize, usize),
+    ShaderParam(usize, usize),
     DialogWidth,
     DialogHeight,
     DialogSeed,
@@ -83,9 +78,8 @@ impl NumberBinding {
 
     /// What the field should be showing.
     ///
-    /// `None` where the binding names something the document no longer has — a stack
-    /// that shrank under a panel waiting to be rebuilt, or a node whose op has
-    /// changed to one with no such number.
+    /// `None` where the binding names something the document no longer has — a
+    /// parameter that went away under a panel waiting to be rebuilt.
     pub fn read(self, document: &Document, dialog: &NewDialog) -> Option<NumberInputValue> {
         let value = match self {
             Self::Unbound => return None,
@@ -97,12 +91,12 @@ impl NumberBinding {
             Self::DialogWidth => dialog.width as f32,
             Self::DialogHeight => dialog.height as f32,
             Self::DialogSeed => dialog.seed as f32,
-            Self::ShaderParam(id, param, component) => {
-                let NodeOp::Shader(shader) = op(document, id)? else {
-                    return None;
-                };
-                *shader.params.values().nth(param)?.get(component)?
-            }
+            Self::ShaderParam(param, component) => *field(document)?
+                .shader
+                .params
+                .values()
+                .nth(param)?
+                .get(component)?,
         };
         Some(if self.is_integer() {
             NumberInputValue::I32(value as i32)
@@ -173,14 +167,10 @@ impl NumberBinding {
             _ => return Slot::Once,
         };
         let index = match self {
-            Self::ShaderParam(_, param, component) => [param, component],
+            Self::ShaderParam(param, component) => [param, component],
             _ => [0, 0],
         };
-        Slot::Control {
-            property,
-            node: self.node(),
-            index,
-        }
+        Slot::Control { property, index }
     }
 
     fn write_document(self, value: f32, document: &mut Document) {
@@ -188,47 +178,24 @@ impl NumberBinding {
         document.write(&active, self.slot(), move |field| match self {
             Self::RangeLow => field.range.0 = value,
             Self::RangeHigh => field.range.1 = value,
-            _ => {
-                if let Some(node) = self.node().and_then(|id| field.graph.node_mut(id)) {
-                    self.write_op(value, &mut node.op);
+            Self::ShaderParam(param, component) => {
+                if let Some(slot) = field
+                    .shader
+                    .params
+                    .values_mut()
+                    .nth(param)
+                    .and_then(|value| value.get_mut(component))
+                {
+                    *slot = value;
                 }
             }
+            _ => {}
         });
-    }
-
-    fn write_op(self, value: f32, op: &mut NodeOp) -> bool {
-        let Self::ShaderParam(_, param, component) = self else {
-            return false;
-        };
-        let NodeOp::Shader(shader) = op else {
-            return false;
-        };
-        let Some(slot) = shader
-            .params
-            .values_mut()
-            .nth(param)
-            .and_then(|value| value.get_mut(component))
-        else {
-            return false;
-        };
-        *slot = value;
-        true
-    }
-
-    fn node(self) -> Option<NodeId> {
-        match self {
-            Self::ShaderParam(id, _, _) => Some(id),
-            _ => None,
-        }
     }
 }
 
 fn field(document: &Document) -> Option<&crate::terrain::Field> {
     document.terrain()?.field(document.active())
-}
-
-fn op(document: &Document, id: NodeId) -> Option<&NodeOp> {
-    field(document)?.graph.node(id).map(|node| &node.op)
 }
 
 /// Takes a finished float entry and writes it through its binding.
