@@ -3,7 +3,7 @@
 //! The status bar says one thing — the latest — and the next refusal overwrites it, so
 //! a compile failure read half a second too late is gone. This is the same stream kept
 //! as a list, so it can still be read after the bar has moved on. It is the history;
-//! what a node currently says about itself is on its card.
+//! what a field currently says about itself is on its card.
 
 use bevy::feathers::controls::FeathersDisclosureToggle;
 use bevy::feathers::theme::ThemeBackgroundColor;

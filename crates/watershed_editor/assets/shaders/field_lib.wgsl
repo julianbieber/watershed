@@ -1,4 +1,4 @@
-// What every shader node is compiled against: the bindings a dispatch supplies, and
+// What every field's shader is compiled against: the bindings a dispatch supplies, and
 // the noise primitives a shader is expected to reach for.
 //
 // The Rust half of this file is `gpu.rs`, which writes `Globals` out as
@@ -7,7 +7,7 @@
 
 // Everything a shader is told about where it is being evaluated. Positions are in
 // document cells, not in a normalised coordinate, so a scale means the same thing at
-// every shift and in every rectangle a re-bake covers.
+// every shift.
 struct Globals {
     // The document's extent, in cells.
     document: vec2<u32>,
@@ -139,14 +139,14 @@ fn uv(p: vec2<f32>) -> vec2<f32> {
 
 // The texel of this field's own raster a document position falls in — the inverse of
 // `cell_position`, and how a shader turns a neighbour's position into an index into
-// an input.
+// a layer.
 fn field_texel(p: vec2<f32>) -> vec2<i32> {
     return vec2<i32>(floor(p / f32(1u << globals.shift)));
 }
 
-// One texel of an input texture, clamped to its edge — so a neighbourhood read at the
-// border repeats the edge rather than reading nothing, and an unwired input, which is
-// one texel of zero, reads 0.0 everywhere.
+// One texel of a layer texture, clamped to its edge — so a neighbourhood read at the
+// border repeats the edge rather than reading nothing, and a layer with no raster,
+// which is one texel of zero, reads 0.0 everywhere.
 fn input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32 {
     let last = vec2<i32>(textureDimensions(source)) - vec2<i32>(1, 1);
     return textureLoad(source, clamp(at, vec2<i32>(0, 0), last), 0).r;

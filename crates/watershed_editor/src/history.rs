@@ -2,23 +2,20 @@
 //! that turn those into undo and redo.
 //!
 //! An entry does not cost the size of the document. It is kept as the authored state of
-//! every field and nothing derived from it, so it costs the graphs.
+//! every field and nothing derived from it, so it costs the settings and parameter
+//! values.
 
-use crate::terrain::graph::NodeOp;
 use crate::terrain::{Field, TerrainSpec, WaterSpec};
 
 /// How many changes can be undone. Recording past this drops the oldest.
 pub const HISTORY_DEPTH: usize = 100;
-
 /// The authored state of every field on the far side of one change, the water spec
 /// there, the field that was on screen, and whether crossing that change reaches the
 /// bake.
 ///
 /// Which field was on screen is part of what one change leaves behind because a
-/// change may move the view: a field added is the one shown afterwards, so going
-/// back across that change has to put the earlier one back, in the same step. The
-/// water spec is held for the same reason: a change may rewrite it, as a field renamed
-/// rewrites the name the spec solves over.
+/// change may move the view, so going back across that change has to put the earlier
+/// one back, in the same step.
 pub struct Snapshot {
     fields: Vec<Field>,
     water_spec: Option<WaterSpec>,
@@ -39,33 +36,28 @@ impl Snapshot {
             reaches_bake,
         }
     }
-
-    /// Puts the fields and the water spec back into `terrain`, keeping what the
-    /// history does not own: each live field's bake, and the values and declared reach
-    /// of a shader node under the same id on both sides. A live field the snapshot does
-    /// not name keeps nothing — it is not in the document afterwards. A graph's next id
-    /// is never lowered, so an id freed by an undo is not handed out again.
+    /// Puts each held field's settings and parameter values back onto the live field
+    /// of the same name, and the water spec back into `terrain`.
+    ///
+    /// Never adds or removes a field: a live field the snapshot does not hold is left
+    /// as it is, and a held field no live field matches is dropped. Everything the
+    /// history does not own — bakes, shader values, the fields a file reads — stays
+    /// with the live field.
     pub fn restore(self, terrain: &mut TerrainSpec) {
-        let mut fields = self.fields;
-        for field in &mut fields {
-            let Some(live) = terrain.field_mut(field.id.as_str()) else {
+        for held in self.fields {
+            let Some(live) = terrain.field_mut(held.id.as_str()) else {
                 continue;
             };
-            field.put_baked(live.take_baked());
-            field.graph.next_id = field.graph.next_id.max(live.graph.next_id);
-            for node in &mut field.graph.nodes {
-                let Some(held) = live.graph.node_mut(node.id) else {
-                    continue;
-                };
-                if let (NodeOp::Shader(shader), NodeOp::Shader(theirs)) =
-                    (&mut node.op, &mut held.op)
-                {
-                    shader.put_values(theirs.take_values());
-                    shader.reach = theirs.reach;
-                }
-            }
+            live.role = held.role;
+            live.shift = held.shift;
+            live.range = held.range;
+            live.export = held.export;
+            live.hillshade = held.hillshade;
+            live.light_azimuth = held.light_azimuth;
+            live.contours = held.contours;
+            live.contour_interval = held.contour_interval;
+            live.shader.params = held.shader.params;
         }
-        terrain.fields = fields;
         terrain.water_spec = self.water_spec;
     }
 }
@@ -159,37 +151,20 @@ fn swap(entry: Snapshot, terrain: &mut TerrainSpec, active: &str) -> (Restored, 
     entry.restore(terrain);
     (restored, now)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::graph::NodeId;
     use bevy::math::UVec2;
-    use watershed::raster::Raster;
 
     fn held(size: u32) -> TerrainSpec {
-        let mut terrain = TerrainSpec::new(UVec2::splat(size))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
+        let mut terrain =
+            TerrainSpec::new(UVec2::splat(size)).with_field(Field::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         terrain
     }
 
-    fn values_of(terrain: &TerrainSpec) -> &Raster<f32> {
-        match &terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .node(NodeId(0))
-            .unwrap()
-            .op
-        {
-            NodeOp::Shader(shader) => shader.values(),
-            other => panic!("the fixture node is {other:?}"),
-        }
-    }
-
-    // The whole reason a snapshot is affordable: neither a bake nor a shader node's
-    // values is kept, since both are re-obtained by baking.
+    // The whole reason a snapshot is affordable: neither a bake nor a shader's values is
+    // kept, since both are re-obtained by baking.
     #[test]
     fn a_recorded_snapshot_keeps_no_bake_and_no_shader_values() {
         let terrain = held(8);
@@ -198,76 +173,65 @@ mod tests {
 
         let kept = &history.undo[0].fields[0];
         assert!(kept.baked().is_empty(), "a bake was kept");
-        let NodeOp::Shader(shader) = &kept.graph.node(NodeId(0)).unwrap().op else {
-            panic!("the op changed");
-        };
-        assert!(shader.values().is_empty(), "the shader values were kept");
+        assert!(
+            kept.shader.values().is_empty(),
+            "the shader values were kept"
+        );
     }
 
-    // A change to the graph must not move what a shader node last produced: values
-    // landed after that change have to survive it being undone and redone, because
-    // nothing in the history holds them.
+    // Ctrl+Z covers parameter values, and the picture on screen stays the last one
+    // until the re-bake lands rather than going blank.
     #[test]
-    fn a_shader_nodes_values_survive_an_undo_and_a_redo_that_keep_its_node() {
+    fn undoing_a_parameter_change_restores_it_and_keeps_the_bake() {
         let mut terrain = held(8);
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.field_mut("height").unwrap().shift = 2;
-        history.record(before);
-        if let NodeOp::Shader(shader) = &mut terrain
+        terrain
             .field_mut("height")
             .unwrap()
-            .graph
-            .node_mut(NodeId(0))
-            .unwrap()
-            .op
-        {
-            shader.put_values(Raster::new(UVec2::splat(8), 0.75));
-        }
+            .shader
+            .params
+            .insert("value".to_owned(), vec![0.75]);
+        history.record(before);
 
         history.undo(&mut terrain, "height").unwrap();
-        assert_eq!(terrain.field("height").unwrap().shift, 0);
-        assert_eq!(values_of(&terrain).data()[3], 0.75);
-        history.redo(&mut terrain, "height").unwrap();
-        assert_eq!(terrain.field("height").unwrap().shift, 2);
-        assert_eq!(values_of(&terrain).data()[3], 0.75);
+        let field = terrain.field("height").unwrap();
+        assert_eq!(field.shader.params.get("value"), Some(&vec![0.5]));
+        assert!(!field.baked().is_empty());
+        assert!(!field.shader.values().is_empty());
     }
 
-    // The bake is derived and stays with the document across a restore, so the picture
-    // on screen is the last one until the re-bake lands rather than a blank.
+    // Adding a field is a file operation outside the history, so an undo across an
+    // earlier change must not take a field out whose file is still on disk.
     #[test]
-    fn restoring_keeps_the_bake_the_document_has() {
+    fn a_field_added_after_a_snapshot_survives_an_undo() {
         let mut terrain = held(8);
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
         terrain.field_mut("height").unwrap().range = (0.0, 2.0);
         history.record(before);
+        terrain.fields.push(Field::new("temperature"));
 
         history.undo(&mut terrain, "height").unwrap();
-        assert!(!terrain.field("height").unwrap().baked().is_empty());
+        assert!(terrain.field("temperature").is_some());
+        assert_eq!(terrain.field("height").unwrap().range, (0.0, 1.0));
     }
 
-    // A node id names its node for the life of the document, and an undo must not
-    // break that promise by handing an id out twice.
+    // Removing a field deleted its file, so an undo must not bring back a field whose
+    // file is gone.
     #[test]
-    fn an_id_freed_by_an_undo_is_not_reused() {
-        let mut terrain = held(8);
+    fn a_field_removed_after_a_snapshot_is_not_brought_back() {
+        let mut terrain = held(8).with_field(Field::new("temperature"));
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
-        let first = terrain
-            .field_mut("height")
-            .unwrap()
-            .graph
-            .add_node(NodeOp::held(1.0), [0.0, 0.0]);
+        terrain.field_mut("height").unwrap().range = (0.0, 2.0);
         history.record(before);
+        terrain
+            .fields
+            .retain(|field| field.id.as_str() != "temperature");
 
         history.undo(&mut terrain, "height").unwrap();
-        let second = terrain
-            .field_mut("height")
-            .unwrap()
-            .graph
-            .add_node(NodeOp::held(2.0), [0.0, 0.0]);
-        assert_ne!(first, second);
+        assert!(terrain.field("temperature").is_none());
     }
 
     // The two stacks are one sequence of changes: a new change forgets what could have

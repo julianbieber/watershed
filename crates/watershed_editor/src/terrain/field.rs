@@ -1,4 +1,4 @@
-//! A named graph of nodes, and the raster the graph bakes onto.
+//! A named raster, the shader that produces its values, and the raster it bakes onto.
 
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
@@ -6,22 +6,20 @@ use serde::{Deserialize, Serialize};
 use watershed::field::{FieldId, FieldRole};
 use watershed::raster::{Raster, raster_coord, resolution};
 
-use crate::terrain::graph::{FieldGraph, NodeOp};
+use crate::terrain::shader::ShaderLayer;
 
-/// A named graph of nodes together with everything needed to evaluate it onto its
-/// own raster, plus that raster once it has been baked.
+/// A named field together with everything needed to bake its shader onto its own
+/// raster, plus that raster once it has been baked.
 ///
-/// The baked raster is not serialized: it is derived from the graph and is
+/// The baked raster is not serialized: it is derived from the shader and is
 /// re-obtained by baking, so a loaded document starts with every field empty and
 /// sampling as `0.0`. Equality does compare it, so two fields differing only in
 /// bake state are not equal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
-    /// The name this field is referenced by. Assigning it does not rewrite the
-    /// graphs of other fields that reference the old name, nor the water spec that
-    /// names it; renaming a field in a document is
-    /// [`Edit::RenameField`](crate::edit::Edit::RenameField), which rewrites both in
-    /// one change.
+    /// The name this field is referenced by, and the stem of its shader file.
+    /// Assigning it rewrites neither the files of other fields that read the old name
+    /// nor the water spec that names it.
     pub id: FieldId,
     /// What the bake may do with the field. See [`FieldRole`] for the constraints
     /// a document carrying this has to satisfy.
@@ -60,9 +58,9 @@ pub struct Field {
     /// range into ten bands.
     #[serde(default = "default_contour_interval")]
     pub contour_interval: f32,
-    /// What the field's value is built out of. Evaluation order is derived from the
-    /// edges, not stored.
-    pub graph: FieldGraph,
+    /// The parameter values and the fields read of the shader file that produces this
+    /// field's values. Evaluation order is derived from the fields read, not stored.
+    pub shader: ShaderLayer,
     #[serde(skip)]
     baked: Raster<f32>,
 }
@@ -79,7 +77,7 @@ fn default_contour_interval() -> f32 {
 }
 
 impl Field {
-    /// A field named `id` with an empty graph: role `Custom`, shift 0, range
+    /// A field named `id` with no parameter values: role `Custom`, shift 0, range
     /// `0.0..=1.0`, not exported, not hillshaded, lit from the northwest, without
     /// contours at a tenth-unit interval, and unbaked — so it samples as `0.0`
     /// until it is baked.
@@ -94,7 +92,7 @@ impl Field {
             light_azimuth: DEFAULT_LIGHT_AZIMUTH,
             contours: false,
             contour_interval: DEFAULT_CONTOUR_INTERVAL,
-            graph: FieldGraph::new(),
+            shader: ShaderLayer::default(),
             baked: Raster::default(),
         }
     }
@@ -125,34 +123,21 @@ impl Field {
         self
     }
 
-    /// Adds one node of `op` and reads the field from it.
-    ///
-    /// The one-node graph a field starts as, and what most of the test suite wants:
-    /// a field that is exactly one op.
-    pub fn with_op(mut self, op: NodeOp) -> Self {
-        self.graph.add_node(op, [0.0, 0.0]);
-        self
-    }
-
-    /// Replaces the whole graph.
-    pub fn with_graph(mut self, graph: FieldGraph) -> Self {
-        self.graph = graph;
-        self
+    /// The shader file this field's values come from: a plain name inside the
+    /// document's `shaders` directory, never a path.
+    pub fn file(&self) -> String {
+        format!("{}.wgsl", self.id)
     }
 
     /// A copy of everything a person authored and nothing that was derived from it:
-    /// the graph with every shader node's values dropped, and no bake.
+    /// the settings and the parameter values, with no shader values and no bake.
     ///
     /// What a history snapshot is made of — the bake and the shader values are
     /// re-obtained by baking and dispatching, so a copy that carried them would cost
     /// the size of the document per edit.
     pub fn authored(&self) -> Self {
-        let mut graph = self.graph.clone();
-        for node in &mut graph.nodes {
-            if let NodeOp::Shader(shader) = &mut node.op {
-                shader.clear();
-            }
-        }
+        let mut shader = self.shader.clone();
+        shader.clear();
         Self {
             id: self.id.clone(),
             role: self.role,
@@ -163,7 +148,7 @@ impl Field {
             light_azimuth: self.light_azimuth,
             contours: self.contours,
             contour_interval: self.contour_interval,
-            graph,
+            shader,
             baked: Raster::default(),
         }
     }
@@ -223,37 +208,42 @@ impl Field {
         self.baked.sample_bilinear(u, v)
     }
 
-    /// The fields this one reads, through the nodes reachable from its output only;
-    /// bypassing or unwiring a node removes its dependencies.
-    ///
-    /// This is what bake ordering and cycle detection run on, so a cycle that exists
-    /// only through an unreachable node is not a cycle and the document plans.
-    /// Duplicates are not removed and the order is evaluation order.
-    pub fn dependencies(&self) -> impl Iterator<Item = &FieldId> {
-        self.graph.dependencies().into_iter()
-    }
-
-    /// Every field this one's graph reads — named in a `FieldRef` or in a shader's
-    /// `@layer` annotation — whether or not the node is wired to anything, with
+    /// The fields this one's shader file reads by name, in declaration order, with
     /// duplicates kept.
     ///
-    /// Wider than [`Field::dependencies`], which reports only what the output reaches:
-    /// an unconnected reference reads nothing yet, but it is a declared read, and the
-    /// editor refuses one that could not be wired up later. A bypassed node is left out
-    /// of both, because bypass is how a reference is turned off.
-    pub fn declared_reads(&self) -> impl Iterator<Item = &FieldId> {
-        self.graph
-            .nodes
-            .iter()
-            .filter(|node| !node.bypassed)
-            .flat_map(|node| node.op.reads())
+    /// This is what bake ordering and cycle detection run on. It is what the file said
+    /// when it was last read, so it is empty until the shader directory has been read.
+    pub fn dependencies(&self) -> impl Iterator<Item = &FieldId> {
+        self.shader.layers.iter()
+    }
+
+    /// This field holding a 1×1 raster of `value` as its shader's values, and `value`
+    /// as its `value` parameter.
+    #[cfg(test)]
+    pub fn held(mut self, value: f32) -> Self {
+        self.shader.put_values(Raster::new(UVec2::ONE, value));
+        self.shader.params.insert("value".to_owned(), vec![value]);
+        self
+    }
+
+    /// This field holding `raster` as its shader's values.
+    #[cfg(test)]
+    pub fn holding(mut self, raster: Raster<f32>) -> Self {
+        self.shader.put_values(raster);
+        self
+    }
+
+    /// This field's shader reading the fields `names`, in that order.
+    #[cfg(test)]
+    pub fn reading(mut self, names: &[&str]) -> Self {
+        self.shader.layers = names.iter().map(|name| FieldId::from(*name)).collect();
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::graph::{FieldGraph, NodeOp};
 
     // Shift 0 is what the `Height` field is pinned to, so a document's cell grid and
     // its height raster have to be the same grid.
@@ -282,35 +272,13 @@ mod tests {
         assert_eq!(field.bounds(), (-1.0, 1.0));
     }
 
-    // Pins both halves of what bake ordering is computed from: every reference the
-    // output reaches counts, and one it cannot reach counts for nothing.
-    #[test]
-    fn a_field_reports_the_dependencies_its_output_reaches_and_no_others() {
-        let mut graph = FieldGraph::new();
-        let relief = graph.node_with(NodeOp::FieldRef(FieldId::from("relief")), &[]);
-        let ridge = graph.node_with(NodeOp::FieldRef(FieldId::from("ridge")), &[]);
-        let mixed = graph.node_with(NodeOp::piped(2), &[relief, ridge]);
-        graph.node_with(NodeOp::FieldRef(FieldId::from("hidden")), &[]);
-        graph.set_output(Some(mixed)).unwrap();
-
-        let field = Field::new("height").with_graph(graph);
-        let deps: Vec<_> = field.dependencies().map(|id| id.as_str()).collect();
-        assert_eq!(deps.len(), 2);
-        assert!(deps.contains(&"relief") && deps.contains(&"ridge"));
-        assert!(!deps.contains(&"hidden"));
-    }
-
     // A shader's `@layer` names are the file's dependency on another field, so bake
-    // order and the editor's read checks have to see them as reads.
+    // order and the editor's read checks have to see them.
     #[test]
-    fn a_shader_nodes_layers_are_declared_reads_and_dependencies() {
-        let mut shader = crate::terrain::shader::ShaderLayer::new("reader.wgsl");
-        shader.layers = vec![FieldId::from("base")];
-        let field = Field::new("height").with_op(NodeOp::Shader(shader));
-        let declared: Vec<_> = field.declared_reads().map(|id| id.as_str()).collect();
+    fn a_fields_layers_are_its_dependencies() {
+        let field = Field::new("height").reading(&["base", "relief"]);
         let deps: Vec<_> = field.dependencies().map(|id| id.as_str()).collect();
-        assert_eq!(declared, ["base"]);
-        assert_eq!(deps, ["base"]);
+        assert_eq!(deps, ["base", "relief"]);
     }
 
     // A history snapshot is `authored()`, so a display property missing from it is a

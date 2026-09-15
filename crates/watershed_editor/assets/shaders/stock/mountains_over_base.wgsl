@@ -1,6 +1,3 @@
-// @shader Mountains over base
-// @reach 0
-
 struct Params {
     // @group Ridges
     ridge_scale: f32,  // @ui "Ridge scale" 0.006 [0.001, 0.05]

@@ -2,18 +2,17 @@
 //! lets a person change anywhere but on the canvas itself.
 //!
 //! Everything here follows from one rule. **A choice is shape and a number is a
-//! value**: choosing an op or a mode changes which widgets exist, so the panel
+//! value**: choosing a role or a mode changes which widgets exist, so the panel
 //! is thrown away and rebuilt; typing a number changes only what a widget holds, so
 //! the panel stands and the value is pushed into it. Getting a number into the shape
 //! would rebuild the panel under the keyboard on the frame it was typed into, and
 //! leaving a choice out of it would leave a menu showing what it used to say over a
 //! document that had already changed.
 
-use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
 use bevy::feathers::containers::{group, group_body, group_header};
 use bevy::feathers::controls::{
-    ButtonVariant, FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersTextInput,
-    FeathersTextInputContainer, FeathersToolButton,
+    FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersTextInput,
+    FeathersTextInputContainer,
 };
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
@@ -21,16 +20,17 @@ use bevy::prelude::*;
 use bevy::text::{EditableText, TextEdit, TextEditChange};
 use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
-use watershed::{FieldId, FieldRole};
+use watershed::FieldRole;
 
-use crate::canvas::{OpenField, Selection};
+use crate::canvas::OpenField;
 use crate::document::{Baked, Document};
-use crate::edit::{Edit, node_path, op_name, op_summary};
-use crate::gpu::{STOCK, ShaderLibrary, shader_reference};
-use crate::terrain::graph::{GraphNode, NodeId, NodeOp};
+use crate::edit::Edit;
+use crate::gpu::{ShaderLibrary, shader_reference};
+use crate::terrain::Field;
+use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
-use crate::ui::{ADDABLE, AddLayer, Expanded, NewField, PANEL_WIDTH, report};
+use crate::ui::{Expanded, NewField, PANEL_WIDTH, report};
 
 /// What the panel was last built from, and which rebuild that was.
 ///
@@ -89,14 +89,12 @@ pub fn panel() -> impl Scene {
 pub fn rebuild(
     document: Res<Document>,
     expanded: Res<Expanded>,
-    add: Res<AddLayer>,
     library: Res<ShaderLibrary>,
-    selection: Res<Selection>,
     mut shape: ResMut<Shape>,
     body: Single<Entity, With<StackBody>>,
     mut commands: Commands,
 ) {
-    let key = fingerprint(&document, &expanded, &add, &library, &selection);
+    let key = fingerprint(&document, &expanded, &library);
     if shape.key == key {
         return;
     }
@@ -104,11 +102,10 @@ pub fn rebuild(
     shape.generation += 1;
     let generation = shape.generation;
 
-    let entries: Vec<Box<dyn SceneList>> =
-        contents(&document, &expanded, &add, &library, &selection)
-            .into_iter()
-            .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
-            .collect();
+    let entries: Vec<Box<dyn SceneList>> = contents(&document, &expanded, &library)
+        .into_iter()
+        .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
+        .collect();
 
     commands
         .entity(*body)
@@ -152,29 +149,15 @@ fn shift_is_pinned(document: &Document) -> bool {
         })
 }
 
-fn field_of(document: &Document) -> Option<&crate::terrain::Field> {
+fn field_of(document: &Document) -> Option<&Field> {
     document.terrain()?.field(document.active())
 }
 
-fn fingerprint(
-    document: &Document,
-    expanded: &Expanded,
-    add: &AddLayer,
-    library: &ShaderLibrary,
-    selection: &Selection,
-) -> String {
+fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary) -> String {
     let mut key = String::new();
     key.push_str(document.active());
     key.push('|');
-    key.push_str(
-        &selection
-            .node
-            .map_or_else(|| "none".to_owned(), |node| node.to_string()),
-    );
-    key.push('|');
     key.push_str(&document.field_names().join(","));
-    key.push('|');
-    key.push_str(&add.0);
     key.push('|');
     key.push_str(if expanded.reference { "ref" } else { "noref" });
     key.push('|');
@@ -196,44 +179,22 @@ fn fingerprint(
     key.push_str(field.role.as_str());
     key.push_str(&format!("|hillshade:{}", field.hillshade));
     key.push_str(&format!("|contours:{}", field.contours));
-    key.push_str(&format!(
-        "|out:{}",
-        field
-            .graph
-            .output
-            .map_or_else(|| "none".to_owned(), |id| id.to_string())
-    ));
-    for node in &field.graph.nodes {
-        key.push_str(&format!(
-            "|{}:{}:{}:{}:{:?}",
-            node.id,
-            op_name(&node.op),
-            node.bypassed,
-            expanded.has(node.id),
-            node.inputs,
-        ));
-        match &node.op {
-            NodeOp::FieldRef(id) => key.push_str(id.as_ref()),
-            NodeOp::Shader(shader) => {
-                key.push_str(&shader.file);
-                match library.entry(&shader.file) {
-                    Some(entry) => {
-                        for param in &entry.layout.fields {
-                            key.push(':');
-                            key.push_str(&param.group);
-                            key.push('/');
-                            key.push_str(&param.label);
-                        }
-                        key.push_str(if entry.error.is_some() {
-                            ":broken"
-                        } else {
-                            ":good"
-                        });
-                    }
-                    None => key.push_str(":missing"),
-                }
+    key.push('|');
+    match library.entry(&field.file()) {
+        Some(entry) => {
+            for param in &entry.layout.fields {
+                key.push(':');
+                key.push_str(&param.group);
+                key.push('/');
+                key.push_str(&param.label);
             }
+            key.push_str(if entry.error.is_some() {
+                ":broken"
+            } else {
+                ":good"
+            });
         }
+        None => key.push_str(":missing"),
     }
     key
 }
@@ -241,64 +202,37 @@ fn fingerprint(
 fn contents(
     document: &Document,
     expanded: &Expanded,
-    add: &AddLayer,
     library: &ShaderLibrary,
-    selection: &Selection,
 ) -> Vec<Box<dyn Scene>> {
     let active = document.active().to_owned();
-    let names = document.field_names();
     let Some(field) = field_of(document) else {
         return vec![widgets::boxed(widgets::text("no document"))];
     };
-    let selected = selection
-        .node
-        .filter(|node| field.graph.node(*node).is_some());
 
     let mut children: Vec<Box<dyn Scene>> = vec![widgets::boxed(widgets::row(vec![
         one(widgets::text(active.clone())),
         one(bsn! { widgets::small("") PreviewTag }),
     ]))];
 
-    if selected.is_none_or(|node| field.graph.output == Some(node)) {
-        let reads = crate::edit::reads_of(field);
-        let read_by = document
-            .terrain()
-            .map(|terrain| crate::edit::readers_of(terrain, &active))
-            .unwrap_or_default();
-        children.push(widgets::boxed(properties(
-            &active,
-            field,
-            shift_is_pinned(document),
-            &reads,
-            &read_by,
-        )));
-    }
-
-    match selected.and_then(|node| field.graph.node(node)) {
-        Some(node) => {
-            children.push(widgets::boxed(node_entry(
-                &active,
-                node,
-                &names,
-                expanded.has(node.id),
-                library,
-            )));
-            if matches!(node.op, NodeOp::Shader(_)) {
-                children.push(widgets::boxed(reference_section(expanded.reference)));
-            }
-        }
-        None => children.push(widgets::boxed(widgets::small(
-            "select a node on the canvas",
-        ))),
-    }
-
-    children.push(widgets::boxed(add_row(&active, &names, add)));
+    let reads = crate::edit::reads_of(field);
+    let read_by = document
+        .terrain()
+        .map(|terrain| crate::edit::readers_of(terrain, &active))
+        .unwrap_or_default();
+    children.push(widgets::boxed(properties(
+        &active,
+        field,
+        shift_is_pinned(document),
+        &reads,
+        &read_by,
+    )));
+    children.push(widgets::boxed(shader_section(field, library)));
+    children.push(widgets::boxed(reference_section(expanded.reference)));
     children.push(widgets::boxed(field_row(&active)));
     children
 }
 
 fn field_row(active: &str) -> impl Scene {
-    let rename_from = active.to_owned();
     let remove = active.to_owned();
     widgets::column(vec![
         one(widgets::row(vec![
@@ -334,40 +268,19 @@ fn field_row(active: &str) -> impl Scene {
                 })
             }),
         ])),
-        one(widgets::row(vec![
-            one(bsn! {
-                @FeathersButton {
-                    @caption: bsn! { Text("Rename") ThemedText },
-                }
-                on(move |_: On<Activate>,
-                    mut document: ResMut<Document>,
-                    mut name: ResMut<NewField>| {
-                    let result = document
-                        .apply(&Edit::RenameField {
-                            from: rename_from.clone(),
-                            to: name.0.clone(),
-                        })
-                        .map(|_| ());
-                    if result.is_ok() {
-                        name.0.clear();
-                    }
-                    report(&mut document, result);
-                })
-            }),
-            one(bsn! {
-                @FeathersButton {
-                    @caption: bsn! { Text("Remove field") ThemedText },
-                }
-                on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document
-                        .apply(&Edit::RemoveField {
-                            name: remove.clone(),
-                        })
-                        .map(|_| ());
-                    report(&mut document, result);
-                })
-            }),
-        ])),
+        one(bsn! {
+            @FeathersButton {
+                @caption: bsn! { Text("Remove field") ThemedText },
+            }
+            on(move |_: On<Activate>, mut document: ResMut<Document>| {
+                let result = document
+                    .apply(&Edit::RemoveField {
+                        name: remove.clone(),
+                    })
+                    .map(|_| ());
+                report(&mut document, result);
+            })
+        }),
     ])
 }
 
@@ -397,7 +310,6 @@ fn field_links(caption: &str, names: &[String]) -> impl Scene {
             on(move |_: On<Activate>, mut open: MessageWriter<OpenField>| {
                 open.write(OpenField {
                     field: field.clone(),
-                    select: None,
                 });
             })
         }));
@@ -417,7 +329,7 @@ fn field_links(caption: &str, names: &[String]) -> impl Scene {
 
 fn properties(
     active: &str,
-    field: &crate::terrain::Field,
+    field: &Field,
     pinned: bool,
     reads: &[String],
     read_by: &[String],
@@ -486,73 +398,6 @@ fn properties(
     ])
 }
 
-fn node_entry(
-    active: &str,
-    node: &GraphNode,
-    names: &[String],
-    open: bool,
-    library: &ShaderLibrary,
-) -> impl Scene {
-    let active = active.to_owned();
-    let id = node.id;
-    let title = match &node.name {
-        Some(name) => format!("{id}  {name}"),
-        None => format!("{id}  {}", op_name(&node.op)),
-    };
-
-    let header = widgets::row(vec![
-        one(bypass_checkbox(&active, id, node.bypassed)),
-        one(remove_button(&active, id)),
-        one(widgets::text(title)),
-    ]);
-
-    let mut body: Vec<Box<dyn SceneList>> = Vec::new();
-    if !node.inputs.is_empty() {
-        body.push(one(widgets::small(inputs_caption(node))));
-    }
-    body.push(one(op_editor(id, &node.op, names, library)));
-
-    widgets::column(vec![
-        one(header),
-        one(section(
-            op_summary(&node.op),
-            open,
-            body,
-            move |open, expanded: &mut Expanded| expanded.set(id, open),
-        )),
-    ])
-}
-
-fn inputs_caption(node: &GraphNode) -> String {
-    let pins: Vec<String> = node
-        .inputs
-        .iter()
-        .map(|pin| match pin {
-            Some(source) => source.to_string(),
-            None => "-".to_owned(),
-        })
-        .collect();
-    format!("inputs {}", pins.join(" "))
-}
-
-fn bypass_checkbox(active: &str, id: NodeId, bypassed: bool) -> impl Scene {
-    let active = active.to_owned();
-    bsn! {
-        {widgets::when(!bypassed, Checked)}
-        @FeathersCheckbox
-        on(move |change: On<ValueChange<bool>>, mut document: ResMut<Document>| {
-            let result = document
-                .apply(&Edit::Bypass {
-                    field: active.clone(),
-                    node: id.to_string(),
-                    bypassed: Some(!change.value),
-                })
-                .map(|_| ());
-            report(&mut document, result);
-        })
-    }
-}
-
 fn toggle_row(
     active: &str,
     property: &'static str,
@@ -580,67 +425,22 @@ fn toggle_row(
     widgets::row(children)
 }
 
-fn remove_button(active: &str, id: NodeId) -> impl Scene {
-    let active = active.to_owned();
-    bsn! {
-        @FeathersToolButton {
-            @caption: bsn! { Text("x") ThemedText },
-            @variant: ButtonVariant::Plain,
-        }
-        on(move |_: On<Activate>, mut document: ResMut<Document>| {
-            let result = document
-                .apply(&Edit::RemoveNode {
-                    field: active.clone(),
-                    node: id.to_string(),
-                })
-                .map(|_| ());
-            report(&mut document, result);
-        })
-    }
-}
-
-fn op_editor(id: NodeId, op: &NodeOp, names: &[String], library: &ShaderLibrary) -> impl Scene {
-    let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::small(op_name(op)))];
-
-    match op {
-        NodeOp::FieldRef(read) => {
-            let current = read.clone();
-            rows.push(one(widgets::captioned(
-                "of",
-                one(field_menu(read, names, move |document, chosen| {
-                    if chosen == current {
-                        return;
-                    }
-                    let active = document.active().to_owned();
-                    let result = document
-                        .apply(&Edit::Set {
-                            path: format!("{active}.{}.field", node_path(id)),
-                            words: vec![chosen.to_string()],
-                        })
-                        .map(|_| ());
-                    report(document, result);
-                })),
-            )));
-        }
-
-        NodeOp::Shader(shader) => {
-            rows.push(one(widgets::small(shader.file.clone())));
-            match library.entry(&shader.file) {
-                None => rows.push(one(widgets::small("no such shader in this document"))),
-                Some(entry) => {
-                    if let Some(error) = &entry.error {
-                        rows.push(one(widgets::small(error.clone())));
-                    }
-                    rows.extend(param_rows(id, shader, &entry.layout));
-                }
+fn shader_section(field: &Field, library: &ShaderLibrary) -> impl Scene {
+    let file = field.file();
+    let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::small(file.clone()))];
+    match library.entry(&file) {
+        None => rows.push(one(widgets::small("no such file in shaders/"))),
+        Some(entry) => {
+            if let Some(error) = &entry.error {
+                rows.push(one(widgets::small(error.clone())));
             }
+            rows.extend(param_rows(&field.shader, &entry.layout));
         }
     }
-
     widgets::column(rows)
 }
 
-fn param_rows(id: NodeId, shader: &ShaderLayer, layout: &ParamsLayout) -> Vec<Box<dyn SceneList>> {
+fn param_rows(shader: &ShaderLayer, layout: &ParamsLayout) -> Vec<Box<dyn SceneList>> {
     let mut rows: Vec<Box<dyn SceneList>> = Vec::new();
     let mut group = String::new();
     for field in &layout.fields {
@@ -665,59 +465,11 @@ fn param_rows(id: NodeId, shader: &ShaderLayer, layout: &ParamsLayout) -> Vec<Bo
             };
             rows.push(one(widgets::number_row(
                 caption,
-                NumberBinding::ShaderParam(id, param, component),
+                NumberBinding::ShaderParam(param, component),
             )));
         }
     }
     rows
-}
-
-fn add_row(active: &str, names: &[String], add: &AddLayer) -> impl Scene {
-    let active = active.to_owned();
-    let names = names.to_vec();
-    let items: Vec<Box<dyn SceneList>> = ADDABLE
-        .into_iter()
-        .map(|kind| {
-            one(bsn! {
-                widgets::item_caption(kind)
-                on(move |_: On<Activate>, mut add: ResMut<AddLayer>| {
-                    add.0 = kind.to_owned();
-                })
-            })
-        })
-        .collect();
-
-    let chosen = add.0.clone();
-    widgets::row(vec![
-        one(widgets::menu(add.0.clone(), items)),
-        one(bsn! {
-            @FeathersButton {
-                @caption: bsn! { Text("Add node") ThemedText },
-            }
-            on(move |_: On<Activate>, mut document: ResMut<Document>, mut library: ResMut<ShaderLibrary>, selection: Res<Selection>| {
-                let at = field_of(&document)
-                    .map(|field| field.graph.free_position_beside(selection.node));
-                let op = match stock_of(&chosen) {
-                    Some(stock) => match library.adopt(stock) {
-                        Ok(file) => NodeOp::Shader(ShaderLayer::new(file)),
-                        Err(error) => {
-                            report(&mut document, Err(error));
-                            return;
-                        }
-                    },
-                    None => default_op(&names),
-                };
-                let result = document
-                    .apply(&Edit::AddNode {
-                        field: active.clone(),
-                        op,
-                        position: at,
-                    })
-                    .map(|_| ());
-                report(&mut document, result);
-            })
-        }),
-    ])
 }
 
 fn section(
@@ -791,112 +543,49 @@ fn reference_body() -> impl Scene {
     }
 }
 
-fn field_menu(
-    current: &FieldId,
-    names: &[String],
-    write: impl Fn(&mut Document, FieldId) + Clone + Send + Sync + 'static,
-) -> impl Scene {
-    let current = current.to_string();
-    let items: Vec<Box<dyn SceneList>> = names
-        .iter()
-        .map(|name| {
-            let chosen = FieldId::from(name.as_str());
-            let write = write.clone();
-            one(bsn! {
-                widgets::item_caption(name.clone())
-                on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                    write(&mut document, chosen.clone());
-                })
-            })
-        })
-        .collect();
-    widgets::menu(current, items)
-}
-
-fn stock_of(chosen: &str) -> Option<&'static str> {
-    let name = chosen.strip_prefix("shader:")?;
-    let file = if name == "blank" {
-        "_template.wgsl".to_owned()
-    } else {
-        format!("{name}.wgsl")
-    };
-    STOCK
-        .iter()
-        .find(|(stock, _)| *stock == file)
-        .map(|(stock, _)| *stock)
-}
-
-fn default_op(names: &[String]) -> NodeOp {
-    NodeOp::FieldRef(first_field(names))
-}
-
-fn first_field(names: &[String]) -> FieldId {
-    names
-        .first()
-        .map(|name| FieldId::from(name.as_str()))
-        .unwrap_or_else(|| FieldId::from("height"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terrain::TerrainSpec;
+    use watershed::FieldId;
 
-    fn document_with(ops: Vec<NodeOp>) -> Document {
+    fn document_with(value: f32) -> Document {
         let mut document = Document::default();
-        let field = ops
-            .into_iter()
-            .fold(crate::terrain::Field::new("height"), |field, op| {
-                field.with_op(op)
-            });
-        document.adopt(TerrainSpec::new(UVec2::splat(64)).with_field(field));
+        document
+            .adopt(TerrainSpec::new(UVec2::splat(64)).with_field(Field::new("height").held(value)));
         document
     }
 
-    fn selecting(document: &Document) -> Selection {
-        let mut selection = Selection::default();
-        selection.select(
-            document
-                .terrain()
-                .and_then(|terrain| terrain.field("height"))
-                .and_then(|field| field.graph.nodes.first())
-                .map(|node| node.id),
-        );
-        selection
-    }
-
     fn key(document: &Document) -> String {
-        fingerprint(
-            document,
-            &Expanded::default(),
-            &AddLayer::default(),
-            &ShaderLibrary::default(),
-            &selecting(document),
-        )
+        fingerprint(document, &Expanded::default(), &ShaderLibrary::default())
     }
 
-    // The `read by` row is derived from every *other* field's graph, so retargeting a
-    // reference elsewhere changes neither the field names nor any node of the field on
-    // screen. Without the readers in the key the row would keep naming the old reader
-    // with nothing left to correct it.
+    fn height(document: &mut Document) -> &mut Field {
+        document.terrain_mut().unwrap().field_mut("height").unwrap()
+    }
+
+    // The `read by` row is derived from every *other* field's shader, so retargeting a
+    // reader elsewhere changes neither the field names nor the field on screen. Without
+    // the readers in the key the row would keep naming the old reader.
     #[test]
-    fn retargeting_another_fields_reference_rebuilds_the_panel() {
+    fn retargeting_another_fields_read_rebuilds_the_panel() {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(64))
-                .with_field(crate::terrain::Field::new("height").with_op(NodeOp::held(0.5)))
-                .with_field(crate::terrain::Field::new("other").with_op(NodeOp::held(0.25)))
-                .with_field(
-                    crate::terrain::Field::new("reader")
-                        .with_op(NodeOp::FieldRef(FieldId::from("height"))),
-                ),
+                .with_field(Field::new("height").held(0.5))
+                .with_field(Field::new("other").held(0.25))
+                .with_field(Field::new("reader").held(0.0).reading(&["height"])),
         );
         document.set_active("height").unwrap();
         let before = key(&document);
 
-        let field = document.terrain_mut().unwrap().field_mut("reader").unwrap();
-        let node = field.graph.nodes[0].id;
-        field.graph.node_mut(node).unwrap().op = NodeOp::FieldRef(FieldId::from("other"));
+        document
+            .terrain_mut()
+            .unwrap()
+            .field_mut("reader")
+            .unwrap()
+            .shader
+            .layers = vec![FieldId::from("other")];
         assert_ne!(key(&document), before, "`read by` went stale");
     }
 
@@ -905,54 +594,33 @@ mod tests {
     // used to be on, with the document already changed underneath it.
     #[test]
     fn a_choice_changes_the_shape_the_panel_is_built_from() {
-        let mut document = document_with(vec![NodeOp::held(0.5)]);
+        let mut document = document_with(0.5);
         let before = key(&document);
 
-        let node = {
-            let field = document.terrain_mut().unwrap().field_mut("height").unwrap();
-            let node = field.graph.nodes[0].id;
-            field.graph.node_mut(node).unwrap().op = NodeOp::FieldRef(FieldId::from("height"));
-            node
-        };
-        assert_ne!(key(&document), before, "the op a node carries is a choice");
-
-        document
-            .terrain_mut()
-            .unwrap()
-            .field_mut("height")
-            .unwrap()
-            .graph
-            .set_bypassed(node, true)
+        let field = height(&mut document);
+        field.role = FieldRole::ALL
+            .into_iter()
+            .find(|role| *role != field.role)
             .unwrap();
-        assert_ne!(key(&document), before, "so is being bypassed");
+        assert_ne!(key(&document), before, "the role is a choice");
+
+        let after_role = key(&document);
+        let field = height(&mut document);
+        field.hillshade = !field.hillshade;
+        assert_ne!(key(&document), after_role, "so is hillshading");
     }
 
     // And from the other side: a number in the shape would rebuild the panel on the
     // frame it was typed into, which throws away the field the keyboard is in.
     #[test]
     fn a_number_does_not_change_the_shape() {
-        let mut document = document_with(vec![NodeOp::held(0.5)]);
+        let mut document = document_with(0.5);
         let before = key(&document);
 
-        {
-            let field = document.terrain_mut().unwrap().field_mut("height").unwrap();
-            field.range = (-1.0, 2.0);
-            let node = field.graph.nodes[0].id;
-            let NodeOp::Shader(shader) = &mut field.graph.node_mut(node).unwrap().op else {
-                panic!("the node stopped being a shader");
-            };
-            shader.params.get_mut("value").expect("a held value")[0] = 0.9;
-        }
+        let field = height(&mut document);
+        field.range = (-1.0, 2.0);
+        field.shader.params.get_mut("value").expect("a held value")[0] = 0.9;
         assert_eq!(key(&document), before);
-    }
-
-    // A node added or taken away changes how many widgets there are, which is the one
-    // thing a standing panel cannot absorb.
-    #[test]
-    fn the_number_of_nodes_is_part_of_the_shape() {
-        let one = document_with(vec![NodeOp::held(0.5)]);
-        let two = document_with(vec![NodeOp::held(0.5), NodeOp::held(0.25)]);
-        assert_ne!(key(&one), key(&two));
     }
 
     // The shift is a number field or a plain label depending on this, so it decides how
@@ -961,89 +629,29 @@ mod tests {
     // arrived coarse some other way can still be repaired from the panel.
     #[test]
     fn whether_the_shift_is_pinned_is_part_of_the_shape() {
-        let mut document = document_with(vec![NodeOp::held(0.5)]);
-        document
-            .terrain_mut()
-            .unwrap()
-            .field_mut("height")
-            .unwrap()
-            .role = watershed::FieldRole::Height;
+        let mut document = document_with(0.5);
+        height(&mut document).role = FieldRole::Height;
         assert!(
             shift_is_pinned(&document),
             "the solve height sits at shift 0"
         );
         let pinned = key(&document);
 
-        document
-            .terrain_mut()
-            .unwrap()
-            .field_mut("height")
-            .unwrap()
-            .shift = 2;
+        height(&mut document).shift = 2;
         assert!(!shift_is_pinned(&document), "a coarse height is not pinned");
         assert_ne!(key(&document), pinned);
-    }
-
-    // An open section holds widgets a shut one does not, so which sections are open is
-    // shape rather than decoration.
-    #[test]
-    fn opening_a_section_changes_the_shape() {
-        let document = document_with(vec![NodeOp::held(0.5)]);
-        let opened = document
-            .terrain()
-            .unwrap()
-            .field("height")
-            .unwrap()
-            .graph
-            .nodes[0]
-            .id;
-        let shut = key(&document);
-        let open = fingerprint(
-            &document,
-            &Expanded {
-                reference: false,
-                nodes: vec![opened],
-            },
-            &AddLayer::default(),
-            &ShaderLibrary::default(),
-            &selecting(&document),
-        );
-        assert_ne!(shut, open);
-    }
-
-    // The panel is an inspector for whatever the canvas has selected, so the selection
-    // decides which widgets exist and therefore belongs in the shape. Deselecting is
-    // the case that matters: the panel becomes the field's own properties, which is a
-    // different set of widgets rather than the same ones showing nothing.
-    #[test]
-    fn what_is_selected_is_part_of_the_shape() {
-        let document = document_with(vec![NodeOp::held(0.5)]);
-        let selected = key(&document);
-        let deselected = fingerprint(
-            &document,
-            &Expanded::default(),
-            &AddLayer::default(),
-            &ShaderLibrary::default(),
-            &Selection::default(),
-        );
-        assert_ne!(selected, deselected);
     }
 
     // The toggle is a choice, and a choice is shape: a Reference flag outside the key
     // would leave the panel showing what it showed before the toggle was pressed.
     #[test]
     fn opening_the_reference_changes_the_shape() {
-        let document = document_with(vec![NodeOp::held(0.5)]);
+        let document = document_with(0.5);
         let shut = key(&document);
         let open = fingerprint(
             &document,
-            &Expanded {
-                reference: true,
-                nodes: Vec::new(),
-            },
-            &AddLayer::default(),
+            &Expanded { reference: true },
             &ShaderLibrary::default(),
-            &selecting(&document),
         );
         assert_ne!(shut, open);
     }

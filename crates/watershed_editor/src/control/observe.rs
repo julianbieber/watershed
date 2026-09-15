@@ -1,7 +1,7 @@
 //! What a caller can ask the running editor about itself.
 //!
 //! Every answer is what the editor *acted on*, not something the caller could work out
-//! for itself: the fitted colour range, the rectangle a live re-bake covers. A second
+//! for itself: the fitted colour range, the fault that left a field unbaked. A second
 //! derivation on the caller's side would part company with the editor the moment the
 //! camera moved.
 //!
@@ -14,8 +14,7 @@ use bevy::prelude::*;
 use serde_json::{Value, json};
 
 use super::log::LogBuffer;
-use crate::document::{Baked, Document};
-use crate::edit::{op_name, op_summary};
+use crate::document::Document;
 use crate::gpu::{STOCK, ShaderLibrary};
 use crate::view::{
     CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
@@ -28,10 +27,6 @@ pub(super) enum Topic {
     Document,
     /// A summary of the active field's baked values.
     Field,
-    /// Every field's whole graph, not just the active one's — an edit names a field,
-    /// so a caller has to be able to see the graph it is about to address without
-    /// switching the view to it first.
-    Nodes,
     /// The solved water, counted, and the fields the water spec is over.
     Water,
     /// Where the camera is and what the ramp is fitted to.
@@ -52,7 +47,6 @@ impl Topic {
         match word {
             "document" => Ok(Self::Document),
             "field" => Ok(Self::Field),
-            "nodes" => Ok(Self::Nodes),
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
@@ -70,7 +64,6 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
     match topic {
         Topic::Document => document(world),
         Topic::Field => field(world),
-        Topic::Nodes => nodes(world),
         Topic::Water => water(world),
         Topic::View => view(world),
         Topic::Log => log(world),
@@ -88,10 +81,6 @@ fn document(world: &World) -> Value {
         "error": document.error(),
         "bake_failed": document.bake_failed(),
         "baked": document.baked().name(),
-        "baked_rect": match document.baked() {
-            Baked::Rect(rect) => json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
-            _ => Value::Null,
-        },
         "size": [document.size.x, document.size.y],
         "undo": document.history().undo,
         "redo": document.history().redo,
@@ -118,11 +107,16 @@ fn field(world: &World) -> Value {
     let reads = crate::edit::reads_of(field);
     let read_by = crate::edit::readers_of(terrain, document.active());
 
+    let file = field.file();
+    let params = &field.shader.params;
+
     let baked = field.baked();
     if baked.is_empty() {
         return json!({
             "available": false,
             "reason": "not baked",
+            "file": file,
+            "params": params,
             "reads": reads,
             "read_by": read_by,
         });
@@ -148,59 +142,11 @@ fn field(world: &World) -> Value {
         "median": at(0.50),
         "p90": at(0.90),
         "max": at(1.0),
+        "file": file,
+        "params": params,
         "reads": reads,
         "read_by": read_by,
     })
-}
-
-fn nodes(world: &World) -> Value {
-    let document = world.resource::<Document>();
-    let Some(terrain) = document.terrain() else {
-        return json!({ "available": false });
-    };
-
-    let fields: Vec<Value> = terrain
-        .fields
-        .iter()
-        .map(|field| {
-            let nodes: Vec<Value> = field
-                .graph
-                .nodes
-                .iter()
-                .map(|node| {
-                    json!({
-                        "node": node.id.to_string(),
-                        "name": node.name,
-                        "op": op_name(&node.op),
-                        "summary": op_summary(&node.op),
-                        "bypassed": node.bypassed,
-                        "inputs": node
-                            .inputs
-                            .iter()
-                            .map(|pin| match pin {
-                                Some(source) => json!(source.to_string()),
-                                None => Value::Null,
-                            })
-                            .collect::<Vec<Value>>(),
-                        "position": node.position,
-                    })
-                })
-                .collect();
-            json!({
-                "field": field.id.to_string(),
-                "shift": field.shift,
-                "range": [field.range.0, field.range.1],
-                "hillshade": field.hillshade,
-                "light_azimuth": field.light_azimuth,
-                "contours": field.contours,
-                "contour_interval": field.contour_interval,
-                "output": field.graph.output.map(|id| id.to_string()),
-                "nodes": nodes,
-            })
-        })
-        .collect();
-
-    json!({ "available": true, "active": document.active(), "fields": fields })
 }
 
 fn fields(world: &World) -> Value {
@@ -228,6 +174,7 @@ fn fields(world: &World) -> Value {
         ),
     };
     let faults = terrain.field_faults();
+    let library = world.get_resource::<ShaderLibrary>();
     let fields: Vec<Value> = names
         .iter()
         .filter_map(|name| terrain.field(name))
@@ -240,7 +187,12 @@ fn fields(world: &World) -> Value {
                 "fault": faults
                     .iter()
                     .find(|(id, _)| *id == field.id)
-                    .map(|(_, fault)| fault),
+                    .map(|(_, fault)| fault.clone())
+                    .or_else(|| {
+                        library
+                            .and_then(|library| library.entry(&field.file()))
+                            .and_then(|entry| entry.error.clone())
+                    }),
             })
         })
         .collect();
@@ -362,15 +314,6 @@ fn shaders(world: &mut World) -> Value {
                         "group": param.group,
                     }))
                     .collect::<Vec<_>>(),
-                "inputs": entry
-                    .inputs
-                    .iter()
-                    .map(|input| json!({
-                        "name": input.name,
-                        "label": input.label,
-                        "binding": input.binding,
-                    }))
-                    .collect::<Vec<_>>(),
                 "layers": entry
                     .layers
                     .iter()
@@ -380,7 +323,6 @@ fn shaders(world: &mut World) -> Value {
                         "binding": read.binding,
                     }))
                     .collect::<Vec<_>>(),
-                "reach": entry.reach,
                 "error": entry.error,
             })
         })
@@ -395,19 +337,16 @@ fn shaders(world: &mut World) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::graph::NodeOp;
     use crate::terrain::{Field, TerrainSpec};
-    use watershed::FieldId;
 
     // Acceptance criterion five, which is the socket's half of the whole task: a caller
     // driving the editor over the control port can read the dependency both ways round
-    // without walking every field's graph itself.
+    // without opening every field's file itself.
     #[test]
     fn observing_a_field_reports_both_ends_of_the_relation() {
-        let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
-            .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
-        terrain.bake_in_place().expect("a bake");
+        let terrain = TerrainSpec::new(UVec2::splat(16))
+            .with_field(Field::new("base").held(0.25))
+            .with_field(Field::new("height").reading(&["base"]));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -425,14 +364,31 @@ mod tests {
         assert_eq!(base["read_by"], json!(["height"]));
     }
 
+    // A field is one shader file and the numbers set on it, so the socket has to name
+    // both — a caller about to `set <field>.<param>` has to see what is there.
+    #[test]
+    fn observing_a_field_reports_its_file_and_its_parameters() {
+        let terrain = TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("base").held(0.25));
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        document.set_active("base").unwrap();
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let base = field(&world);
+        assert_eq!(base["file"], json!("base.wgsl"));
+        assert_eq!(base["params"], json!({ "value": [0.25] }));
+    }
+
     // Acceptance criterion seven: the whole document's shape over the socket, in the
     // order the bake visits the fields in, so a caller sees the same picture the
-    // overview draws without walking every graph itself.
+    // overview draws without opening every file itself.
     #[test]
     fn observing_the_fields_reports_them_in_bake_order_with_what_each_reads() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))))
-            .with_field(Field::new("base").with_op(NodeOp::held(0.25)));
+            .with_field(Field::new("height").reading(&["base"]))
+            .with_field(Field::new("base").held(0.25));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -457,8 +413,8 @@ mod tests {
     #[test]
     fn observing_the_fields_of_a_cyclic_document_names_the_cycle() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("here").with_op(NodeOp::FieldRef(FieldId::from("there"))))
-            .with_field(Field::new("there").with_op(NodeOp::FieldRef(FieldId::from("here"))));
+            .with_field(Field::new("here").reading(&["there"]))
+            .with_field(Field::new("there").reading(&["here"]));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -479,14 +435,10 @@ mod tests {
     // opening the file.
     #[test]
     fn observing_the_fields_reports_a_layer_read_and_the_fault_of_a_name_that_is_no_field() {
-        let mut reads_base = crate::terrain::shader::ShaderLayer::new("reader.wgsl");
-        reads_base.layers = vec![FieldId::from("base")];
-        let mut reads_nowhere = crate::terrain::shader::ShaderLayer::new("lost.wgsl");
-        reads_nowhere.layers = vec![FieldId::from("nowhere")];
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
-            .with_field(Field::new("height").with_op(NodeOp::Shader(reads_base)))
-            .with_field(Field::new("lost").with_op(NodeOp::Shader(reads_nowhere)));
+            .with_field(Field::new("base").held(0.25))
+            .with_field(Field::new("height").reading(&["base"]))
+            .with_field(Field::new("lost").reading(&["nowhere"]));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -505,5 +457,25 @@ mod tests {
         assert_eq!(named("height")["fault"], Value::Null);
         let fault = named("lost")["fault"].as_str().expect("the fault, as text");
         assert!(fault.contains("nowhere"), "{fault:?}");
+    }
+
+    // A field whose own file does not parse has no fault in the document's reads, so
+    // the socket has to fall back to the file's error — otherwise a caller sees a field
+    // that silently never bakes.
+    #[test]
+    fn observing_the_fields_reports_the_error_of_a_file_that_did_not_parse() {
+        let terrain = TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("height"));
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        let mut world = World::new();
+        world.insert_resource(document);
+        world.insert_resource(ShaderLibrary::with_fault(
+            "height.wgsl",
+            "line 3: expected `;`",
+        ));
+
+        let answer = fields(&world);
+        assert_eq!(answer["fields"][0]["fault"], json!("line 3: expected `;`"));
     }
 }

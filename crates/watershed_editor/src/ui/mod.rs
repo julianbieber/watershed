@@ -6,7 +6,7 @@
 //! window can do can be driven from outside the process. The rule runs that way round:
 //! a new action is written where both can reach it, and then given a button.
 
-use bevy::feathers::controls::{ButtonVariant, FeathersButton, FeathersToggleSwitch};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
 use bevy::input_focus::InputFocus;
@@ -15,15 +15,13 @@ use bevy::picking::Pickable;
 use bevy::picking::hover::HoverMap;
 use bevy::prelude::*;
 use bevy::text::EditableText;
-use bevy::ui::Checked;
 use bevy::ui::UiSystems;
-use bevy::ui_widgets::{Activate, ValueChange};
+use bevy::ui_widgets::Activate;
 use bevy::window::PrimaryWindow;
 
-use crate::canvas::{CanvasCameraTag, CanvasFrame, CanvasViewport, Overview, frame_canvas};
+use crate::canvas::{CanvasCameraTag, CanvasFrame, CanvasViewport, frame_canvas};
 use crate::document::Document;
 use crate::preset::Preset;
-use crate::terrain::graph::NodeId;
 use crate::view::FreeView;
 
 mod bind;
@@ -43,7 +41,6 @@ impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NewDialog>()
             .init_resource::<FilePath>()
-            .init_resource::<AddLayer>()
             .init_resource::<NewField>()
             .init_resource::<Expanded>()
             .init_resource::<toolbar::FieldChoices>()
@@ -63,7 +60,6 @@ impl Plugin for UiPlugin {
                     dialog::sync,
                     legend::sync,
                     log::sync,
-                    sync_overview_toggle,
                     scroll::send,
                 ),
             )
@@ -120,21 +116,7 @@ impl Default for FilePath {
     }
 }
 
-/// Which op the panel's add button will make, as one of [`ADDABLE`].
-///
-/// Held across frames because choosing from the menu and pressing the button are two
-/// separate acts, and the choice has to stand between them.
-#[derive(Resource)]
-pub struct AddLayer(pub String);
-
-impl Default for AddLayer {
-    fn default() -> Self {
-        Self("shader:blank".to_owned())
-    }
-}
-
-/// The name typed into the panel's field box: what "Add field" will call a new field,
-/// and what "Rename" will call the field on screen.
+/// The name typed into the panel's field box: what "Add field" will call a new field.
 ///
 /// Held across frames because typing a name and pressing the button are two separate
 /// acts, and because the panel is rebuilt whenever the document changes shape — a name
@@ -145,49 +127,15 @@ pub struct NewField(pub String);
 /// Which of the panel's collapsible sections are open.
 ///
 /// Kept here rather than in the toggles themselves because the panel is rebuilt
-/// whenever the graph changes shape — adding a node despawns every toggle in it, and
-/// state left in one would be lost with it, closing every section on each edit.
+/// whenever the document changes shape — adding a field despawns every toggle in it,
+/// and state left in one would be lost with it, closing every section on each edit.
 #[derive(Resource, Default)]
 pub struct Expanded {
     /// Whether the shader reference is open.
     pub reference: bool,
-    /// The open nodes, in no particular order.
-    pub nodes: Vec<NodeId>,
-}
-
-impl Expanded {
-    /// Whether that node's section is open.
-    pub fn has(&self, id: NodeId) -> bool {
-        self.nodes.contains(&id)
-    }
-
-    /// Opens or closes that node's section. Any number may be open at once.
-    pub fn set(&mut self, id: NodeId, open: bool) {
-        self.nodes.retain(|held| *held != id);
-        if open {
-            self.nodes.push(id);
-        }
-    }
 }
 
 const PANEL_WIDTH: f32 = 320.0;
-
-/// What the panel's add button offers.
-///
-/// An op is spelled as [`crate::edit::parse_op`] spells it, so the button and the
-/// control client's verb name the same thing. A `shader:` entry is not an op word: it
-/// names the stock shader to copy into the document, and the node it makes is a
-/// `shader` op over the copy.
-pub const ADDABLE: [&str; 8] = [
-    "fieldref",
-    "shader:fbm",
-    "shader:continents",
-    "shader:mountains",
-    "shader:ridged",
-    "shader:warped",
-    "shader:terrace",
-    "shader:blank",
-];
 
 #[derive(Component, Default, Clone)]
 struct WorldViewport;
@@ -227,14 +175,12 @@ fn canvas_bar() -> impl Scene {
                 }
                 on(|_: On<Activate>,
                     document: Res<Document>,
-                    overview: Res<Overview>,
                     frame: Res<CanvasFrame>,
                     window: Single<&Window, With<PrimaryWindow>>,
                     camera: Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>| {
                     let (mut transform, mut projection) = camera.into_inner();
                     frame_canvas(
                         &document,
-                        &overview,
                         &frame,
                         *window,
                         &mut transform,
@@ -242,35 +188,7 @@ fn canvas_bar() -> impl Scene {
                     );
                 })
             ),
-            (
-                @FeathersToggleSwitch
-                OverviewToggle
-                on(|change: On<ValueChange<bool>>, mut overview: ResMut<Overview>| {
-                    overview.showing = change.value;
-                })
-            ),
-            widgets::small("fields"),
         ]
-    }
-}
-
-/// The canvas bar's switch between the open field's graph and the document's fields.
-#[derive(Component, Default, Clone)]
-pub struct OverviewToggle;
-
-fn sync_overview_toggle(
-    overview: Res<Overview>,
-    toggle: Option<Single<(Entity, Has<Checked>), With<OverviewToggle>>>,
-    mut commands: Commands,
-) {
-    let Some(toggle) = toggle else {
-        return;
-    };
-    let (entity, checked) = *toggle;
-    if overview.showing && !checked {
-        commands.entity(entity).insert(Checked);
-    } else if !overview.showing && checked {
-        commands.entity(entity).remove::<Checked>();
     }
 }
 

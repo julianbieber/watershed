@@ -156,7 +156,7 @@ pub fn toolbar() -> impl Scene {
                 }
                 BakeAllButton
                 on(|_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document.start_bake(None);
+                    let result = document.start_bake();
                     report(&mut document, result);
                 })
             ),

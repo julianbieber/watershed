@@ -617,7 +617,6 @@ impl PartialOrd for Pending {
 mod tests {
     use super::*;
     use crate::terrain::field::Field;
-    use crate::terrain::graph::NodeOp;
 
     fn raster_from(size: UVec2, cell: impl Fn(u32, u32) -> f32) -> Raster<f32> {
         let mut raster = Raster::new(size, 0.0f32);
@@ -911,8 +910,8 @@ mod tests {
     // this.
     #[test]
     fn a_document_solves_water_over_the_field_it_names() {
-        let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
+        let mut terrain =
+            TerrainSpec::new(UVec2::new(16, 16)).with_field(Field::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         assert!(terrain.water().is_none());
         terrain.solve_water(&WaterSpec::default()).unwrap();
@@ -928,8 +927,8 @@ mod tests {
     // again, and looks exactly like an ordinary one.
     #[test]
     fn invalidating_the_water_keeps_the_recipe_where_clearing_it_does_not() {
-        let mut terrain = TerrainSpec::new(UVec2::new(16, 16))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
+        let mut terrain =
+            TerrainSpec::new(UVec2::new(16, 16)).with_field(Field::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         terrain.solve_water(&WaterSpec::default()).unwrap();
 
@@ -955,12 +954,8 @@ mod tests {
     fn a_named_moisture_field_weights_what_the_sinks_deliver() {
         let size = UVec2::new(24, 24);
         let mut terrain = TerrainSpec::new(size)
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)))
-            .with_field(
-                Field::new("moisture")
-                    .with_op(NodeOp::held(0.25))
-                    .with_range((0.0, 1.0)),
-            );
+            .with_field(Field::new("height").held(0.5))
+            .with_field(Field::new("moisture").held(0.25).with_range((0.0, 1.0)));
         terrain.bake_in_place().unwrap();
         terrain
             .solve_water(&WaterSpec::default().with_moisture("moisture"))
@@ -987,7 +982,7 @@ mod tests {
     #[test]
     fn a_solve_refuses_a_field_it_cannot_read() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)))
+            .with_field(Field::new("height").held(0.5))
             .with_field(Field::new("coarse").with_shift(2));
         terrain.bake_in_place().unwrap();
 
@@ -1010,8 +1005,8 @@ mod tests {
     // check the solve would quietly return an empty state instead of an error.
     #[test]
     fn a_solve_of_an_unbaked_document_is_refused() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height").with_op(NodeOp::held(0.5)));
+        let mut terrain =
+            TerrainSpec::new(UVec2::new(8, 8)).with_field(Field::new("height").held(0.5));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::default()),
             Err(WaterError::UnbakedHeight(_))

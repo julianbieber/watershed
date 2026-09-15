@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::observe::{self, Topic};
 use crate::document::Document;
-use crate::edit::{Edit, parse_op};
+use crate::edit::Edit;
 use crate::preset::Preset;
 use crate::ui::report;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
@@ -70,8 +70,8 @@ pub(super) enum Command {
     Field(String),
     /// An edit and the re-bake that answers it, held together: the reply says the
     /// effect has happened, and for an edit the effect is the bake rather than the
-    /// changed number. A document that no longer bakes — a cycle a toggle uncovered —
-    /// reports that error here rather than answering with a success nothing followed.
+    /// changed number. A document that no longer bakes reports that error here rather
+    /// than answering with a success nothing followed.
     /// A refused edit also reaches the status bar and the log panel, so a person at the
     /// editor sees why a command driven from elsewhere changed nothing.
     Edit {
@@ -94,9 +94,6 @@ pub(super) enum Command {
     },
     /// Drops the water and its spec. Synchronous.
     ResetWater,
-    /// Copies a stock shader into the document's shader directory. Synchronous, and
-    /// answers the name the copy was given — which is what a `node add … shader` names.
-    AdoptShader(String),
     /// Writes the document and waits for it.
     Save {
         /// Where to write.
@@ -167,8 +164,8 @@ pub(super) enum Condition {
 }
 
 impl Command {
-    /// The word this command was parsed from, for the reply. Every structural graph
-    /// edit answers `"node"`, whatever it did.
+    /// The word this command was parsed from, for the reply. Every edit that is not a
+    /// `set` answers `"field"`.
     pub(super) fn verb(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -178,15 +175,11 @@ impl Command {
             Self::Field(_) => "field",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
-                Edit::AddField { .. } | Edit::RenameField { .. } | Edit::RemoveField { .. } => {
-                    "field"
-                }
-                _ => "node",
+                _ => "field",
             },
             Self::Bake { .. } => "bake",
             Self::SolveWater { .. } => "solve-water",
             Self::ResetWater => "reset-water",
-            Self::AdoptShader(_) => "shader",
             Self::Save { .. } => "save",
             Self::Load { .. } => "load",
             Self::Pan(_) => "pan",
@@ -240,28 +233,19 @@ impl Command {
                     },
                     applied: None,
                 }),
-                ["rename", from, to, ..] => Ok(Self::Edit {
-                    edit: Edit::RenameField {
-                        from: (*from).to_owned(),
-                        to: (*to).to_owned(),
-                    },
-                    applied: None,
-                }),
                 ["rm", name, ..] => Ok(Self::Edit {
                     edit: Edit::RemoveField {
                         name: (*name).to_owned(),
                     },
                     applied: None,
                 }),
-                ["rename", ..] => Err("field rename needs the old name and the new one".to_owned()),
+                ["rename", ..] => {
+                    Err("field rename is gone: rename the file in shaders/ instead".to_owned())
+                }
                 ["rm"] => Err("field rm needs a name".to_owned()),
                 [name, ..] => Ok(Self::Field((*name).to_owned())),
                 [] => Err("field needs a name".to_owned()),
             },
-            "node" => Ok(Self::Edit {
-                edit: node_edit(&rest)?,
-                applied: None,
-            }),
             "set" => {
                 let path = rest.first().ok_or("set needs a path")?;
                 Ok(Self::Edit {
@@ -275,12 +259,6 @@ impl Command {
             "bake" => Ok(Self::Bake { started: false }),
             "solve-water" => Ok(Self::SolveWater { started: false }),
             "reset-water" => Ok(Self::ResetWater),
-            "shader" => match rest.first() {
-                Some(&"adopt") => Ok(Self::AdoptShader(
-                    (*rest.get(1).ok_or("shader adopt needs a stock name")?).to_owned(),
-                )),
-                _ => Err("shader needs adopt".to_owned()),
-            },
             "save" => Ok(Self::Save {
                 path: PathBuf::from(rest.first().ok_or("save needs a path")?),
                 options: match rest.get(1) {
@@ -422,7 +400,7 @@ impl Command {
                 if !*started {
                     *started = true;
                     let mut document = world.resource_mut::<Document>();
-                    if let Err(error) = document.start_bake(None) {
+                    if let Err(error) = document.start_bake() {
                         return Poll::Failed(error);
                     }
                     return Poll::Running;
@@ -456,14 +434,6 @@ impl Command {
                 let mut document = world.resource_mut::<Document>();
                 match document.reset_water() {
                     Ok(()) => Poll::Done(json!({})),
-                    Err(error) => Poll::Failed(error),
-                }
-            }
-
-            Self::AdoptShader(stock) => {
-                let mut library = world.resource_mut::<crate::gpu::ShaderLibrary>();
-                match library.adopt(stock) {
-                    Ok(file) => Poll::Done(json!({ "file": file })),
                     Err(error) => Poll::Failed(error),
                 }
             }
@@ -662,74 +632,6 @@ impl Condition {
     }
 }
 
-fn node_edit(rest: &[&str]) -> Result<Edit, String> {
-    let what = *rest
-        .first()
-        .ok_or("node needs add, rm, connect, disconnect, bypass, place, name or output")?;
-    let field = (*rest.get(1).ok_or("node needs a field name")?).to_owned();
-    let named = |at: usize, what: &str| -> Result<String, String> {
-        rest.get(at)
-            .map(|word| (*word).to_owned())
-            .ok_or_else(|| format!("node {what} needs a node"))
-    };
-    match what {
-        "add" => Ok(Edit::AddNode {
-            field,
-            op: parse_op(&owned(&rest[2..]))?,
-            position: None,
-        }),
-        "rm" => Ok(Edit::RemoveNode {
-            field,
-            node: named(2, "rm")?,
-        }),
-        "connect" => Ok(Edit::Connect {
-            field,
-            from: named(2, "connect")?,
-            to: named(3, "connect")?,
-            pin: number(rest.get(4).ok_or("node connect needs a pin")?)?,
-        }),
-        "disconnect" => Ok(Edit::Disconnect {
-            field,
-            node: named(2, "disconnect")?,
-            pin: number(rest.get(3).ok_or("node disconnect needs a pin")?)?,
-        }),
-        "bypass" => Ok(Edit::Bypass {
-            field,
-            node: named(2, "bypass")?,
-            bypassed: match rest.get(3) {
-                None => None,
-                Some(&"on") => Some(true),
-                Some(&"off") => Some(false),
-                Some(word) => return Err(format!("a bypass is on or off, not `{word}`")),
-            },
-        }),
-        "place" => Ok(Edit::PlaceNode {
-            field,
-            node: named(2, "place")?,
-            position: [
-                number(rest.get(3).ok_or("node place needs an x")?)?,
-                number(rest.get(4).ok_or("node place needs a y")?)?,
-            ],
-        }),
-        "name" => {
-            let name = named(3, "name")?;
-            Ok(Edit::RenameNode {
-                field,
-                node: named(2, "name")?,
-                name: (name != "none").then_some(name),
-            })
-        }
-        "output" => {
-            let node = named(2, "output")?;
-            Ok(Edit::SetOutput {
-                field,
-                node: (node != "none").then_some(node),
-            })
-        }
-        other => Err(format!("no node edit called `{other}`")),
-    }
-}
-
 fn owned(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| (*word).to_owned()).collect()
 }
@@ -791,22 +693,9 @@ mod tests {
             ("new 256 256 7 ridges", "new"),
             ("field height", "field"),
             ("field add biomes", "field"),
-            ("field rename base continent", "field"),
             ("field rm base", "field"),
-            ("node add height fieldref base", "node"),
-            ("node add height shader ridged.wgsl", "node"),
-            ("node rm height n2", "node"),
-            ("node connect height n2 n0 0", "node"),
-            ("node disconnect height n0 0", "node"),
-            ("node bypass height n1", "node"),
-            ("node bypass height n1 off", "node"),
-            ("node place height n1 20 40", "node"),
-            ("node name height n1 ridge", "node"),
-            ("node output height n1", "node"),
-            ("set height.1.amplitude 0.5", "set"),
-            ("set height.1.blend mul", "set"),
-            ("set height.1.mask field moisture 0.4 0.6 0 1", "set"),
-            ("set height.1.op.scale 0.004", "set"),
+            ("set height.scale 0.004", "set"),
+            ("set height.offset 0.5 0.25", "set"),
             ("set height.shift 2", "set"),
             ("bake", "bake"),
             ("solve-water", "solve-water"),
@@ -843,19 +732,16 @@ mod tests {
         assert!(Command::parse("zoom").is_err());
         assert!(Command::parse("save /tmp/a-terrain sideways").is_err());
         assert!(Command::parse("field").is_err());
-        assert!(Command::parse("node").is_err());
-        assert!(Command::parse("node add height").is_err());
+        assert!(Command::parse("field rm").is_err());
         assert!(Command::parse("layer sideways height 1").is_err());
-        assert!(Command::parse("node bypass height n1 maybe").is_err());
-        assert!(Command::parse("node rm height").is_err());
         assert!(Command::parse("set").is_err());
     }
 
-    // The brush and the CPU ops are gone rather than hidden: a script still written
-    // against them has to be told the verb, the topic or the op does not exist, naming
-    // the word it used, rather than have any of it half happen.
+    // The brush is gone rather than hidden: a script still written against it has to be
+    // told the verb, the topic or the preset does not exist, naming the word it used,
+    // rather than have any of it half happen.
     #[test]
-    fn the_brush_verbs_its_topic_and_a_removed_op_are_refused_by_name() {
+    fn the_brush_verbs_its_topic_and_a_removed_preset_are_refused_by_name() {
         for (line, refusal) in [
             ("brush radius 24", "no such command: brush"),
             ("stroke 10,20", "no such command: stroke"),
@@ -866,14 +752,31 @@ mod tests {
             };
             assert_eq!(error, refusal);
         }
-        let Err(error) = Command::parse("node add height noise") else {
-            panic!("a noise op parsed");
-        };
-        assert!(error.contains("noise"), "{error}");
         let Err(error) = Command::parse("new 256 256 7 regions") else {
             panic!("the regions preset parsed");
         };
         assert!(error.contains("regions"), "{error}");
+    }
+
+    // A field is one shader file now, so a script still driving the node graph, adopting
+    // a stock shader or renaming a field in place has to be refused with a message that
+    // names the word it used, rather than have a half-edited document behind it.
+    #[test]
+    fn the_node_graph_verbs_its_topic_and_field_rename_are_refused_by_name() {
+        for (line, refusal) in [
+            ("node add height shader:ridged", "no such command: node"),
+            ("shader adopt ridged", "no such command: shader"),
+            ("observe nodes", "nothing to observe called nodes"),
+            (
+                "field rename base continent",
+                "field rename is gone: rename the file in shaders/ instead",
+            ),
+        ] {
+            let Err(error) = Command::parse(line) else {
+                panic!("`{line}` parsed");
+            };
+            assert_eq!(error, refusal);
+        }
     }
 
     // A field whose file names no field is left unbaked on purpose, so a scenario
@@ -881,14 +784,10 @@ mod tests {
     // raster that never comes.
     #[test]
     fn waiting_for_the_bake_is_met_by_a_field_left_unbaked_by_its_fault() {
-        use crate::terrain::graph::NodeOp;
-        use crate::terrain::shader::ShaderLayer;
         use crate::terrain::{Field, TerrainSpec};
-        let mut shader = ShaderLayer::new("lost.wgsl");
-        shader.layers = vec![watershed::FieldId::from("nowhere")];
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
-            .with_field(Field::new("height").with_op(NodeOp::Shader(shader)));
+            .with_field(Field::new("base").held(0.25))
+            .with_field(Field::new("height").reading(&["nowhere"]));
         terrain.bake_in_place().unwrap();
         assert!(terrain.field("height").unwrap().baked().is_empty());
 

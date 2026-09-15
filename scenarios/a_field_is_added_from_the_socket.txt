@@ -1,48 +1,47 @@
-# Build a field from outside the process: add it, take it back, replay it, and carry it
+# Build a field from outside the process: add it, remove it, add it again, and carry it
 # through a save and a load — from `observe document` and `observe field` rather than
 # from a person typing a name into the panel and looking.
 #
 # Run with:  just drive run scenarios/a_field_is_added_from_the_socket.txt
 #
 # What makes this reproducible is that every verb below holds its reply until the
-# document has settled, so nothing here counts frames. The two refusals the task also
-# names — a name already taken, and a blank one — are not in this file: replay stops at
-# the first failure, so they are pinned by the unit tests in `edit.rs` instead, the way
-# `a_node_moves_the_bake.txt` leaves the cycle refusal there.
+# document has settled, so nothing here counts frames. The refusals that go with an add
+# and a removal — a name already taken, a blank one, one that cannot be a file stem, a
+# field another file reads — are not in this file: replay stops at the first failure,
+# so they are pinned by the unit tests in `edit.rs` and `document.rs` instead.
 
 observe log
 
 fixed-delta 1/60
 
-# 256 square and fitted, so a re-bake covers the whole document rather than the part
-# that happened to be on screen. `continents` builds `moisture` and `height`.
+# 256 square and fitted. `continents` builds `moisture` and `height`.
 new 256 256 7 continents
 wait bake
 zoom fit
 
 # The "before" the rest of this is measured against: two fields, `height` on screen,
-# and the bake whole. That last one is what the add below must not disturb.
+# and the bake whole.
 observe document
 
-# The add itself. The field list grows by one, the new field is on screen, the history
-# reaches one change back — and `baked` is still `whole`, because a field nothing reads
-# yet moves no texel of any field already baked.
+# The add itself. The field list grows by one and the new field is on screen. It copies
+# the template into `shaders/biomes.wgsl`, which is a file operation, so the history
+# does not grow.
 field add biomes
 observe document
 
-# It came in empty: no output node, so nothing has been baked into it.
+# It came in as the template: its parameters are the template's defaults.
 observe field
 
-# One undo step, not two: the field goes and `height` comes back on screen with it.
-undo
+# The add takes no undo step, so the way back is a removal, which deletes the file.
+field rm biomes
 observe document
 
-# And the redo puts both back.
-redo
+# And adding it again writes the template again.
+field add biomes
 observe document
 
-# A round trip through the terrain directory. Saving bakes a copy, so the empty field
-# is written as zeros and read back as a field that is there and holds nothing.
+# A round trip through the terrain directory. Saving carries the shader directory with
+# it, so the field comes back from its file.
 save /tmp/watershed-scenario/added-field
 load /tmp/watershed-scenario/added-field
 observe document

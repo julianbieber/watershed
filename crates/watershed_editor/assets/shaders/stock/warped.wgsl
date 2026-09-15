@@ -1,5 +1,3 @@
-// @shader Warped
-
 struct Params {
     // @group Shape
     scale: f32,     // @ui 0.015 [0.001, 0.2]

@@ -3,14 +3,13 @@
 //!
 //! Nothing outside the editor holds any of this. A consuming project reads a
 //! terrain directory, and a directory was settled when it was written — so the
-//! field graphs, the water solve and the bake are all authoring-time machinery and
+//! field shaders, the water solve and the bake are all authoring-time machinery and
 //! live here rather than in the library.
 
 #![allow(dead_code)]
 
 pub mod bake;
 pub mod field;
-pub mod graph;
 pub mod recipe;
 pub mod shader;
 pub mod water;
