@@ -141,7 +141,7 @@ const PANEL_WIDTH: f32 = 320.0;
 struct WorldViewport;
 
 fn shell() -> impl SceneList {
-    bsn_list![chrome(), dialog::dialog()]
+    bsn_list! { @chrome() -- @dialog::dialog() }
 }
 
 fn canvas_divider() -> impl Scene {
@@ -152,7 +152,7 @@ fn canvas_divider() -> impl Scene {
             flex_shrink: 0.0,
         }
         Pickable { should_block_lower: false, is_hoverable: false }
-        ThemeBackgroundColor(tokens::GROUP_HEADER_BORDER)
+        ThemeBackgroundColor(tokens::GROUP_BORDER)
     }
 }
 
@@ -168,26 +168,24 @@ fn canvas_bar() -> impl Scene {
         }
         ThemeBackgroundColor(tokens::WINDOW_BG)
         Children [
-            (
-                @FeathersButton {
-                    @caption: bsn! { Text("Fit") ThemedText },
-                    @variant: ButtonVariant::Plain,
-                }
-                on(|_: On<Activate>,
-                    document: Res<Document>,
-                    frame: Res<CanvasFrame>,
-                    window: Single<&Window, With<PrimaryWindow>>,
-                    camera: Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>| {
-                    let (mut transform, mut projection) = camera.into_inner();
-                    frame_canvas(
-                        &document,
-                        &frame,
-                        *window,
-                        &mut transform,
-                        &mut projection,
-                    );
-                })
-            ),
+            @FeathersButton {
+                @caption: bsn! { Text("Fit") ThemedText },
+                @variant: ButtonVariant::Plain,
+            }
+            on(|_: On<Activate>,
+                document: Res<Document>,
+                frame: Res<CanvasFrame>,
+                window: Single<&Window, With<PrimaryWindow>>,
+                camera: Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>| {
+                let (mut transform, mut projection) = camera.into_inner();
+                frame_canvas(
+                    &document,
+                    &frame,
+                    *window,
+                    &mut transform,
+                    &mut projection,
+                );
+            })
         ]
     }
 }
@@ -204,57 +202,55 @@ fn chrome() -> impl Scene {
         TabGroup
         Pickable { should_block_lower: false, is_hoverable: false }
         Children [
-            toolbar::toolbar(),
-            (
+            @toolbar::toolbar()
+            --
+            Node {
+                flex_grow: 1.0,
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Stretch,
+                min_height: px(0),
+            }
+            Pickable { should_block_lower: false, is_hoverable: false }
+            Children [
                 Node {
                     flex_grow: 1.0,
                     display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
+                    flex_direction: FlexDirection::Column,
                     align_items: AlignItems::Stretch,
-                    min_height: px(0),
+                    min_width: px(0),
                 }
                 Pickable { should_block_lower: false, is_hoverable: false }
                 Children [
-                    (
-                        Node {
-                            flex_grow: 1.0,
-                            display: Display::Flex,
-                            flex_direction: FlexDirection::Column,
-                            align_items: AlignItems::Stretch,
-                            min_width: px(0),
-                        }
-                        Pickable { should_block_lower: false, is_hoverable: false }
-                        Children [
-                            (
-                                Node {
-                                    flex_grow: 1.0,
-                                    display: Display::Flex,
-                                    flex_direction: FlexDirection::Column,
-                                    justify_content: JustifyContent::End,
-                                    align_items: AlignItems::Start,
-                                    padding: px(12),
-                                    min_height: px(0),
-                                }
-                                Pickable { should_block_lower: false, is_hoverable: false }
-                                WorldViewport
-                                Children [ legend::legend() ]
-                            ),
-                            canvas_divider(),
-                            canvas_bar(),
-                            (
-                                Node {
-                                    flex_grow: 0.72,
-                                    min_height: px(0),
-                                }
-                                Pickable { should_block_lower: false, is_hoverable: false }
-                                CanvasViewport
-                            ),
-                        ]
-                    ),
-                    stack::panel(),
+                    Node {
+                        flex_grow: 1.0,
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Column,
+                        justify_content: JustifyContent::End,
+                        align_items: AlignItems::Start,
+                        padding: px(12),
+                        min_height: px(0),
+                    }
+                    Pickable { should_block_lower: false, is_hoverable: false }
+                    WorldViewport
+                    Children [ @legend::legend() ]
+                    --
+                    @canvas_divider()
+                    --
+                    @canvas_bar()
+                    --
+                    Node {
+                        flex_grow: 0.72,
+                        min_height: px(0),
+                    }
+                    Pickable { should_block_lower: false, is_hoverable: false }
+                    CanvasViewport
                 ]
-            ),
-            log::panel(),
+                --
+                @stack::panel()
+            ]
+            --
+            @log::panel()
         ]
     }
 }

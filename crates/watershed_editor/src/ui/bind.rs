@@ -6,7 +6,7 @@
 //! place, so they live side by side — a binding that read one number and wrote
 //! another would look like a field that will not take an edit.
 
-use bevy::feathers::controls::{NumberFormat, NumberInputValue, UpdateNumberInput};
+use bevy::feathers::controls::NumberInputValue;
 use bevy::prelude::*;
 use bevy::ui_widgets::ValueChange;
 
@@ -41,16 +41,6 @@ pub enum NumberBinding {
 }
 
 impl NumberBinding {
-    /// How the field is to be edited. Whole-numbered bindings edit as integers, so the
-    /// field cannot offer a fraction the document has nowhere to put.
-    pub fn format(self) -> NumberFormat {
-        if self.is_integer() {
-            NumberFormat::I32
-        } else {
-            NumberFormat::F32
-        }
-    }
-
     fn is_integer(self) -> bool {
         matches!(
             self,
@@ -249,19 +239,23 @@ fn apply(
 
 /// The other direction: writes what the document holds into every bound field.
 ///
-/// Runs every frame. A field with the keyboard in it is left alone by the widget
-/// itself, so this cannot overwrite a number part way through being typed. Bindings
-/// that resolve to nothing are skipped, leaving the field as it was.
+/// Runs every frame, but writes a field only when the document's number differs from
+/// the one the field was last given. Every write replaces whatever text the field
+/// holds, focused or not, so this is what keeps a number part way through being typed
+/// from being overwritten before it is finished. Bindings that resolve to nothing are
+/// skipped, leaving the field as it was.
 pub fn push(
     document: Res<Document>,
     dialog: Res<NewDialog>,
-    inputs: Query<(Entity, &NumberBinding)>,
+    inputs: Query<(Entity, &NumberBinding, Option<&NumberInputValue>)>,
     mut commands: Commands,
 ) {
-    for (entity, binding) in inputs.iter() {
+    for (entity, binding, shown) in inputs.iter() {
         let Some(value) = binding.read(&document, &dialog) else {
             continue;
         };
-        commands.trigger(UpdateNumberInput { entity, value });
+        if shown != Some(&value) {
+            commands.entity(entity).insert(value);
+        }
     }
 }

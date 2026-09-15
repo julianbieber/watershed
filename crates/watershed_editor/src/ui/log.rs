@@ -39,7 +39,7 @@ pub struct LogRow(usize);
 /// records arrive.
 pub fn panel() -> impl Scene {
     let rows: Vec<Box<dyn SceneList>> = (0..ROWS)
-        .map(|index| one(bsn! { (widgets::small("") LogRow({index})) }))
+        .map(|index| one(bsn! { @widgets::small("") LogRow({index}) }))
         .collect();
     bsn! {
         Node {
@@ -52,34 +52,30 @@ pub fn panel() -> impl Scene {
         }
         ThemeBackgroundColor(tokens::WINDOW_BG)
         Children [
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: px(6),
-                }
-                Children [
-                    (
-                        @FeathersDisclosureToggle
-                        on(|change: On<ValueChange<bool>>, mut open: ResMut<Open>| {
-                            open.0 = change.value;
-                        })
-                    ),
-                    (widgets::small("log") LogCaption),
-                ]
-            ),
-            (
-                Node {
-                    display: Display::None,
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::Stretch,
-                    max_height: {px(BODY_HEIGHT)},
-                    overflow: {Overflow::scroll_y()},
-                }
-                LogBody
-                Children [ {rows} ]
-            ),
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(6),
+            }
+            Children [
+                @FeathersDisclosureToggle
+                on(|change: On<ValueChange<bool>>, mut open: ResMut<Open>| {
+                    open.0 = change.value;
+                })
+                --
+                @widgets::small("log") LogCaption
+            ]
+            --
+            Node {
+                display: Display::None,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Stretch,
+                max_height: {px(BODY_HEIGHT)},
+                overflow: {Overflow::scroll_y()},
+            }
+            LogBody
+            Children [ {rows} ]
         ]
     }
 }

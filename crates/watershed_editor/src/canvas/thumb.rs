@@ -161,7 +161,7 @@ mod tests {
     }
 
     // The raster's row zero is its bottom and an image's row zero is its top, which
-    // `layer.wgsl` says and flips `v` for. Without the flip every card's picture is
+    // `layer.wesl` says and flips `v` for. Without the flip every card's picture is
     // upside down against the map showing the same layer.
     #[test]
     fn the_rasters_bottom_row_lands_in_the_images_last_row() {

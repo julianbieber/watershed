@@ -30,7 +30,7 @@ pub fn boxed(scene: impl Scene) -> Box<dyn Scene> {
 /// A component the scene only carries when the condition holds — a checked checkbox, a
 /// button that cannot be pressed. `None` is a scene that patches nothing.
 pub fn when<C: Component + Clone + Default + Unpin>(on: bool, component: C) -> Option<impl Scene> {
-    on.then_some(template_value(component))
+    on.then(|| bsn! { ~{component} })
 }
 
 /// Written only when it changed. A `Text` touched every frame is a text layout redone
@@ -79,25 +79,22 @@ pub fn captioned(caption: impl Into<String>, control: Box<dyn SceneList>) -> imp
             column_gap: px(6),
         }
         Children [
-            (
-                Node { min_width: px(84) }
-                Children [ label_small(caption) ]
-            ),
-            (
-                Node { flex_grow: 1.0, max_width: px(150) }
-                Children [ {control} ]
-            ),
+            Node { min_width: px(84) }
+            Children [ @label_small(caption) ]
+            --
+            Node { flex_grow: 1.0, max_width: px(150) }
+            Children [ {control} ]
         ]
     }
 }
 
-/// A number field bound to one place in the document or the dialog.
+/// A number field bound to one place in the document or the dialog. Whole-numbered
+/// bindings edit as integers, so the field cannot offer a fraction the document has
+/// nowhere to put.
 pub fn number(binding: NumberBinding) -> impl Scene {
     bsn! {
-        @FeathersNumberInput {
-            @number_format: {binding.format()},
-        }
-        template_value(binding)
+        @FeathersNumberInput
+        binding
         Node { flex_grow: 1.0 }
         on(bind::on_f32)
         on(bind::on_i32)
@@ -118,16 +115,13 @@ pub fn menu(caption: impl Into<String>, items: Vec<Box<dyn SceneList>>) -> impl 
         @FeathersMenu
         Node { flex_grow: 1.0 }
         Children [
-            (
-                @FeathersMenuButton {
-                    @caption: bsn! { Text({caption}) ThemedText },
-                }
-                Node { flex_grow: 1.0 }
-            ),
-            (
-                @FeathersMenuPopup
-                Children [ {items} ]
-            ),
+            @FeathersMenuButton {
+                @caption: bsn! { Text({caption}) ThemedText },
+            }
+            Node { flex_grow: 1.0 }
+            --
+            @FeathersMenuPopup
+            Children [ {items} ]
         ]
     }
 }

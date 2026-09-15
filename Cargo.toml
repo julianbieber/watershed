@@ -10,10 +10,10 @@ repository = "https://github.com/julianbieber/watershed"
 
 [workspace.dependencies]
 watershed = { path = "crates/watershed" }
-bevy = { version = "0.19", features = ["bevy_feathers"] }
-glam = { version = "0.32", features = ["serde"] }
-naga = { version = "29", features = ["wgsl-in"] }
-wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl"] }
+bevy = { git = "https://github.com/bevyengine/bevy", rev = "7ed2d31ff422f0a9e625b3ba62f07e892b6ff876", features = ["bevy_feathers"] }
+glam = { version = "0.33", features = ["serde"] }
+naga = { version = "30", features = ["wgsl-in"] }
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
 rayon = "1.11"
 ron = "0.12"
 serde = { version = "1.0", features = ["derive"] }

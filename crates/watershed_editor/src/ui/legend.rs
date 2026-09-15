@@ -58,31 +58,31 @@ pub fn legend() -> impl Scene {
             border: px(1),
         }
         ThemeBackgroundColor(tokens::WINDOW_BG)
-        ThemeBorderColor(tokens::GROUP_HEADER_BORDER)
+        ThemeBorderColor(tokens::GROUP_BORDER)
         LegendRoot
         Children [
-            (widgets::text("") LegendTitle),
-            (
-                Node {
-                    width: {px(RAMP_WIDTH)},
-                    height: px(14),
-                    border: px(1),
-                }
-                BorderColor::all(Color::srgb(0.35, 0.35, 0.35))
-                LegendRamp
-            ),
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                }
-                Children [
-                    (widgets::small("") LegendLow),
-                    (widgets::small("") LegendHigh),
-                ]
-            ),
-            (widgets::small("") LegendCaption),
+            @widgets::text("") LegendTitle
+            --
+            Node {
+                width: {px(RAMP_WIDTH)},
+                height: px(14),
+                border: px(1),
+            }
+            BorderColor::all(Color::srgb(0.35, 0.35, 0.35))
+            LegendRamp
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+            }
+            Children [
+                @widgets::small("") LegendLow
+                --
+                @widgets::small("") LegendHigh
+            ]
+            --
+            @widgets::small("") LegendCaption
         ]
     }
 }

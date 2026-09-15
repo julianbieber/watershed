@@ -104,7 +104,7 @@ pub fn rebuild(
 
     let entries: Vec<Box<dyn SceneList>> = contents(&document, &expanded, &library)
         .into_iter()
-        .map(|scene| one(bsn! { {scene} StackEntry({generation}) }))
+        .map(|scene| one(bsn! { @{scene} StackEntry({generation}) }))
         .collect();
 
     commands
@@ -211,7 +211,7 @@ fn contents(
 
     let mut children: Vec<Box<dyn Scene>> = vec![widgets::boxed(widgets::row(vec![
         one(widgets::text(active.clone())),
-        one(bsn! { widgets::small("") PreviewTag }),
+        one(bsn! { @widgets::small("") PreviewTag }),
     ]))];
 
     let reads = crate::edit::reads_of(layer);
@@ -240,17 +240,15 @@ fn layer_row(active: &str) -> impl Scene {
                 @FeathersTextInputContainer
                 Node { width: px(120) }
                 Children [
-                    (
-                        @FeathersTextInput
-                        NewLayerInput
-                        on(|change: On<TextEditChange>,
-                            texts: Query<&EditableText>,
-                            mut name: ResMut<NewLayer>| {
-                            if let Ok(text) = texts.get(change.event_target()) {
-                                name.0 = text.value().to_string();
-                            }
-                        })
-                    )
+                    @FeathersTextInput
+                    NewLayerInput
+                    on(|change: On<TextEditChange>,
+                        texts: Query<&EditableText>,
+                        mut name: ResMut<NewLayer>| {
+                        if let Ok(text) = texts.get(change.event_target()) {
+                            name.0 = text.value().to_string();
+                        }
+                    })
                 ]
             }),
             one(bsn! {
@@ -341,7 +339,7 @@ fn properties(
         .map(|choice| {
             let active = active.clone();
             one(bsn! {
-                widgets::item_caption(choice.as_str())
+                @widgets::item_caption(choice.as_str())
                 on(move |_: On<Activate>, mut document: ResMut<Document>| {
                     let result = document
                         .apply(&Edit::Set {
@@ -407,7 +405,7 @@ fn toggle_row(
     let active = active.to_owned();
     let mut children: Vec<Box<dyn SceneList>> = vec![
         one(bsn! {
-            {widgets::when(checked, Checked)}
+            @{widgets::when(checked, Checked)}
             @FeathersCheckbox
             on(move |change: On<ValueChange<bool>>, mut document: ResMut<Document>| {
                 let result = document
@@ -482,38 +480,32 @@ fn section(
     let body: Vec<Box<dyn SceneList>> = if open { body } else { Vec::new() };
 
     bsn! {
-        group()
+        @group()
         Children [
-            (
-                group_header()
+            @group_header()
+            Children [
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(6),
+                }
                 Children [
-                    (
-                        Node {
-                            display: Display::Flex,
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: px(6),
-                        }
-                        Children [
-                            (
-                                {widgets::when(open, Checked)}
-                                @FeathersDisclosureToggle
-                                on(move |
-                                    change: On<ValueChange<bool>>,
-                                    mut expanded: ResMut<Expanded>,
-                                | {
-                                    toggle(change.value, &mut expanded);
-                                })
-                            ),
-                            widgets::small(caption),
-                        ]
-                    ),
+                    @{widgets::when(open, Checked)}
+                    @FeathersDisclosureToggle
+                    on(move |
+                        change: On<ValueChange<bool>>,
+                        mut expanded: ResMut<Expanded>,
+                    | {
+                        toggle(change.value, &mut expanded);
+                    })
+                    --
+                    @widgets::small(caption)
                 ]
-            ),
-            (
-                group_body()
-                Children [ {body} ]
-            ),
+            ]
+            --
+            @group_body()
+            Children [ {body} ]
         ]
     }
 }
@@ -539,7 +531,7 @@ fn reference_body() -> impl Scene {
             max_height: {px(REFERENCE_HEIGHT)},
             overflow: {Overflow::scroll_y()},
         }
-        Children [ widgets::small(reference) ]
+        Children [ @widgets::small(reference) ]
     }
 }
 
