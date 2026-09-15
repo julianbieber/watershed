@@ -1,4 +1,4 @@
-// What every field's shader is compiled against: the bindings a dispatch supplies, and
+// What every layer's shader is compiled against: the bindings a dispatch supplies, and
 // the noise primitives a shader is expected to reach for.
 //
 // The Rust half of this file is `gpu.rs`, which writes `Globals` out as
@@ -11,18 +11,18 @@
 struct Globals {
     // The document's extent, in cells.
     document: vec2<u32>,
-    // The extent of this dispatch, in texels of the field's own raster.
+    // The extent of this dispatch, in texels of the layer's own raster.
     texels: vec2<u32>,
-    // Where this dispatch starts, in texels of the field's own raster.
+    // Where this dispatch starts, in texels of the layer's own raster.
     origin: vec2<u32>,
-    // The field's raster shift: one texel per cell at 0, per 2^shift cells above.
+    // The layer's raster shift: one texel per cell at 0, per 2^shift cells above.
     shift: u32,
     // The document's seed.
     seed: u32,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var<storage, read_write> field_out: array<f32>;
+@group(0) @binding(1) var<storage, read_write> layer_out: array<f32>;
 
 const TAU: f32 = 6.2831853;
 const RIDGE_GAIN: f32 = 2.0;
@@ -69,7 +69,7 @@ fn gradient_noise(p: vec2<f32>) -> f32 {
 
 // Octaves of `gradient_noise` summed, each at `lacunarity` times the frequency and
 // `persistence` times the amplitude of the one before, divided by the total
-// amplitude — so changing the octave count refines the field rather than rescaling
+// amplitude — so changing the octave count refines the layer rather than rescaling
 // it. Zero octaves gives a NaN.
 fn fbm(p: vec2<f32>, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
     var total = 0.0;
@@ -103,7 +103,7 @@ fn ridged_fbm(p: vec2<f32>, octaves: u32, persistence: f32, lacunarity: f32) -> 
     return total / max_amplitude;
 }
 
-// `fbm` stretched around its midpoint onto 0..1, which is the reading a height field's
+// `fbm` stretched around its midpoint onto 0..1, which is the reading a height layer's
 // range expects.
 fn fbm_unit(p: vec2<f32>, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
     return clamp(fbm(p, octaves, persistence, lacunarity) * NOISE_GAIN * 0.5 + 0.5, 0.0, 1.0);
@@ -137,10 +137,10 @@ fn uv(p: vec2<f32>) -> vec2<f32> {
     return p / document_extent();
 }
 
-// The texel of this field's own raster a document position falls in — the inverse of
+// The texel of this layer's own raster a document position falls in — the inverse of
 // `cell_position`, and how a shader turns a neighbour's position into an index into
 // a layer.
-fn field_texel(p: vec2<f32>) -> vec2<i32> {
+fn layer_texel(p: vec2<f32>) -> vec2<i32> {
     return vec2<i32>(floor(p / f32(1u << globals.shift)));
 }
 
@@ -167,8 +167,8 @@ fn layer_shift(layer: texture_2d<f32>) -> u32 {
     return 16u;
 }
 
-// Another field's value at a document position, interpolated between its texels and
-// clamped to its edge, whatever shift it was baked at — the same read a field
+// Another layer's value at a document position, interpolated between its texels and
+// clamped to its edge, whatever shift it was baked at — the same read a layer
 // reference makes.
 fn layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
     let step = f32(1u << layer_shift(layer));

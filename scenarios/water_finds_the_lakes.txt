@@ -23,7 +23,7 @@ new 512 512 7 continents
 wait bake
 
 observe document
-observe field
+observe layer
 
 zoom fit
 capture /tmp/watershed-scenario/height.png
@@ -39,13 +39,13 @@ observe water
 # the numbers above cannot disagree.
 capture /tmp/watershed-scenario/water.png
 
-# Moisture is baked four shifts down, so switching to it is what proves a coarse field is
+# Moisture is baked four shifts down, so switching to it is what proves a coarse layer is
 # drawn at its own resolution rather than the document's.
-field moisture
-observe field
+layer moisture
+observe layer
 capture /tmp/watershed-scenario/moisture.png
 
-field height
+layer height
 
 # A round trip through the terrain directory. The save writes the values as images and
 # the load re-bakes from the recipe and the shader files rather than reading those

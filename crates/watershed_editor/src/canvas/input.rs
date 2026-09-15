@@ -98,7 +98,7 @@ pub fn undo_keys(
     report(&mut document, result);
 }
 
-/// F frames every field card, unless a text field has the keyboard.
+/// F frames every layer card, unless a text field has the keyboard.
 ///
 /// Reads the logical key rather than the physical position, so the key printed F fits
 /// on every layout. Does nothing while a pan is held: the pan keeps its anchor under

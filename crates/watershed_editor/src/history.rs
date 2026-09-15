@@ -2,50 +2,50 @@
 //! that turn those into undo and redo.
 //!
 //! An entry does not cost the size of the document. It is kept as the authored state of
-//! every field and nothing derived from it, so it costs the settings and parameter
+//! every layer and nothing derived from it, so it costs the settings and parameter
 //! values.
 
-use crate::terrain::{Field, TerrainSpec, WaterSpec};
+use crate::terrain::{Layer, TerrainSpec, WaterSpec};
 
 /// How many changes can be undone. Recording past this drops the oldest.
 pub const HISTORY_DEPTH: usize = 100;
-/// The authored state of every field on the far side of one change, the water spec
-/// there, the field that was on screen, and whether crossing that change reaches the
+/// The authored state of every layer on the far side of one change, the water spec
+/// there, the layer that was on screen, and whether crossing that change reaches the
 /// bake.
 ///
-/// Which field was on screen is part of what one change leaves behind because a
+/// Which layer was on screen is part of what one change leaves behind because a
 /// change may move the view, so going back across that change has to put the earlier
 /// one back, in the same step.
 pub struct Snapshot {
-    fields: Vec<Field>,
+    layers: Vec<Layer>,
     water_spec: Option<WaterSpec>,
     active: String,
     reaches_bake: bool,
 }
 
 impl Snapshot {
-    /// Copies every field's authored state as it stands: no bake and no shader values.
+    /// Copies every layer's authored state as it stands: no bake and no shader values.
     ///
-    /// `active` is the field on screen at the moment of the copy, which crossing the
+    /// `active` is the layer on screen at the moment of the copy, which crossing the
     /// change puts back.
     pub fn take(terrain: &TerrainSpec, reaches_bake: bool, active: &str) -> Self {
         Self {
-            fields: terrain.fields.iter().map(Field::authored).collect(),
+            layers: terrain.layers.iter().map(Layer::authored).collect(),
             water_spec: terrain.water_spec.clone(),
             active: active.to_owned(),
             reaches_bake,
         }
     }
-    /// Puts each held field's settings and parameter values back onto the live field
+    /// Puts each held layer's settings and parameter values back onto the live layer
     /// of the same name, and the water spec back into `terrain`.
     ///
-    /// Never adds or removes a field: a live field the snapshot does not hold is left
-    /// as it is, and a held field no live field matches is dropped. Everything the
-    /// history does not own — bakes, shader values, the fields a file reads — stays
-    /// with the live field.
+    /// Never adds or removes a layer: a live layer the snapshot does not hold is left
+    /// as it is, and a held layer no live layer matches is dropped. Everything the
+    /// history does not own — bakes, shader values, the layers a file reads — stays
+    /// with the live layer.
     pub fn restore(self, terrain: &mut TerrainSpec) {
-        for held in self.fields {
-            let Some(live) = terrain.field_mut(held.id.as_str()) else {
+        for held in self.layers {
+            let Some(live) = terrain.layer_mut(held.id.as_str()) else {
                 continue;
             };
             live.role = held.role;
@@ -66,7 +66,7 @@ impl Snapshot {
 pub struct Restored {
     /// Whether crossing this change reaches the bake.
     pub reaches_bake: bool,
-    /// The field that was on screen on the far side of the change. Equal to the
+    /// The layer that was on screen on the far side of the change. Equal to the
     /// current one for every change that did not move the view.
     pub active: String,
 }
@@ -106,7 +106,7 @@ impl History {
     /// Puts the document back to before the last change and says what came back, or
     /// `None` with nothing to undo.
     ///
-    /// `active` is the field on screen now, recorded so that redoing the change puts
+    /// `active` is the layer on screen now, recorded so that redoing the change puts
     /// it back.
     pub fn undo(&mut self, terrain: &mut TerrainSpec, active: &str) -> Option<Restored> {
         let entry = self.undo.pop()?;
@@ -118,7 +118,7 @@ impl History {
     /// Replays the last change undone and says what came back, or `None` with nothing to
     /// redo.
     ///
-    /// `active` is the field on screen now, recorded so that undoing the change again
+    /// `active` is the layer on screen now, recorded so that undoing the change again
     /// puts it back.
     pub fn redo(&mut self, terrain: &mut TerrainSpec, active: &str) -> Option<Restored> {
         let entry = self.redo.pop()?;
@@ -158,7 +158,7 @@ mod tests {
 
     fn held(size: u32) -> TerrainSpec {
         let mut terrain =
-            TerrainSpec::new(UVec2::splat(size)).with_field(Field::new("height").held(0.5));
+            TerrainSpec::new(UVec2::splat(size)).with_layer(Layer::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         terrain
     }
@@ -171,7 +171,7 @@ mod tests {
         let mut history = History::default();
         history.record(Snapshot::take(&terrain, true, "height"));
 
-        let kept = &history.undo[0].fields[0];
+        let kept = &history.undo[0].layers[0];
         assert!(kept.baked().is_empty(), "a bake was kept");
         assert!(
             kept.shader.values().is_empty(),
@@ -187,7 +187,7 @@ mod tests {
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
         terrain
-            .field_mut("height")
+            .layer_mut("height")
             .unwrap()
             .shader
             .params
@@ -195,43 +195,43 @@ mod tests {
         history.record(before);
 
         history.undo(&mut terrain, "height").unwrap();
-        let field = terrain.field("height").unwrap();
-        assert_eq!(field.shader.params.get("value"), Some(&vec![0.5]));
-        assert!(!field.baked().is_empty());
-        assert!(!field.shader.values().is_empty());
+        let layer = terrain.layer("height").unwrap();
+        assert_eq!(layer.shader.params.get("value"), Some(&vec![0.5]));
+        assert!(!layer.baked().is_empty());
+        assert!(!layer.shader.values().is_empty());
     }
 
-    // Adding a field is a file operation outside the history, so an undo across an
-    // earlier change must not take a field out whose file is still on disk.
+    // Adding a layer is a file operation outside the history, so an undo across an
+    // earlier change must not take a layer out whose file is still on disk.
     #[test]
-    fn a_field_added_after_a_snapshot_survives_an_undo() {
+    fn a_layer_added_after_a_snapshot_survives_an_undo() {
         let mut terrain = held(8);
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.field_mut("height").unwrap().range = (0.0, 2.0);
+        terrain.layer_mut("height").unwrap().range = (0.0, 2.0);
         history.record(before);
-        terrain.fields.push(Field::new("temperature"));
+        terrain.layers.push(Layer::new("temperature"));
 
         history.undo(&mut terrain, "height").unwrap();
-        assert!(terrain.field("temperature").is_some());
-        assert_eq!(terrain.field("height").unwrap().range, (0.0, 1.0));
+        assert!(terrain.layer("temperature").is_some());
+        assert_eq!(terrain.layer("height").unwrap().range, (0.0, 1.0));
     }
 
-    // Removing a field deleted its file, so an undo must not bring back a field whose
+    // Removing a layer deleted its file, so an undo must not bring back a layer whose
     // file is gone.
     #[test]
-    fn a_field_removed_after_a_snapshot_is_not_brought_back() {
-        let mut terrain = held(8).with_field(Field::new("temperature"));
+    fn a_layer_removed_after_a_snapshot_is_not_brought_back() {
+        let mut terrain = held(8).with_layer(Layer::new("temperature"));
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.field_mut("height").unwrap().range = (0.0, 2.0);
+        terrain.layer_mut("height").unwrap().range = (0.0, 2.0);
         history.record(before);
         terrain
-            .fields
-            .retain(|field| field.id.as_str() != "temperature");
+            .layers
+            .retain(|layer| layer.id.as_str() != "temperature");
 
         history.undo(&mut terrain, "height").unwrap();
-        assert!(terrain.field("temperature").is_none());
+        assert!(terrain.layer("temperature").is_none());
     }
 
     // The two stacks are one sequence of changes: a new change forgets what could have
@@ -242,7 +242,7 @@ mod tests {
         let mut history = History::default();
         for step in 0..(HISTORY_DEPTH + 5) {
             let before = Snapshot::take(&terrain, true, "height");
-            terrain.field_mut("height").unwrap().range = (0.0, step as f32);
+            terrain.layer_mut("height").unwrap().range = (0.0, step as f32);
             history.record(before);
         }
         assert_eq!(history.depth().undo, HISTORY_DEPTH);
@@ -251,7 +251,7 @@ mod tests {
         history.undo(&mut terrain, "height").unwrap();
         assert_eq!(history.depth().redo, 2);
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.field_mut("height").unwrap().range = (0.0, 1.0);
+        terrain.layer_mut("height").unwrap().range = (0.0, 1.0);
         history.record(before);
         assert_eq!(history.depth().redo, 0);
         assert!(history.redo(&mut terrain, "height").is_none());

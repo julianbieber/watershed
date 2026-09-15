@@ -1,10 +1,10 @@
-# Read another field from a shader by naming it in the file, from outside the process:
+# Read another layer from a shader by naming it in the file, from outside the process:
 # `ridges`' `height` is the file `height.wgsl`, which binds `base` with
-# `// @layer base`, and the read is reported by `observe shaders` and `observe fields`.
+# `// @layer base`, and the read is reported by `observe shaders` and `observe layers`.
 #
 # Run with:  just drive run scenarios/a_shader_reads_a_layer_by_name.txt
 #
-# The file edits that go with this — an `@layer` naming no field, and one that makes
+# The file edits that go with this — an `@layer` naming no layer, and one that makes
 # `base` and `height` read each other — are not in this file: replay cannot edit a
 # shader file, so they are pinned by the unit tests in `bake.rs` instead.
 
@@ -19,13 +19,13 @@ wait bake
 # no other file reads one.
 observe shaders
 
-# `height` reads `base`, so `base` is baked before it, and no field carries a fault.
-observe fields
+# `height` reads `base`, so `base` is baked before it, and no layer carries a fault.
+observe layers
 
-# Both ends of the read, and both fields baked.
-field height
-observe field
-field base
-observe field
+# Both ends of the read, and both layers baked.
+layer height
+observe layer
+layer base
+observe layer
 
 observe log

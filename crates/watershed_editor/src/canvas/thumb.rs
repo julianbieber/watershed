@@ -1,4 +1,4 @@
-//! The picture on a field's card: what raster it is drawn from, and what keeps those
+//! The picture on a layer's card: what raster it is drawn from, and what keeps those
 //! pictures in step with the document.
 
 use bevy::asset::RenderAssetUsages;
@@ -13,31 +13,31 @@ use crate::terrain::TerrainSpec;
 
 const TEXELS: u32 = 64;
 
-/// The square on a card that shows the field the card stands for.
+/// The square on a card that shows the layer the card stands for.
 #[derive(Component)]
 pub struct CardThumb {
-    /// The field the picture is drawn from, by name.
-    pub field: String,
+    /// The layer the picture is drawn from, by name.
+    pub layer: String,
     blank: Color,
     drawn: Option<u64>,
 }
 
 impl CardThumb {
-    /// A thumbnail for the field named `field`, showing `blank` until there is a raster
+    /// A thumbnail for the layer named `layer`, showing `blank` until there is a raster
     /// to draw and again if it loses one.
-    pub fn new(field: String, blank: Color) -> Self {
+    pub fn new(layer: String, blank: Color) -> Self {
         Self {
-            field,
+            layer,
             blank,
             drawn: None,
         }
     }
 }
 
-/// Redraws each card's picture from the bake of the field it names.
+/// Redraws each card's picture from the bake of the layer it names.
 ///
-/// A card keeps the flat square until its field has been baked once, and goes back to
-/// it if the document stops carrying that field.
+/// A card keeps the flat square until its layer has been baked once, and goes back to
+/// it if the document stops carrying that layer.
 pub fn sync_thumbnails(
     document: Res<Document>,
     shape: Res<CanvasShape>,
@@ -51,7 +51,7 @@ pub fn sync_thumbnails(
         return;
     };
     for (mut thumb, mut sprite) in &mut thumbs {
-        match field_picture(terrain, &thumb.field) {
+        match layer_picture(terrain, &thumb.layer) {
             Some(bytes) => {
                 let mark = hash(&bytes);
                 if thumb.drawn == Some(mark) {
@@ -73,10 +73,10 @@ pub fn sync_thumbnails(
     }
 }
 
-fn field_picture(terrain: &TerrainSpec, field: &str) -> Option<Vec<u8>> {
+fn layer_picture(terrain: &TerrainSpec, layer: &str) -> Option<Vec<u8>> {
     terrain
-        .field(field)
-        .and_then(|field| picture(field.baked()))
+        .layer(layer)
+        .and_then(|layer| picture(layer.baked()))
 }
 
 fn picture<T: Texel>(raster: &Raster<T>) -> Option<Vec<u8>> {
@@ -143,7 +143,7 @@ fn hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::Field;
+    use crate::terrain::Layer;
 
     fn ramp(size: u32) -> Raster<f32> {
         let mut raster = Raster::new(UVec2::splat(size), 0.0);
@@ -161,8 +161,8 @@ mod tests {
     }
 
     // The raster's row zero is its bottom and an image's row zero is its top, which
-    // `field.wgsl` says and flips `v` for. Without the flip every card's picture is
-    // upside down against the map showing the same field.
+    // `layer.wgsl` says and flips `v` for. Without the flip every card's picture is
+    // upside down against the map showing the same layer.
     #[test]
     fn the_rasters_bottom_row_lands_in_the_images_last_row() {
         let bytes = picture(&ramp(16)).expect("a picture");
@@ -176,7 +176,7 @@ mod tests {
         );
     }
 
-    // A field that has not varied yet — a shader holding one value — has a zero span,
+    // A layer that has not varied yet — a shader holding one value — has a zero span,
     // and normalising against it would divide by zero.
     #[test]
     fn a_flat_raster_draws_one_colour_and_does_not_divide_by_zero() {
@@ -185,26 +185,26 @@ mod tests {
         assert!(bytes.chunks(4).all(|pixel| pixel == &bytes[..4]));
     }
 
-    fn two_field_terrain() -> TerrainSpec {
+    fn two_layer_terrain() -> TerrainSpec {
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_range((0.0, 1.0)).holding(ramp(16)))
-            .with_field(Field::new("height").reading(&["base"]));
+            .with_layer(Layer::new("base").with_range((0.0, 1.0)).holding(ramp(16)))
+            .with_layer(Layer::new("height").reading(&["base"]));
         terrain.bake_in_place().expect("a bake");
         terrain
     }
 
-    // A field's card is drawn from that field's own bake, which is the same raster the
-    // map shows when the field is opened — and a name the document does not carry draws
-    // nothing rather than whatever field happens to be first.
+    // A layer's card is drawn from that layer's own bake, which is the same raster the
+    // map shows when the layer is opened — and a name the document does not carry draws
+    // nothing rather than whatever layer happens to be first.
     #[test]
-    fn a_card_draws_its_fields_baked_raster() {
-        let terrain = two_field_terrain();
-        let drawn = field_picture(&terrain, "base").expect("a picture of `base`");
-        let expected = picture(terrain.field("base").unwrap().baked()).expect("a picture");
+    fn a_card_draws_its_layers_baked_raster() {
+        let terrain = two_layer_terrain();
+        let drawn = layer_picture(&terrain, "base").expect("a picture of `base`");
+        let expected = picture(terrain.layer("base").unwrap().baked()).expect("a picture");
         assert_eq!(drawn, expected);
         assert!(
-            field_picture(&terrain, "nowhere").is_none(),
-            "a field the document does not carry drew something"
+            layer_picture(&terrain, "nowhere").is_none(),
+            "a layer the document does not carry drew something"
         );
     }
 }

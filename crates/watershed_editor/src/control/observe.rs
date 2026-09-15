@@ -1,7 +1,7 @@
 //! What a caller can ask the running editor about itself.
 //!
 //! Every answer is what the editor *acted on*, not something the caller could work out
-//! for itself: the fitted colour range, the fault that left a field unbaked. A second
+//! for itself: the fitted colour range, the fault that left a layer unbaked. A second
 //! derivation on the caller's side would part company with the editor the moment the
 //! camera moved.
 //!
@@ -25,9 +25,9 @@ use crate::view::{
 pub(super) enum Topic {
     /// The document's state: what is running, what failed, how much is baked.
     Document,
-    /// A summary of the active field's baked values.
-    Field,
-    /// The solved water, counted, and the fields the water spec is over.
+    /// A summary of the active layer's baked values.
+    Layer,
+    /// The solved water, counted, and the layers the water spec is over.
     Water,
     /// Where the camera is and what the ramp is fitted to.
     View,
@@ -36,9 +36,9 @@ pub(super) enum Topic {
     /// The shaders the document carries, what each declares, and why one did not
     /// parse.
     Shaders,
-    /// Every field of the document in bake order, what each one reads, and the cycle
+    /// Every layer of the document in bake order, what each one reads, and the cycle
     /// that stopped the order from being computed.
-    Fields,
+    Layers,
 }
 
 impl Topic {
@@ -46,29 +46,29 @@ impl Topic {
     pub(super) fn parse(word: &str) -> Result<Self, String> {
         match word {
             "document" => Ok(Self::Document),
-            "field" => Ok(Self::Field),
+            "layer" => Ok(Self::Layer),
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
             "shaders" => Ok(Self::Shaders),
-            "fields" => Ok(Self::Fields),
+            "layers" => Ok(Self::Layers),
             other => Err(format!("nothing to observe called {other}")),
         }
     }
 }
 
-/// Answers the topic. Every answer carries `available`, or is a shape whose fields
+/// Answers the topic. Every answer carries `available`, or is a shape whose layers
 /// are always there — a topic asked of a document that has none says so rather than
 /// failing.
 pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
     match topic {
         Topic::Document => document(world),
-        Topic::Field => field(world),
+        Topic::Layer => layer(world),
         Topic::Water => water(world),
         Topic::View => view(world),
         Topic::Log => log(world),
         Topic::Shaders => shaders(world),
-        Topic::Fields => fields(world),
+        Topic::Layers => layers(world),
     }
 }
 
@@ -88,29 +88,29 @@ fn document(world: &World) -> Value {
         "preset": document.preset.name(),
         "path": document.path.as_ref().map(|path| path.display().to_string()),
         "active": document.active(),
-        "fields": document.field_names(),
+        "layers": document.layer_names(),
         "water": document
             .terrain()
             .is_some_and(|terrain| terrain.water().is_some()),
     })
 }
 
-fn field(world: &World) -> Value {
+fn layer(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(terrain) = document.terrain() else {
         return json!({ "available": false });
     };
-    let Some(field) = terrain.field(document.active()) else {
+    let Some(layer) = terrain.layer(document.active()) else {
         return json!({ "available": false });
     };
 
-    let reads = crate::edit::reads_of(field);
+    let reads = crate::edit::reads_of(layer);
     let read_by = crate::edit::readers_of(terrain, document.active());
 
-    let file = field.file();
-    let params = &field.shader.params;
+    let file = layer.file();
+    let params = &layer.shader.params;
 
-    let baked = field.baked();
+    let baked = layer.baked();
     if baked.is_empty() {
         return json!({
             "available": false,
@@ -133,8 +133,8 @@ fn field(world: &World) -> Value {
 
     json!({
         "available": true,
-        "name": field.id.to_string(),
-        "shift": field.shift,
+        "name": layer.id.to_string(),
+        "shift": layer.shift,
         "resolution": [baked.width(), baked.height()],
         "cells": values.len(),
         "min": at(0.0),
@@ -149,7 +149,7 @@ fn field(world: &World) -> Value {
     })
 }
 
-fn fields(world: &World) -> Value {
+fn layers(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(terrain) = document.terrain() else {
         return json!({ "available": false });
@@ -165,32 +165,32 @@ fn fields(world: &World) -> Value {
         ),
         Err(error) => (
             terrain
-                .fields
+                .layers
                 .iter()
-                .map(|field| field.id.to_string())
+                .map(|layer| layer.id.to_string())
                 .collect(),
             "declaration",
             json!(error.to_string()),
         ),
     };
-    let faults = terrain.field_faults();
+    let faults = terrain.layer_faults();
     let library = world.get_resource::<ShaderLibrary>();
-    let fields: Vec<Value> = names
+    let layers: Vec<Value> = names
         .iter()
-        .filter_map(|name| terrain.field(name))
-        .map(|field| {
+        .filter_map(|name| terrain.layer(name))
+        .map(|layer| {
             json!({
-                "name": field.id.to_string(),
-                "role": field.role.as_str(),
-                "shift": field.shift,
-                "reads": crate::edit::reads_of(field),
+                "name": layer.id.to_string(),
+                "role": layer.role.as_str(),
+                "shift": layer.shift,
+                "reads": crate::edit::reads_of(layer),
                 "fault": faults
                     .iter()
-                    .find(|(id, _)| *id == field.id)
+                    .find(|(id, _)| *id == layer.id)
                     .map(|(_, fault)| fault.clone())
                     .or_else(|| {
                         library
-                            .and_then(|library| library.entry(&field.file()))
+                            .and_then(|library| library.entry(&layer.file()))
                             .and_then(|entry| entry.error.clone())
                     }),
             })
@@ -202,7 +202,7 @@ fn fields(world: &World) -> Value {
         "active": document.active(),
         "order": order,
         "cycle": cycle,
-        "fields": fields,
+        "layers": layers,
     })
 }
 
@@ -337,16 +337,16 @@ fn shaders(world: &mut World) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::{Field, TerrainSpec};
+    use crate::terrain::{Layer, TerrainSpec};
 
     // Acceptance criterion five, which is the socket's half of the whole task: a caller
     // driving the editor over the control port can read the dependency both ways round
-    // without opening every field's file itself.
+    // without opening every layer's file itself.
     #[test]
-    fn observing_a_field_reports_both_ends_of_the_relation() {
+    fn observing_a_layer_reports_both_ends_of_the_relation() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").held(0.25))
-            .with_field(Field::new("height").reading(&["base"]));
+            .with_layer(Layer::new("base").held(0.25))
+            .with_layer(Layer::new("height").reading(&["base"]));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -354,21 +354,21 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(document);
 
-        let height = field(&world);
+        let height = layer(&world);
         assert_eq!(height["reads"], json!(["base"]));
         assert_eq!(height["read_by"], json!([]));
 
         world.resource_mut::<Document>().set_active("base").unwrap();
-        let base = field(&world);
+        let base = layer(&world);
         assert_eq!(base["reads"], json!([]));
         assert_eq!(base["read_by"], json!(["height"]));
     }
 
-    // A field is one shader file and the numbers set on it, so the socket has to name
-    // both — a caller about to `set <field>.<param>` has to see what is there.
+    // A layer is one shader file and the numbers set on it, so the socket has to name
+    // both — a caller about to `set <layer>.<param>` has to see what is there.
     #[test]
-    fn observing_a_field_reports_its_file_and_its_parameters() {
-        let terrain = TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("base").held(0.25));
+    fn observing_a_layer_reports_its_file_and_its_parameters() {
+        let terrain = TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("base").held(0.25));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -376,29 +376,29 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(document);
 
-        let base = field(&world);
+        let base = layer(&world);
         assert_eq!(base["file"], json!("base.wgsl"));
         assert_eq!(base["params"], json!({ "value": [0.25] }));
     }
 
     // Acceptance criterion seven: the whole document's shape over the socket, in the
-    // order the bake visits the fields in, so a caller sees the same picture the
+    // order the bake visits the layers in, so a caller sees the same picture the
     // overview draws without opening every file itself.
     #[test]
-    fn observing_the_fields_reports_them_in_bake_order_with_what_each_reads() {
+    fn observing_the_layers_reports_them_in_bake_order_with_what_each_reads() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("height").reading(&["base"]))
-            .with_field(Field::new("base").held(0.25));
+            .with_layer(Layer::new("height").reading(&["base"]))
+            .with_layer(Layer::new("base").held(0.25));
 
         let mut document = Document::default();
         document.adopt(terrain);
         let mut world = World::new();
         world.insert_resource(document);
 
-        let answer = fields(&world);
+        let answer = layers(&world);
         assert_eq!(answer["order"], json!("bake"));
         assert_eq!(answer["cycle"], Value::Null);
-        let listed = answer["fields"].as_array().expect("an array of fields");
+        let listed = answer["layers"].as_array().expect("an array of layers");
         assert_eq!(listed[0]["name"], json!("base"));
         assert_eq!(listed[0]["reads"], json!([]));
         assert_eq!(listed[0]["role"], json!("custom"));
@@ -408,49 +408,49 @@ mod tests {
     }
 
     // Acceptance criterion eight, read from the socket rather than from the status bar:
-    // a document whose fields cannot be ordered still reports every one of them, says
+    // a document whose layers cannot be ordered still reports every one of them, says
     // the order is the declared one, and names the cycle.
     #[test]
-    fn observing_the_fields_of_a_cyclic_document_names_the_cycle() {
+    fn observing_the_layers_of_a_cyclic_document_names_the_cycle() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("here").reading(&["there"]))
-            .with_field(Field::new("there").reading(&["here"]));
+            .with_layer(Layer::new("here").reading(&["there"]))
+            .with_layer(Layer::new("there").reading(&["here"]));
 
         let mut document = Document::default();
         document.adopt(terrain);
         let mut world = World::new();
         world.insert_resource(document);
 
-        let answer = fields(&world);
+        let answer = layers(&world);
         assert_eq!(answer["order"], json!("declaration"));
         let cycle = answer["cycle"].as_str().expect("the cycle, as text");
         assert!(cycle.contains("cycle"), "{cycle:?} does not name the cycle");
-        let listed = answer["fields"].as_array().expect("an array of fields");
+        let listed = answer["layers"].as_array().expect("an array of layers");
         assert_eq!(listed[0]["name"], json!("here"));
         assert_eq!(listed[1]["name"], json!("there"));
     }
 
     // The socket's half of a read by name: a caller sees a file's `@layer` as a read of
-    // the field it names, and a name that is no field as the reader's fault, without
+    // the layer it names, and a name that is no layer as the reader's fault, without
     // opening the file.
     #[test]
-    fn observing_the_fields_reports_a_layer_read_and_the_fault_of_a_name_that_is_no_field() {
+    fn observing_the_layers_reports_a_layer_read_and_the_fault_of_a_name_that_is_no_layer() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").held(0.25))
-            .with_field(Field::new("height").reading(&["base"]))
-            .with_field(Field::new("lost").reading(&["nowhere"]));
+            .with_layer(Layer::new("base").held(0.25))
+            .with_layer(Layer::new("height").reading(&["base"]))
+            .with_layer(Layer::new("lost").reading(&["nowhere"]));
 
         let mut document = Document::default();
         document.adopt(terrain);
         let mut world = World::new();
         world.insert_resource(document);
 
-        let answer = fields(&world);
-        let listed = answer["fields"].as_array().expect("an array of fields");
+        let answer = layers(&world);
+        let listed = answer["layers"].as_array().expect("an array of layers");
         let named = |name: &str| {
             listed
                 .iter()
-                .find(|field| field["name"] == json!(name))
+                .find(|layer| layer["name"] == json!(name))
                 .unwrap_or_else(|| panic!("{name} is not listed"))
         };
         assert_eq!(named("height")["reads"], json!(["base"]));
@@ -459,12 +459,12 @@ mod tests {
         assert!(fault.contains("nowhere"), "{fault:?}");
     }
 
-    // A field whose own file does not parse has no fault in the document's reads, so
-    // the socket has to fall back to the file's error — otherwise a caller sees a field
+    // A layer whose own file does not parse has no fault in the document's reads, so
+    // the socket has to fall back to the file's error — otherwise a caller sees a layer
     // that silently never bakes.
     #[test]
-    fn observing_the_fields_reports_the_error_of_a_file_that_did_not_parse() {
-        let terrain = TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("height"));
+    fn observing_the_layers_reports_the_error_of_a_file_that_did_not_parse() {
+        let terrain = TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("height"));
 
         let mut document = Document::default();
         document.adopt(terrain);
@@ -475,7 +475,7 @@ mod tests {
             "line 3: expected `;`",
         ));
 
-        let answer = fields(&world);
-        assert_eq!(answer["fields"][0]["fault"], json!("line 3: expected `;`"));
+        let answer = layers(&world);
+        assert_eq!(answer["layers"][0]["fault"], json!("line 3: expected `;`"));
     }
 }

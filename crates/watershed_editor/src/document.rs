@@ -15,9 +15,9 @@
 //! edit invalidates a bake without touching it: see [`Baked`] for whether the
 //! document currently matches its own shaders.
 //!
-//! Which fields the document has follows the shader directory: adding or removing a
-//! field is a file operation, and a file added or deleted by hand adds or removes its
-//! field. Neither is recorded in the history.
+//! Which layers the document has follows the shader directory: adding or removing a
+//! layer is a file operation, and a file added or deleted by hand adds or removes its
+//! layer. Neither is recorded in the history.
 
 use std::path::PathBuf;
 
@@ -30,7 +30,7 @@ use crate::edit::{Edit, Slot, check_add, check_remove};
 use crate::gpu::{self, ShaderRuntime};
 use crate::history::{History, HistoryDepth, Restored, Snapshot};
 use crate::preset::Preset;
-use crate::terrain::Field;
+use crate::terrain::Layer;
 use crate::terrain::shader::SHADER_DIR;
 
 /// Holds the document and runs the two systems that land finished jobs and open the
@@ -128,9 +128,9 @@ enum Held {
         slot: Slot,
     },
     Write {
-        field: String,
+        layer: String,
         slot: Slot,
-        write: Box<dyn FnOnce(&mut crate::terrain::Field) + Send + Sync>,
+        write: Box<dyn FnOnce(&mut crate::terrain::Layer) + Send + Sync>,
     },
 }
 
@@ -219,13 +219,13 @@ impl Document {
         self.terrain.as_ref()
     }
 
-    /// The field on screen. Always a name, even when there is no document, and always
+    /// The layer on screen. Always a name, even when there is no document, and always
     /// one the document carries when there is.
     pub fn active(&self) -> &str {
         &self.active
     }
 
-    /// Bumped whenever the field textures might need re-uploading. Compared against a
+    /// Bumped whenever the layer textures might need re-uploading. Compared against a
     /// remembered value rather than the rasters themselves, which at a full document
     /// size would cost more to compare than to upload.
     pub fn revision(&self) -> u64 {
@@ -281,7 +281,7 @@ impl Document {
     }
 
     /// The terrain, to be edited in place, for a change the history does not own: the
-    /// parameters and the fields read that a re-read shader file reconciled.
+    /// parameters and the layers read that a re-read shader file reconciled.
     /// Whatever is changed through this has to be followed by [`Document::note_edit`],
     /// and cannot be undone.
     ///
@@ -303,7 +303,7 @@ impl Document {
             .terrain()
             .map(|terrain| {
                 terrain
-                    .field_faults()
+                    .layer_faults()
                     .into_iter()
                     .map(|(_, fault)| fault)
                     .collect()
@@ -318,7 +318,7 @@ impl Document {
         fresh
     }
 
-    /// Installs what a field's shader is dispatched through: into the open terrain when
+    /// Installs what a layer's shader is dispatched through: into the open terrain when
     /// there is one, and into the document, so a document built or loaded later bakes
     /// on the same device.
     ///
@@ -338,7 +338,7 @@ impl Document {
         &self.runtime
     }
 
-    /// Records that a field has changed: the whole bake is stale, the last error no
+    /// Records that a layer has changed: the whole bake is stale, the last error no
     /// longer applies, a document that would not bake is worth trying again, and any
     /// solved water is invalidated — it was derived from a height that has just moved.
     ///
@@ -367,12 +367,12 @@ impl Document {
     /// asks for its re-bake, when the job does. Refused only with no document open, or
     /// by the edit itself — and a refusal leaves the document untouched.
     ///
-    /// An edit that names a field to show — see [`Edit::shows`] — also puts that field
+    /// An edit that names a layer to show — see [`Edit::shows`] — also puts that layer
     /// on screen, as part of the same change: undoing it puts back both the document
-    /// and the field that was being looked at.
+    /// and the layer that was being looked at.
     ///
     /// A file operation — see [`Edit::is_file_operation`] — is different on three
-    /// counts. It is refused rather than held while a job runs. Adding a field **writes
+    /// counts. It is refused rather than held while a job runs. Adding a layer **writes
     /// `<name>.wgsl`** into [`Document::shader_root`] as a copy of the template, and is
     /// refused when that file already exists; removing one **deletes that file** after
     /// the edit's own refusals have passed. And neither is recorded in the history, so
@@ -416,7 +416,7 @@ impl Document {
             .as_mut()
             .ok_or("there is no document to edit")?;
         match edit {
-            Edit::AddField { name } => {
+            Edit::AddLayer { name } => {
                 let name = check_add(terrain, name)?;
                 let file = root.join(format!("{name}.wgsl"));
                 if file.exists() {
@@ -426,7 +426,7 @@ impl Document {
                     .and_then(|()| std::fs::write(&file, gpu::template_source()))
                     .map_err(|error| format!("{}: {error}", file.display()))?;
             }
-            Edit::RemoveField { name } => {
+            Edit::RemoveLayer { name } => {
                 let name = check_remove(terrain, name)?;
                 let file = root.join(format!("{name}.wgsl"));
                 match std::fs::remove_file(&file) {
@@ -447,36 +447,36 @@ impl Document {
         Ok(reply)
     }
 
-    /// Makes the open document's fields the ones `names` lists: a field of each name
-    /// the document lacks is added with no parameter values, and a field no name lists
+    /// Makes the open document's layers the ones `names` lists: a layer of each name
+    /// the document lacks is added with no parameter values, and a layer no name lists
     /// is removed. What a file added to or deleted from the shader directory by hand
     /// does to the document.
     ///
     /// Not recorded in the history. When anything moved it is noted as an edit, and
-    /// a field on screen that is gone gives way to `height`, or to the first field.
+    /// a layer on screen that is gone gives way to `height`, or to the first layer.
     /// Does nothing with no document open.
-    pub fn sync_fields(&mut self, names: &[String]) {
+    pub fn sync_layers(&mut self, names: &[String]) {
         let Some(terrain) = self.terrain.as_mut() else {
             return;
         };
-        let before = terrain.fields.len();
+        let before = terrain.layers.len();
         terrain
-            .fields
-            .retain(|field| names.iter().any(|name| name == field.id.as_str()));
-        let mut moved = terrain.fields.len() != before;
+            .layers
+            .retain(|layer| names.iter().any(|name| name == layer.id.as_str()));
+        let mut moved = terrain.layers.len() != before;
         for name in names {
-            if terrain.field(name).is_none() {
-                terrain.fields.push(Field::new(name.as_str()));
+            if terrain.layer(name).is_none() {
+                terrain.layers.push(Layer::new(name.as_str()));
                 moved = true;
             }
         }
         if !moved {
             return;
         }
-        if terrain.field(&self.active).is_none() {
-            if terrain.field("height").is_some() {
+        if terrain.layer(&self.active).is_none() {
+            if terrain.layer("height").is_some() {
                 self.active = "height".to_owned();
-            } else if let Some(first) = terrain.fields.first() {
+            } else if let Some(first) = terrain.layers.first() {
                 self.active = first.id.to_string();
             }
         }
@@ -492,10 +492,10 @@ impl Document {
             .map_or_else(gpu::scratch_root, |path| path.join(SHADER_DIR))
     }
 
-    /// Writes one field in place through `write`, as one change in the history: the
+    /// Writes one layer in place through `write`, as one change in the history: the
     /// path for a panel control whose value the [`Edit`] grammar cannot spell.
     ///
-    /// Answers whether the document has changed or will change: the field's authored
+    /// Answers whether the document has changed or will change: the layer's authored
     /// state differs afterwards, and only then is the change recorded and noted — the
     /// closure's own opinion is not consulted, so a control committed at the value it
     /// already had leaves no entry and no re-bake.
@@ -503,19 +503,19 @@ impl Document {
     /// While a job holds the terrain the closure is held under `slot` and run when the
     /// job lands, which answers `true` before anything has been written. Two writes
     /// held under one slot leave only the second, so `slot` has to name the control
-    /// being written and not merely the field.
+    /// being written and not merely the layer.
     ///
-    /// Answers `false` with no document open, with no field of that name, or for a
-    /// value the field already had.
+    /// Answers `false` with no document open, with no layer of that name, or for a
+    /// value the layer already had.
     pub fn write(
         &mut self,
-        field: &str,
+        layer: &str,
         slot: Slot,
-        write: impl FnOnce(&mut crate::terrain::Field) + Send + Sync + 'static,
+        write: impl FnOnce(&mut crate::terrain::Layer) + Send + Sync + 'static,
     ) -> bool {
         if self.is_busy() {
             self.hold(Held::Write {
-                field: field.to_owned(),
+                layer: layer.to_owned(),
                 slot,
                 write: Box::new(write),
             });
@@ -526,7 +526,7 @@ impl Document {
             return false;
         };
         let before = Snapshot::take(terrain, true, &active);
-        let Some(target) = terrain.field_mut(field) else {
+        let Some(target) = terrain.layer_mut(layer) else {
             return false;
         };
         let was = target.authored();
@@ -582,7 +582,7 @@ impl Document {
         if self
             .terrain
             .as_ref()
-            .is_some_and(|terrain| terrain.field(&restored.active).is_some())
+            .is_some_and(|terrain| terrain.layer(&restored.active).is_some())
         {
             self.active = restored.active;
         }
@@ -624,10 +624,10 @@ impl Document {
                         Err(error) => warn!("a held edit was refused: {error}"),
                     }
                 }
-                Held::Write { field, write, .. } => {
+                Held::Write { layer, write, .. } => {
                     let before = Snapshot::take(terrain, true, &active);
-                    let Some(target) = terrain.field_mut(&field) else {
-                        warn!("a held write names no field `{field}`");
+                    let Some(target) = terrain.layer_mut(&layer) else {
+                        warn!("a held write names no layer `{layer}`");
                         continue;
                     };
                     let was = target.authored();
@@ -649,20 +649,20 @@ impl Document {
         }
     }
 
-    /// Puts a field on screen.
+    /// Puts a layer on screen.
     ///
-    /// Refused if the open document has no such field: the legend prints the active
+    /// Refused if the open document has no such layer: the legend prints the active
     /// name over the picture, so a name nothing baked would caption an empty view with
-    /// a field that does not exist. Accepted with no document open, since there is
+    /// a layer that does not exist. Accepted with no document open, since there is
     /// nothing yet to check against.
-    pub fn set_active(&mut self, field: &str) -> Result<(), String> {
+    pub fn set_active(&mut self, layer: &str) -> Result<(), String> {
         match self.terrain.as_ref() {
-            Some(terrain) if terrain.field(field).is_none() => {
-                Err(format!("no field named `{field}`"))
+            Some(terrain) if terrain.layer(layer).is_none() => {
+                Err(format!("no layer named `{layer}`"))
             }
             _ => {
-                if self.active != field {
-                    self.active = field.to_owned();
+                if self.active != layer {
+                    self.active = layer.to_owned();
                     self.revision += 1;
                 }
                 Ok(())
@@ -670,16 +670,16 @@ impl Document {
         }
     }
 
-    /// The open document's field names in declaration order, or empty when there is no
+    /// The open document's layer names in declaration order, or empty when there is no
     /// document.
-    pub fn field_names(&self) -> Vec<String> {
+    pub fn layer_names(&self) -> Vec<String> {
         self.terrain
             .as_ref()
             .map(|terrain| {
                 terrain
-                    .fields
+                    .layers
                     .iter()
-                    .map(|field| field.id.to_string())
+                    .map(|layer| layer.id.to_string())
                     .collect()
             })
             .unwrap_or_default()
@@ -728,7 +728,7 @@ impl Document {
 
     /// Starts building a preset and baking it whole, dropping whatever was open.
     ///
-    /// The preset's field files are written into the scratch shader directory first,
+    /// The preset's layer files are written into the scratch shader directory first,
     /// **deleting every other `.wgsl` file there**, and the bake dispatches them through
     /// programs built from those sources on the device the document last had.
     ///
@@ -740,8 +740,8 @@ impl Document {
         gpu::write_preset(&gpu::scratch_root(), preset)?;
         let runtime = self.runtime.with_sources(
             seed,
-            preset.files().iter().filter_map(|(field, stock)| {
-                gpu::stock_source(stock).map(|source| (format!("{field}.wgsl"), source.to_owned()))
+            preset.files().iter().filter_map(|(layer, stock)| {
+                gpu::stock_source(stock).map(|source| (format!("{layer}.wgsl"), source.to_owned()))
             }),
         );
         self.size = size;
@@ -843,7 +843,7 @@ impl Document {
     /// carried, because the reader re-derives what the file left out; on a failure the
     /// editor is left with no document rather than the old one.
     ///
-    /// The bake dispatches each field's shader through programs built from the
+    /// The bake dispatches each layer's shader through programs built from the
     /// document's own `shaders` directory, on the device the document last had.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
         self.busy_check()?;
@@ -932,7 +932,7 @@ fn finish_job(mut document: ResMut<Document>) {
         document.error = Some(error);
     }
 
-    let names = document.field_names();
+    let names = document.layer_names();
     if !names.is_empty() && !names.iter().any(|name| name == document.active()) {
         let fallback = if names.iter().any(|name| name == "height") {
             "height".to_owned()
@@ -977,8 +977,8 @@ fn wants_bake(bake_failed: bool, baked: Baked, open: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::LayerRole;
     use crate::terrain::{TerrainSpec, WaterSpec};
-    use watershed::FieldRole;
 
     fn scratch(name: &str) -> PathBuf {
         let path =
@@ -987,10 +987,10 @@ mod tests {
         path
     }
 
-    fn one_field_document() -> Document {
+    fn one_layer_document() -> Document {
         let mut document = Document::default();
         let mut terrain =
-            TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("height").held(0.5));
+            TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         document.adopt(terrain);
         document.dirty = false;
@@ -998,13 +998,13 @@ mod tests {
         document
     }
 
-    fn two_field_document(name: &str) -> Document {
+    fn two_layer_document(name: &str) -> Document {
         let mut document = Document::default();
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").held(0.25))
-            .with_field(
-                Field::new("height")
-                    .with_role(FieldRole::Height)
+            .with_layer(Layer::new("base").held(0.25))
+            .with_layer(
+                Layer::new("height")
+                    .with_role(LayerRole::Height)
                     .held(0.5)
                     .reading(&["base"]),
             );
@@ -1022,13 +1022,13 @@ mod tests {
     }
 
     fn add(document: &mut Document, name: &str) -> Result<Value, String> {
-        document.apply(&Edit::AddField {
+        document.apply(&Edit::AddLayer {
             name: name.to_owned(),
         })
     }
 
     fn remove(document: &mut Document, name: &str) -> Result<Value, String> {
-        document.apply(&Edit::RemoveField {
+        document.apply(&Edit::RemoveLayer {
             name: name.to_owned(),
         })
     }
@@ -1040,11 +1040,11 @@ mod tests {
         })
     }
 
-    // What `field add` has to do: the file arrives as a copy of the template, the field
+    // What `layer add` has to do: the file arrives as a copy of the template, the layer
     // is on screen, and — because it is a file operation — no undo step is spent on it.
     #[test]
-    fn adding_a_field_writes_the_template_and_shows_it_without_an_undo_step() {
-        let mut document = two_field_document("add");
+    fn adding_a_layer_writes_the_template_and_shows_it_without_an_undo_step() {
+        let mut document = two_layer_document("add");
         add(&mut document, "temperature").unwrap();
 
         let file = document.shader_root().join("temperature.wgsl");
@@ -1053,17 +1053,17 @@ mod tests {
             gpu::template_source()
         );
         assert_eq!(document.active(), "temperature");
-        assert_eq!(document.field_names(), ["base", "height", "temperature"]);
+        assert_eq!(document.layer_names(), ["base", "height", "temperature"]);
         assert_eq!(document.history().undo, 0);
         assert!(document.is_dirty());
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
     // A file operation cannot be held for later, because the directory and the document
-    // would disagree about which fields exist until the job landed.
+    // would disagree about which layers exist until the job landed.
     #[test]
     fn a_file_operation_is_refused_while_a_job_runs() {
-        let mut document = two_field_document("busy");
+        let mut document = two_layer_document("busy");
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         document.start_bake().unwrap();
 
@@ -1072,54 +1072,54 @@ mod tests {
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    // A removal refused because another field reads the name must leave the file, or the
-    // reader would be left naming a field that can never come back.
+    // A removal refused because another layer reads the name must leave the file, or the
+    // reader would be left naming a layer that can never come back.
     #[test]
-    fn removing_a_read_field_is_refused_and_its_file_stays() {
-        let mut document = two_field_document("read");
+    fn removing_a_read_layer_is_refused_and_its_file_stays() {
+        let mut document = two_layer_document("read");
         document.reset_water().unwrap();
 
         let error = remove(&mut document, "base").unwrap_err();
         assert!(error.contains("height"), "{error}");
         assert!(document.shader_root().join("base.wgsl").is_file());
-        assert_eq!(document.field_names(), ["base", "height"]);
+        assert_eq!(document.layer_names(), ["base", "height"]);
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    // `field rm` of a field nothing reads takes the file with it, and the panel is left
-    // on a field that still exists.
+    // `layer rm` of a layer nothing reads takes the file with it, and the panel is left
+    // on a layer that still exists.
     #[test]
-    fn removing_an_unread_field_deletes_its_file_and_moves_the_view() {
-        let mut document = two_field_document("unread");
+    fn removing_an_unread_layer_deletes_its_file_and_moves_the_view() {
+        let mut document = two_layer_document("unread");
         document.reset_water().unwrap();
         document.set_active("height").unwrap();
 
         remove(&mut document, "height").unwrap();
         assert!(!document.shader_root().join("height.wgsl").exists());
-        assert_eq!(document.field_names(), ["base"]);
+        assert_eq!(document.layer_names(), ["base"]);
         assert_eq!(document.active(), "base");
         assert_eq!(document.history().undo, 0);
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
-    // A file dropped into or deleted from the directory by hand is a field added or
+    // A file dropped into or deleted from the directory by hand is a layer added or
     // removed, and like one added from the editor it is no undo step.
     #[test]
-    fn syncing_the_field_names_adds_and_removes_fields_without_history() {
-        let mut document = one_field_document();
-        document.sync_fields(&["dunes".to_owned(), "height".to_owned()]);
-        assert_eq!(document.field_names(), ["height", "dunes"]);
+    fn syncing_the_layer_names_adds_and_removes_layers_without_history() {
+        let mut document = one_layer_document();
+        document.sync_layers(&["dunes".to_owned(), "height".to_owned()]);
+        assert_eq!(document.layer_names(), ["height", "dunes"]);
         assert!(document.is_dirty());
 
         document.baked = Baked::Whole;
         document.dirty = false;
-        document.sync_fields(&["height".to_owned()]);
-        assert_eq!(document.field_names(), ["height"]);
+        document.sync_layers(&["height".to_owned()]);
+        assert_eq!(document.layer_names(), ["height"]);
         assert_eq!(document.history().undo, 0);
 
         document.baked = Baked::Whole;
         document.dirty = false;
-        document.sync_fields(&["height".to_owned()]);
+        document.sync_layers(&["height".to_owned()]);
         assert!(
             !document.is_dirty(),
             "a sync that moved nothing asked for a bake"
@@ -1130,7 +1130,7 @@ mod tests {
     // the whole re-bake that shows it.
     #[test]
     fn undoing_a_parameter_restores_it_and_asks_for_a_bake() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         set(&mut document, "height.value", "0.75").unwrap();
         assert_eq!(constant_of(&document), 0.75);
 
@@ -1143,11 +1143,11 @@ mod tests {
     }
 
     // A display property is saved with the document and undone like any other edit, but
-    // it says how the map draws the field rather than what the field holds — so, like a
+    // it says how the map draws the layer rather than what the layer holds — so, like a
     // card drag, it must cost neither a re-bake nor the solved water.
     #[test]
     fn toggling_hillshade_is_undoable_and_does_not_make_the_bake_stale() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
 
         document
             .apply(&Edit::Set {
@@ -1160,7 +1160,7 @@ mod tests {
             document
                 .terrain()
                 .unwrap()
-                .field("height")
+                .layer("height")
                 .unwrap()
                 .hillshade
         );
@@ -1173,7 +1173,7 @@ mod tests {
             !document
                 .terrain()
                 .unwrap()
-                .field("height")
+                .layer("height")
                 .unwrap()
                 .hillshade
         );
@@ -1184,7 +1184,7 @@ mod tests {
     // hillshade one, and is under the same rule: undoable, and free of the bake.
     #[test]
     fn toggling_contours_is_undoable_and_does_not_make_the_bake_stale() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
 
         document
             .apply(&Edit::Set {
@@ -1197,7 +1197,7 @@ mod tests {
             document
                 .terrain()
                 .unwrap()
-                .field("height")
+                .layer("height")
                 .unwrap()
                 .contours
         );
@@ -1210,17 +1210,17 @@ mod tests {
             !document
                 .terrain()
                 .unwrap()
-                .field("height")
+                .layer("height")
                 .unwrap()
                 .contours
         );
         assert_eq!(document.baked, Baked::Whole);
     }
 
-    // A parameter is what the field holds, so changing one has to make the bake stale.
+    // A parameter is what the layer holds, so changing one has to make the bake stale.
     #[test]
     fn changing_a_parameter_does_make_the_bake_stale() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         set(&mut document, "height.value", "0.75").unwrap();
         assert_eq!(document.baked, Baked::Nothing);
         assert!(document.dirty);
@@ -1238,24 +1238,24 @@ mod tests {
         assert_eq!(document.held.len(), 2);
     }
 
-    fn set_value(field: &mut Field, value: f32) {
-        field.shader.params.insert("value".to_owned(), vec![value]);
+    fn set_value(layer: &mut Layer, value: f32) {
+        layer.shader.params.insert("value".to_owned(), vec![value]);
     }
 
-    fn authored_of(document: &Document) -> Field {
+    fn authored_of(document: &Document) -> Layer {
         document
             .terrain()
             .unwrap()
-            .field("height")
+            .layer("height")
             .unwrap()
             .authored()
     }
 
-    // Three undos return the field to what it was, each one leaving the document with a
+    // Three undos return the layer to what it was, each one leaving the document with a
     // re-bake to run, and three redos replay the edits.
     #[test]
-    fn three_undos_return_the_field_and_three_redos_replay_the_edits() {
-        let mut document = one_field_document();
+    fn three_undos_return_the_layer_and_three_redos_replay_the_edits() {
+        let mut document = one_layer_document();
         let original = authored_of(&document);
 
         set(&mut document, "height.value", "0.6").unwrap();
@@ -1292,7 +1292,7 @@ mod tests {
     // entry for it would undo a change that never happened.
     #[test]
     fn a_refused_edit_leaves_no_history_entry() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         assert!(set(&mut document, "nowhere.value", "1").is_err());
         assert_eq!(document.history().undo, 0);
     }
@@ -1301,7 +1301,7 @@ mod tests {
     // has it — so it is refused, and the entry stays where it was for the next try.
     #[test]
     fn undo_is_refused_while_a_job_holds_the_terrain_and_keeps_its_entry() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         set(&mut document, "height.value", "0.75").unwrap();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         document.start_bake().unwrap();
@@ -1310,20 +1310,20 @@ mod tests {
         assert_eq!(document.history().undo, 1);
     }
 
-    // The panel's path into the history: a control committed at the value the field
+    // The panel's path into the history: a control committed at the value the layer
     // already has is not a change, so it must neither re-bake nor cost a redo.
     #[test]
     fn a_write_that_changes_nothing_records_nothing() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         set(&mut document, "height.value", "0.75").unwrap();
         document.undo().unwrap();
         assert_eq!(document.history().redo, 1);
 
-        let changed = document.write("height", Slot::Once, |field| set_value(field, 0.5));
+        let changed = document.write("height", Slot::Once, |layer| set_value(layer, 0.5));
         assert!(!changed);
         assert_eq!(document.history().redo, 1, "a no-op write forgot the redo");
 
-        let changed = document.write("height", Slot::Once, |field| set_value(field, 0.25));
+        let changed = document.write("height", Slot::Once, |layer| set_value(layer, 0.25));
         assert!(changed);
         assert_eq!(
             document.history(),
@@ -1337,7 +1337,7 @@ mod tests {
     // the landed document refuses must not leave an entry.
     #[test]
     fn a_held_value_is_recorded_when_it_lands_and_a_refused_one_is_not() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         let held = |edit: Edit| Held::Edit {
             slot: edit.slot(),
             edit,
@@ -1378,14 +1378,14 @@ mod tests {
         document
             .terrain()
             .unwrap()
-            .field("height")
+            .layer("height")
             .unwrap()
             .shader
             .params["value"][0]
     }
 
     fn bake_in_flight() -> (Document, ()) {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         document.start_bake().unwrap();
         assert!(document.terrain().is_none(), "a job holds the terrain");
@@ -1445,8 +1445,8 @@ mod tests {
 
         for value in [0.6, 0.8] {
             assert!(
-                document.write("height", slot.clone(), move |field| {
-                    set_value(field, value);
+                document.write("height", slot.clone(), move |layer| {
+                    set_value(layer, value);
                 }),
                 "a write during a bake is accepted"
             );
@@ -1466,7 +1466,7 @@ mod tests {
     fn a_held_write_that_changes_nothing_records_nothing() {
         let (mut document, _) = bake_in_flight();
 
-        document.write("height", Slot::Once, |field| set_value(field, 0.5));
+        document.write("height", Slot::Once, |layer| set_value(layer, 0.5));
 
         let document = landed(document);
         assert_eq!(constant_of(&document), 0.5);
@@ -1479,10 +1479,10 @@ mod tests {
     }
 
     // A new document has nothing to go back to: an entry from the one before would
-    // restore fields that never belonged to it.
+    // restore layers that never belonged to it.
     #[test]
     fn a_new_document_starts_with_an_empty_history() {
-        let mut document = one_field_document();
+        let mut document = one_layer_document();
         set(&mut document, "height.value", "0.75").unwrap();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         document
@@ -1509,11 +1509,11 @@ mod tests {
     // A bake lands after every edit, so a fault that has not changed has to reach the
     // log once rather than once per bake that lands.
     #[test]
-    fn a_field_fault_that_has_not_changed_is_logged_once() {
+    fn a_layer_fault_that_has_not_changed_is_logged_once() {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("height").reading(&["nowhere"])),
+                .with_layer(Layer::new("height").reading(&["nowhere"])),
         );
         let first = document.unlogged_faults();
         assert_eq!(first.len(), 1, "{first:?}");

@@ -1,4 +1,4 @@
-//! The document as one graph of fields: what a field is drawn as, where the cards sit,
+//! The document as one graph of layers: what a layer is drawn as, where the cards sit,
 //! and what the pointer does among them.
 
 use bevy::asset::AssetServer;
@@ -13,7 +13,7 @@ use bevy::window::PrimaryWindow;
 use super::thumb::CardThumb;
 use super::{
     CANVAS_LAYER, CARD, CanvasCameraTag, CanvasFrame, CanvasLabel, CanvasShape, DETAIL_SIZE, Grab,
-    MARGIN, MAX_SCALE, MIN_SCALE, OpenField, PARAM_SIZE, ROW_STEP, THUMB, TITLE_BAR, TITLE_SIZE,
+    MARGIN, MAX_SCALE, MIN_SCALE, OpenLayer, PARAM_SIZE, ROW_STEP, THUMB, TITLE_BAR, TITLE_SIZE,
     edges, input,
 };
 use crate::document::Document;
@@ -21,7 +21,7 @@ use crate::gpu::ShaderLibrary;
 use crate::terrain::TerrainSpec;
 use crate::ui::{pointer_over_ui, report};
 
-const FIELD: Color = Color::srgb(0.42, 0.33, 0.55);
+const LAYER: Color = Color::srgb(0.42, 0.33, 0.55);
 const BODY: Color = Color::srgb(0.16, 0.17, 0.21);
 const SELECTED: Color = Color::srgb(0.85, 0.87, 0.95);
 const WIRE: Color = Color::srgb(0.48, 0.64, 0.86);
@@ -40,14 +40,14 @@ const CARD_ROW: f32 = CARD.y * 1.3;
 #[derive(Component)]
 pub(super) struct CanvasOwned;
 
-/// One field's card.
+/// One layer's card.
 ///
-/// Carries the field's name rather than an index, so a hit test answers something the
+/// Carries the layer's name rather than an index, so a hit test answers something the
 /// document can be addressed by after the cards have been rebuilt under it.
 #[derive(Component)]
-pub struct FieldCard {
-    /// The field this card stands for.
-    pub field: String,
+pub struct LayerCard {
+    /// The layer this card stands for.
+    pub layer: String,
     /// Width and height in canvas units.
     pub size: Vec2,
 }
@@ -57,13 +57,13 @@ pub struct FieldCard {
 /// The points rather than the two card entities: a card never moves, because its place
 /// comes from the layout and is not in the document.
 #[derive(Component)]
-pub(super) struct FieldRibbon {
+pub(super) struct LayerRibbon {
     from: Vec2,
     to: Vec2,
 }
 
 struct Placed {
-    field: String,
+    layer: String,
     at: Vec2,
 }
 
@@ -78,9 +78,9 @@ fn layout(terrain: &TerrainSpec) -> (Vec<Placed>, Option<String>) {
         ),
         Err(error) => (
             terrain
-                .fields
+                .layers
                 .iter()
-                .map(|field| field.id.to_string())
+                .map(|layer| layer.id.to_string())
                 .collect(),
             Some(error.to_string()),
         ),
@@ -94,10 +94,10 @@ fn layout(terrain: &TerrainSpec) -> (Vec<Placed>, Option<String>) {
     for _ in 0..columns.len() * usize::from(cycle.is_none()) {
         let mut moved = false;
         for index in 0..columns.len() {
-            let Some(field) = terrain.field(&columns[index].0) else {
+            let Some(layer) = terrain.layer(&columns[index].0) else {
                 continue;
             };
-            let wanted = crate::edit::reads_of(field)
+            let wanted = crate::edit::reads_of(layer)
                 .iter()
                 .filter_map(|read| columns.iter().find(|(held, _)| held == read))
                 .map(|(_, column)| column + 1)
@@ -115,14 +115,14 @@ fn layout(terrain: &TerrainSpec) -> (Vec<Placed>, Option<String>) {
 
     let mut rows: Vec<usize> = Vec::new();
     let mut placed = Vec::with_capacity(columns.len());
-    for (field, column) in columns {
+    for (layer, column) in columns {
         if rows.len() <= column {
             rows.resize(column + 1, 0);
         }
         let row = rows[column];
         rows[column] += 1;
         placed.push(Placed {
-            field,
+            layer,
             at: Vec2::new(column as f32 * CARD_COLUMN, -(row as f32) * CARD_ROW),
         });
     }
@@ -132,13 +132,13 @@ fn layout(terrain: &TerrainSpec) -> (Vec<Placed>, Option<String>) {
 fn edges_between(placed: &[Placed], terrain: &TerrainSpec) -> Vec<(Vec2, Vec2)> {
     let mut wires = Vec::new();
     for reader in placed {
-        let Some(field) = terrain.field(&reader.field) else {
+        let Some(layer) = terrain.layer(&reader.layer) else {
             continue;
         };
-        for read in crate::edit::reads_of(field) {
+        for read in crate::edit::reads_of(layer) {
             let Some(from) = placed
                 .iter()
-                .find(|held| held.field == read)
+                .find(|held| held.layer == read)
                 .map(|held| held.at)
             else {
                 continue;
@@ -152,13 +152,13 @@ fn edges_between(placed: &[Placed], terrain: &TerrainSpec) -> Vec<(Vec2, Vec2)> 
     wires
 }
 
-/// Where the canvas camera has to sit, and at what scale, for every field card to be
+/// Where the canvas camera has to sit, and at what scale, for every layer card to be
 /// inside a viewport that many logical pixels across.
 ///
-/// What the key `F` and the Fit button reach. `None` for a document with no fields or a
+/// What the key `F` and the Fit button reach. `None` for a document with no layers or a
 /// viewport with no area — there is nothing to frame in either case.
 pub(super) fn overview_fit(terrain: &TerrainSpec, viewport: Vec2) -> Option<(Vec2, f32)> {
-    if terrain.fields.is_empty() || viewport.x <= 1.0 || viewport.y <= 1.0 {
+    if terrain.layers.is_empty() || viewport.x <= 1.0 || viewport.y <= 1.0 {
         return None;
     }
     let (placed, _) = layout(terrain);
@@ -176,11 +176,11 @@ pub(super) fn overview_fit(terrain: &TerrainSpec, viewport: Vec2) -> Option<(Vec
     Some(((low + high) * 0.5, scale))
 }
 
-/// The field whose card contains that canvas point, as its name and the card's centre.
+/// The layer whose card contains that canvas point, as its name and the card's centre.
 ///
 /// The hit test a press is resolved through. `None` for a point between cards.
-pub fn field_at<'a>(
-    cards: impl IntoIterator<Item = (&'a FieldCard, &'a Transform)>,
+pub fn layer_at<'a>(
+    cards: impl IntoIterator<Item = (&'a LayerCard, &'a Transform)>,
     world: Vec2,
 ) -> Option<(String, Vec2)> {
     cards
@@ -188,16 +188,16 @@ pub fn field_at<'a>(
         .find(|(card, at)| {
             Rect::from_center_size(at.translation.truncate(), card.size).contains(world)
         })
-        .map(|(card, at)| (card.field.clone(), at.translation.truncate()))
+        .map(|(card, at)| (card.layer.clone(), at.translation.truncate()))
 }
 
-/// Respawns the field cards and their ribbons when what they show changes.
+/// Respawns the layer cards and their ribbons when what they show changes.
 ///
 /// Driven by a fingerprint rather than by an event, because an edit can arrive from the
 /// panel, from the control socket, from a preset load or from a shader file changing on
 /// disk, and a fingerprint catches all of them without each having to announce itself.
 /// The key carries the names, the roles, the shifts, the relation and every fault a card
-/// shows, so a field added, a read added and a shader broken or fixed each bring the
+/// shows, so a layer added, a read added and a shader broken or fixed each bring the
 /// cards up to date.
 pub(super) fn rebuild_overview(
     mut commands: Commands,
@@ -227,20 +227,20 @@ pub(super) fn rebuild_overview(
     };
     let (placed, cycle) = layout(terrain);
     let wires = edges_between(&placed, terrain);
-    let faults = terrain.field_faults();
+    let faults = terrain.layer_faults();
     let cards: Vec<(String, &'static str, u8, Vec2, Option<String>)> = placed
         .iter()
         .filter_map(|card| {
-            let field = terrain.field(&card.field)?;
+            let layer = terrain.layer(&card.layer)?;
             let fault = faults
                 .iter()
-                .find(|(id, _)| *id == field.id)
+                .find(|(id, _)| *id == layer.id)
                 .map(|(_, fault)| fault.clone())
-                .or_else(|| library_fault(&library, &field.file()));
+                .or_else(|| library_fault(&library, &layer.file()));
             Some((
-                card.field.clone(),
-                field.role.as_str(),
-                field.shift,
+                card.layer.clone(),
+                layer.role.as_str(),
+                layer.shift,
                 card.at,
                 fault,
             ))
@@ -254,7 +254,7 @@ pub(super) fn rebuild_overview(
     let font = assets.load(fonts::REGULAR);
     for (name, role, shift, at, fault) in cards {
         let selected = name == active;
-        spawn_field_card(
+        spawn_layer_card(
             &mut commands,
             &font,
             &name,
@@ -274,7 +274,7 @@ pub(super) fn rebuild_overview(
             Transform::from_xyz(0.0, 0.0, -1.0),
             NoFrustumCulling,
             RenderLayers::layer(CANVAS_LAYER),
-            FieldRibbon { from, to },
+            LayerRibbon { from, to },
             CanvasOwned,
         ));
     }
@@ -284,7 +284,7 @@ fn library_fault(library: &ShaderLibrary, file: &str) -> Option<String> {
     library.entry(file).and_then(|entry| entry.error.clone())
 }
 
-fn spawn_field_card(
+fn spawn_layer_card(
     commands: &mut Commands,
     font: &Handle<Font>,
     name: &str,
@@ -298,7 +298,7 @@ fn spawn_field_card(
     let accent = match (&fault, selected) {
         (Some(_), _) => BROKEN,
         (None, true) => SELECTED,
-        (None, false) => FIELD,
+        (None, false) => LAYER,
     };
     let entity = commands
         .spawn((
@@ -309,8 +309,8 @@ fn spawn_field_card(
             },
             Transform::from_translation(at.extend(0.0)),
             RenderLayers::layer(CANVAS_LAYER),
-            FieldCard {
-                field: name.to_owned(),
+            LayerCard {
+                layer: name.to_owned(),
                 size: CARD,
             },
             CanvasOwned,
@@ -340,7 +340,7 @@ fn spawn_field_card(
             RenderLayers::layer(CANVAS_LAYER),
             CanvasLabel(TITLE_SIZE),
         ));
-        let blank = FIELD.with_alpha(0.35);
+        let blank = LAYER.with_alpha(0.35);
         parent.spawn((
             Sprite {
                 color: blank,
@@ -414,10 +414,10 @@ fn thumb_centre() -> Vec2 {
 /// Only when the zoom changed or a ribbon was just spawned: a card never moves, so those
 /// are the only two things the mesh depends on — the half-width is in screen pixels, and
 /// so follows the camera's scale.
-pub(super) fn route_field_ribbons(
+pub(super) fn route_layer_ribbons(
     camera: Option<Single<&Projection, With<CanvasCameraTag>>>,
-    ribbons: Query<(&FieldRibbon, &Mesh2d)>,
-    spawned: Query<(), Added<FieldRibbon>>,
+    ribbons: Query<(&LayerRibbon, &Mesh2d)>,
+    spawned: Query<(), Added<LayerRibbon>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut applied: Local<Option<f32>>,
 ) {
@@ -442,10 +442,10 @@ pub(super) fn route_field_ribbons(
     }
 }
 
-/// Opens a field on a double-click on its card, and pans the canvas on a press between
+/// Opens a layer on a double-click on its card, and pans the canvas on a press between
 /// cards.
 ///
-/// Writes nothing to the document: opening goes through [`OpenField`], and card
+/// Writes nothing to the document: opening goes through [`OpenLayer`], and card
 /// positions come from the layout and are never stored.
 pub(super) fn overview_drag(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -453,10 +453,10 @@ pub(super) fn overview_drag(
     ui: Query<(), With<Node>>,
     window: Option<Single<&Window, With<PrimaryWindow>>>,
     frame: Res<CanvasFrame>,
-    camera: Option<Single<(&Transform, &Projection), (With<CanvasCameraTag>, Without<FieldCard>)>>,
-    cards: Query<(&FieldCard, &Transform), Without<CanvasCameraTag>>,
+    camera: Option<Single<(&Transform, &Projection), (With<CanvasCameraTag>, Without<LayerCard>)>>,
+    cards: Query<(&LayerCard, &Transform), Without<CanvasCameraTag>>,
     time: Res<Time>,
-    mut open: MessageWriter<OpenField>,
+    mut open: MessageWriter<OpenLayer>,
     mut grab: ResMut<Grab>,
     mut last_click: Local<Option<(f32, String)>>,
 ) {
@@ -477,16 +477,16 @@ pub(super) fn overview_drag(
 
     if mouse.just_pressed(MouseButton::Left) && !pointer_over_ui(&hover, &ui) {
         let now = time.elapsed_secs();
-        match field_at(cards.iter(), world) {
-            Some((field, _)) => {
+        match layer_at(cards.iter(), world) {
+            Some((layer, _)) => {
                 let again = last_click.as_ref().is_some_and(|(at, before)| {
-                    *before == field && now - at <= input::DOUBLE_CLICK
+                    *before == layer && now - at <= input::DOUBLE_CLICK
                 });
                 if again {
-                    open.write(OpenField { field });
+                    open.write(OpenLayer { layer });
                     *last_click = None;
                 } else {
-                    *last_click = Some((now, field));
+                    *last_click = Some((now, layer));
                 }
             }
             None => {
@@ -508,19 +508,19 @@ fn fingerprint(document: &Document, library: &ShaderLibrary) -> String {
         key.push_str("|none");
         return key;
     };
-    for field in &terrain.fields {
+    for layer in &terrain.layers {
         key.push_str(&format!(
             "|{}:{}:{}:{}",
-            field.id,
-            field.role.as_str(),
-            field.shift,
-            crate::edit::reads_of(field).join(","),
+            layer.id,
+            layer.role.as_str(),
+            layer.shift,
+            crate::edit::reads_of(layer).join(","),
         ));
-        if let Some(error) = library_fault(library, &field.file()) {
-            key.push_str(&format!("|error {}:{error}", field.id));
+        if let Some(error) = library_fault(library, &layer.file()) {
+            key.push_str(&format!("|error {}:{error}", layer.id));
         }
     }
-    for (id, fault) in terrain.field_faults() {
+    for (id, fault) in terrain.layer_faults() {
         key.push_str(&format!("|fault {id}:{fault}"));
     }
     key
@@ -531,34 +531,34 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use super::*;
-    use crate::terrain::{Field, TerrainSpec};
+    use crate::terrain::{Layer, TerrainSpec};
 
     fn height_reads_base_and_relief() -> TerrainSpec {
         TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("moisture").held(0.5))
-            .with_field(Field::new("base").held(0.25))
-            .with_field(Field::new("relief").held(0.75))
-            .with_field(Field::new("height").reading(&["base", "relief"]))
+            .with_layer(Layer::new("moisture").held(0.5))
+            .with_layer(Layer::new("base").held(0.25))
+            .with_layer(Layer::new("relief").held(0.75))
+            .with_layer(Layer::new("height").reading(&["base", "relief"]))
     }
 
     fn cyclic() -> TerrainSpec {
         TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("here").reading(&["there"]))
-            .with_field(Field::new("there").reading(&["here"]))
+            .with_layer(Layer::new("here").reading(&["there"]))
+            .with_layer(Layer::new("there").reading(&["here"]))
     }
 
     fn at(placed: &[Placed], name: &str) -> Vec2 {
         placed
             .iter()
-            .find(|card| card.field == name)
+            .find(|card| card.layer == name)
             .unwrap_or_else(|| panic!("no card for `{name}`"))
             .at
     }
 
-    // What a field reads is drawn to its left, so the document is read left to right in
+    // What a layer reads is drawn to its left, so the document is read left to right in
     // the order it is baked in rather than in the order it happens to be declared in.
     #[test]
-    fn a_field_is_placed_right_of_everything_it_reads() {
+    fn a_layer_is_placed_right_of_everything_it_reads() {
         let terrain = height_reads_base_and_relief();
         let (placed, cycle) = layout(&terrain);
         assert!(cycle.is_none(), "a document that orders reported a cycle");
@@ -566,10 +566,10 @@ mod tests {
         assert!(at(&placed, "relief").x < at(&placed, "height").x);
     }
 
-    // A field at neither end of the relation carries no ribbon at all, rather than a
+    // A layer at neither end of the relation carries no ribbon at all, rather than a
     // stub to nothing.
     #[test]
-    fn a_field_nothing_reads_and_that_reads_nothing_has_no_ribbon() {
+    fn a_layer_nothing_reads_and_that_reads_nothing_has_no_ribbon() {
         let terrain = height_reads_base_and_relief();
         let (placed, _) = layout(&terrain);
         let moisture = at(&placed, "moisture");
@@ -579,7 +579,7 @@ mod tests {
         }
     }
 
-    // One ribbon per declared read and no more: `height` reads two fields, so a double
+    // One ribbon per declared read and no more: `height` reads two layers, so a double
     // count here would draw two ribbons over each other.
     #[test]
     fn every_declared_read_is_joined_once() {
@@ -592,7 +592,7 @@ mod tests {
         assert!(ends.contains(&(at(&placed, "relief") + Vec2::new(CARD.x * 0.5, 0.0))));
     }
 
-    // A document whose fields cannot be ordered still draws every card — in declaration
+    // A document whose layers cannot be ordered still draws every card — in declaration
     // order, one per column — and says what the cycle is, rather than showing an empty
     // canvas with no account of why.
     #[test]
@@ -602,8 +602,8 @@ mod tests {
         let named = cycle.expect("a cyclic document reports its cycle");
         assert!(named.contains("cycle"), "{named:?} does not name the cycle");
         assert_eq!(placed.len(), 2);
-        assert_eq!(placed[0].field, "here");
-        assert_eq!(placed[1].field, "there");
+        assert_eq!(placed[0].layer, "here");
+        assert_eq!(placed[1].layer, "there");
         assert!(placed[0].at.x < placed[1].at.x);
     }
 
@@ -613,41 +613,41 @@ mod tests {
     #[test]
     fn the_hit_test_answers_the_card_under_the_point_and_nothing_between_two() {
         let left = (
-            FieldCard {
-                field: "base".to_owned(),
+            LayerCard {
+                layer: "base".to_owned(),
                 size: CARD,
             },
             Transform::from_translation(Vec3::ZERO),
         );
         let right = (
-            FieldCard {
-                field: "height".to_owned(),
+            LayerCard {
+                layer: "height".to_owned(),
                 size: CARD,
             },
             Transform::from_xyz(CARD_COLUMN, 0.0, 0.0),
         );
         let cards = vec![(&left.0, &left.1), (&right.0, &right.1)];
 
-        let hit = field_at(cards.clone(), Vec2::new(CARD.x * 0.25, 0.0));
-        assert_eq!(hit.map(|(field, _)| field), Some("base".to_owned()));
-        let over = field_at(cards.clone(), Vec2::new(CARD_COLUMN, 0.0));
-        assert_eq!(over.map(|(field, _)| field), Some("height".to_owned()));
-        assert!(field_at(cards, Vec2::new(CARD_COLUMN * 0.5, 0.0)).is_none());
+        let hit = layer_at(cards.clone(), Vec2::new(CARD.x * 0.25, 0.0));
+        assert_eq!(hit.map(|(layer, _)| layer), Some("base".to_owned()));
+        let over = layer_at(cards.clone(), Vec2::new(CARD_COLUMN, 0.0));
+        assert_eq!(over.map(|(layer, _)| layer), Some("height".to_owned()));
+        assert!(layer_at(cards, Vec2::new(CARD_COLUMN * 0.5, 0.0)).is_none());
     }
 
     // Pinned at the arithmetic the key F runs: whatever the fit answers has to put every
     // card of a document wider than the viewport inside the framed rectangle.
     #[test]
-    fn a_fit_puts_every_field_card_of_a_wide_document_in_view() {
+    fn a_fit_puts_every_layer_card_of_a_wide_document_in_view() {
         let mut terrain = TerrainSpec::new(UVec2::splat(16));
         let mut previous: Option<String> = None;
         for step in 0..8 {
             let name = format!("f{step}");
-            let field = match &previous {
-                Some(read) => Field::new(name.as_str()).reading(&[read.as_str()]),
-                None => Field::new(name.as_str()).held(0.5),
+            let layer = match &previous {
+                Some(read) => Layer::new(name.as_str()).reading(&[read.as_str()]),
+                None => Layer::new(name.as_str()).held(0.5),
             };
-            terrain = terrain.with_field(field);
+            terrain = terrain.with_layer(layer);
             previous = Some(name);
         }
 
@@ -666,7 +666,7 @@ mod tests {
     // nothing to frame, or the Fit button would throw the camera at whatever the empty
     // bounds came out as.
     #[test]
-    fn there_is_nothing_to_fit_without_fields_or_without_a_viewport() {
+    fn there_is_nothing_to_fit_without_layers_or_without_a_viewport() {
         assert!(
             overview_fit(&TerrainSpec::new(UVec2::splat(16)), Vec2::new(800.0, 600.0)).is_none()
         );
@@ -727,54 +727,54 @@ mod tests {
         assert_eq!(document.revision(), before.4);
         assert_eq!(
             app.world_mut()
-                .query::<&FieldCard>()
+                .query::<&LayerCard>()
                 .iter(app.world())
                 .count(),
             4,
-            "one card per field"
+            "one card per layer"
         );
     }
 
     // A card carries the name rather than an index, so the double-click addresses a
-    // field that survives the cards being rebuilt under it.
+    // layer that survives the cards being rebuilt under it.
     #[test]
-    fn every_field_gets_a_card_carrying_its_name() {
+    fn every_layer_gets_a_card_carrying_its_name() {
         let mut app = overview_app(height_reads_base_and_relief(), ShaderLibrary::default());
         app.world_mut().run_system_once(rebuild_overview).unwrap();
         let mut names: Vec<String> = app
             .world_mut()
-            .query::<&FieldCard>()
+            .query::<&LayerCard>()
             .iter(app.world())
-            .map(|card| card.field.clone())
+            .map(|card| card.layer.clone())
             .collect();
         names.sort();
         assert_eq!(names, ["base", "height", "moisture", "relief"]);
     }
 
-    // The fingerprint is what brings the cards up to date, so adding a field and adding a
+    // The fingerprint is what brings the cards up to date, so adding a layer and adding a
     // read each have to move it.
     #[test]
-    fn the_fingerprint_moves_when_a_field_or_a_reference_is_added() {
+    fn the_fingerprint_moves_when_a_layer_or_a_reference_is_added() {
         let library = ShaderLibrary::default();
         let mut document = Document::default();
         document.adopt(height_reads_base_and_relief());
         let before = fingerprint(&document, &library);
 
         let mut added = Document::default();
-        added.adopt(height_reads_base_and_relief().with_field(Field::new("temperature")));
+        added.adopt(height_reads_base_and_relief().with_layer(Layer::new("temperature")));
         assert_ne!(
             fingerprint(&added, &library),
             before,
-            "a new field left the key alone"
+            "a new layer left the key alone"
         );
 
         let mut read = Document::default();
         read.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("moisture").reading(&["base"]))
-                .with_field(Field::new("base").held(0.25))
-                .with_field(Field::new("relief").held(0.75))
-                .with_field(Field::new("height").reading(&["base", "relief"])),
+                .with_layer(Layer::new("moisture").reading(&["base"]))
+                .with_layer(Layer::new("base").held(0.25))
+                .with_layer(Layer::new("relief").held(0.75))
+                .with_layer(Layer::new("height").reading(&["base", "relief"])),
         );
         assert_ne!(
             fingerprint(&read, &library),
@@ -786,7 +786,7 @@ mod tests {
     // A shader breaking on disk changes nothing in the document, so the fingerprint has
     // to carry the library's error or the card keeps looking whole until some edit.
     #[test]
-    fn the_fingerprint_moves_when_a_fields_shader_stops_compiling() {
+    fn the_fingerprint_moves_when_a_layers_shader_stops_compiling() {
         let mut document = Document::default();
         document.adopt(height_reads_base_and_relief());
         let good = fingerprint(&document, &ShaderLibrary::default());
@@ -797,13 +797,13 @@ mod tests {
         assert_ne!(good, broken);
     }
 
-    // A field that cannot bake reads as zero, so its card has to say why, or the
-    // overview shows a document that looks whole while one field of it is empty.
+    // A layer that cannot bake reads as zero, so its card has to say why, or the
+    // overview shows a document that looks whole while one layer of it is empty.
     #[test]
-    fn a_field_naming_no_field_carries_the_fault_on_its_card() {
+    fn a_layer_naming_no_layer_carries_the_fault_on_its_card() {
         let mut app = overview_app(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("height").reading(&["nowhere"])),
+                .with_layer(Layer::new("height").reading(&["nowhere"])),
             ShaderLibrary::default(),
         );
         app.world_mut().run_system_once(rebuild_overview).unwrap();
@@ -814,10 +814,10 @@ mod tests {
         );
     }
 
-    // A field is its shader file, so a file that will not compile is that field's fault
+    // A layer is its shader file, so a file that will not compile is that layer's fault
     // and has to reach its card and redden its bar, not only the status line.
     #[test]
-    fn a_field_whose_shader_will_not_compile_carries_the_error_on_its_card() {
+    fn a_layer_whose_shader_will_not_compile_carries_the_error_on_its_card() {
         let mut app = overview_app(
             height_reads_base_and_relief(),
             ShaderLibrary::with_fault("height.wgsl", "line 2: unknown type: 'vec4'"),
@@ -834,7 +834,7 @@ mod tests {
             .iter(app.world())
             .filter(|sprite| sprite.color == BROKEN)
             .count();
-        assert_eq!(broken, 1, "only the broken field's bar is reddened");
+        assert_eq!(broken, 1, "only the broken layer's bar is reddened");
     }
 
     // Every line of a card has to sit inside the card and clear the line above it,

@@ -1,5 +1,5 @@
-//! A field's shader as the document sees it: the parameters its file declares, the
-//! fields it reads by name, and the values a document carries for them.
+//! A layer's shader as the document sees it: the parameters its file declares, the
+//! layers it reads by name, and the values a document carries for them.
 //!
 //! Nothing here touches a GPU. This is the document's half of a shader layer — what
 //! is saved, what the panel is generated from, and what a dispatch is handed — so it
@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::terrain::LayerId;
 use serde::{Deserialize, Serialize};
-use watershed::field::FieldId;
 use watershed::raster::Raster;
 
 /// The directory, inside a terrain, that a document's shaders live in.
@@ -453,24 +453,24 @@ fn parse_numbers(line: usize, text: &str) -> Result<Vec<f32>, ParamError> {
         .collect()
 }
 
-/// Another field a shader reads by name: a texture binding the dispatch fills with
-/// that field's baked raster, at the field's own shift.
+/// Another layer a shader reads by name: a texture binding the dispatch fills with
+/// that layer's baked raster, at the layer's own shift.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerRead {
     /// The variable name the WGSL declaration spells.
     pub name: String,
-    /// The field the annotation names, which need not exist in any document.
+    /// The layer the annotation names, which need not exist in any document.
     pub layer: String,
     /// The binding the declaration takes. At least [`FIRST_INPUT_BINDING`].
     pub binding: u32,
 }
 
-/// The fields a shader reads by name, in declaration order.
+/// The layers a shader reads by name, in declaration order.
 ///
-/// A layer read is a `var` of `texture_2d<f32>` annotated `@layer <field>`, at group
+/// A layer read is a `var` of `texture_2d<f32>` annotated `@layer <layer>`, at group
 /// 0 and a binding of [`FIRST_INPUT_BINDING`] or above. A line whose code half is
-/// empty declares nothing. One field may be named on two bindings; one binding or one
-/// variable may not be declared twice, and an annotation naming no field is a fault.
+/// empty declares nothing. One layer may be named on two bindings; one binding or one
+/// variable may not be declared twice, and an annotation naming no layer is a fault.
 ///
 /// Fails on the first fault and reports the line it is on.
 pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
@@ -492,7 +492,7 @@ pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
         }
         let layer = rest.trim();
         if layer.is_empty() {
-            return Err(fault(number, "`@layer` names no field"));
+            return Err(fault(number, "`@layer` names no layer"));
         }
 
         let (name, binding) = parse_input_declaration(number, declaration)?;
@@ -526,7 +526,7 @@ pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
     Ok(layers)
 }
 
-/// The annotations a field's shader used to declare and no longer may, as a fault on
+/// The annotations a layer's shader used to declare and no longer may, as a fault on
 /// the first line that still declares one.
 ///
 /// `@in` is a trailing annotation on a line of code, and `@reach` a line of its own;
@@ -542,7 +542,7 @@ pub fn parse_retired(source: &str) -> Result<(), ParamError> {
         {
             return Err(fault(
                 number,
-                "`@in` is no longer read; read another field with `@layer <name>`",
+                "`@in` is no longer read; read another layer with `@layer <name>`",
             ));
         }
         if let Some(rest) = line.trim().strip_prefix("// @reach")
@@ -603,10 +603,10 @@ fn parse_input_declaration(line: usize, declaration: &str) -> Result<(String, u3
     Ok((name, binding))
 }
 
-/// The values a field's WGSL shader produces, and what the document carries for it.
+/// The values a layer's WGSL shader produces, and what the document carries for it.
 ///
-/// Holds the parameter values and the fields the file reads by name, and the raster
-/// the last dispatch left. Only the parameter values are serialized: the fields read
+/// Holds the parameter values and the layers the file reads by name, and the raster
+/// the last dispatch left. Only the parameter values are serialized: the layers read
 /// are re-read from the file, and the raster is derived, so a loaded document reads
 /// the layer as zero until it has been dispatched.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -615,9 +615,9 @@ pub struct ShaderLayer {
     /// spells. A key the shader no longer declares is dropped when the file is
     /// parsed; one it declares that is missing here takes the shader's default.
     pub params: BTreeMap<String, Vec<f32>>,
-    /// The fields the file read by name when it was last read, in declaration order.
+    /// The layers the file read by name when it was last read, in declaration order.
     #[serde(skip)]
-    pub layers: Vec<FieldId>,
+    pub layers: Vec<LayerId>,
     #[serde(skip)]
     values: Raster<f32>,
     #[serde(skip)]
@@ -638,7 +638,7 @@ impl ShaderLayer {
     }
 
     /// Installs `values` as the dispatch result, dropping whatever was there and
-    /// forgetting which dispatch produced it. Nothing checks it against the field's
+    /// forgetting which dispatch produced it. Nothing checks it against the layer's
     /// resolution.
     pub fn put_values(&mut self, values: Raster<f32>) {
         self.values = values;
@@ -670,7 +670,7 @@ impl ShaderLayer {
     /// declares that is missing, which is what a shader edited under a document
     /// leaves behind.
     ///
-    /// Answers whether anything moved, so a caller sweeping every field each frame can
+    /// Answers whether anything moved, so a caller sweeping every layer each frame can
     /// tell an edit from a frame in which nothing changed.
     pub fn reconcile(&mut self, layout: &ParamsLayout) -> bool {
         let before = self.params.len();
@@ -686,13 +686,13 @@ impl ShaderLayer {
         moved
     }
 
-    /// Takes the fields the file now reads by name, answering whether the list moved.
+    /// Takes the layers the file now reads by name, answering whether the list moved.
     ///
-    /// `true` means the field's dependencies, and so its bake order, may have moved.
+    /// `true` means the layer's dependencies, and so its bake order, may have moved.
     pub fn reconcile_layers(&mut self, declared: &[LayerRead]) -> bool {
-        let names: Vec<FieldId> = declared
+        let names: Vec<LayerId> = declared
             .iter()
-            .map(|read| FieldId::from(read.layer.as_str()))
+            .map(|read| LayerId::from(read.layer.as_str()))
             .collect();
         if self.layers == names {
             return false;
@@ -889,10 +889,10 @@ mod tests {
         assert_eq!(error.line, 3);
     }
 
-    // The annotation is the whole of a dependency on another field, so the field it
+    // The annotation is the whole of a dependency on another layer, so the layer it
     // names and the binding its raster lands on both have to come out of the line.
     #[test]
-    fn a_layer_read_gives_its_name_its_field_and_its_binding() {
+    fn a_layer_read_gives_its_name_its_layer_and_its_binding() {
         let layers =
             parse_layers("@group(0) @binding(4) var base: texture_2d<f32>; // @layer base\n")
                 .unwrap();
@@ -907,7 +907,7 @@ mod tests {
     }
 
     // The template carries a commented-out example, which must not make every file
-    // copied from it depend on a field called `base`.
+    // copied from it depend on a layer called `base`.
     #[test]
     fn a_fully_commented_line_declares_no_layer() {
         let layers =
@@ -916,7 +916,7 @@ mod tests {
         assert!(layers.is_empty());
     }
 
-    // An annotation with no name gives no field to bind, and silently binding nothing
+    // An annotation with no name gives no layer to bind, and silently binding nothing
     // would read as a zero layer instead of saying the line is unfinished.
     #[test]
     fn an_empty_layer_annotation_is_a_fault_on_its_line() {
@@ -943,7 +943,7 @@ mod tests {
             parse_layers("@group(0) @binding(3) var a: texture_2d<f32>; // @layer base\n").unwrap();
         let mut layer = ShaderLayer::default();
         assert!(layer.reconcile_layers(&declared));
-        assert_eq!(layer.layers, vec![FieldId::from("base")]);
+        assert_eq!(layer.layers, vec![LayerId::from("base")]);
         assert!(!layer.reconcile_layers(&declared));
     }
 
@@ -959,7 +959,7 @@ mod tests {
         assert_eq!(layout.field("shown").unwrap().offset, 4);
     }
 
-    // A file written for a node graph still declares its pins, and a field that
+    // A file written for a node graph still declares its pins, and a layer that
     // silently ignored one would read zero where the author expected a raster.
     #[test]
     fn an_in_annotation_is_a_fault_on_its_line_naming_it() {

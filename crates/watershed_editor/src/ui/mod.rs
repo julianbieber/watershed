@@ -41,9 +41,9 @@ impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NewDialog>()
             .init_resource::<FilePath>()
-            .init_resource::<NewField>()
+            .init_resource::<NewLayer>()
             .init_resource::<Expanded>()
-            .init_resource::<toolbar::FieldChoices>()
+            .init_resource::<toolbar::LayerChoices>()
             .init_resource::<stack::Shape>()
             .init_resource::<log::Open>()
             .add_systems(Startup, shell.spawn())
@@ -51,11 +51,11 @@ impl Plugin for UiPlugin {
                 Update,
                 (
                     toolbar::sync,
-                    toolbar::rebuild_field_menu,
+                    toolbar::rebuild_layer_menu,
                     toolbar::seed_path,
                     stack::rebuild,
                     stack::sync,
-                    stack::seed_field_name,
+                    stack::seed_layer_name,
                     stack::prune,
                     dialog::sync,
                     legend::sync,
@@ -116,18 +116,18 @@ impl Default for FilePath {
     }
 }
 
-/// The name typed into the panel's field box: what "Add field" will call a new field.
+/// The name typed into the panel's field box: what "Add layer" will call a new layer.
 ///
 /// Held across frames because typing a name and pressing the button are two separate
 /// acts, and because the panel is rebuilt whenever the document changes shape — a name
 /// left only in the text input would be lost with it.
 #[derive(Resource, Default)]
-pub struct NewField(pub String);
+pub struct NewLayer(pub String);
 
 /// Which of the panel's collapsible sections are open.
 ///
 /// Kept here rather than in the toggles themselves because the panel is rebuilt
-/// whenever the document changes shape — adding a field despawns every toggle in it,
+/// whenever the document changes shape — adding a layer despawns every toggle in it,
 /// and state left in one would be lost with it, closing every section on each edit.
 #[derive(Resource, Default)]
 pub struct Expanded {

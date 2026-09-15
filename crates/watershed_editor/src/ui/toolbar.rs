@@ -1,11 +1,11 @@
 //! The strip along the top: the actions that apply to a document as a whole, the path
-//! it is read from and written to, which field is on screen, and what the run is
+//! it is read from and written to, which layer is on screen, and what the run is
 //! doing.
 //!
 //! The toolbar's shape does not depend on the document, so it is built once and only
 //! dressed afterwards — captions rewritten, buttons enabled and disabled. The one
-//! part that does depend on the document, the field menu, is rebuilt when the list of
-//! fields changes and not otherwise.
+//! part that does depend on the document, the layer menu, is rebuilt when the list of
+//! layers changes and not otherwise.
 
 use crate::terrain::SaveOptions;
 use bevy::feathers::controls::{
@@ -28,11 +28,11 @@ use crate::view::{EditorCamera, FreeView, fit_camera};
 #[derive(Component, Default, Clone)]
 pub struct NewButton;
 
-/// Loads the document at the path in the field. Disabled while a job is running.
+/// Loads the document at the path in the layer. Disabled while a job is running.
 #[derive(Component, Default, Clone)]
 pub struct OpenButton;
 
-/// Writes the document to the path in the field. Disabled while a job is running or
+/// Writes the document to the path in the layer. Disabled while a job is running or
 /// there is no document.
 #[derive(Component, Default, Clone)]
 pub struct SaveButton;
@@ -59,21 +59,21 @@ pub struct StatusLabel;
 #[derive(Component, Default, Clone)]
 pub struct PathInput;
 
-/// The field menu's button caption, which names the field on screen.
+/// The layer menu's button caption, which names the layer on screen.
 #[derive(Component, Default, Clone)]
-pub struct FieldMenuCaption;
+pub struct LayerMenuCaption;
 
-/// The field menu's popup, whose children [`rebuild_field_menu`] replaces.
+/// The layer menu's popup, whose children [`rebuild_layer_menu`] replaces.
 #[derive(Component, Default, Clone)]
-pub struct FieldMenuPopup;
+pub struct LayerMenuPopup;
 
-/// The field list the popup was last built from, so it is rebuilt when the document's
-/// fields change and not every frame. Nothing else records what the popup holds.
+/// The layer list the popup was last built from, so it is rebuilt when the document's
+/// layers change and not every frame. Nothing else records what the popup holds.
 #[derive(Resource, Default)]
-pub struct FieldChoices(Vec<String>);
+pub struct LayerChoices(Vec<String>);
 
 /// The toolbar's scene. Built once; everything document-dependent about it is filled
-/// in afterwards by [`sync`], [`rebuild_field_menu`] and [`seed_path`].
+/// in afterwards by [`sync`], [`rebuild_layer_menu`] and [`seed_path`].
 pub fn toolbar() -> impl Scene {
     bsn! {
         Node {
@@ -142,11 +142,11 @@ pub fn toolbar() -> impl Scene {
                 Children [
                     (
                         @FeathersMenuButton {
-                            @caption: bsn! { Text("field") ThemedText FieldMenuCaption },
+                            @caption: bsn! { Text("layer") ThemedText LayerMenuCaption },
                         }
                         Node { flex_grow: 1.0 }
                     ),
-                    (@FeathersMenuPopup FieldMenuPopup),
+                    (@FeathersMenuPopup LayerMenuPopup),
                 ]
             ),
             separator(),
@@ -216,7 +216,7 @@ fn separator() -> impl Scene {
 }
 
 /// Enables and disables the buttons for what the document can currently take, names
-/// the field on screen, and writes the status line.
+/// the layer on screen, and writes the status line.
 ///
 /// The status line prefers the running job, then the last refusal, then a description
 /// of the document — a job in flight is the answer to most of "why has nothing
@@ -225,7 +225,7 @@ pub fn sync(
     document: Res<Document>,
     mut commands: Commands,
     mut status: Single<&mut Text, With<StatusLabel>>,
-    mut caption: Single<&mut Text, (With<FieldMenuCaption>, Without<StatusLabel>)>,
+    mut caption: Single<&mut Text, (With<LayerMenuCaption>, Without<StatusLabel>)>,
     disabled: Query<(), With<InteractionDisabled>>,
     new_button: Single<Entity, With<NewButton>>,
     open_button: Single<Entity, With<OpenButton>>,
@@ -269,10 +269,10 @@ pub fn sync(
         (None, Some(error)) => error.to_owned(),
         (None, None) => match document.terrain() {
             Some(terrain) => format!(
-                "{}x{}  {} field(s){}{}",
+                "{}x{}  {} layer(s){}{}",
                 terrain.size.x,
                 terrain.size.y,
-                terrain.fields.len(),
+                terrain.layers.len(),
                 if has_water { "  water" } else { "" },
                 if whole { "" } else { "  preview" },
             ),
@@ -299,15 +299,15 @@ fn enable(
     }
 }
 
-/// Replaces the field menu's items when the document's field names change, and does
+/// Replaces the layer menu's items when the document's layer names change, and does
 /// nothing otherwise.
-pub fn rebuild_field_menu(
+pub fn rebuild_layer_menu(
     document: Res<Document>,
-    mut choices: ResMut<FieldChoices>,
-    popup: Single<Entity, With<FieldMenuPopup>>,
+    mut choices: ResMut<LayerChoices>,
+    popup: Single<Entity, With<LayerMenuPopup>>,
     mut commands: Commands,
 ) {
-    let names = document.field_names();
+    let names = document.layer_names();
     if names == choices.0 {
         return;
     }

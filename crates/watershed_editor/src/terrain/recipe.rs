@@ -2,7 +2,7 @@
 //! `watershed::Terrain` was written from.
 //!
 //! The values and the recipe are two files because they are two audiences. A
-//! consuming project reads `terrain.ron` and never learns what a field's shader is;
+//! consuming project reads `terrain.ron` and never learns what a layer's shader is;
 //! the editor reads both, and only the editor can. Nothing here is needed to read a
 //! terrain, and a directory with this half deleted is still a terrain.
 //!
@@ -15,15 +15,15 @@ use std::path::Path;
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use watershed::field::{FieldId, FieldRole};
 use watershed::io::IoError;
 use watershed::terrain::Terrain;
 
 use crate::gpu::ShaderRuntime;
 use crate::terrain::bake::{BakeError, PlanError, TerrainSpec};
-use crate::terrain::field::Field;
+use crate::terrain::layer::Layer;
 use crate::terrain::shader::SHADER_DIR;
 use crate::terrain::water::{WaterError, WaterSpec};
+use crate::terrain::{LayerId, LayerRole};
 
 /// The recipe file a terrain directory carries when it was saved as a document, and
 /// the only name this reader knows without being told it.
@@ -33,7 +33,7 @@ pub const RECIPE_FILE: &str = "recipe.ron";
 ///
 /// Separate from [`watershed::meta::VERSION`], which versions the `terrain.ron` a
 /// consuming project reads: the two files have two audiences and change for
-/// different reasons, and a recipe that gains a field must not invalidate every
+/// different reasons, and a recipe that gains a layer must not invalidate every
 /// terrain already exported.
 ///
 /// A recipe carrying any other version is refused outright; there is no migration
@@ -105,24 +105,24 @@ impl SaveOptions {
         Self { recipe: false }
     }
 }
-/// The recipe for one field: everything needed to bake it again beside its shader
-/// file, which is the field's `shaders/<name>.wgsl`.
+/// The recipe for one layer: everything needed to bake it again beside its shader
+/// file, which is the layer's `shaders/<name>.wgsl`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FieldRecipe {
-    /// The field's name, and the stem of its shader file.
-    pub name: FieldId,
-    /// What the bake may do with the field.
-    pub role: FieldRole,
-    /// The field's resolution shift.
+pub struct LayerRecipe {
+    /// The layer's name, and the stem of its shader file.
+    pub name: LayerId,
+    /// What the bake may do with the layer.
+    pub role: LayerRole,
+    /// The layer's resolution shift.
     pub shift: u8,
     /// The interval a bake clamps into. Not the same number as the range of the
-    /// channel the field's values are stored in, which is what the byte spreads
+    /// channel the layer's values are stored in, which is what the byte spreads
     /// over.
     pub range: (f32, f32),
     /// Carried through and never read by the bake.
     #[serde(default)]
     pub export: bool,
-    /// A value per parameter the field's shader declares.
+    /// A value per parameter the layer's shader declares.
     pub params: BTreeMap<String, Vec<f32>>,
 }
 
@@ -139,8 +139,9 @@ pub struct RecipeMeta {
     /// The spec the water was solved from, kept so a document that carries no
     /// solved water can still be re-solved rather than losing it.
     pub water_spec: Option<WaterSpec>,
-    /// One entry per field, in declaration order.
-    pub fields: Vec<FieldRecipe>,
+    /// One entry per layer, in declaration order. Written as `fields` in `recipe.ron`.
+    #[serde(rename = "fields")]
+    pub layers: Vec<LayerRecipe>,
 }
 
 #[derive(Deserialize)]
@@ -154,16 +155,16 @@ fn recipe_of(spec: &TerrainSpec) -> RecipeMeta {
         size: spec.size,
         seed: spec.seed,
         water_spec: spec.water_spec.clone(),
-        fields: spec
-            .fields
+        layers: spec
+            .layers
             .iter()
-            .map(|field| FieldRecipe {
-                name: field.id.clone(),
-                role: field.role,
-                shift: field.shift,
-                range: field.range,
-                export: field.export,
-                params: field.shader.params.clone(),
+            .map(|layer| LayerRecipe {
+                name: layer.id.clone(),
+                role: layer.role,
+                shift: layer.shift,
+                range: layer.range,
+                export: layer.export,
+                params: layer.shader.params.clone(),
             })
             .collect(),
     }
@@ -189,9 +190,9 @@ impl TerrainSpec {
         let root = path.as_ref().to_path_buf();
         let mut baked = self.clone();
         if baked
-            .fields
+            .layers
             .iter()
-            .any(|field| field.baked().size() != field.resolution(baked.size))
+            .any(|layer| layer.baked().size() != layer.resolution(baked.size))
         {
             baked.bake_in_place()?;
         }
@@ -210,16 +211,16 @@ impl TerrainSpec {
         Ok(())
     }
     /// Reads a document from a directory and re-bakes it from its recipe, dispatching
-    /// each field's shader from the directory's `shaders` through `base`'s device at
+    /// each layer's shader from the directory's `shaders` through `base`'s device at
     /// the recipe's seed, then solves the water again when the recipe carries a water
     /// spec.
     ///
     /// The bake is redone rather than taken from the values: the carried values were
     /// quantised, and a document whose bakes came from them would disagree with itself
     /// the first time part of it was re-baked. Under a runtime holding no device every
-    /// field reads `0.0`.
+    /// layer reads `0.0`.
     ///
-    /// A directory carrying no `recipe.ron` loads its fields' names, roles and shifts
+    /// A directory carrying no `recipe.ron` loads its layers' names, roles and shifts
     /// from the values, at seed 0 and with no parameter values.
     pub fn load_from_dir(path: impl AsRef<Path>, base: ShaderRuntime) -> Result<Self, RecipeError> {
         let root = path.as_ref().to_path_buf();
@@ -232,20 +233,20 @@ impl TerrainSpec {
                 spec.size = meta.size;
                 spec.seed = meta.seed;
                 spec.water_spec = meta.water_spec.clone();
-                for entry in &meta.fields {
-                    let mut field = Field::new(entry.name.clone())
+                for entry in &meta.layers {
+                    let mut layer = Layer::new(entry.name.clone())
                         .with_role(entry.role)
                         .with_shift(entry.shift)
                         .with_range(entry.range)
                         .with_export(entry.export);
-                    field.shader.params = entry.params.clone();
-                    spec.fields.push(field);
+                    layer.shader.params = entry.params.clone();
+                    spec.layers.push(layer);
                 }
             }
             None => {
                 for view in terrain.fields() {
-                    spec.fields.push(
-                        Field::new(view.name().to_owned())
+                    spec.layers.push(
+                        Layer::new(view.name().to_owned())
                             .with_role(view.role())
                             .with_shift(view.shift()),
                     );
@@ -254,15 +255,15 @@ impl TerrainSpec {
         }
 
         let runtime = base.with_directory(spec.seed, &root.join(SHADER_DIR));
-        for field in &mut spec.fields {
-            if let Some(program) = runtime.program(&field.file()) {
-                field.shader.reconcile(&program.layout);
-                field.shader.reconcile_layers(&program.layers);
+        for layer in &mut spec.layers {
+            if let Some(program) = runtime.program(&layer.file()) {
+                layer.shader.reconcile(&program.layout);
+                layer.shader.reconcile_layers(&program.layers);
             }
         }
         spec.set_shader_runtime(runtime);
 
-        if !spec.fields.is_empty() {
+        if !spec.layers.is_empty() {
             spec.bake_in_place()?;
             if let Some(water) = spec.water_spec.clone() {
                 spec.solve_water(&water)?;
@@ -308,25 +309,25 @@ mod tests {
             .collect();
         Raster::from_vec(SIZE, data).unwrap()
     }
-    fn moisture() -> Field {
-        Field::new("moisture")
+    fn moisture() -> Layer {
+        Layer::new("moisture")
             .with_shift(2)
             .holding(Raster::new(UVec2::new(12, 8), 0.5))
     }
 
     fn reading_document() -> TerrainSpec {
-        TerrainSpec::new(SIZE).with_field(moisture()).with_field(
-            Field::new("height")
-                .with_role(FieldRole::Height)
+        TerrainSpec::new(SIZE).with_layer(moisture()).with_layer(
+            Layer::new("height")
+                .with_role(LayerRole::Height)
                 .holding(ramp())
                 .reading(&["moisture"]),
         )
     }
 
     fn baked_document() -> TerrainSpec {
-        let mut terrain = TerrainSpec::new(SIZE).with_field(moisture()).with_field(
-            Field::new("height")
-                .with_role(FieldRole::Height)
+        let mut terrain = TerrainSpec::new(SIZE).with_layer(moisture()).with_layer(
+            Layer::new("height")
+                .with_role(LayerRole::Height)
                 .holding(ramp()),
         );
         terrain.bake_in_place().unwrap();
@@ -379,12 +380,12 @@ mod tests {
         assert!(!root.join(RECIPE_FILE).exists());
         assert!(Terrain::load_from_dir(&root).is_ok());
         let loaded = load(&root).unwrap();
-        assert_eq!(loaded.fields.len(), 2);
+        assert_eq!(loaded.layers.len(), 2);
         assert!(
             loaded
-                .fields
+                .layers
                 .iter()
-                .all(|field| field.shader.params.is_empty())
+                .all(|layer| layer.shader.params.is_empty())
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -429,10 +430,10 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // Fields at the same shift share an image and one at another shift starts its own;
+    // Layers at the same shift share an image and one at another shift starts its own;
     // this is the packing rule as the format actually applies it.
     #[test]
-    fn fields_sharing_a_shift_share_an_image() {
+    fn layers_sharing_a_shift_share_an_image() {
         let root = saved(&reading_document(), SaveOptions::document(), "packing");
         let meta = values_meta(&root);
 
@@ -479,7 +480,7 @@ mod tests {
         let second_root = saved(&first, SaveOptions::document(), "trip-two");
         let second = load(&second_root).unwrap();
 
-        for (left, right) in first.fields.iter().zip(&second.fields) {
+        for (left, right) in first.layers.iter().zip(&second.layers) {
             assert_eq!(left.baked().size(), right.baked().size());
             for (a, b) in left.baked().data().iter().zip(right.baked().data()) {
                 assert_eq!(a.to_bits(), b.to_bits(), "a second trip moved {a} to {b}");
@@ -488,28 +489,28 @@ mod tests {
         std::fs::remove_dir_all(&first_root).unwrap();
         std::fs::remove_dir_all(&second_root).unwrap();
     }
-    // A field's recipe is its settings, the document's seed and the values for its
+    // A layer's recipe is its settings, the document's seed and the values for its
     // parameters — and not the raster, which is derived from the file and re-made on
     // the way in rather than saved.
     #[test]
-    fn a_field_carries_its_settings_parameters_and_seed_and_no_values() {
-        let mut height = Field::new("height")
-            .with_role(FieldRole::Height)
+    fn a_layer_carries_its_settings_parameters_and_seed_and_no_values() {
+        let mut height = Layer::new("height")
+            .with_role(LayerRole::Height)
             .with_range((-2.0, 3.0))
             .holding(Raster::new(SIZE, 0.5));
         height.shader.params.insert("scale".to_owned(), vec![0.03]);
-        let mut spec = TerrainSpec::new(SIZE).with_field(height);
+        let mut spec = TerrainSpec::new(SIZE).with_layer(height);
         spec.seed = 42;
         let root = saved(&spec, SaveOptions::document(), "shader");
 
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.seed, 42);
-        let field = &loaded.fields[0];
-        assert_eq!(field.role, FieldRole::Height);
-        assert_eq!(field.range, (-2.0, 3.0));
-        assert_eq!(field.shader.params.get("scale"), Some(&vec![0.03]));
+        let layer = &loaded.layers[0];
+        assert_eq!(layer.role, LayerRole::Height);
+        assert_eq!(layer.range, (-2.0, 3.0));
+        assert_eq!(layer.shader.params.get("scale"), Some(&vec![0.03]));
         assert!(
-            field.shader.values().is_empty(),
+            layer.shader.values().is_empty(),
             "the values were serialized"
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -532,7 +533,7 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).unwrap();
     }
-    // A document saved while a field was a graph of nodes has no reading here, so it
+    // A document saved while a layer was a graph of nodes has no reading here, so it
     // is refused by its version before the unknown shape of the rest is parsed, and
     // the message says which version it was.
     #[test]
@@ -551,5 +552,26 @@ mod tests {
         );
         assert!(error.to_string().contains('3'), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Pins the on-disk key the editor's rename to layer must not move: a recipe saved
+    // before it still loads, and one saved after it still says `fields`.
+    #[test]
+    fn a_recipe_keeps_its_fields_key_on_disk() {
+        let written = ron::ser::to_string_pretty(
+            &recipe_of(&baked_document()),
+            ron::ser::PrettyConfig::default(),
+        )
+        .unwrap();
+        assert!(written.contains("fields:"), "{written}");
+        assert!(!written.contains("layers:"), "{written}");
+
+        let text = format!(
+            "(version: {RECIPE_VERSION}, size: (64, 64), seed: 0, water_spec: None, \
+             fields: [(name: (\"height\"), role: Height, shift: 0, range: (0.0, 1.0), params: {{}})])"
+        );
+        let meta: RecipeMeta = ron::from_str(&text).unwrap();
+        assert_eq!(meta.layers.len(), 1);
+        assert_eq!(meta.layers[0].name, LayerId::from("height"));
     }
 }
