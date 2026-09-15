@@ -7,7 +7,7 @@
 
 use crate::gpu;
 use crate::terrain::graph::{FieldGraph, NodeOp};
-use crate::terrain::shader::{ShaderLayer, parse_inputs, parse_params, parse_reach};
+use crate::terrain::shader::{ShaderLayer, parse_inputs, parse_layers, parse_params, parse_reach};
 use crate::terrain::{Field, TerrainSpec, WaterSpec};
 use bevy::prelude::*;
 use watershed::FieldRole;
@@ -20,7 +20,7 @@ pub enum Preset {
     #[default]
     Continents,
     /// Ridged relief laid over a continent, which needs the continent to be a field of
-    /// its own read into the shader node that lifts it.
+    /// its own that the shader lifting it reads by name.
     Ridges,
 }
 
@@ -49,7 +49,7 @@ impl Preset {
     pub fn stock_files(self) -> &'static [&'static str] {
         match self {
             Self::Continents => &["fbm.wgsl", "continents.wgsl"],
-            Self::Ridges => &["fbm.wgsl", "mountains.wgsl"],
+            Self::Ridges => &["fbm.wgsl", "continents.wgsl", "mountains_over_base.wgsl"],
         }
     }
 
@@ -98,6 +98,7 @@ fn layer(file: &str, seed: u32, values: &[(&str, f32)]) -> ShaderLayer {
     let mut layer = ShaderLayer::new(file);
     layer.reconcile(&parse_params(source).expect("a stock shader declares readable parameters"));
     layer.reconcile_inputs(&parse_inputs(source).expect("a stock shader declares readable inputs"));
+    layer.reconcile_layers(&parse_layers(source).expect("a stock shader declares readable layers"));
     layer.reconcile_reach(parse_reach(source).expect("a stock shader declares a readable reach"));
     layer.params.insert("seed".to_owned(), vec![seed as f32]);
     for (name, value) in values {
@@ -133,27 +134,18 @@ fn continents(size: UVec2, seed: u32) -> TerrainSpec {
 }
 
 fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
-    let mut height = FieldGraph::new();
-    let base = height.add_node(NodeOp::FieldRef("base".into()), at(0, 0));
-    let lifted = height.add_node(
-        NodeOp::Shader(layer("mountains.wgsl", salted(seed, 3), &[])),
-        at(1, 0),
-    );
-    height
-        .connect(base, lifted, 0)
-        .expect("the mountains shader declares one input pin");
-    height
-        .set_output(Some(lifted))
-        .expect("the node was just added to this graph");
-
     TerrainSpec::new(size)
         .with_field(moisture(seed))
         .with_field(Field::new("base").with_graph(single(layer(
-            "fbm.wgsl",
+            "continents.wgsl",
             salted(seed, 1),
-            &[("scale", 0.0015), ("octaves", 4.0)],
+            &[("land_scale", 0.0015), ("relief", 0.0)],
         ))))
-        .with_field(Field::new("height").with_graph(height))
+        .with_field(Field::new("height").with_graph(single(layer(
+            "mountains_over_base.wgsl",
+            salted(seed, 3),
+            &[],
+        ))))
 }
 
 #[cfg(test)]
@@ -217,25 +209,35 @@ mod tests {
         }
     }
 
-    // The shape `observe nodes height` reports for each preset: one shader node for
-    // `continents`, and for `ridges` a reference to `base` wired into the one pin of
-    // the shader node the field is read from.
+    // The shape `observe nodes height` reports for `ridges`: one shader node and no
+    // reference, its file naming `base`, which is what makes `base` a read of `height`.
     #[test]
-    fn continents_height_is_one_shader_node_and_ridges_height_reads_base_into_one() {
-        let continents = Preset::Continents.build(SIZE, 7);
-        let graph = &continents.field("height").unwrap().graph;
-        assert_eq!(graph.nodes.len(), 1);
-        assert!(matches!(graph.nodes[0].op, NodeOp::Shader(_)));
-
+    fn ridges_height_is_one_shader_node_that_reads_base_by_name() {
         let ridges = Preset::Ridges.build(SIZE, 7);
-        let graph = &ridges.field("height").unwrap().graph;
-        assert_eq!(graph.nodes.len(), 2);
-        let output = graph.node(graph.output.unwrap()).unwrap();
-        assert!(matches!(&output.op, NodeOp::Shader(shader) if shader.file == "mountains.wgsl"));
-        let read = graph
-            .node(output.inputs[0].expect("the pin is wired"))
-            .unwrap();
-        assert!(matches!(&read.op, NodeOp::FieldRef(id) if id.as_str() == "base"));
+        let height = ridges.field("height").unwrap();
+        assert_eq!(height.graph.nodes.len(), 1);
+        let NodeOp::Shader(shader) = &height.graph.nodes[0].op else {
+            panic!("ridges' height is not a shader node");
+        };
+        assert_eq!(shader.file, "mountains_over_base.wgsl");
+        assert_eq!(shader.layers, vec![watershed::FieldId::from("base")]);
+        assert_eq!(crate::edit::reads_of(height), ["base"]);
+    }
+
+    // Editing one field's file is how a person changes that field, so no two fields of
+    // `ridges` may share a file — an edit to `base`'s would otherwise move `moisture`
+    // with it.
+    #[test]
+    fn every_field_of_ridges_names_a_file_of_its_own() {
+        let ridges = Preset::Ridges.build(SIZE, 7);
+        let mut files: Vec<&str> = shaders(&ridges)
+            .iter()
+            .map(|shader| shader.file.as_str())
+            .collect();
+        let count = files.len();
+        files.sort_unstable();
+        files.dedup();
+        assert_eq!(files.len(), count, "{files:?}");
     }
 
     // `seed` is the whole of what varies a preset, so the same arguments have to build

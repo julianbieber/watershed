@@ -34,16 +34,15 @@ pub enum NodeOp {
     ///
     /// One input pin per input the file declares, in declaration order, each read
     /// inside the shader as a texture of the whole upstream raster; an unwired pin
-    /// reads `0.0`. The shader reads no *field*, so this op contributes no dependency,
-    /// but a wired pin does widen the re-bake: by the reach the file declares, or — for
-    /// a file that declares none, which may read any texel of its input — by baking the
+    /// reads `0.0`. Every field the file names in a `@layer` annotation is a
+    /// dependency, bound as that field's baked raster. A wired pin or a layer read
+    /// widens the re-bake: by the reach the file declares, or — for a file that
+    /// declares none, which may read any texel of what it is handed — by baking the
     /// field whole instead. The values are not serialized: a loaded document reads the
     /// node as `0.0` until it has been dispatched again.
     Shader(ShaderLayer),
     /// Another field's value at the position, interpolated between that field's
     /// texels.
-    ///
-    /// The only op that reads another field.
     FieldRef(FieldId),
 }
 
@@ -57,11 +56,22 @@ impl NodeOp {
         }
     }
 
-    /// The field this op reads, if any. Feeds bake ordering and cycle detection.
+    /// The field a [`NodeOp::FieldRef`] names, and `None` for every other op —
+    /// including a shader that reads fields by name, which [`NodeOp::reads`] reports.
     pub fn dependency(&self) -> Option<&FieldId> {
         match self {
             NodeOp::FieldRef(id) => Some(id),
             NodeOp::Shader(_) => None,
+        }
+    }
+
+    /// Every field this op reads: a reference's one field, or the fields a shader's
+    /// file names in `@layer` annotations, in declaration order and with duplicates
+    /// kept. Feeds bake ordering and cycle detection.
+    pub fn reads(&self) -> Vec<&FieldId> {
+        match self {
+            NodeOp::FieldRef(id) => vec![id],
+            NodeOp::Shader(shader) => shader.layers.iter().collect(),
         }
     }
 }
@@ -506,14 +516,18 @@ impl FieldGraph {
 
     /// The fields this graph reads, in evaluation order and with duplicates kept.
     ///
-    /// Only [`NodeOp::FieldRef`] nodes the walk actually reached, so an unreachable
-    /// or bypassed reference contributes no bake-order dependency and cannot make a
-    /// cycle between fields.
+    /// Only what [`NodeOp::reads`] reports for the nodes the walk actually reached, so
+    /// an unreachable or bypassed node contributes no bake-order dependency and cannot
+    /// make a cycle between fields.
     pub fn dependencies(&self) -> Vec<&FieldId> {
         self.evaluation_order()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|id| self.node(id)?.op.dependency())
+            .flat_map(|id| {
+                self.node(id)
+                    .map(|node| node.op.reads())
+                    .unwrap_or_default()
+            })
             .collect()
     }
 

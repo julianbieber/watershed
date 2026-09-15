@@ -21,8 +21,9 @@
 // BINDINGS
 //
 // Binding 0 is `globals`, 1 is the output the entry point writes, 2 is the `Params`
-// uniform the file declares. An input texture starts at 3, and at most 8 are
-// declared. `globals` carries:
+// uniform the file declares. An `@in` input and an `@layer` texture both take a
+// binding from 3 up, no binding is used twice, and at most 8 of each are declared.
+// `globals` carries:
 //
 //   document: vec2<u32>  the document's extent, in cells
 //   texels:   vec2<u32>  the extent of this dispatch, in texels of this raster
@@ -54,6 +55,10 @@
 //       the texel of this raster a position falls in — the inverse of `cell_position`
 //   input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32
 //       one texel of an input, clamped to its edge
+//   layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32
+//       another field's value at a document position, interpolated, whatever its shift
+//   layer_shift(layer: texture_2d<f32>) -> u32
+//       the shift that field was baked at
 //
 // THE NODE'S NAME — @shader
 //
@@ -84,6 +89,18 @@
 // Read it with `input_texel(source, field_texel(p))`. Reads are clamped to the edge,
 // and an unwired pin reads 0.0 everywhere.
 //
+// LAYERS — @layer
+//
+// Another field of the document, read by naming it after the texture's `//`:
+//
+//   @group(0) @binding(4) var base: texture_2d<f32>; // @layer base
+//
+// The binding holds that field's baked raster, at the field's own shift. Read it with
+// `layer_value(base, p)`. The field named is baked first. A name that is no field, or
+// one that makes fields read each other in a circle, leaves this field unbaked with
+// the reason on its card. Bindings share the range from 3 with `@in`, and no binding
+// may be used twice.
+//
 // RE-BAKE REACH — @reach
 //
 // How far this shader reads around the texel it writes, in document cells, on a line
@@ -105,6 +122,10 @@ struct Params {
 // Uncomment to grow an input pin on the node, and read it with
 // `input_texel(source, field_texel(p))`. Bindings start at 3.
 // @group(0) @binding(3) var source: texture_2d<f32>; // @in "Source"
+
+// Uncomment, and name a field of the document, to read that field with
+// `layer_value(base, p)`.
+// @group(0) @binding(4) var base: texture_2d<f32>; // @layer base
 
 fn value(p: vec2<f32>) -> f32 {
     return fbm_unit(p * params.scale, 4u, 0.5, 2.0);

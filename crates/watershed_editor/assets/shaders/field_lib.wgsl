@@ -151,3 +151,36 @@ fn input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32 {
     let last = vec2<i32>(textureDimensions(source)) - vec2<i32>(1, 1);
     return textureLoad(source, clamp(at, vec2<i32>(0, 0), last), 0).r;
 }
+
+// The shift a bound layer was baked at: the smallest one whose raster covers the
+// document at the layer texture's own extent. Every shift reads a one-texel layer the
+// same way, so which one answers for it does not matter.
+fn layer_shift(layer: texture_2d<f32>) -> u32 {
+    let size = textureDimensions(layer);
+    for (var shift = 0u; shift < 16u; shift = shift + 1u) {
+        let step = 1u << shift;
+        let fits = max((globals.document + vec2<u32>(step - 1u)) / step, vec2<u32>(1u, 1u));
+        if all(fits == size) {
+            return shift;
+        }
+    }
+    return 16u;
+}
+
+// Another field's value at a document position, interpolated between its texels and
+// clamped to its edge, whatever shift it was baked at — the same read a field
+// reference makes.
+fn layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
+    let step = f32(1u << layer_shift(layer));
+    let last = vec2<f32>(textureDimensions(layer)) - vec2<f32>(1.0, 1.0);
+    let at = clamp(p / step - vec2<f32>(0.5, 0.5), vec2<f32>(0.0, 0.0), last);
+    let low = floor(at);
+    let f = at - low;
+    let i0 = vec2<i32>(low);
+    let i1 = min(i0 + vec2<i32>(1, 1), vec2<i32>(last));
+    let a = textureLoad(layer, i0, 0).r;
+    let b = textureLoad(layer, vec2<i32>(i1.x, i0.y), 0).r;
+    let c = textureLoad(layer, vec2<i32>(i0.x, i1.y), 0).r;
+    let d = textureLoad(layer, i1, 0).r;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}

@@ -33,7 +33,8 @@ use crate::document::{Document, EditorSystems, JobKind};
 use crate::terrain::TerrainSpec;
 use crate::terrain::graph::NodeOp;
 use crate::terrain::shader::{
-    ParamsLayout, SHADER_DIR, ShaderInput, parse_inputs, parse_params, parse_reach,
+    LayerRead, ParamsLayout, SHADER_DIR, ShaderInput, parse_inputs, parse_layers, parse_params,
+    parse_reach,
 };
 
 const FIELD_LIB: &str = include_str!("../assets/shaders/field_lib.wgsl");
@@ -54,7 +55,7 @@ fn generate(@builtin(global_invocation_id) id: vec3<u32>) {
 ///
 /// A name beginning with `_` is a template: it is copied like any other but is not
 /// offered as something to add.
-pub const STOCK: [(&str, &str); 7] = [
+pub const STOCK: [(&str, &str); 8] = [
     ("_template.wgsl", TEMPLATE_SOURCE),
     (
         "ridged.wgsl",
@@ -76,6 +77,10 @@ pub const STOCK: [(&str, &str); 7] = [
     (
         "mountains.wgsl",
         include_str!("../assets/shaders/stock/mountains.wgsl"),
+    ),
+    (
+        "mountains_over_base.wgsl",
+        include_str!("../assets/shaders/stock/mountains_over_base.wgsl"),
     ),
 ];
 
@@ -146,6 +151,45 @@ fn validate(source: &str) -> Result<(), String> {
     }
 }
 
+struct Declared {
+    layout: ParamsLayout,
+    inputs: Vec<ShaderInput>,
+    layers: Vec<LayerRead>,
+    reach: Option<u32>,
+}
+
+fn declare(source: &str) -> Result<Declared, String> {
+    let layout = parse_params(source).map_err(|error| error.to_string())?;
+    let inputs = parse_inputs(source).map_err(|error| error.to_string())?;
+    let layers = parse_layers(source).map_err(|error| error.to_string())?;
+    let reach = parse_reach(source).map_err(|error| error.to_string())?;
+    if let Some(shared) = layers
+        .iter()
+        .find(|read| inputs.iter().any(|input| input.binding == read.binding))
+    {
+        let line = source
+            .lines()
+            .position(|line| {
+                line.split_once("//").is_some_and(|(code, note)| {
+                    note.trim().starts_with("@layer")
+                        && code.contains(&format!("@binding({})", shared.binding))
+                })
+            })
+            .map_or(0, |at| at + 1);
+        return Err(format!(
+            "line {line}: binding {} is declared twice",
+            shared.binding
+        ));
+    }
+    validate(source)?;
+    Ok(Declared {
+        layout,
+        inputs,
+        layers,
+        reach,
+    })
+}
+
 fn fault_at(line: usize, message: &str) -> String {
     match line.checked_sub(library_lines()) {
         Some(own) if own > 0 => format!("line {own}: {message}"),
@@ -164,6 +208,9 @@ pub struct ShaderEntry {
     /// The input textures the file declares, in pin order. As with the layout, the
     /// last list that parsed.
     pub inputs: Vec<ShaderInput>,
+    /// The fields the file reads by name, in declaration order. As with the layout,
+    /// the last list that parsed.
+    pub layers: Vec<LayerRead>,
     /// How far, in document cells, the file declares it reads around the texel it
     /// writes, or `None` for a file that declares nothing and so re-bakes whole. As
     /// with the layout, the last reach that parsed.
@@ -343,6 +390,8 @@ pub struct ShaderProgram {
     pub layout: ParamsLayout,
     /// The inputs it declares, in pin order.
     pub inputs: Vec<ShaderInput>,
+    /// The fields it reads by name, in declaration order.
+    pub layers: Vec<LayerRead>,
 }
 
 struct Runtime {
@@ -408,6 +457,7 @@ impl ShaderRuntime {
                         source: entry.source.clone(),
                         layout: entry.layout.clone(),
                         inputs: entry.inputs.clone(),
+                        layers: entry.layers.clone(),
                     },
                 )
             })
@@ -489,7 +539,8 @@ impl ShaderRuntime {
     ///
     /// `inputs` is one entry per declared input, in pin order; `None` is an unwired
     /// pin and reads `0.0` everywhere. A shorter slice leaves the pins after it
-    /// unwired.
+    /// unwired. `layers` is the same, one entry per [`ShaderProgram::layers`] in
+    /// order, with `None` for a field that has no raster to hand over.
     ///
     /// Blocks until the GPU has finished and the result has been read back. Answers
     /// an error rather than panicking when the runtime holds no device.
@@ -499,6 +550,7 @@ impl ShaderRuntime {
         params: &[u8],
         globals: DispatchGlobals,
         inputs: &[Option<&Raster<f32>>],
+        layers: &[Option<&Raster<f32>>],
     ) -> Result<Vec<f32>, String> {
         let Some(runtime) = &self.0 else {
             return Err("there is no render device to dispatch a shader on".to_owned());
@@ -508,6 +560,13 @@ impl ShaderRuntime {
             .iter()
             .enumerate()
             .map(|(pin, input)| (input.binding, inputs.get(pin).copied().flatten()))
+            .chain(
+                program
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(at, read)| (read.binding, layers.get(at).copied().flatten())),
+            )
             .collect();
         dispatch(
             &runtime.device,
@@ -526,16 +585,14 @@ fn programs(
     sources
         .into_iter()
         .filter_map(|(name, source)| {
-            let layout = parse_params(&source).ok()?;
-            let inputs = parse_inputs(&source).ok()?;
-            parse_reach(&source).ok()?;
-            validate(&source).ok()?;
+            let declared = declare(&source).ok()?;
             Some((
                 name,
                 ShaderProgram {
                     source,
-                    layout,
-                    inputs,
+                    layout: declared.layout,
+                    inputs: declared.inputs,
+                    layers: declared.layers,
                 },
             ))
         })
@@ -607,30 +664,31 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
             continue;
         };
         library.generation += 1;
-        let previous = library
-            .entries
-            .get(&name)
-            .map(|held| (held.layout.clone(), held.inputs.clone(), held.reach));
-        let outcome = parse_params(&source)
-            .and_then(|layout| parse_inputs(&source).map(|inputs| (layout, inputs)))
-            .and_then(|(layout, inputs)| parse_reach(&source).map(|reach| (layout, inputs, reach)))
-            .map_err(|error| error.to_string())
-            .and_then(|declared| validate(&source).map(|()| declared));
-        let entry = match outcome {
-            Ok((layout, inputs, reach)) => ShaderEntry {
+        let previous = library.entries.get(&name).map(|held| {
+            (
+                held.layout.clone(),
+                held.inputs.clone(),
+                held.layers.clone(),
+                held.reach,
+            )
+        });
+        let entry = match declare(&source) {
+            Ok(declared) => ShaderEntry {
                 source,
-                layout,
-                inputs,
-                reach,
+                layout: declared.layout,
+                inputs: declared.inputs,
+                layers: declared.layers,
+                reach: declared.reach,
                 error: None,
                 modified,
             },
             Err(reason) => {
-                let (layout, inputs, reach) = previous.unwrap_or_default();
+                let (layout, inputs, layers, reach) = previous.unwrap_or_default();
                 ShaderEntry {
                     source,
                     layout,
                     inputs,
+                    layers,
                     reach,
                     error: Some(reason),
                     modified,
@@ -709,6 +767,7 @@ fn attend_shaders(
                 node.inputs.resize(pins, None);
                 moved = true;
             }
+            moved |= shader.reconcile_layers(&entry.layers);
             moved |= shader.reconcile_reach(entry.reach);
             touched |= moved;
         }
@@ -984,6 +1043,7 @@ impl ShaderLibrary {
                 source: String::new(),
                 layout: ParamsLayout::default(),
                 inputs: Vec::new(),
+                layers: Vec::new(),
                 reach: None,
                 error: Some(fault.to_owned()),
                 modified: None,
@@ -991,6 +1051,35 @@ impl ShaderLibrary {
         );
         library.generation = 1;
         library
+    }
+}
+
+#[cfg(test)]
+impl ShaderRuntime {
+    /// A runtime on a device of its own, outside any app, holding the programs of an
+    /// empty library, or `None` on a machine with no adapter — hardware or software —
+    /// to run one on.
+    pub fn headless(seed: u32) -> Option<ShaderRuntime> {
+        use bevy::render::renderer::WgpuWrapper;
+        let instance = wgpu::Instance::default();
+        let adapter = [false, true].into_iter().find_map(|fallback| {
+            bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                force_fallback_adapter: fallback,
+                ..Default::default()
+            }))
+            .ok()
+        })?;
+        let (device, queue) =
+            bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .ok()?;
+        let device = RenderDevice::from(device);
+        let queue = RenderQueue(Arc::new(WgpuWrapper::new(queue)));
+        Some(ShaderRuntime::compile(
+            &device,
+            &queue,
+            &ShaderLibrary::default(),
+            seed,
+        ))
     }
 }
 
@@ -1059,7 +1148,16 @@ mod tests {
                 .any(|line| line.trim_start().starts_with("//")),
             "the reference still carries comment markers"
         );
-        for needle in ["uv(", "document_extent(", "@ui", "@in", "@reach", "@group"] {
+        for needle in [
+            "uv(",
+            "document_extent(",
+            "@ui",
+            "@in",
+            "@layer",
+            "layer_value(",
+            "@reach",
+            "@group",
+        ] {
             assert!(
                 reference.contains(needle),
                 "the reference never names `{needle}`"
@@ -1101,6 +1199,31 @@ mod tests {
         }
         assert_eq!(parse_reach(TEMPLATE_SOURCE).unwrap(), None);
         assert!(parse_inputs(TEMPLATE_SOURCE).unwrap().is_empty());
+        assert!(parse_layers(TEMPLATE_SOURCE).unwrap().is_empty());
+    }
+
+    // What the `@layer` annotation is for: a file naming a field and reading it
+    // through the library helper has to compile, or the reference would describe a
+    // read no shader can make.
+    #[test]
+    fn a_shader_reading_a_layer_through_the_helper_compiles() {
+        let source = "@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) + f32(layer_shift(base));\n}\n";
+        assert_eq!(parse_layers(source).unwrap().len(), 1);
+        if let Err(error) = validate(source) {
+            panic!("a read of a named layer does not compile: {error}");
+        }
+    }
+
+    // The dispatch binds a pin's raster and a layer's raster by binding number, so a
+    // file giving both one binding would have one of them silently replaced.
+    #[test]
+    fn an_input_and_a_layer_on_one_binding_are_refused() {
+        let source = "@group(0) @binding(3) var a: texture_2d<f32>; // @in\n@group(0) @binding(3) var b: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
+        let error = declare(source)
+            .err()
+            .expect("a binding shared by an input and a layer was accepted");
+        assert!(error.contains("binding 3 is declared twice"), "{error}");
+        assert!(error.starts_with("line 2:"), "{error}");
     }
 
     // The reason a shader is validated before the device sees it: wgpu reports a
