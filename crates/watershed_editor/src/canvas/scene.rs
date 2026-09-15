@@ -9,8 +9,9 @@ use bevy::text::FontSize;
 
 use super::thumb::{CardThumb, ThumbSource};
 use super::{
-    CANVAS_LAYER, CARD, CanvasLabel, CanvasShape, DETAIL_SIZE, Grab, MARGIN, NodeCard, NodeEdge,
-    NodePin, PARAM_SIZE, PIN_RADIUS, ROW_STEP, Selection, THUMB, TITLE_BAR, TITLE_SIZE, open_graph,
+    CANVAS_LAYER, CARD, CanvasLabel, CanvasShape, DETAIL_SIZE, FLAG, Grab, MARGIN, NodeCard,
+    NodeEdge, NodePin, OutputFlag, PARAM_SIZE, PIN_RADIUS, ROW_STEP, Selection, THUMB, TITLE_BAR,
+    TITLE_SIZE, open_graph,
 };
 use crate::document::Document;
 use crate::edit::{op_name, op_params};
@@ -40,6 +41,9 @@ const FAULT_SIZE: f32 = 11.0;
 const FAULT_CHARS: usize = 34;
 const PARAM_CHARS: usize = 23;
 const FILE_CHARS: usize = 21;
+const TITLE_CHARS: usize = 19;
+const FLAG_SET: Color = Color::srgb(0.96, 0.97, 1.0);
+const FLAG_UNSET: Color = Color::srgba(0.96, 0.97, 1.0, 0.25);
 
 /// Everything the canvas owns, so a rebuild can take it all down in one query.
 #[derive(Component)]
@@ -207,7 +211,7 @@ pub fn sync_canvas(
             continue;
         };
         **text = match line.kind {
-            LineKind::Title => caption(node),
+            LineKind::Title => clip(&caption(node), TITLE_CHARS),
             LineKind::Op => op_name(&node.op).to_owned(),
             LineKind::Params => clip(&params_line(node, library.as_deref()), PARAM_CHARS),
             LineKind::File => match &node.op {
@@ -387,7 +391,7 @@ fn spawn_card(
             CardTitleBar(node.id),
         ));
         parent.spawn((
-            Text2d::new(caption(node)),
+            Text2d::new(clip(&caption(node), TITLE_CHARS)),
             TextFont {
                 font: bevy::text::FontSource::Handle(font.clone()),
                 font_size: FontSize::Px(TITLE_SIZE),
@@ -402,6 +406,16 @@ fn spawn_card(
                 node: node.id,
                 kind: LineKind::Title,
             },
+        ));
+        parent.spawn((
+            Sprite {
+                color: if is_output { FLAG_SET } else { FLAG_UNSET },
+                custom_size: Some(Vec2::splat(FLAG)),
+                ..default()
+            },
+            Transform::from_translation(super::flag_offset().extend(0.03)),
+            RenderLayers::layer(CANVAS_LAYER),
+            OutputFlag,
         ));
         let blank = accent.with_alpha(0.35);
         parent.spawn((

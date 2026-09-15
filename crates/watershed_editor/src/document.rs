@@ -1439,6 +1439,38 @@ mod tests {
         assert_eq!(document.history().redo, 0);
     }
 
+    // A wire and the output it carried along are one change, so one undo takes both back.
+    #[test]
+    fn one_undo_takes_back_a_wire_and_the_output_it_moved() {
+        use crate::terrain::graph::NodeOp;
+        let mut document = one_node_document();
+        let node = only_node(&document);
+        let original = graph_of(&document);
+
+        document
+            .apply(&Edit::AddNode {
+                field: "height".to_owned(),
+                op: NodeOp::Scale(2.0),
+                position: None,
+            })
+            .unwrap();
+        let added = graph_of(&document).nodes.last().unwrap().id;
+        document
+            .apply(&Edit::Connect {
+                field: "height".to_owned(),
+                from: node,
+                to: added.to_string(),
+                pin: 0,
+            })
+            .unwrap();
+        assert_eq!(graph_of(&document).output, Some(added));
+
+        document.undo().unwrap();
+        let undone = graph_of(&document);
+        assert_eq!(undone.output, original.output);
+        assert_eq!(undone.node(added).unwrap().inputs, vec![None]);
+    }
+
     // Undoing a move is the same kind of change as making one: the bake was never
     // reached, so taking the move back must not throw it away either.
     #[test]

@@ -11,7 +11,8 @@ use bevy::window::PrimaryWindow;
 
 use super::{
     CanvasCameraTag, CanvasFrame, Grab, MAX_SCALE, MIN_SCALE, NodeCard, NodePin, OpenField,
-    Overview, Selection, ZOOM_PER_STEP, frame_canvas, open_graph,
+    Overview, Selection, ZOOM_PER_STEP, flag_area, flag_press, frame_canvas, labels_readable,
+    open_graph,
 };
 use crate::document::Document;
 use crate::edit::Edit;
@@ -136,6 +137,15 @@ pub fn canvas_drag(
                 Rect::from_center_size(at.translation.truncate(), card.size).contains(world)
             })
             .map(|(entity, card, at)| (entity, card.node, at.translation.truncate()));
+
+        if let Some((_, node, at)) = on_card
+            && labels_readable(ortho.scale)
+            && flag_area(at).contains(world)
+        {
+            *last_click = None;
+            finished.0 = flag_press(&document, node);
+            return;
+        }
 
         *pressed_at = Some(cursor);
         let now = time.elapsed_secs();

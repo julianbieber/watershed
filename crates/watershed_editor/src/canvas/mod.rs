@@ -30,6 +30,7 @@ const TITLE_SIZE: f32 = 17.0;
 const DETAIL_SIZE: f32 = 12.0;
 const PARAM_SIZE: f32 = 11.0;
 const PIN_RADIUS: f32 = 7.0;
+const FLAG: f32 = 14.0;
 const ZOOM_PER_STEP: f32 = 1.2;
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 8.0;
@@ -159,6 +160,11 @@ pub struct NodeEdge {
 /// [`scale_canvas_labels`] rasterises against the current zoom.
 #[derive(Component)]
 pub struct CanvasLabel(pub f32);
+
+/// The mark at the right end of a card's title bar: filled on the field's output,
+/// hollow on every other card, and pressed to make that card's node the output.
+#[derive(Component)]
+pub struct OutputFlag;
 
 /// Which node the panel is showing and which one the map is showing.
 #[derive(Resource, Default)]
@@ -542,19 +548,11 @@ fn graph_fit(graph: &FieldGraph, viewport: Vec2) -> Option<(Vec2, f32)> {
     Some(((low + high) * 0.5, scale))
 }
 
-/// Rasterises each label at the size it is about to be shown at.
-///
-/// World-space text is rasterised at its font size and the camera then scales that, so
-/// a label zoomed past 1:1 is blurred by exactly the zoom. Each label is given a font
-/// size of its world height divided by the camera's scale and a counter-scale that puts
-/// the height back, so what is rasterised is what is shown.
-///
-/// Runs only when the zoom changes, and against a size rounded to the pixel: every
-/// distinct size is a font atlas, and a smooth wheel zoom would otherwise build one per
-/// frame.
 fn scale_canvas_labels(
     camera: Option<Single<&Projection, With<CanvasCameraTag>>>,
     mut labels: Query<(&CanvasLabel, &mut TextFont, &mut Transform, &mut Visibility)>,
+    mut flags: Query<&mut Visibility, (With<OutputFlag>, Without<CanvasLabel>)>,
+    added: Query<(), Or<(Added<CanvasLabel>, Added<OutputFlag>)>>,
     mut applied: Local<Option<f32>>,
 ) {
     let Some(camera) = camera else {
@@ -563,18 +561,22 @@ fn scale_canvas_labels(
     let Projection::Orthographic(ortho) = camera.into_inner() else {
         return;
     };
-    if *applied == Some(ortho.scale) {
+    if *applied == Some(ortho.scale) && added.is_empty() {
         return;
     }
     *applied = Some(ortho.scale);
 
-    let readable = 1.0 / ortho.scale >= CHIP_ZOOM;
+    let readable = labels_readable(ortho.scale);
+    let shown = if readable {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut visibility in &mut flags {
+        *visibility = shown;
+    }
     for (label, mut font, mut transform, mut visibility) in &mut labels {
-        *visibility = if readable {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
+        *visibility = shown;
         if !readable {
             continue;
         }
@@ -621,6 +623,26 @@ fn input_offset(card: &NodeCard, index: usize) -> Vec2 {
     )
 }
 
+fn labels_readable(scale: f32) -> bool {
+    1.0 / scale >= CHIP_ZOOM
+}
+
+fn flag_offset() -> Vec2 {
+    Vec2::new((CARD.x - TITLE_BAR) * 0.5, (CARD.y - TITLE_BAR) * 0.5)
+}
+
+fn flag_area(card_centre: Vec2) -> Rect {
+    Rect::from_center_size(card_centre + flag_offset(), Vec2::splat(TITLE_BAR))
+}
+
+fn flag_press(document: &Document, node: NodeId) -> Option<crate::edit::Edit> {
+    let graph = open_graph(document)?;
+    (graph.output != Some(node)).then(|| crate::edit::Edit::SetOutput {
+        field: document.active().to_owned(),
+        node: Some(node.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use bevy::ecs::system::RunSystemOnce;
@@ -648,6 +670,87 @@ mod tests {
         world.insert_resource(Overview { showing: true });
         world.init_resource::<Messages<OpenField>>();
         world
+    }
+
+    // The flag is tested before the pins, so a flag covering a pin's press zone would
+    // take the press that should start a wire.
+    #[test]
+    fn the_flag_is_on_the_title_bar_and_clear_of_every_pin() {
+        let area = flag_area(Vec2::ZERO);
+        let bar = Rect::from_center_size(
+            Vec2::new(0.0, (CARD.y - TITLE_BAR) * 0.5),
+            Vec2::new(CARD.x, TITLE_BAR),
+        );
+        assert!(bar.contains(area.min) && bar.contains(area.max));
+        for inputs in 0..=4 {
+            let card = NodeCard {
+                node: node(0),
+                size: CARD,
+                inputs,
+            };
+            let pins = (0..inputs)
+                .map(|index| input_offset(&card, index))
+                .chain([output_offset(&card)]);
+            for pin in pins {
+                let reach = Rect::from_center_size(pin, Vec2::splat(PIN_RADIUS * 4.0));
+                assert!(
+                    area.intersect(reach).is_empty(),
+                    "the flag covers the pin at {pin}"
+                );
+            }
+        }
+    }
+
+    // Pressing the output's own flag changes nothing, and any other node's flag names
+    // that node.
+    #[test]
+    fn a_flag_press_names_its_node_unless_it_is_already_the_output() {
+        let mut world = open_field_world();
+        let mut document = world.remove_resource::<Document>().unwrap();
+        let output = open_graph(&document).unwrap().output.unwrap();
+        document
+            .apply(&crate::edit::Edit::AddNode {
+                field: "height".to_owned(),
+                op: NodeOp::Scale(2.0),
+                position: None,
+            })
+            .unwrap();
+        let added = open_graph(&document).unwrap().nodes.last().unwrap().id;
+        assert!(flag_press(&document, output).is_none());
+        assert!(matches!(
+            flag_press(&document, added),
+            Some(crate::edit::Edit::SetOutput { node: Some(named), .. }) if named == added.to_string()
+        ));
+    }
+
+    // A card rebuilt while zoomed out must not put its flag or labels back on screen
+    // until the next zoom.
+    #[test]
+    fn a_flag_and_a_label_spawned_below_the_chip_zoom_are_hidden() {
+        let mut world = World::new();
+        world.spawn((
+            CanvasCameraTag,
+            Projection::Orthographic(OrthographicProjection {
+                scale: 2.0 / CHIP_ZOOM,
+                ..OrthographicProjection::default_2d()
+            }),
+        ));
+        let system = world.register_system(scale_canvas_labels);
+        world.run_system(system).unwrap();
+
+        let flag = world.spawn((OutputFlag, Visibility::Inherited)).id();
+        let label = world
+            .spawn((
+                CanvasLabel(TITLE_SIZE),
+                TextFont::default(),
+                Transform::default(),
+                Visibility::Inherited,
+            ))
+            .id();
+        world.run_system(system).unwrap();
+
+        assert_eq!(world.get::<Visibility>(flag), Some(&Visibility::Hidden));
+        assert_eq!(world.get::<Visibility>(label), Some(&Visibility::Hidden));
     }
 
     // A solo is an inspection that ends with the selection that made it, so every path
