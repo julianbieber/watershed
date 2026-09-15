@@ -6,23 +6,17 @@
 //! shader reads exist only inside the bake, which is off the main thread. What is
 //! answered for here is everything a dispatch needs before it can run.
 
+mod dispatch;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
-use bevy::render::render_resource::{
-    BindGroupEntry, BindGroupLayoutEntry, BindingResource, BindingType, BufferBindingType,
-    BufferDescriptor, BufferInitDescriptor, BufferUsages, CommandEncoderDescriptor,
-    ComputePassDescriptor, Extent3d, MapMode, Origin3d, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, PollType, RawComputePipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureView, TextureViewDescriptor, TextureViewDimension,
-};
-use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::shader::Shader;
 use glam::UVec2;
 use watershed::raster::Raster;
 
@@ -30,6 +24,8 @@ use crate::document::{Document, EditorSystems, JobKind};
 use crate::preset::Preset;
 use crate::terrain::TerrainSpec;
 use crate::terrain::shader::{LayerRead, ParamsLayout, parse_layers, parse_params, parse_retired};
+
+use dispatch::{DispatchBridge, DispatchSender, LayerInput};
 
 const LAYER_LIB: &str = include_str!("../assets/shaders/layer_lib.wgsl");
 
@@ -110,34 +106,6 @@ fn library_lines() -> usize {
     LAYER_LIB.lines().count() + 1
 }
 
-fn validate(source: &str) -> Result<(), String> {
-    let assembled = assemble(source);
-    let module = match naga::front::wgsl::parse_str(&assembled) {
-        Ok(module) => module,
-        Err(error) => {
-            let line = error
-                .location(&assembled)
-                .map(|at| at.line_number as usize)
-                .unwrap_or(0);
-            return Err(fault_at(line, error.message()));
-        }
-    };
-    let mut validator = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    );
-    match validator.validate(&module) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let line = error
-                .location(&assembled)
-                .map(|at| at.line_number as usize)
-                .unwrap_or(0);
-            Err(fault_at(line, &error.to_string()))
-        }
-    }
-}
-
 struct Declared {
     layout: ParamsLayout,
     layers: Vec<LayerRead>,
@@ -147,7 +115,6 @@ fn declare(source: &str) -> Result<Declared, String> {
     let layout = parse_params(source).map_err(|error| error.to_string())?;
     let layers = parse_layers(source).map_err(|error| error.to_string())?;
     parse_retired(source).map_err(|error| error.to_string())?;
-    validate(source)?;
     Ok(Declared { layout, layers })
 }
 
@@ -156,6 +123,31 @@ fn fault_at(line: usize, message: &str) -> String {
         Some(own) if own > 0 => format!("line {own}: {message}"),
         _ => message.to_owned(),
     }
+}
+
+fn compile_fault(description: &str) -> String {
+    let lines = || {
+        description
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    let Some(message) = lines().find(|line| line.contains("error")).map(|line| {
+        let line = line.strip_prefix("Shader validation ").unwrap_or(line);
+        let line = line
+            .strip_prefix("Shader '")
+            .and_then(|rest| rest.split_once("' parsing "))
+            .map_or(line, |(_, after)| after);
+        line.strip_prefix("error: ").unwrap_or(line)
+    }) else {
+        return lines().next().unwrap_or(description).to_owned();
+    };
+    let line = lines()
+        .find_map(|line| line.strip_prefix("┌─ "))
+        .and_then(|at| at.rsplit(':').nth(1))
+        .and_then(|number| number.parse::<usize>().ok())
+        .unwrap_or(0);
+    fault_at(line, message)
 }
 
 /// One shader file as the editor last read it.
@@ -169,14 +161,23 @@ pub struct ShaderEntry {
     /// The layers the file reads by name, in declaration order. As with the layout,
     /// the last list that parsed.
     pub layers: Vec<LayerRead>,
-    /// Why the file did not parse or compile: `line N: message` against the file's own
-    /// lines, or the bare message when the fault is not on a line the file owns.
-    /// `None` when it is good.
+    /// Why the file does not run: its annotations did not parse, or its source did not
+    /// compile. `line N: message` against the file's own lines, or the bare message when
+    /// the fault is not on a line the file owns. `None` when it is good.
+    ///
+    /// A compile fault arrives a few frames after the file is read, and a fault from the
+    /// previous save stays until the new source has compiled or failed.
     ///
     /// The file name is not part of it — every reader already has the name and says it
     /// in its own words.
     pub error: Option<String>,
     modified: Option<SystemTime>,
+    read_at: Instant,
+    handle: Option<Handle<Shader>>,
+    key: u64,
+    declared: bool,
+    compile_fault: Option<u64>,
+    settled: bool,
 }
 
 /// What a shader is told about where it is being evaluated.
@@ -337,12 +338,19 @@ pub struct ShaderPlugin;
 
 impl Plugin for ShaderPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ShaderLibrary>().add_systems(
-            Update,
-            (follow_document, scan, attend_shaders)
-                .chain()
-                .before(EditorSystems::Document),
-        );
+        app.init_resource::<ShaderLibrary>()
+            .add_plugins(dispatch::DispatchPlugin)
+            .add_systems(
+                Update,
+                (
+                    follow_document,
+                    scan,
+                    dispatch::land_compile_states,
+                    attend_shaders,
+                )
+                    .chain()
+                    .before(EditorSystems::Document),
+            );
     }
 }
 
@@ -357,28 +365,46 @@ pub struct ShaderProgram {
     pub layout: ParamsLayout,
     /// The layers it reads by name, in declaration order.
     pub layers: Vec<LayerRead>,
+    /// The fingerprint of `source`: which compiled pipeline a dispatch of this program
+    /// runs on.
+    pub key: u64,
+    file: String,
+}
+
+fn program(
+    file: &str,
+    source: String,
+    layout: ParamsLayout,
+    layers: Vec<LayerRead>,
+) -> ShaderProgram {
+    ShaderProgram {
+        key: fingerprint(source.as_bytes()),
+        source,
+        layout,
+        layers,
+        file: file.to_owned(),
+    }
 }
 
 struct Runtime {
-    device: RenderDevice,
-    queue: RenderQueue,
+    sender: DispatchSender,
     programs: BTreeMap<String, ShaderProgram>,
     generation: u64,
     seed: u32,
 }
 
-/// What a bake needs to run a shader: the device, the queue, and every program the
-/// document's shader directory currently compiles to.
+/// What a bake needs to run a shader: the way to the render world, and every program the
+/// document's shader directory currently declares.
 ///
 /// Derived state a document carries so that a bake — which is off the main thread and
 /// holds the document — can dispatch without reaching back for a resource. Cloning is
 /// an `Arc` clone, so a history snapshot costs nothing; two runtimes always compare
-/// equal, because what a document *is* does not include the device it was last run
-/// against.
+/// equal, because what a document *is* does not include the render world it was last run
+/// in.
 ///
-/// A default one holds no device, and running anything through it is an error rather
-/// than a panic — which is what a headless test and a document baked before the first
-/// sweep both get.
+/// A default one holds no render world, and running anything through it is an error
+/// rather than a panic — which is what a headless test and a document baked before the
+/// first sweep both get.
 #[derive(Clone, Default)]
 pub struct ShaderRuntime(Option<Arc<Runtime>>);
 
@@ -403,32 +429,28 @@ impl PartialEq for ShaderRuntime {
 }
 
 impl ShaderRuntime {
-    /// The library's error-free entries as programs, held with the device that will
-    /// run them and the document seed they will be told about.
-    pub fn compile(
-        device: &RenderDevice,
-        queue: &RenderQueue,
-        library: &ShaderLibrary,
-        seed: u32,
-    ) -> Self {
+    /// The library's entries whose annotations parse as programs, held with the render
+    /// world that will run them and the document seed they will be told about. A file
+    /// that parses but does not compile is kept; its dispatch answers not compiled.
+    pub(crate) fn compile(sender: &DispatchSender, library: &ShaderLibrary, seed: u32) -> Self {
         let programs = library
             .entries
             .iter()
-            .filter(|(_, entry)| entry.error.is_none())
+            .filter(|(_, entry)| entry.declared)
             .map(|(name, entry)| {
                 (
                     name.clone(),
-                    ShaderProgram {
-                        source: entry.source.clone(),
-                        layout: entry.layout.clone(),
-                        layers: entry.layers.clone(),
-                    },
+                    program(
+                        name,
+                        entry.source.clone(),
+                        entry.layout.clone(),
+                        entry.layers.clone(),
+                    ),
                 )
             })
             .collect();
         Self(Some(Arc::new(Runtime {
-            device: device.clone(),
-            queue: queue.clone(),
+            sender: sender.clone(),
             programs,
             generation: library.generation,
             seed,
@@ -436,10 +458,10 @@ impl ShaderRuntime {
     }
 
     /// A runtime holding programs built from `sources`, as `(file name, source)`, on
-    /// this runtime's device and queue and at its library generation, telling a
-    /// dispatch `seed`. A source that does not parse or compile is left out.
+    /// this runtime's render world and at its library generation, telling a dispatch
+    /// `seed`. A source whose annotations do not parse is left out.
     ///
-    /// Answers a runtime holding no device when this one holds none.
+    /// Answers a runtime holding no render world when this one holds none.
     pub fn with_sources(
         &self,
         seed: u32,
@@ -449,8 +471,7 @@ impl ShaderRuntime {
             return Self::default();
         };
         Self(Some(Arc::new(Runtime {
-            device: runtime.device.clone(),
-            queue: runtime.queue.clone(),
+            sender: runtime.sender.clone(),
             programs: programs(sources),
             generation: runtime.generation,
             seed,
@@ -480,57 +501,55 @@ impl ShaderRuntime {
     }
 
     /// The library generation these programs were taken at, or `None` for a runtime
-    /// holding no device. What decides that the programs are stale.
+    /// holding no render world. What decides that the programs are stale.
     pub fn generation(&self) -> Option<u64> {
         self.0.as_ref().map(|runtime| runtime.generation)
     }
 
     /// The document seed a dispatch through this runtime tells the shader, or `None`
-    /// for a runtime holding no device. Part of the runtime because a bake has no
+    /// for a runtime holding no render world. Part of the runtime because a bake has no
     /// other way to reach the document's seed.
     pub fn seed(&self) -> Option<u32> {
         self.0.as_ref().map(|runtime| runtime.seed)
     }
 
     /// The program for that file, or `None` for a name this runtime does not carry —
-    /// a file that does not compile, or one added since the programs were taken.
+    /// a file whose annotations do not parse, or one added since the programs were taken.
     pub fn program(&self, file: &str) -> Option<&ShaderProgram> {
         self.0.as_ref()?.programs.get(file)
     }
 
     /// Runs one program over the whole of `globals.texels` and answers its values,
-    /// row-major.
+    /// row-major, or `None` when the program's source did not run: it failed to compile,
+    /// or its file was read again as another source before the dispatch started.
     ///
     /// `layers` is one entry per [`ShaderProgram::layers`], in order; `None` is a layer
     /// that has no raster to hand over and reads `0.0` everywhere. A shorter slice
     /// leaves the layers after it reading `0.0`.
     ///
-    /// Blocks until the GPU has finished and the result has been read back. Answers
-    /// an error rather than panicking when the runtime holds no device.
+    /// Blocks until the render world has dispatched and the result has been read back,
+    /// so it must not be called on the main thread. Answers an error rather than
+    /// panicking when the runtime holds no render world, and when the dispatch does not
+    /// answer within a minute.
     pub fn run(
         &self,
         program: &ShaderProgram,
         params: &[u8],
         globals: DispatchGlobals,
         layers: &[Option<&Raster<f32>>],
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Option<Vec<f32>>, String> {
         let Some(runtime) = &self.0 else {
-            return Err("there is no render device to dispatch a shader on".to_owned());
+            return Err("there is no render world to dispatch a shader in".to_owned());
         };
-        let bound: Vec<(u32, Option<&Raster<f32>>)> = program
+        let inputs = program
             .layers
             .iter()
             .enumerate()
-            .map(|(at, read)| (read.binding, layers.get(at).copied().flatten()))
+            .map(|(at, read)| LayerInput::new(read.binding, layers.get(at).copied().flatten()))
             .collect();
-        dispatch(
-            &runtime.device,
-            &runtime.queue,
-            &program.source,
-            params,
-            globals,
-            &bound,
-        )
+        runtime
+            .sender
+            .run(&program.file, program.key, params, globals, inputs)
     }
 }
 
@@ -541,14 +560,8 @@ fn programs(
         .into_iter()
         .filter_map(|(name, source)| {
             let declared = declare(&source).ok()?;
-            Some((
-                name,
-                ShaderProgram {
-                    source,
-                    layout: declared.layout,
-                    layers: declared.layers,
-                },
-            ))
+            let program = program(&name, source, declared.layout, declared.layers);
+            Some((name, program))
         })
         .collect()
 }
@@ -586,7 +599,12 @@ fn carry_shaders(from: &Path, to: &Path, moving: bool) {
     }
 }
 
-fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
+fn scan(
+    mut library: ResMut<ShaderLibrary>,
+    mut document: ResMut<Document>,
+    mut shaders: ResMut<Assets<Shader>>,
+    bridge: Option<Res<DispatchBridge>>,
+) {
     let root = library.root.clone();
     let Ok(dir) = std::fs::read_dir(&root) else {
         library.present = false;
@@ -617,30 +635,16 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
             continue;
         };
         library.generation += 1;
-        let previous = library
-            .entries
-            .get(&name)
-            .map(|held| (held.layout.clone(), held.layers.clone()));
-        let entry = match declare(&source) {
-            Ok(declared) => ShaderEntry {
-                source,
-                layout: declared.layout,
-                layers: declared.layers,
-                error: None,
-                modified,
-            },
-            Err(reason) => {
-                let (layout, layers) = previous.unwrap_or_default();
-                ShaderEntry {
-                    source,
-                    layout,
-                    layers,
-                    error: Some(reason),
-                    modified,
-                }
-            }
-        };
-        if let Some(reason) = &entry.error {
+        let previous = library.entries.remove(&name);
+        let entry = read_entry(
+            &name,
+            source,
+            modified,
+            previous,
+            &mut shaders,
+            bridge.is_none(),
+        );
+        if let Some(reason) = entry.error.as_ref().filter(|_| !entry.declared) {
             warn!("{name}: {reason}");
             document.refuse(format!("{name}: {reason}"));
         }
@@ -659,6 +663,83 @@ fn scan(mut library: ResMut<ShaderLibrary>, mut document: ResMut<Document>) {
     }
 }
 
+fn read_entry(
+    name: &str,
+    source: String,
+    modified: Option<SystemTime>,
+    previous: Option<ShaderEntry>,
+    shaders: &mut Assets<Shader>,
+    confirmed: bool,
+) -> ShaderEntry {
+    let read_at = Instant::now();
+    match declare(&source) {
+        Ok(declared) => {
+            let key = fingerprint(source.as_bytes());
+            let settled = confirmed
+                || previous
+                    .as_ref()
+                    .is_some_and(|held| held.declared && held.settled && held.key == key);
+            let shader = Shader::from_wgsl(assemble(&source), format!("watershed/layers/{name}"));
+            let bindings = |layers: &[LayerRead]| -> Vec<u32> {
+                layers.iter().map(|read| read.binding).collect()
+            };
+            let reusable = previous
+                .as_ref()
+                .filter(|held| bindings(&held.layers) == bindings(&declared.layers))
+                .and_then(|held| held.handle.clone());
+            let handle = match reusable {
+                Some(handle) => {
+                    if let Err(error) = shaders.insert(&handle, shader) {
+                        warn!("{name}: {error}");
+                    }
+                    handle
+                }
+                None => shaders.add(shader),
+            };
+            let (error, compile_fault) = match previous {
+                Some(ShaderEntry {
+                    error: Some(error),
+                    compile_fault: Some(at),
+                    ..
+                }) => (Some(error), Some(at)),
+                _ => (None, None),
+            };
+            ShaderEntry {
+                source,
+                layout: declared.layout,
+                layers: declared.layers,
+                error,
+                modified,
+                read_at,
+                handle: Some(handle),
+                key,
+                declared: true,
+                compile_fault,
+                settled,
+            }
+        }
+        Err(reason) => {
+            let settled = previous.as_ref().is_some_and(|held| held.settled);
+            let (layout, layers, handle, key) = previous
+                .map(|held| (held.layout, held.layers, held.handle, held.key))
+                .unwrap_or_default();
+            ShaderEntry {
+                source,
+                layout,
+                layers,
+                error: Some(reason),
+                modified,
+                read_at,
+                handle,
+                key,
+                declared: false,
+                compile_fault: None,
+                settled,
+            }
+        }
+    }
+}
+
 fn shaders_moved(terrain: &TerrainSpec, current: &ShaderRuntime, next: &ShaderRuntime) -> bool {
     let reseeded = current.seed() != next.seed();
     terrain.layers.iter().any(|layer| {
@@ -670,8 +751,7 @@ fn shaders_moved(terrain: &TerrainSpec, current: &ShaderRuntime, next: &ShaderRu
 }
 
 fn attend_shaders(
-    device: Option<Res<RenderDevice>>,
-    queue: Option<Res<RenderQueue>>,
+    bridge: Option<Res<DispatchBridge>>,
     library: Res<ShaderLibrary>,
     mut document: ResMut<Document>,
 ) {
@@ -683,8 +763,8 @@ fn attend_shaders(
         current.generation() != Some(library.generation) || current.seed() != Some(document.seed)
     };
     let mut touched = false;
-    if stale && let (Some(device), Some(queue)) = (device, queue) {
-        let next = ShaderRuntime::compile(&device, &queue, &library, document.seed);
+    if stale && let Some(bridge) = bridge {
+        let next = ShaderRuntime::compile(bridge.sender(), &library, document.seed);
         touched = document
             .terrain()
             .is_some_and(|terrain| shaders_moved(terrain, terrain.shader_runtime(), &next));
@@ -698,7 +778,7 @@ fn attend_shaders(
         return;
     };
     for layer in &mut terrain.layers {
-        let Some(entry) = library.entry(&layer.file()) else {
+        let Some(entry) = library.entry(&layer.file()).filter(|entry| entry.settled) else {
             continue;
         };
         touched |= layer.shader.reconcile(&entry.layout);
@@ -731,239 +811,6 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn upload_input(
-    device: &RenderDevice,
-    queue: &RenderQueue,
-    raster: Option<&Raster<f32>>,
-) -> TextureView {
-    let zero = [0.0f32];
-    let (size, data) = match raster.filter(|held| !held.is_empty()) {
-        Some(raster) => (raster.size(), raster.data()),
-        None => (UVec2::ONE, &zero[..]),
-    };
-    let extent = Extent3d {
-        width: size.x,
-        height: size.y,
-        depth_or_array_layers: 1,
-    };
-    let texture = device.create_texture(&TextureDescriptor {
-        label: Some("watershed shader layer"),
-        size: extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::R32Float,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
-    queue.write_texture(
-        TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        &bytes,
-        TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(size.x * 4),
-            rows_per_image: Some(size.y),
-        },
-        extent,
-    );
-    texture.create_view(&TextureViewDescriptor::default())
-}
-
-/// One shader run over one rectangle, read back as the values its layer holds.
-///
-/// `inputs` is `(binding, raster)` per declared layer. A `None` raster is bound as a
-/// single texel of `0.0`, which is what makes a layer with no raster read `0.0`
-/// without a branch in the shader or a hole in the bind group.
-///
-/// Blocks until the GPU has finished and the result has been mapped: the bake samples
-/// the result as soon as this returns, and the bake is synchronous.
-///
-/// The shader is compiled from the library, the file's own source and the entry
-/// point, in that order, because WGSL has no forward declaration.
-pub fn dispatch(
-    device: &RenderDevice,
-    queue: &RenderQueue,
-    source: &str,
-    params: &[u8],
-    globals: DispatchGlobals,
-    inputs: &[(u32, Option<&Raster<f32>>)],
-) -> Result<Vec<f32>, String> {
-    let texels = (globals.texels.x as u64) * (globals.texels.y as u64);
-    if texels == 0 {
-        return Ok(Vec::new());
-    }
-    let bytes = texels * 4;
-    let assembled = format!("{LAYER_LIB}\n{source}\n{ENTRY_POINT}");
-
-    let module = device.create_and_validate_shader_module(ShaderModuleDescriptor {
-        label: Some("watershed layer shader"),
-        source: ShaderSource::Wgsl(assembled.into()),
-    });
-
-    let uniform = |binding: u32| BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: BindingType::Buffer {
-            ty: BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let mut layout_entries = vec![
-        uniform(0),
-        BindGroupLayoutEntry {
-            binding: 1,
-            visibility: ShaderStages::COMPUTE,
-            ty: BindingType::Buffer {
-                ty: BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        },
-        uniform(2),
-    ];
-    for (binding, _) in inputs {
-        layout_entries.push(BindGroupLayoutEntry {
-            binding: *binding,
-            visibility: ShaderStages::COMPUTE,
-            ty: BindingType::Texture {
-                sample_type: TextureSampleType::Float { filterable: false },
-                view_dimension: TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        });
-    }
-    let layout = device.create_bind_group_layout(Some("watershed layer shader"), &layout_entries);
-
-    let views: Vec<(u32, TextureView)> = inputs
-        .iter()
-        .map(|(binding, raster)| (*binding, upload_input(device, queue, *raster)))
-        .collect();
-
-    let globals_buffer = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("watershed shader globals"),
-        contents: &globals.bytes(),
-        usage: BufferUsages::UNIFORM,
-    });
-    let params_bytes = if params.is_empty() {
-        &[0u8; 16][..]
-    } else {
-        params
-    };
-    let params_buffer = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("watershed shader params"),
-        contents: params_bytes,
-        usage: BufferUsages::UNIFORM,
-    });
-    let output = device.create_buffer(&BufferDescriptor {
-        label: Some("watershed shader output"),
-        size: bytes,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let staging = device.create_buffer(&BufferDescriptor {
-        label: Some("watershed shader readback"),
-        size: bytes,
-        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut group_entries = vec![
-        BindGroupEntry {
-            binding: 0,
-            resource: globals_buffer.as_entire_binding(),
-        },
-        BindGroupEntry {
-            binding: 1,
-            resource: output.as_entire_binding(),
-        },
-        BindGroupEntry {
-            binding: 2,
-            resource: params_buffer.as_entire_binding(),
-        },
-    ];
-    for (binding, view) in &views {
-        group_entries.push(BindGroupEntry {
-            binding: *binding,
-            resource: BindingResource::TextureView(view),
-        });
-    }
-    let bind_group =
-        device.create_bind_group(Some("watershed layer shader"), &layout, &group_entries);
-
-    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("watershed layer shader"),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 0,
-    });
-    let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
-        label: Some("watershed layer shader"),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some("generate"),
-        compilation_options: PipelineCompilationOptions {
-            constants: &[],
-            zero_initialize_workgroup_memory: false,
-        },
-        cache: None,
-    });
-
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("watershed layer shader"),
-    });
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("watershed layer shader"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(
-            globals.texels.x.div_ceil(8),
-            globals.texels.y.div_ceil(8),
-            1,
-        );
-    }
-    encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
-    queue.submit([encoder.finish()]);
-
-    let slice = staging.slice(..);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    device.map_buffer(&slice, MapMode::Read, move |result| {
-        let _ = sender.send(result.is_ok());
-    });
-    device
-        .poll(PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .map_err(|error| format!("the shader dispatch did not finish: {error}"))?;
-    match receiver.recv() {
-        Ok(true) => {}
-        _ => return Err("the shader output could not be read back".to_owned()),
-    }
-
-    let view = slice
-        .get_mapped_range()
-        .map_err(|error| format!("the shader output could not be mapped: {error}"))?;
-    let values: Vec<f32> = view
-        .chunks_exact(4)
-        .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-        .collect();
-    drop(view);
-    staging.unmap();
-    Ok(values)
-}
-
 #[cfg(test)]
 impl ShaderLibrary {
     /// A library holding `file` as a shader that failed with `fault`, for tests that
@@ -978,6 +825,12 @@ impl ShaderLibrary {
                 layers: Vec::new(),
                 error: Some(fault.to_owned()),
                 modified: None,
+                read_at: Instant::now(),
+                handle: None,
+                key: 0,
+                declared: true,
+                compile_fault: Some(0),
+                settled: true,
             },
         );
         library.generation = 1;
@@ -987,7 +840,36 @@ impl ShaderLibrary {
 
 #[cfg(test)]
 mod tests {
+    use wgpu::naga;
+
     use super::*;
+
+    fn described(report: String) -> String {
+        format!("Validation Error\n\nCaused by:\n  In Device::create_shader_module\n    {report}\n")
+    }
+
+    fn compiles(source: &str) -> Result<(), String> {
+        let assembled = assemble(source);
+        let reported = |inner| naga::error::ShaderError {
+            source: assembled.clone(),
+            label: None,
+            inner: Box::new(inner),
+        };
+        let module = naga::front::wgsl::parse_str(&assembled)
+            .map_err(|error| compile_fault(&described(reported(error).to_string())))?;
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.validate(&module).map(|_| ()).map_err(|error| {
+            let report = naga::error::ShaderError {
+                source: assembled.clone(),
+                label: None,
+                inner: Box::new(error),
+            };
+            compile_fault(&described(report.to_string()))
+        })
+    }
 
     // The stock shaders are what a preset's layers are copied from, so one that does
     // not parse would hand the user a broken layer on the first `new`.
@@ -1017,7 +899,7 @@ mod tests {
     #[test]
     fn every_stock_shader_compiles_against_the_library_and_the_entry_point() {
         for (name, source) in STOCK {
-            if let Err(error) = validate(source) {
+            if let Err(error) = compiles(source) {
                 panic!("{name} does not compile: {error}");
             }
         }
@@ -1078,7 +960,7 @@ mod tests {
     fn the_headers_worked_example_compiles_and_its_examples_declare_nothing() {
         let source =
             "fn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(uv(p) * 4.0, 4u, 0.5, 2.0);\n}\n";
-        if let Err(error) = validate(source) {
+        if let Err(error) = compiles(source) {
             panic!("the header's worked example does not compile: {error}");
         }
         assert!(parse_layers(TEMPLATE_SOURCE).unwrap().is_empty());
@@ -1095,7 +977,7 @@ mod tests {
     fn a_shader_reading_a_layer_through_the_helper_compiles() {
         let source = "@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) + f32(layer_shift(base));\n}\n";
         assert_eq!(parse_layers(source).unwrap().len(), 1);
-        if let Err(error) = validate(source) {
+        if let Err(error) = compiles(source) {
             panic!("a read of a named layer does not compile: {error}");
         }
     }
@@ -1113,29 +995,27 @@ mod tests {
         assert!(error.contains("@in"), "{error}");
     }
 
-    // The reason a shader is validated before the device sees it: wgpu reports a
-    // compile fault through a handler that panics, so a typo has to be caught here.
+    // The card shows a parse fault from the pipeline against the file the author is looking at, not the assembled source.
     #[test]
-    fn a_shader_that_does_not_compile_is_reported_rather_than_handed_over() {
-        let error = validate("fn value(p: vec2<f32>) -> f32 { return nonesuch(p); }\n")
-            .expect_err("a call to nothing compiled");
-        assert!(error.contains("nonesuch"), "{error}");
-    }
-
-    // The fault is shown against the file the author is looking at, so the library's
-    // own length has to be taken back off the line the compiler reported.
-    #[test]
-    fn a_compile_fault_is_reported_against_the_shaders_own_lines() {
-        let error = validate("fn value(p: vec2<f32>) -> f32 {\n    return oops;\n}\n")
+    fn a_parse_fault_is_reported_against_the_shaders_own_lines() {
+        let error = compiles("fn value(p: vec2<f32>) -> f32 {\n    return oops;\n}\n")
             .expect_err("a reference to nothing compiled");
         assert!(error.starts_with("line 2:"), "{error}");
+        assert!(error.contains("oops"), "{error}");
     }
 
-    // A preset's first bake compiles its programs from sources rather than from a
-    // scanned directory, and a source the GPU would refuse has to be left out there
-    // too, since handing one over panics.
+    // A fault only the validator finds arrives under a different heading, and must still land on the file's line.
     #[test]
-    fn programs_keep_a_source_that_compiles_and_leave_out_one_that_does_not() {
+    fn a_validation_fault_is_reported_against_the_shaders_own_lines() {
+        let error = compiles("fn value(p: vec2<f32>) -> f32 {\n    return p;\n}\n")
+            .expect_err("returning a vector from a scalar function compiled");
+        assert!(error.starts_with("line "), "{error}");
+        assert!(!error.contains("Shader"), "{error}");
+    }
+
+    // Programs are built before the GPU has compiled anything, so only a declaration can keep a file out; a compile fault is the dispatch's to answer.
+    #[test]
+    fn programs_leave_out_a_retired_annotation_and_keep_a_source_that_only_fails_to_compile() {
         let built = programs([
             (
                 "fbm.wgsl".to_owned(),
@@ -1145,16 +1025,102 @@ mod tests {
                 "bad.wgsl".to_owned(),
                 "fn value(p: vec2<f32>) -> f32 { return nonesuch(p); }\n".to_owned(),
             ),
+            (
+                "retired.wgsl".to_owned(),
+                "// @reach 2\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n".to_owned(),
+            ),
         ]);
         assert!(built.contains_key("fbm.wgsl"));
-        assert!(!built.contains_key("bad.wgsl"));
+        assert!(built.contains_key("bad.wgsl"));
+        assert!(!built.contains_key("retired.wgsl"));
+        assert_eq!(
+            built["bad.wgsl"].key,
+            fingerprint(built["bad.wgsl"].source.as_bytes())
+        );
     }
 
-    // Headless tests and a document built before the editor has seen a device both
+    // Every pipeline built from a shader asset is recompiled when it changes, so a file whose `@layer`s changed must not keep the asset an older layout was built from — that recompile is refused and quits the editor.
+    #[test]
+    fn a_file_keeps_its_shader_asset_only_while_its_layer_bindings_stay_the_same() {
+        let mut shaders = Assets::<Shader>::default();
+        let reads = "@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p);\n}\n";
+        let tuned = "@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) * 0.5;\n}\n";
+        let first = read_entry(
+            "height.wgsl",
+            reads.to_owned(),
+            None,
+            None,
+            &mut shaders,
+            false,
+        );
+        let same = read_entry(
+            "height.wgsl",
+            tuned.to_owned(),
+            None,
+            Some(first.clone()),
+            &mut shaders,
+            false,
+        );
+        assert_eq!(same.handle, first.handle);
+        let emptied = read_entry(
+            "height.wgsl",
+            String::new(),
+            None,
+            Some(same.clone()),
+            &mut shaders,
+            false,
+        );
+        assert!(emptied.declared);
+        assert_ne!(emptied.handle, same.handle);
+        let restored = read_entry(
+            "height.wgsl",
+            reads.to_owned(),
+            None,
+            Some(emptied.clone()),
+            &mut shaders,
+            false,
+        );
+        assert_ne!(restored.handle, emptied.handle);
+    }
+
+    // A save that has not compiled yet — a half-written file, say — must not reconcile its layer's parameter values away against what that source declares.
+    #[test]
+    fn a_read_source_is_settled_only_once_it_has_compiled_unless_nothing_will_compile_it() {
+        let mut shaders = Assets::<Shader>::default();
+        let fbm = stock_source("fbm.wgsl").unwrap();
+        let first = read_entry("fbm.wgsl", fbm.to_owned(), None, None, &mut shaders, false);
+        assert!(!first.settled);
+        let compiled = ShaderEntry {
+            settled: true,
+            ..first
+        };
+        let touched = read_entry(
+            "fbm.wgsl",
+            fbm.to_owned(),
+            None,
+            Some(compiled.clone()),
+            &mut shaders,
+            false,
+        );
+        assert!(touched.settled);
+        let emptied = read_entry(
+            "fbm.wgsl",
+            String::new(),
+            None,
+            Some(compiled),
+            &mut shaders,
+            false,
+        );
+        assert!(emptied.declared && !emptied.settled);
+        let headless = read_entry("fbm.wgsl", String::new(), None, None, &mut shaders, true);
+        assert!(headless.settled);
+    }
+
+    // Headless tests and a document built before the editor has a render world both
     // start from a runtime holding none, and building from sources must not pretend
     // to have one.
     #[test]
-    fn a_runtime_built_from_sources_on_one_holding_no_device_holds_none() {
+    fn a_runtime_built_from_sources_on_one_holding_no_bridge_holds_none() {
         let built = ShaderRuntime::default().with_sources(
             7,
             [(
