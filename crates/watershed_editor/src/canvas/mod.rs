@@ -1,4 +1,4 @@
-//! The document's fields as a thing on screen: one card per field with ribbons for what
+//! The document's layers as a thing on screen: one card per layer with ribbons for what
 //! each reads, and how that canvas is panned, zoomed and framed.
 
 mod edges;
@@ -32,7 +32,7 @@ const CANVAS_LAYER: usize = 1;
 
 const CANVAS_GROUND: Color = Color::srgb(0.115, 0.125, 0.165);
 
-/// Draws the document's fields, and keeps the drawing in step with the document.
+/// Draws the document's layers, and keeps the drawing in step with the document.
 pub struct CanvasPlugin;
 
 impl Plugin for CanvasPlugin {
@@ -40,12 +40,12 @@ impl Plugin for CanvasPlugin {
         app.init_resource::<Grab>()
             .init_resource::<CanvasFrame>()
             .init_resource::<CanvasShape>()
-            .add_message::<OpenField>()
+            .add_message::<OpenLayer>()
             .add_systems(Startup, spawn_canvas_camera)
             .add_systems(
                 Update,
                 (
-                    apply_open_field,
+                    apply_open_layer,
                     input::undo_keys,
                     overview::rebuild_overview,
                     frame_overview,
@@ -53,7 +53,7 @@ impl Plugin for CanvasPlugin {
                     input::canvas_camera,
                     input::fit_key,
                     overview::overview_drag,
-                    overview::route_field_ribbons,
+                    overview::route_layer_ribbons,
                     scale_canvas_labels,
                 )
                     .chain()
@@ -76,25 +76,25 @@ pub struct CanvasCameraTag;
 #[derive(Component)]
 pub struct CanvasLabel(pub f32);
 
-/// Asks for another field of the open document to be the active one.
+/// Asks for another layer of the open document to be the active one.
 ///
-/// The one way anything asks for a field change: the canvas's double-click, the
+/// The one way anything asks for a layer change: the canvas's double-click, the
 /// panel's `reads` and `read by` buttons, and whatever else comes to want it all write
 /// this rather than reaching for the document themselves. It is a view change and not
 /// an edit — nothing is written to the terrain, no history entry is made, and no bake
-/// is started — so a field opened this way can be shut again by opening the first one.
+/// is started — so a layer opened this way can be shut again by opening the first one.
 ///
-/// A name no field of the document carries is refused the way any other bad reference
-/// is: the refusal is reported and the active field stays where it was.
+/// A name no layer of the document carries is refused the way any other bad reference
+/// is: the refusal is reported and the active layer stays where it was.
 #[derive(Message)]
-pub struct OpenField {
-    /// The field to open. Must be one the document carries.
-    pub field: String,
+pub struct OpenLayer {
+    /// The layer to open. Must be one the document carries.
+    pub layer: String,
 }
 
-fn apply_open_field(mut open: MessageReader<OpenField>, mut document: ResMut<Document>) {
+fn apply_open_layer(mut open: MessageReader<OpenLayer>, mut document: ResMut<Document>) {
     for message in open.read() {
-        let opened = document.set_active(&message.field);
+        let opened = document.set_active(&message.layer);
         crate::ui::report(&mut document, opened);
     }
 }
@@ -148,13 +148,13 @@ impl Default for CanvasFrame {
     }
 }
 
-/// What the canvas was last built from, and whether it has been framed since fields
+/// What the canvas was last built from, and whether it has been framed since layers
 /// appeared.
 #[derive(Resource, Default)]
 pub struct CanvasShape {
     /// The fingerprint the cards on screen were built from.
     pub key: String,
-    /// Whether the camera has framed the cards since the document last had fields, so
+    /// Whether the camera has framed the cards since the document last had layers, so
     /// it frames them once rather than fighting a pan the person made afterwards.
     pub framed: bool,
 }
@@ -221,10 +221,10 @@ fn frame_overview(
     mut shape: ResMut<CanvasShape>,
     camera: Option<Single<(&mut Transform, &mut Projection), With<CanvasCameraTag>>>,
 ) {
-    let has_fields = document
+    let has_layers = document
         .terrain()
-        .is_some_and(|terrain| !terrain.fields.is_empty());
-    if !has_fields {
+        .is_some_and(|terrain| !terrain.layers.is_empty());
+    if !has_layers {
         if shape.framed {
             shape.framed = false;
         }
@@ -248,10 +248,10 @@ fn frame_overview(
     }
 }
 
-/// Puts every field card in view on the canvas camera.
+/// Puts every layer card in view on the canvas camera.
 ///
 /// What the canvas's Fit button and the key F both do. Answers whether the camera was
-/// moved: `false` when there is no document, when the document has no fields, and when
+/// moved: `false` when there is no document, when the document has no layers, and when
 /// the canvas has not been measured yet.
 pub fn frame_canvas(
     document: &Document,
@@ -340,20 +340,20 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
 
     use super::*;
-    use crate::terrain::{Field, TerrainSpec};
+    use crate::terrain::{Layer, TerrainSpec};
 
-    fn open_field_world() -> World {
+    fn open_layer_world() -> World {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("base").held(0.25))
-                .with_field(Field::new("height").held(0.5)),
+                .with_layer(Layer::new("base").held(0.25))
+                .with_layer(Layer::new("height").held(0.5)),
         );
         document.set_active("height").unwrap();
 
         let mut world = World::new();
         world.insert_resource(document);
-        world.init_resource::<Messages<OpenField>>();
+        world.init_resource::<Messages<OpenLayer>>();
         world
     }
 
@@ -385,17 +385,17 @@ mod tests {
         assert_eq!(world.get::<Visibility>(label), Some(&Visibility::Hidden));
     }
 
-    // Opening a field is a view change, so the active field moves while the history and
+    // Opening a layer is a view change, so the active layer moves while the history and
     // the dirty flag stand still — otherwise following a `reads` link would make a
     // document that has to be saved.
     #[test]
-    fn opening_a_field_moves_the_view_without_making_an_edit() {
-        let mut world = open_field_world();
+    fn opening_a_layer_moves_the_view_without_making_an_edit() {
+        let mut world = open_layer_world();
         let before = world.resource::<Document>().history();
-        world.write_message(OpenField {
-            field: "base".to_owned(),
+        world.write_message(OpenLayer {
+            layer: "base".to_owned(),
         });
-        world.run_system_once(apply_open_field).unwrap();
+        world.run_system_once(apply_open_layer).unwrap();
 
         let document = world.resource::<Document>();
         assert_eq!(document.active(), "base");
@@ -404,16 +404,16 @@ mod tests {
         assert!(!document.is_dirty());
     }
 
-    // A name no field carries has to leave the active field where it was and say so,
+    // A name no layer carries has to leave the active layer where it was and say so,
     // because the panel and the canvas both write this message from names they read off
     // a document that may have moved under them.
     #[test]
-    fn opening_a_field_that_is_not_there_leaves_the_view_alone() {
-        let mut world = open_field_world();
-        world.write_message(OpenField {
-            field: "nowhere".to_owned(),
+    fn opening_a_layer_that_is_not_there_leaves_the_view_alone() {
+        let mut world = open_layer_world();
+        world.write_message(OpenLayer {
+            layer: "nowhere".to_owned(),
         });
-        world.run_system_once(apply_open_field).unwrap();
+        world.run_system_once(apply_open_layer).unwrap();
 
         let document = world.resource::<Document>();
         assert_eq!(document.active(), "height");

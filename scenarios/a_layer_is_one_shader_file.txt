@@ -1,12 +1,12 @@
-# A field is one shader file, from outside the process: `ridges` writes one file per
-# field into the scratch shader directory, a field added from the socket arrives as a
+# A layer is one shader file, from outside the process: `ridges` writes one file per
+# layer into the scratch shader directory, a layer added from the socket arrives as a
 # copy of the template, a parameter set on it is one undo step, removing it takes the
 # file with it, and every edit re-bakes the whole document — `observe document` reports
 # `baked` as `whole` after each one and never a rectangle.
 #
-# Run with:  just drive run scenarios/a_field_is_one_shader_file.txt
+# Run with:  just drive run scenarios/a_layer_is_one_shader_file.txt
 #
-# The refusals that go with this — removing a field another file reads, a name that
+# The refusals that go with this — removing a layer another file reads, a name that
 # cannot be a file stem — are not in this file: replay stops at the first failure, so
 # they are pinned by the unit tests in `edit.rs` and `document.rs` instead. Copying a
 # file into `shaders/` by hand is not something replay can do either.
@@ -21,45 +21,45 @@ new 256 256 7 ridges
 wait bake
 zoom fit
 
-# Three fields, `height` on screen, the bake whole.
+# Three layers, `height` on screen, the bake whole.
 observe document
 
-# One entry per field with no fault, and one file per field in the shader directory.
-observe fields
+# One entry per layer with no fault, and one file per layer in the shader directory.
+observe layers
 observe shaders
 
-# The add writes `temperature.wgsl` from the template and puts the field on screen. It
+# The add writes `temperature.wgsl` from the template and puts the layer on screen. It
 # is a file operation, so the history does not grow; the document re-bakes whole.
-field add temperature
+layer add temperature
 observe document
 observe shaders
 
 # A parameter the template declares, set from the socket: one undo step, and a whole
 # re-bake.
 set temperature.scale 0.05
-observe field
+observe layer
 observe document
 
 # Undo puts the value back and re-bakes whole again.
 undo
-observe field
+observe layer
 observe document
 
-# Removing the field nothing reads deletes its file and its card.
-field rm temperature
+# Removing the layer nothing reads deletes its file and its card.
+layer rm temperature
 observe document
 
-# A parameter of a stock file, on the field that reads another.
-field height
+# A parameter of a stock file, on the layer that reads another.
+layer height
 set height.ridge 1.2
 observe document
 
-# A round trip through a terrain directory: the fields, their parameter values and the
+# A round trip through a terrain directory: the layers, their parameter values and the
 # seed come back, and the loaded document bakes whole.
 save /tmp/watershed-scenario/one-file
 load /tmp/watershed-scenario/one-file
 wait bake
 observe document
-observe field
+observe layer
 
 observe log

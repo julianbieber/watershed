@@ -1,15 +1,15 @@
-//! Documents to start from: a small fixed set of worked examples, each field of them
+//! Documents to start from: a small fixed set of worked examples, each layer of them
 //! one stock shader file.
 //!
 //! A preset is a starting point for editing and a fixture for testing, not a terrain
 //! anyone is meant to ship. The set stays small for that reason — it is chosen to
-//! cover the ways fields can read each other, not to be a library of landscapes.
+//! cover the ways layers can read each other, not to be a library of landscapes.
 
 use crate::gpu;
+use crate::terrain::LayerRole;
 use crate::terrain::shader::{ShaderLayer, parse_layers, parse_params};
-use crate::terrain::{Field, TerrainSpec, WaterSpec};
+use crate::terrain::{Layer, TerrainSpec, WaterSpec};
 use bevy::prelude::*;
-use watershed::FieldRole;
 
 /// Which starting document to build.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub enum Preset {
     /// document, and the default.
     #[default]
     Continents,
-    /// Ridged relief laid over a continent, which needs the continent to be a field of
+    /// Ridged relief laid over a continent, which needs the continent to be a layer of
     /// its own that the shader lifting it reads by name.
     Ridges,
 }
@@ -41,8 +41,8 @@ impl Preset {
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|preset| preset.name() == word)
     }
-    /// Each field of this preset as `(field, stock file)`: the field's shader file is
-    /// `<field>.wgsl`, a copy of that stock file, which is always in [`gpu::STOCK`].
+    /// Each layer of this preset as `(layer, stock file)`: the layer's shader file is
+    /// `<layer>.wgsl`, a copy of that stock file, which is always in [`gpu::STOCK`].
     pub fn files(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Continents => &[("moisture", "fbm.wgsl"), ("height", "continents.wgsl")],
@@ -56,12 +56,12 @@ impl Preset {
 
     /// The document, unbaked and unsolved.
     ///
-    /// Whatever the preset, the result has a field named `height` holding
-    /// [`FieldRole::Height`], one named `moisture` holding [`FieldRole::Moisture`],
+    /// Whatever the preset, the result has a layer named `height` holding
+    /// [`LayerRole::Height`], one named `moisture` holding [`LayerRole::Moisture`],
     /// and a water spec over the two — so every preset exercises the water overlay
     /// and the role lookups, and none of them opens on an editor with half its
     /// display inert.
-    ///    /// Every field carries a value for every parameter its file declares, its hidden
+    ///    /// Every layer carries a value for every parameter its file declares, its hidden
     /// `seed` drawn from `seed`, and the document's seed is `seed`. Two calls with the
     /// same arguments give equal documents.
     pub fn build(self, size: UVec2, seed: u32) -> TerrainSpec {
@@ -69,11 +69,11 @@ impl Preset {
             Self::Continents => continents(size, seed),
             Self::Ridges => ridges(size, seed),
         };
-        for field in &mut terrain.fields {
-            field.role = match field.id.as_str() {
-                "height" => FieldRole::Height,
-                "moisture" => FieldRole::Moisture,
-                _ => FieldRole::Custom,
+        for layer in &mut terrain.layers {
+            layer.role = match layer.id.as_str() {
+                "height" => LayerRole::Height,
+                "moisture" => LayerRole::Moisture,
+                _ => LayerRole::Custom,
             };
         }
         terrain.water_spec = Some(WaterSpec::new("height").with_moisture("moisture"));
@@ -101,14 +101,14 @@ fn layer(file: &str, seed: u32, values: &[(&str, f32)]) -> ShaderLayer {
     layer
 }
 
-fn with_shader(mut field: Field, shader: ShaderLayer) -> Field {
-    field.shader = shader;
-    field
+fn with_shader(mut layer: Layer, shader: ShaderLayer) -> Layer {
+    layer.shader = shader;
+    layer
 }
 
-fn moisture(seed: u32) -> Field {
+fn moisture(seed: u32) -> Layer {
     with_shader(
-        Field::new("moisture").with_shift(4),
+        Layer::new("moisture").with_shift(4),
         layer(
             "fbm.wgsl",
             salted(seed, 11),
@@ -119,26 +119,26 @@ fn moisture(seed: u32) -> Field {
 
 fn continents(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
-        .with_field(moisture(seed))
-        .with_field(with_shader(
-            Field::new("height"),
+        .with_layer(moisture(seed))
+        .with_layer(with_shader(
+            Layer::new("height"),
             layer("continents.wgsl", salted(seed, 1), &[]),
         ))
 }
 
 fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
-        .with_field(moisture(seed))
-        .with_field(with_shader(
-            Field::new("base"),
+        .with_layer(moisture(seed))
+        .with_layer(with_shader(
+            Layer::new("base"),
             layer(
                 "continents.wgsl",
                 salted(seed, 1),
                 &[("land_scale", 0.0015), ("relief", 0.0)],
             ),
         ))
-        .with_field(with_shader(
-            Field::new("height"),
+        .with_layer(with_shader(
+            Layer::new("height"),
             layer("mountains_over_base.wgsl", salted(seed, 3), &[]),
         ))
 }
@@ -149,50 +149,50 @@ mod tests {
 
     const SIZE: UVec2 = UVec2::new(96, 96);
 
-    fn stock_of(preset: Preset, field: &str) -> &'static str {
+    fn stock_of(preset: Preset, layer: &str) -> &'static str {
         preset
             .files()
             .iter()
-            .find(|(name, _)| *name == field)
+            .find(|(name, _)| *name == layer)
             .map(|(_, stock)| *stock)
-            .unwrap_or_else(|| panic!("{} writes no file for {field}", preset.name()))
+            .unwrap_or_else(|| panic!("{} writes no file for {layer}", preset.name()))
     }
 
     // Every preset opens with the height and water displays live, and a water spec
-    // naming a field the document does not carry plans fine and fails at the water
+    // naming a layer the document does not carry plans fine and fails at the water
     // step, which is a long way from where the mistake is.
     #[test]
-    fn every_preset_names_a_height_field_and_a_water_spec_over_fields_it_has() {
+    fn every_preset_names_a_height_layer_and_a_water_spec_over_layers_it_has() {
         for preset in Preset::ALL {
             let terrain = preset.build(SIZE, 7);
             assert!(
-                terrain.field("height").is_some(),
-                "{} has no height field",
+                terrain.layer("height").is_some(),
+                "{} has no height layer",
                 preset.name()
             );
             let spec = terrain
                 .water_spec
                 .clone()
                 .unwrap_or_else(|| panic!("{} carries no water spec", preset.name()));
-            assert!(terrain.field(spec.height.as_str()).is_some());
+            assert!(terrain.layer(spec.height.as_str()).is_some());
             if let Some(moisture) = &spec.moisture {
-                assert!(terrain.field(moisture.as_str()).is_some());
+                assert!(terrain.layer(moisture.as_str()).is_some());
             }
         }
     }
-    // A `new` writes one file per entry of `files` before it bakes, so a field with no
+    // A `new` writes one file per entry of `files` before it bakes, so a layer with no
     // entry would read zero, and a stock file this build does not ship cannot be
     // written at all.
     #[test]
-    fn every_field_of_a_preset_has_a_shipped_file_and_every_file_a_field() {
+    fn every_layer_of_a_preset_has_a_shipped_file_and_every_file_a_layer() {
         for preset in Preset::ALL {
             let terrain = preset.build(SIZE, 7);
-            for (field, stock) in preset.files() {
+            for (layer, stock) in preset.files() {
                 assert!(gpu::stock_source(stock).is_some(), "{stock} is not shipped");
-                assert!(terrain.field(field).is_some(), "{field} is not built");
+                assert!(terrain.layer(layer).is_some(), "{layer} is not built");
             }
-            for field in &terrain.fields {
-                stock_of(preset, field.id.as_str());
+            for layer in &terrain.layers {
+                stock_of(preset, layer.id.as_str());
             }
         }
     }
@@ -202,8 +202,11 @@ mod tests {
     #[test]
     fn ridges_height_reads_base_by_name() {
         let ridges = Preset::Ridges.build(SIZE, 7);
-        let height = ridges.field("height").unwrap();
-        assert_eq!(height.shader.layers, vec![watershed::FieldId::from("base")]);
+        let height = ridges.layer("height").unwrap();
+        assert_eq!(
+            height.shader.layers,
+            vec![crate::terrain::LayerId::from("base")]
+        );
         assert_eq!(crate::edit::reads_of(height), ["base"]);
     }
 
@@ -219,16 +222,16 @@ mod tests {
     // A parameter left for the first sweep to fill would make that sweep reconcile it
     // and ask for a second bake of a document that has only just baked.
     #[test]
-    fn every_field_already_carries_every_parameter_its_file_declares() {
+    fn every_layer_already_carries_every_parameter_its_file_declares() {
         for preset in Preset::ALL {
-            for field in &preset.build(SIZE, 7).fields {
-                let source = gpu::stock_source(stock_of(preset, field.id.as_str())).unwrap();
-                let mut copy = field.shader.clone();
+            for layer in &preset.build(SIZE, 7).layers {
+                let source = gpu::stock_source(stock_of(preset, layer.id.as_str())).unwrap();
+                let mut copy = layer.shader.clone();
                 assert!(
                     !copy.reconcile(&parse_params(source).unwrap()),
                     "{} leaves {} to be reconciled",
                     preset.name(),
-                    field.id
+                    layer.id
                 );
             }
         }

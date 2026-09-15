@@ -16,38 +16,38 @@ reads was settled when the directory was written, so `Terrain::load_from_dir` is
 only way to obtain one. It needs no GPU and no thread pool, and builds for the web.
 
 `watershed_editor` is the author side, and it carries the whole model a document is
-made of: the fields and their shader files, the water solve, and the bake. A project
+made of: the layers and their shader files, the water solve, and the bake. A project
 that wants a terrain ships the directory the editor wrote; it does not build one at run
 time.
 
 ## The terrain model
 
-A terrain is an extent in cells and a set of named fields over it. A field is one WGSL
-file in the document's `shaders` directory, named after the field, and its values are
-what that shader produces, clamped to the field's declared range. A field reads another
-by naming it in its file with `@layer`, so baking is ordered: every field after the ones
+A terrain is an extent in cells and a set of named layers over it. A layer is one WGSL
+file in the document's `shaders` directory, named after the layer, and its values are
+what that shader produces, clamped to the layer's declared range. A layer reads another
+by naming it in its file with `@layer`, so baking is ordered: every layer after the ones
 it reads. Every edit re-bakes the whole document.
 
-A field is evaluated onto a raster of its own resolution, chosen as a *shift*: one
-texel per cell at 0, one per `2^shift` cells above that. A coarse field still answers
+A layer is evaluated onto a raster of its own resolution, chosen as a *shift*: one
+texel per cell at 0, one per `2^shift` cells above that. A coarse layer still answers
 at every cell of the document, interpolated between its texels.
 
 Two types carry all of this. `TerrainSpec` is the authored document: it holds each
-field's settings and parameter values, it is what an editor mutates, and it lives in the
+layer's settings and parameter values, it is what an editor mutates, and it lives in the
 editor. `Terrain` is what baking one produces, and it is what a consuming project holds.
 
 ## Shaders
 
-A field's values come from its WGSL compute shader. This is how a new way of making a
-field is added without touching Rust: write the file, and the editor reads what it
+A layer's values come from its WGSL compute shader. This is how a new way of making a
+layer is added without touching Rust: write the file, and the editor reads what it
 declares and draws the panel for it.
 
 The shaders live in the document's own `shaders` directory, so a terrain stays portable,
-and they are hot-reloaded — save a file and the document re-bakes. Adding a field copies
-the template into that directory as `<field>.wgsl`, where it is then yours to edit, and
+and they are hot-reloaded — save a file and the document re-bakes. Adding a layer copies
+the template into that directory as `<layer>.wgsl`, where it is then yours to edit, and
 removing one deletes its file. A file added to or deleted from the directory by hand
-adds or removes its field the same way; a file whose name begins with `_` is not a
-field. Neither is an undo step: undo covers parameter values, field settings and the
+adds or removes its layer the same way; a file whose name begins with `_` is not a
+layer. Neither is an undo step: undo covers parameter values, layer settings and the
 water spec.
 
 ```wgsl
@@ -68,17 +68,17 @@ fn value(p: vec2<f32>) -> f32 {
 `p` is a position in **document cells**, not a normalised coordinate, so a scale means
 the same thing at every shift. The entry point is appended by the editor; the bindings,
 the noise, `cell_position`, and `uv` and `document_extent` — the 0..1 coordinate across
-the document, and the cells it spans — come from `assets/shaders/field_lib.wgsl`.
+the document, and the cells it spans — come from `assets/shaders/layer_lib.wgsl`.
 
-A new field's file arrives with all of this in its own header: every library function,
+A new layer's file arrives with all of this in its own header: every library function,
 the bindings, the coordinate convention and the annotations below, so the file need
 not be left to write the first line. The same text is in the editor, under
-**Reference** on a field's panel.
+**Reference** on a layer's panel.
 
 ### `@ui` annotations
 
 One per field of the `Params` struct. A field without one is a parse error, reported in
-the status bar; the field keeps the values it had, because a shader is edited in place
+the status bar; the layer keeps the values it had, because a shader is edited in place
 and is expected to be broken for as long as it takes to type the next line.
 
 | Form | Field types | Widget |
@@ -97,7 +97,7 @@ default.
 
 ### `@layer`
 
-Another field of the document, read by naming it after a texture binding's `//`:
+Another layer of the document, read by naming it after a texture binding's `//`:
 
 ```wgsl
 @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
@@ -108,17 +108,17 @@ fn value(p: vec2<f32>) -> f32 {
 ```
 
 Bindings start at 3, since 0, 1 and 2 are the globals, the output and the parameters.
-The binding holds the named field's baked raster at that field's own shift, and
-`layer_value` reads it at a document position whatever the shift. The field named is
-baked first; a name that is no field, or files that read each other in a circle, leave
-the reading field unbaked with the reason on its card.
+The binding holds the named layer's baked raster at that layer's own shift, and
+`layer_value` reads it at a document position whatever the shift. The layer named is
+baked first; a name that is no layer, or files that read each other in a circle, leave
+the reading layer unbaked with the reason on its card.
 
 ## The water solve
 
-Water is a whole-grid answer over one field — the one holding the `Height` role, at
+Water is a whole-grid answer over one layer — the one holding the `Height` role, at
 shift 0. Depressions are flooded to their outlets, every cell is given a downhill
 neighbour on the filled surface, and the weight each cell contributes (`1.0`, or a
-moisture field's value) is accumulated downstream. What comes back is a depth, a flow
+moisture layer's value) is accumulated downstream. What comes back is a depth, a flow
 direction, an accumulation and a lake id per cell.
 
 It is all or nothing: water leaves the document only at its border, so a rectangle
@@ -133,15 +133,18 @@ A terrain is a directory.
 |---|---|---|
 | `terrain.ron` | the extent, the fields, the images, the water | both |
 | `layer_<n>.png` | the values, eight bits to a channel | both |
-| `recipe.ron` | the extent, the seed, the water spec, and per field its role, shift, range and parameter values | the editor |
-| `shaders/*.wgsl` | one file per field | the editor |
+| `recipe.ron` | the extent, the seed, the water spec, and per layer its role, shift, range and parameter values | the editor |
+| `shaders/*.wgsl` | one file per layer | the editor |
+
+A `layer_<n>.png` is not an authored layer: it is an image the library packs the values
+of every layer at one shift into, and `terrain.ron` calls the authored ones `fields`.
 
 The values are always written; the recipe only when the editor saves a *document*. An
 export writes the values alone, and removes a recipe already in the directory — one
 left behind would claim to describe values it no longer produced.
 
 The split is what makes the boundary real: a reader of values never parses a shader,
-so it never needs the types a field's shader is made of. A directory whose recipe has
+so it never needs the types a layer's shader is made of. A directory whose recipe has
 been deleted is still a terrain.
 
 ## Commands

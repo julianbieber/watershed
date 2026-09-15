@@ -21,7 +21,7 @@ use bevy::ui::IsDefaultUiCamera;
 use watershed::CellRect;
 
 use crate::document::{Document, EditorSystems};
-use crate::material::{FieldMaterial, FieldMaterialPlugin, FieldSettings};
+use crate::material::{LayerMaterial, LayerMaterialPlugin, LayerSettings};
 
 /// How much accumulated flow makes a cell a channel, for the overlay and for anything
 /// asking the editor what it is showing.
@@ -47,7 +47,7 @@ pub struct ViewPlugin;
 
 impl Plugin for ViewPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(FieldMaterialPlugin)
+        app.add_plugins(LayerMaterialPlugin)
             .init_resource::<ViewRange>()
             .init_resource::<VisibleCells>()
             .init_resource::<FreeView>()
@@ -72,7 +72,7 @@ impl Plugin for ViewPlugin {
 pub struct EditorCamera;
 
 #[derive(Component)]
-struct FieldQuad;
+struct LayerQuad;
 
 /// What the colour ramp is currently fitted to.
 ///
@@ -81,7 +81,7 @@ struct FieldQuad;
 /// showing. Deriving it a second time would be a second answer to one question.
 #[derive(Resource, Default, Clone, Copy, Debug)]
 pub struct ViewRange {
-    /// The value the ramp's low end stands for, in the field's own units.
+    /// The value the ramp's low end stands for, in the layer's own units.
     pub low: f32,
     /// The value the ramp's high end stands for.
     pub high: f32,
@@ -154,7 +154,7 @@ impl FreeView {
 
 #[derive(Component)]
 struct MapRevisions {
-    field: Option<u64>,
+    layer: Option<u64>,
     water: Option<u64>,
 }
 
@@ -182,15 +182,15 @@ fn blank(format: TextureFormat) -> Image {
 fn spawn_view(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<FieldMaterial>>,
+    mut materials: ResMut<Assets<LayerMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let field = images.add(blank(TextureFormat::R32Float));
+    let layer = images.add(blank(TextureFormat::R32Float));
     let water = images.add(blank(TextureFormat::Rg8Unorm));
 
-    let material = materials.add(FieldMaterial {
-        settings: FieldSettings::default(),
-        field,
+    let material = materials.add(LayerMaterial {
+        settings: LayerSettings::default(),
+        layer,
         water,
     });
 
@@ -208,9 +208,9 @@ fn spawn_view(
         Mesh2d(meshes.add(Rectangle::new(1.0, 1.0))),
         MeshMaterial2d(material),
         Transform::default(),
-        FieldQuad,
+        LayerQuad,
         MapRevisions {
-            field: None,
+            layer: None,
             water: None,
         },
     ));
@@ -219,9 +219,9 @@ fn spawn_view(
 fn sync_maps(
     document: Res<Document>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<FieldMaterial>>,
+    mut materials: ResMut<Assets<LayerMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    quad: Single<(&Mesh2d, &MeshMaterial2d<FieldMaterial>, &mut MapRevisions), With<FieldQuad>>,
+    quad: Single<(&Mesh2d, &MeshMaterial2d<LayerMaterial>, &mut MapRevisions), With<LayerQuad>>,
 ) {
     let (mesh, material, mut revisions) = quad.into_inner();
     let Some(mut material) = materials.get_mut(&material.0) else {
@@ -231,20 +231,20 @@ fn sync_maps(
         return;
     };
 
-    if let Some(field) = terrain.field(document.active()) {
-        material.settings.hillshade = if field.hillshade { 1.0 } else { 0.0 };
-        material.settings.light_azimuth = field.light_azimuth;
-        material.settings.contours = if field.contours { 1.0 } else { 0.0 };
-        material.settings.contour_interval = field.contour_interval;
+    if let Some(layer) = terrain.layer(document.active()) {
+        material.settings.hillshade = if layer.hillshade { 1.0 } else { 0.0 };
+        material.settings.light_azimuth = layer.light_azimuth;
+        material.settings.contours = if layer.contours { 1.0 } else { 0.0 };
+        material.settings.contour_interval = layer.contour_interval;
     }
 
-    if revisions.field != Some(document.revision()) {
-        revisions.field = Some(document.revision());
+    if revisions.layer != Some(document.revision()) {
+        revisions.layer = Some(document.revision());
 
-        let Some(field) = terrain.field(document.active()) else {
+        let Some(layer) = terrain.layer(document.active()) else {
             return;
         };
-        let baked = field.baked();
+        let baked = layer.baked();
 
         if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
             *mesh = Rectangle::new(terrain.size.x as f32, terrain.size.y as f32).into();
@@ -255,11 +255,11 @@ fn sync_maps(
         } else {
             baked.size()
         };
-        material.settings.field_resolution = resolution.as_vec2();
+        material.settings.layer_resolution = resolution.as_vec2();
         material.settings.document_size = terrain.size.as_vec2();
 
         if baked.is_empty() {
-            material.field = images.add(blank(TextureFormat::R32Float));
+            material.layer = images.add(blank(TextureFormat::R32Float));
         } else {
             let mut bytes = Vec::with_capacity(baked.len() * size_of::<f32>());
             for value in baked.data() {
@@ -277,7 +277,7 @@ fn sync_maps(
                 RenderAssetUsages::RENDER_WORLD,
             );
             image.sampler = ImageSampler::nearest();
-            material.field = images.add(image);
+            material.layer = images.add(image);
         }
     }
 
@@ -400,9 +400,9 @@ fn pan_zoom(
 fn fit_ramp(
     document: Res<Document>,
     mut range: ResMut<ViewRange>,
-    mut materials: ResMut<Assets<FieldMaterial>>,
+    mut materials: ResMut<Assets<LayerMaterial>>,
     camera: Single<(&Transform, &Projection), With<EditorCamera>>,
-    quad: Single<&MeshMaterial2d<FieldMaterial>, With<FieldQuad>>,
+    quad: Single<&MeshMaterial2d<LayerMaterial>, With<LayerQuad>>,
 ) {
     let (transform, projection) = camera.into_inner();
     let Projection::Orthographic(projection) = projection else {
@@ -414,10 +414,10 @@ fn fit_ramp(
     let Some(terrain) = document.terrain() else {
         return;
     };
-    let Some(field) = terrain.field(document.active()) else {
+    let Some(layer) = terrain.layer(document.active()) else {
         return;
     };
-    if field.baked().is_empty() {
+    if layer.baked().is_empty() {
         return;
     }
 
@@ -437,7 +437,7 @@ fn fit_ramp(
                 row as f32 / (FIT_SAMPLES - 1) as f32,
             );
             let cell = min + (max - min) * t;
-            let value = field.sample(cell.x, cell.y);
+            let value = layer.sample(cell.x, cell.y);
             if value.is_finite() {
                 samples.push(value);
             }

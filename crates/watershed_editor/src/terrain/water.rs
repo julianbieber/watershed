@@ -1,4 +1,4 @@
-//! Where water stands and where it runs on a baked height field, and the document
+//! Where water stands and where it runs on a baked height layer, and the document
 //! operations that produce and discard that answer.
 
 use std::cmp::Ordering;
@@ -9,32 +9,32 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::terrain::LayerId;
 use crate::terrain::bake::TerrainSpec;
-use watershed::field::FieldId;
 use watershed::raster::Raster;
 
 /// Why a document could not be solved. Every variant is about the document's state
-/// rather than the solve, which cannot itself fail: on a readable height field the
+/// rather than the solve, which cannot itself fail: on a readable height layer the
 /// solve always produces an answer.
 #[derive(Debug, Error)]
 pub enum WaterError {
     /// The document has no cells to solve over.
     #[error("terrain size has a zero component: {0} by {1}")]
     ZeroSize(u32, u32),
-    /// The spec names a height field the document does not carry.
-    #[error("height field `{0}` is not in the document")]
-    UnknownHeightField(String),
-    /// The spec names a moisture field the document does not carry.
-    #[error("moisture field `{0}` is not in the document")]
-    UnknownMoistureField(String),
-    /// The height field is coarser than the document. Refused rather than
+    /// The spec names a height layer the document does not carry.
+    #[error("height layer `{0}` is not in the document")]
+    UnknownHeightLayer(String),
+    /// The spec names a moisture layer the document does not carry.
+    #[error("moisture layer `{0}` is not in the document")]
+    UnknownMoistureLayer(String),
+    /// The height layer is coarser than the document. Refused rather than
     /// resampled: a filled surface derived from interpolated texels would route
     /// water down slopes that are not in the document.
-    #[error("height field `{0}` is at shift {1}; the solve reads one texel per cell")]
+    #[error("height layer `{0}` is at shift {1}; the solve reads one texel per cell")]
     CoarseHeight(String, u8),
-    /// The height field has no baked raster at the document's size — it has not
+    /// The height layer has no baked raster at the document's size — it has not
     /// been baked, or was baked and released.
-    #[error("height field `{0}` has not been baked at the document's size")]
+    #[error("height layer `{0}` has not been baked at the document's size")]
     UnbakedHeight(String),
 }
 
@@ -65,17 +65,17 @@ const ACCUM_QUANT: f32 = 3900.0;
 
 /// What a solve is to be run over, and the one threshold it takes.
 ///
-/// The height field is named rather than found by role, so a document can solve
-/// water over a field that is not its `Height` — a second surface, or a candidate
-/// being previewed — without changing which field its consumers read as the ground.
+/// The height layer is named rather than found by role, so a document can solve
+/// water over a layer that is not its `Height` — a second surface, or a candidate
+/// being previewed — without changing which layer its consumers read as the ground.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaterSpec {
-    /// The field to solve over. Must be in the document, at shift 0, and baked.
-    pub height: FieldId,
-    /// A field weighting how much water each cell contributes. `None` gives every
+    /// The layer to solve over. Must be in the document, at shift 0, and baked.
+    pub height: LayerId,
+    /// A layer weighting how much water each cell contributes. `None` gives every
     /// cell a weight of `1.0`, so an accumulation counts cells. Sampled at cell
     /// centres and floored at zero.
-    pub moisture: Option<FieldId>,
+    pub moisture: Option<LayerId>,
     /// The smallest connected body of standing water that gets a lake id. Anything
     /// smaller keeps its depth and stays unlabelled.
     pub lake_min_cells: u32,
@@ -84,7 +84,7 @@ pub struct WaterSpec {
 impl Default for WaterSpec {
     fn default() -> Self {
         Self {
-            height: FieldId::from("height"),
+            height: LayerId::from("height"),
             moisture: None,
             lake_min_cells: 64,
         }
@@ -93,7 +93,7 @@ impl Default for WaterSpec {
 
 impl WaterSpec {
     /// Solves over `height`, with unit weights and the default lake threshold.
-    pub fn new(height: impl Into<FieldId>) -> Self {
+    pub fn new(height: impl Into<LayerId>) -> Self {
         Self {
             height: height.into(),
             moisture: None,
@@ -101,8 +101,8 @@ impl WaterSpec {
         }
     }
 
-    /// Weights each cell's contribution by a field instead of by `1.0`.
-    pub fn with_moisture(mut self, moisture: impl Into<FieldId>) -> Self {
+    /// Weights each cell's contribution by a layer instead of by `1.0`.
+    pub fn with_moisture(mut self, moisture: impl Into<LayerId>) -> Self {
         self.moisture = Some(moisture.into());
         self
     }
@@ -212,7 +212,7 @@ impl WaterState {
     }
 
     /// How far the water surface stands above the ground at a cell, in the height
-    /// field's own units. Never negative.
+    /// layer's own units. Never negative.
     ///
     /// `None` outside the extent, and for every cell of an empty state — a caller
     /// that would treat "no water here" and "no answer here" alike wants
@@ -255,7 +255,7 @@ impl WaterState {
     }
 
     /// Whether at least `threshold` reaches the cell — the test that turns an
-    /// accumulation field into a river network. Compares codes, so the quantization
+    /// accumulation layer into a river network. Compares codes, so the quantization
     /// costs nothing here. `false` outside the extent.
     pub fn channel(&self, x: u32, y: u32, threshold: f32) -> bool {
         self.accumulation_code(x, y) >= quantize_accumulation(threshold)
@@ -324,11 +324,11 @@ impl TerrainSpec {
         self.water = None;
     }
 
-    /// Solves water over the field `spec` names and stores both the answer and the
+    /// Solves water over the layer `spec` names and stores both the answer and the
     /// spec on the document, replacing whatever was there.
     ///
-    /// The height field must be in the document, at shift 0, and baked at the
-    /// document's size; a moisture field, if named, must be in the document but may
+    /// The height layer must be in the document, at shift 0, and baked at the
+    /// document's size; a moisture layer, if named, must be in the document but may
     /// be at any shift. On any [`WaterError`] the document is left exactly as it
     /// was.
     pub fn solve_water(&mut self, spec: &WaterSpec) -> Result<(), WaterError> {
@@ -338,8 +338,8 @@ impl TerrainSpec {
 
         let state = {
             let height = self
-                .field(spec.height.as_str())
-                .ok_or_else(|| WaterError::UnknownHeightField(spec.height.to_string()))?;
+                .layer(spec.height.as_str())
+                .ok_or_else(|| WaterError::UnknownHeightLayer(spec.height.to_string()))?;
             if height.shift != 0 {
                 return Err(WaterError::CoarseHeight(
                     spec.height.to_string(),
@@ -353,15 +353,15 @@ impl TerrainSpec {
 
             let weight = match &spec.moisture {
                 Some(id) => {
-                    let field = self
-                        .field(id.as_str())
-                        .ok_or_else(|| WaterError::UnknownMoistureField(id.to_string()))?;
+                    let layer = self
+                        .layer(id.as_str())
+                        .ok_or_else(|| WaterError::UnknownMoistureLayer(id.to_string()))?;
                     let width = self.size.x as usize;
                     (0..(width * self.size.y as usize))
                         .map(|index| {
                             let x = (index % width) as f32 + 0.5;
                             let y = (index / width) as f32 + 0.5;
-                            field.sample(x, y).max(0.0)
+                            layer.sample(x, y).max(0.0)
                         })
                         .collect()
                 }
@@ -616,7 +616,7 @@ impl PartialOrd for Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::field::Field;
+    use crate::terrain::layer::Layer;
 
     fn raster_from(size: UVec2, cell: impl Fn(u32, u32) -> f32) -> Raster<f32> {
         let mut raster = Raster::new(size, 0.0f32);
@@ -905,13 +905,13 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // The document-level path, which resolves the field by name and stores the
+    // The document-level path, which resolves the layer by name and stores the
     // answer on the spec — everything the state tests exercise is reached through
     // this.
     #[test]
-    fn a_document_solves_water_over_the_field_it_names() {
+    fn a_document_solves_water_over_the_layer_it_names() {
         let mut terrain =
-            TerrainSpec::new(UVec2::new(16, 16)).with_field(Field::new("height").held(0.5));
+            TerrainSpec::new(UVec2::new(16, 16)).with_layer(Layer::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         assert!(terrain.water().is_none());
         terrain.solve_water(&WaterSpec::default()).unwrap();
@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn invalidating_the_water_keeps_the_recipe_where_clearing_it_does_not() {
         let mut terrain =
-            TerrainSpec::new(UVec2::new(16, 16)).with_field(Field::new("height").held(0.5));
+            TerrainSpec::new(UVec2::new(16, 16)).with_layer(Layer::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         terrain.solve_water(&WaterSpec::default()).unwrap();
 
@@ -947,15 +947,15 @@ mod tests {
         assert!(terrain.water_spec.is_none());
     }
 
-    // The moisture field is sampled per cell and multiplies what that cell
-    // contributes; a constant field makes the total exactly predictable, so a
+    // The moisture layer is sampled per cell and multiplies what that cell
+    // contributes; a constant layer makes the total exactly predictable, so a
     // sampling offset or a dropped weight shows up as a proportional shortfall.
     #[test]
-    fn a_named_moisture_field_weights_what_the_sinks_deliver() {
+    fn a_named_moisture_layer_weights_what_the_sinks_deliver() {
         let size = UVec2::new(24, 24);
         let mut terrain = TerrainSpec::new(size)
-            .with_field(Field::new("height").held(0.5))
-            .with_field(Field::new("moisture").held(0.25).with_range((0.0, 1.0)));
+            .with_layer(Layer::new("height").held(0.5))
+            .with_layer(Layer::new("moisture").held(0.25).with_range((0.0, 1.0)));
         terrain.bake_in_place().unwrap();
         terrain
             .solve_water(&WaterSpec::default().with_moisture("moisture"))
@@ -980,15 +980,15 @@ mod tests {
     // Each refusal is a distinct variant a caller matches on, and all three leave
     // the document untouched — a partially applied solve would be worse than none.
     #[test]
-    fn a_solve_refuses_a_field_it_cannot_read() {
+    fn a_solve_refuses_a_layer_it_cannot_read() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height").held(0.5))
-            .with_field(Field::new("coarse").with_shift(2));
+            .with_layer(Layer::new("height").held(0.5))
+            .with_layer(Layer::new("coarse").with_shift(2));
         terrain.bake_in_place().unwrap();
 
         assert!(matches!(
             terrain.solve_water(&WaterSpec::new("absent")),
-            Err(WaterError::UnknownHeightField(_))
+            Err(WaterError::UnknownHeightLayer(_))
         ));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::new("coarse")),
@@ -996,17 +996,17 @@ mod tests {
         ));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::default().with_moisture("absent")),
-            Err(WaterError::UnknownMoistureField(_))
+            Err(WaterError::UnknownMoistureLayer(_))
         ));
         assert!(terrain.water().is_none());
     }
 
-    // An unbaked field has an empty raster rather than a wrong one, so without this
+    // An unbaked layer has an empty raster rather than a wrong one, so without this
     // check the solve would quietly return an empty state instead of an error.
     #[test]
     fn a_solve_of_an_unbaked_document_is_refused() {
         let mut terrain =
-            TerrainSpec::new(UVec2::new(8, 8)).with_field(Field::new("height").held(0.5));
+            TerrainSpec::new(UVec2::new(8, 8)).with_layer(Layer::new("height").held(0.5));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::default()),
             Err(WaterError::UnbakedHeight(_))

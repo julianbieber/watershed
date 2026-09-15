@@ -14,8 +14,8 @@ use crate::document::Document;
 use crate::edit::{Edit, Slot};
 use crate::ui::{NewDialog, report};
 
-/// Which number a number field stands for. Every field-side variant reads and writes
-/// the *active* field.
+/// Which number a number field stands for. Every layer-side variant reads and writes
+/// the *active* layer.
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub enum NumberBinding {
     /// A field naming nothing. Never built by the panel — it is what the scene system
@@ -27,8 +27,8 @@ pub enum NumberBinding {
     RangeHigh,
     LightAzimuth,
     ContourInterval,
-    /// One component of one parameter of the active field's shader: the parameter's
-    /// position in the field's own key order, and which component of it.
+    /// One component of one parameter of the active layer's shader: the parameter's
+    /// position in the layer's own key order, and which component of it.
     ///
     /// The parameter is positional because a binding has to be `Copy`, and safe to be
     /// positional because the panel is rebuilt whenever the shader's parameters change
@@ -83,15 +83,15 @@ impl NumberBinding {
     pub fn read(self, document: &Document, dialog: &NewDialog) -> Option<NumberInputValue> {
         let value = match self {
             Self::Unbound => return None,
-            Self::Shift => field(document)?.shift as f32,
-            Self::RangeLow => field(document)?.range.0,
-            Self::RangeHigh => field(document)?.range.1,
-            Self::LightAzimuth => field(document)?.light_azimuth,
-            Self::ContourInterval => field(document)?.contour_interval,
+            Self::Shift => layer(document)?.shift as f32,
+            Self::RangeLow => layer(document)?.range.0,
+            Self::RangeHigh => layer(document)?.range.1,
+            Self::LightAzimuth => layer(document)?.light_azimuth,
+            Self::ContourInterval => layer(document)?.contour_interval,
             Self::DialogWidth => dialog.width as f32,
             Self::DialogHeight => dialog.height as f32,
             Self::DialogSeed => dialog.seed as f32,
-            Self::ShaderParam(param, component) => *field(document)?
+            Self::ShaderParam(param, component) => *layer(document)?
                 .shader
                 .params
                 .values()
@@ -175,11 +175,11 @@ impl NumberBinding {
 
     fn write_document(self, value: f32, document: &mut Document) {
         let active = document.active().to_owned();
-        document.write(&active, self.slot(), move |field| match self {
-            Self::RangeLow => field.range.0 = value,
-            Self::RangeHigh => field.range.1 = value,
+        document.write(&active, self.slot(), move |layer| match self {
+            Self::RangeLow => layer.range.0 = value,
+            Self::RangeHigh => layer.range.1 = value,
             Self::ShaderParam(param, component) => {
-                if let Some(slot) = field
+                if let Some(slot) = layer
                     .shader
                     .params
                     .values_mut()
@@ -194,8 +194,8 @@ impl NumberBinding {
     }
 }
 
-fn field(document: &Document) -> Option<&crate::terrain::Field> {
-    document.terrain()?.field(document.active())
+fn layer(document: &Document) -> Option<&crate::terrain::Layer> {
+    document.terrain()?.layer(document.active())
 }
 
 /// Takes a finished float entry and writes it through its binding.

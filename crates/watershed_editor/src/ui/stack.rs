@@ -9,6 +9,7 @@
 //! leaving a choice out of it would leave a menu showing what it used to say over a
 //! document that had already changed.
 
+use crate::terrain::LayerRole;
 use bevy::feathers::containers::{group, group_body, group_header};
 use bevy::feathers::controls::{
     FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersTextInput,
@@ -20,17 +21,16 @@ use bevy::prelude::*;
 use bevy::text::{EditableText, TextEdit, TextEditChange};
 use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
-use watershed::FieldRole;
 
-use crate::canvas::OpenField;
+use crate::canvas::OpenLayer;
 use crate::document::{Baked, Document};
 use crate::edit::Edit;
 use crate::gpu::{ShaderLibrary, shader_reference};
-use crate::terrain::Field;
+use crate::terrain::Layer;
 use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
-use crate::ui::{Expanded, NewField, PANEL_WIDTH, report};
+use crate::ui::{Expanded, NewLayer, PANEL_WIDTH, report};
 
 /// What the panel was last built from, and which rebuild that was.
 ///
@@ -56,9 +56,9 @@ pub struct StackEntry(u64);
 #[derive(Component, Default, Clone)]
 pub struct StackBody;
 
-/// The text field holding the name the "Add field" button will use.
+/// The text field holding the name the "Add layer" button will use.
 #[derive(Component, Default, Clone)]
-pub struct NewFieldInput;
+pub struct NewLayerInput;
 
 /// The label that says whether what is on screen is the whole bake or a preview.
 #[derive(Component, Default, Clone)]
@@ -83,8 +83,8 @@ pub fn panel() -> impl Scene {
 
 /// Rebuilds the panel when the shape changes, and does nothing otherwise.
 ///
-/// Always for the field the toolbar has selected, whichever that is — nothing here
-/// names a field, so a document's own fields are editable by this panel without it
+/// Always for the layer the toolbar has selected, whichever that is — nothing here
+/// names a layer, so a document's own layers are editable by this panel without it
 /// knowing anything about them.
 pub fn rebuild(
     document: Res<Document>,
@@ -143,21 +143,21 @@ pub fn sync(document: Res<Document>, mut preview: Query<&mut Text, With<PreviewT
 fn shift_is_pinned(document: &Document) -> bool {
     document
         .terrain()
-        .zip(field_of(document))
-        .is_some_and(|(terrain, field)| {
-            crate::edit::is_solve_height(terrain, document.active()) && field.shift == 0
+        .zip(layer_of(document))
+        .is_some_and(|(terrain, layer)| {
+            crate::edit::is_solve_height(terrain, document.active()) && layer.shift == 0
         })
 }
 
-fn field_of(document: &Document) -> Option<&Field> {
-    document.terrain()?.field(document.active())
+fn layer_of(document: &Document) -> Option<&Layer> {
+    document.terrain()?.layer(document.active())
 }
 
 fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary) -> String {
     let mut key = String::new();
     key.push_str(document.active());
     key.push('|');
-    key.push_str(&document.field_names().join(","));
+    key.push_str(&document.layer_names().join(","));
     key.push('|');
     key.push_str(if expanded.reference { "ref" } else { "noref" });
     key.push('|');
@@ -173,14 +173,14 @@ fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary
     }
     key.push('|');
 
-    let Some(field) = field_of(document) else {
+    let Some(layer) = layer_of(document) else {
         return key + "empty";
     };
-    key.push_str(field.role.as_str());
-    key.push_str(&format!("|hillshade:{}", field.hillshade));
-    key.push_str(&format!("|contours:{}", field.contours));
+    key.push_str(layer.role.as_str());
+    key.push_str(&format!("|hillshade:{}", layer.hillshade));
+    key.push_str(&format!("|contours:{}", layer.contours));
     key.push('|');
-    match library.entry(&field.file()) {
+    match library.entry(&layer.file()) {
         Some(entry) => {
             for param in &entry.layout.fields {
                 key.push(':');
@@ -205,7 +205,7 @@ fn contents(
     library: &ShaderLibrary,
 ) -> Vec<Box<dyn Scene>> {
     let active = document.active().to_owned();
-    let Some(field) = field_of(document) else {
+    let Some(layer) = layer_of(document) else {
         return vec![widgets::boxed(widgets::text("no document"))];
     };
 
@@ -214,25 +214,25 @@ fn contents(
         one(bsn! { widgets::small("") PreviewTag }),
     ]))];
 
-    let reads = crate::edit::reads_of(field);
+    let reads = crate::edit::reads_of(layer);
     let read_by = document
         .terrain()
         .map(|terrain| crate::edit::readers_of(terrain, &active))
         .unwrap_or_default();
     children.push(widgets::boxed(properties(
         &active,
-        field,
+        layer,
         shift_is_pinned(document),
         &reads,
         &read_by,
     )));
-    children.push(widgets::boxed(shader_section(field, library)));
+    children.push(widgets::boxed(shader_section(layer, library)));
     children.push(widgets::boxed(reference_section(expanded.reference)));
-    children.push(widgets::boxed(field_row(&active)));
+    children.push(widgets::boxed(layer_row(&active)));
     children
 }
 
-fn field_row(active: &str) -> impl Scene {
+fn layer_row(active: &str) -> impl Scene {
     let remove = active.to_owned();
     widgets::column(vec![
         one(widgets::row(vec![
@@ -242,10 +242,10 @@ fn field_row(active: &str) -> impl Scene {
                 Children [
                     (
                         @FeathersTextInput
-                        NewFieldInput
+                        NewLayerInput
                         on(|change: On<TextEditChange>,
                             texts: Query<&EditableText>,
-                            mut name: ResMut<NewField>| {
+                            mut name: ResMut<NewLayer>| {
                             if let Ok(text) = texts.get(change.event_target()) {
                                 name.0 = text.value().to_string();
                             }
@@ -255,11 +255,11 @@ fn field_row(active: &str) -> impl Scene {
             }),
             one(bsn! {
                 @FeathersButton {
-                    @caption: bsn! { Text("Add field") ThemedText },
+                    @caption: bsn! { Text("Add layer") ThemedText },
                 }
-                on(|_: On<Activate>, mut document: ResMut<Document>, mut name: ResMut<NewField>| {
+                on(|_: On<Activate>, mut document: ResMut<Document>, mut name: ResMut<NewLayer>| {
                     let result = document
-                        .apply(&Edit::AddField { name: name.0.clone() })
+                        .apply(&Edit::AddLayer { name: name.0.clone() })
                         .map(|_| ());
                     if result.is_ok() {
                         name.0.clear();
@@ -270,11 +270,11 @@ fn field_row(active: &str) -> impl Scene {
         ])),
         one(bsn! {
             @FeathersButton {
-                @caption: bsn! { Text("Remove field") ThemedText },
+                @caption: bsn! { Text("Remove layer") ThemedText },
             }
             on(move |_: On<Activate>, mut document: ResMut<Document>| {
                 let result = document
-                    .apply(&Edit::RemoveField {
+                    .apply(&Edit::RemoveLayer {
                         name: remove.clone(),
                     })
                     .map(|_| ());
@@ -284,11 +284,11 @@ fn field_row(active: &str) -> impl Scene {
     ])
 }
 
-/// Puts the name held in [`NewField`] into the text field the frame it appears, so a
+/// Puts the name held in [`NewLayer`] into the text field the frame it appears, so a
 /// half-typed name survives the panel being rebuilt under it.
-pub fn seed_field_name(
-    name: Res<NewField>,
-    mut inputs: Query<&mut EditableText, Added<NewFieldInput>>,
+pub fn seed_layer_name(
+    name: Res<NewLayer>,
+    mut inputs: Query<&mut EditableText, Added<NewLayerInput>>,
 ) {
     for mut text in inputs.iter_mut() {
         text.queue_edit(TextEdit::SelectAll);
@@ -296,20 +296,20 @@ pub fn seed_field_name(
     }
 }
 
-fn field_links(caption: &str, names: &[String]) -> impl Scene {
+fn layer_links(caption: &str, names: &[String]) -> impl Scene {
     let mut children: Vec<Box<dyn SceneList>> = vec![one(widgets::small(caption.to_owned()))];
     if names.is_empty() {
         children.push(one(widgets::small("none")));
     }
     for name in names {
-        let field = name.clone();
+        let layer = name.clone();
         children.push(one(bsn! {
             @FeathersButton {
                 @caption: bsn! { Text({name.clone()}) ThemedText },
             }
-            on(move |_: On<Activate>, mut open: MessageWriter<OpenField>| {
-                open.write(OpenField {
-                    field: field.clone(),
+            on(move |_: On<Activate>, mut open: MessageWriter<OpenLayer>| {
+                open.write(OpenLayer {
+                    layer: layer.clone(),
                 });
             })
         }));
@@ -329,14 +329,14 @@ fn field_links(caption: &str, names: &[String]) -> impl Scene {
 
 fn properties(
     active: &str,
-    field: &Field,
+    layer: &Layer,
     pinned: bool,
     reads: &[String],
     read_by: &[String],
 ) -> impl Scene {
     let active = active.to_owned();
-    let role = field.role;
-    let role_items: Vec<Box<dyn SceneList>> = FieldRole::ALL
+    let role = layer.role;
+    let role_items: Vec<Box<dyn SceneList>> = LayerRole::ALL
         .into_iter()
         .map(|choice| {
             let active = active.clone();
@@ -359,7 +359,7 @@ fn properties(
         one(widgets::captioned(
             "shift",
             if pinned {
-                one(widgets::small(field.shift.to_string()))
+                one(widgets::small(layer.shift.to_string()))
             } else {
                 one(widgets::number(NumberBinding::Shift))
             },
@@ -378,7 +378,7 @@ fn properties(
         one(toggle_row(
             &active,
             "hillshade",
-            field.hillshade,
+            layer.hillshade,
             vec![
                 one(widgets::small("azimuth")),
                 one(widgets::number(NumberBinding::LightAzimuth)),
@@ -387,14 +387,14 @@ fn properties(
         one(toggle_row(
             &active,
             "contours",
-            field.contours,
+            layer.contours,
             vec![
                 one(widgets::small("interval")),
                 one(widgets::number(NumberBinding::ContourInterval)),
             ],
         )),
-        one(field_links("reads", reads)),
-        one(field_links("read by", read_by)),
+        one(layer_links("reads", reads)),
+        one(layer_links("read by", read_by)),
     ])
 }
 
@@ -425,8 +425,8 @@ fn toggle_row(
     widgets::row(children)
 }
 
-fn shader_section(field: &Field, library: &ShaderLibrary) -> impl Scene {
-    let file = field.file();
+fn shader_section(layer: &Layer, library: &ShaderLibrary) -> impl Scene {
+    let file = layer.file();
     let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::small(file.clone()))];
     match library.entry(&file) {
         None => rows.push(one(widgets::small("no such file in shaders/"))),
@@ -434,7 +434,7 @@ fn shader_section(field: &Field, library: &ShaderLibrary) -> impl Scene {
             if let Some(error) = &entry.error {
                 rows.push(one(widgets::small(error.clone())));
             }
-            rows.extend(param_rows(&field.shader, &entry.layout));
+            rows.extend(param_rows(&layer.shader, &entry.layout));
         }
     }
     widgets::column(rows)
@@ -546,13 +546,13 @@ fn reference_body() -> impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::LayerId;
     use crate::terrain::TerrainSpec;
-    use watershed::FieldId;
 
     fn document_with(value: f32) -> Document {
         let mut document = Document::default();
         document
-            .adopt(TerrainSpec::new(UVec2::splat(64)).with_field(Field::new("height").held(value)));
+            .adopt(TerrainSpec::new(UVec2::splat(64)).with_layer(Layer::new("height").held(value)));
         document
     }
 
@@ -560,21 +560,21 @@ mod tests {
         fingerprint(document, &Expanded::default(), &ShaderLibrary::default())
     }
 
-    fn height(document: &mut Document) -> &mut Field {
-        document.terrain_mut().unwrap().field_mut("height").unwrap()
+    fn height(document: &mut Document) -> &mut Layer {
+        document.terrain_mut().unwrap().layer_mut("height").unwrap()
     }
 
-    // The `read by` row is derived from every *other* field's shader, so retargeting a
-    // reader elsewhere changes neither the field names nor the field on screen. Without
+    // The `read by` row is derived from every *other* layer's shader, so retargeting a
+    // reader elsewhere changes neither the layer names nor the layer on screen. Without
     // the readers in the key the row would keep naming the old reader.
     #[test]
-    fn retargeting_another_fields_read_rebuilds_the_panel() {
+    fn retargeting_another_layers_read_rebuilds_the_panel() {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(64))
-                .with_field(Field::new("height").held(0.5))
-                .with_field(Field::new("other").held(0.25))
-                .with_field(Field::new("reader").held(0.0).reading(&["height"])),
+                .with_layer(Layer::new("height").held(0.5))
+                .with_layer(Layer::new("other").held(0.25))
+                .with_layer(Layer::new("reader").held(0.0).reading(&["height"])),
         );
         document.set_active("height").unwrap();
         let before = key(&document);
@@ -582,10 +582,10 @@ mod tests {
         document
             .terrain_mut()
             .unwrap()
-            .field_mut("reader")
+            .layer_mut("reader")
             .unwrap()
             .shader
-            .layers = vec![FieldId::from("other")];
+            .layers = vec![LayerId::from("other")];
         assert_ne!(key(&document), before, "`read by` went stale");
     }
 
@@ -597,40 +597,40 @@ mod tests {
         let mut document = document_with(0.5);
         let before = key(&document);
 
-        let field = height(&mut document);
-        field.role = FieldRole::ALL
+        let layer = height(&mut document);
+        layer.role = LayerRole::ALL
             .into_iter()
-            .find(|role| *role != field.role)
+            .find(|role| *role != layer.role)
             .unwrap();
         assert_ne!(key(&document), before, "the role is a choice");
 
         let after_role = key(&document);
-        let field = height(&mut document);
-        field.hillshade = !field.hillshade;
+        let layer = height(&mut document);
+        layer.hillshade = !layer.hillshade;
         assert_ne!(key(&document), after_role, "so is hillshading");
     }
 
     // And from the other side: a number in the shape would rebuild the panel on the
-    // frame it was typed into, which throws away the field the keyboard is in.
+    // frame it was typed into, which throws away the layer the keyboard is in.
     #[test]
     fn a_number_does_not_change_the_shape() {
         let mut document = document_with(0.5);
         let before = key(&document);
 
-        let field = height(&mut document);
-        field.range = (-1.0, 2.0);
-        field.shader.params.get_mut("value").expect("a held value")[0] = 0.9;
+        let layer = height(&mut document);
+        layer.range = (-1.0, 2.0);
+        layer.shader.params.get_mut("value").expect("a held value")[0] = 0.9;
         assert_eq!(key(&document), before);
     }
 
     // The shift is a number field or a plain label depending on this, so it decides how
     // many widgets there are and belongs in the shape however numeric it looks. It is
-    // pinned only while the height field is already at shift 0, so a document that
+    // pinned only while the height layer is already at shift 0, so a document that
     // arrived coarse some other way can still be repaired from the panel.
     #[test]
     fn whether_the_shift_is_pinned_is_part_of_the_shape() {
         let mut document = document_with(0.5);
-        height(&mut document).role = FieldRole::Height;
+        height(&mut document).role = LayerRole::Height;
         assert!(
             shift_is_pinned(&document),
             "the solve height sits at shift 0"

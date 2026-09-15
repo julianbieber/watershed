@@ -1,4 +1,4 @@
-//! The curve between two field cards, and the ribbon it is drawn as.
+//! The curve between two layer cards, and the ribbon it is drawn as.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};

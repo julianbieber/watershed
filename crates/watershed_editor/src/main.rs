@@ -1,4 +1,4 @@
-//! A graphical editor for a watershed document: authoring the fields and the shader
+//! A graphical editor for a watershed document: authoring the layers and the shader
 //! files that produce them, and previewing the baked terrain.
 //!
 //! Every capability the editor has is reachable from `watershed-ctl` as well as from

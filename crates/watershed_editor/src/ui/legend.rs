@@ -1,8 +1,8 @@
-//! The key to what the viewport is showing: which field, which colour ramp, and what
+//! The key to what the viewport is showing: which layer, which colour ramp, and what
 //! its two ends are worth.
 //!
 //! The numbers are the ends the ramp is *currently* fitted to, not the range the
-//! field declares. The viewport refits to what is on screen as the camera moves, so
+//! layer declares. The viewport refits to what is on screen as the camera moves, so
 //! a declared range would say nothing about the colours actually in front of the
 //! reader.
 
@@ -24,7 +24,7 @@ const RAMP_WIDTH: f32 = 200.0;
 #[derive(Component, Default, Clone)]
 pub struct LegendRoot;
 
-/// The line naming the field on show.
+/// The line naming the layer on show.
 #[derive(Component, Default, Clone)]
 pub struct LegendTitle;
 

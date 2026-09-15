@@ -65,9 +65,9 @@ pub(super) enum Command {
         /// Whether the job has been asked for yet.
         started: bool,
     },
-    /// Puts a field on screen. `field add <name>` is a different thing — an
+    /// Puts a layer on screen. `layer add <name>` is a different thing — an
     /// [`Edit`] — and parses to [`Command::Edit`].
-    Field(String),
+    Layer(String),
     /// An edit and the re-bake that answers it, held together: the reply says the
     /// effect has happened, and for an edit the effect is the bake rather than the
     /// changed number. A document that no longer bakes reports that error here rather
@@ -155,7 +155,7 @@ pub(super) enum ZoomTo {
 /// answered by a bake that a system opens on a later frame, so a document between the
 /// two has nothing in flight and is not finished either.
 pub(super) enum Condition {
-    /// Every field carries a baked raster.
+    /// Every layer carries a baked raster.
     Bake,
     /// The document carries a solved water state.
     Water,
@@ -165,17 +165,17 @@ pub(super) enum Condition {
 
 impl Command {
     /// The word this command was parsed from, for the reply. Every edit that is not a
-    /// `set` answers `"field"`.
+    /// `set` answers `"layer"`.
     pub(super) fn verb(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
             Self::Step(_) => "step",
             Self::Wait { .. } => "wait",
             Self::New { .. } => "new",
-            Self::Field(_) => "field",
+            Self::Layer(_) => "layer",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
-                _ => "field",
+                _ => "layer",
             },
             Self::Bake { .. } => "bake",
             Self::SolveWater { .. } => "solve-water",
@@ -226,25 +226,25 @@ impl Command {
                     started: false,
                 })
             }
-            "field" => match rest.as_slice() {
+            "layer" => match rest.as_slice() {
                 ["add", name, ..] => Ok(Self::Edit {
-                    edit: Edit::AddField {
+                    edit: Edit::AddLayer {
                         name: (*name).to_owned(),
                     },
                     applied: None,
                 }),
                 ["rm", name, ..] => Ok(Self::Edit {
-                    edit: Edit::RemoveField {
+                    edit: Edit::RemoveLayer {
                         name: (*name).to_owned(),
                     },
                     applied: None,
                 }),
                 ["rename", ..] => {
-                    Err("field rename is gone: rename the file in shaders/ instead".to_owned())
+                    Err("layer rename is gone: rename the file in shaders/ instead".to_owned())
                 }
-                ["rm"] => Err("field rm needs a name".to_owned()),
-                [name, ..] => Ok(Self::Field((*name).to_owned())),
-                [] => Err("field needs a name".to_owned()),
+                ["rm"] => Err("layer rm needs a name".to_owned()),
+                [name, ..] => Ok(Self::Layer((*name).to_owned())),
+                [] => Err("layer needs a name".to_owned()),
             },
             "set" => {
                 let path = rest.first().ok_or("set needs a path")?;
@@ -350,15 +350,15 @@ impl Command {
                 finished(world, |document| {
                     json!({
                         "size": [document.size.x, document.size.y],
-                        "fields": document.field_names(),
+                        "layers": document.layer_names(),
                     })
                 })
             }
 
-            Self::Field(name) => {
+            Self::Layer(name) => {
                 let mut document = world.resource_mut::<Document>();
                 match document.set_active(name) {
-                    Ok(()) => Poll::Done(json!({ "field": name })),
+                    Ok(()) => Poll::Done(json!({ "layer": name })),
                     Err(error) => Poll::Failed(error),
                 }
             }
@@ -470,7 +470,7 @@ impl Command {
                 finished(world, |document| {
                     json!({
                         "size": [document.size.x, document.size.y],
-                        "fields": document.field_names(),
+                        "layers": document.layer_names(),
                         "water": document
                             .terrain()
                             .is_some_and(|terrain| terrain.water().is_some()),
@@ -590,14 +590,14 @@ fn answered(world: &World, applied: &mut Option<Value>) -> Poll {
     }
 }
 
-fn finished(world: &mut World, fields: impl FnOnce(&Document) -> Value) -> Poll {
+fn finished(world: &mut World, layers: impl FnOnce(&Document) -> Value) -> Poll {
     let document = world.resource::<Document>();
     if document.is_busy() {
         return Poll::Running;
     }
     match document.error() {
         Some(error) => Poll::Failed(error.to_owned()),
-        None => Poll::Done(fields(document)),
+        None => Poll::Done(layers(document)),
     }
 }
 
@@ -619,9 +619,9 @@ impl Condition {
         match self {
             Self::Idle => true,
             Self::Bake => document.terrain().is_some_and(|terrain| {
-                let faults = terrain.field_faults();
+                let faults = terrain.layer_faults();
                 terrain
-                    .fields
+                    .layers
                     .iter()
                     .all(|f| !f.baked().is_empty() || faults.iter().any(|(id, _)| *id == f.id))
             }),
@@ -691,9 +691,9 @@ mod tests {
             ("wait bake", "wait"),
             ("wait water 600", "wait"),
             ("new 256 256 7 ridges", "new"),
-            ("field height", "field"),
-            ("field add biomes", "field"),
-            ("field rm base", "field"),
+            ("layer height", "layer"),
+            ("layer add biomes", "layer"),
+            ("layer rm base", "layer"),
             ("set height.scale 0.004", "set"),
             ("set height.offset 0.5 0.25", "set"),
             ("set height.shift 2", "set"),
@@ -731,9 +731,8 @@ mod tests {
         assert!(Command::parse("new 256 256 1 nothing-like-this").is_err());
         assert!(Command::parse("zoom").is_err());
         assert!(Command::parse("save /tmp/a-terrain sideways").is_err());
-        assert!(Command::parse("field").is_err());
-        assert!(Command::parse("field rm").is_err());
-        assert!(Command::parse("layer sideways height 1").is_err());
+        assert!(Command::parse("layer").is_err());
+        assert!(Command::parse("layer rm").is_err());
         assert!(Command::parse("set").is_err());
     }
 
@@ -758,18 +757,18 @@ mod tests {
         assert!(error.contains("regions"), "{error}");
     }
 
-    // A field is one shader file now, so a script still driving the node graph, adopting
-    // a stock shader or renaming a field in place has to be refused with a message that
+    // A layer is one shader file now, so a script still driving the node graph, adopting
+    // a stock shader or renaming a layer in place has to be refused with a message that
     // names the word it used, rather than have a half-edited document behind it.
     #[test]
-    fn the_node_graph_verbs_its_topic_and_field_rename_are_refused_by_name() {
+    fn the_node_graph_verbs_its_topic_and_layer_rename_are_refused_by_name() {
         for (line, refusal) in [
             ("node add height shader:ridged", "no such command: node"),
             ("shader adopt ridged", "no such command: shader"),
             ("observe nodes", "nothing to observe called nodes"),
             (
-                "field rename base continent",
-                "field rename is gone: rename the file in shaders/ instead",
+                "layer rename base continent",
+                "layer rename is gone: rename the file in shaders/ instead",
             ),
         ] {
             let Err(error) = Command::parse(line) else {
@@ -779,17 +778,34 @@ mod tests {
         }
     }
 
-    // A field whose file names no field is left unbaked on purpose, so a scenario
+    // The authoring unit is called a layer now, so a script still written with the old
+    // word is told the word does not exist rather than having anything happen.
+    #[test]
+    fn the_field_verb_and_its_topics_are_refused_by_name() {
+        for (line, refusal) in [
+            ("field height", "no such command: field"),
+            ("field add biomes", "no such command: field"),
+            ("observe field", "nothing to observe called field"),
+            ("observe fields", "nothing to observe called fields"),
+        ] {
+            let Err(error) = Command::parse(line) else {
+                panic!("`{line}` parsed");
+            };
+            assert_eq!(error, refusal);
+        }
+    }
+
+    // A layer whose file names no layer is left unbaked on purpose, so a scenario
     // waiting for the bake after such an edit has to be released rather than wait for a
     // raster that never comes.
     #[test]
-    fn waiting_for_the_bake_is_met_by_a_field_left_unbaked_by_its_fault() {
-        use crate::terrain::{Field, TerrainSpec};
+    fn waiting_for_the_bake_is_met_by_a_layer_left_unbaked_by_its_fault() {
+        use crate::terrain::{Layer, TerrainSpec};
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").held(0.25))
-            .with_field(Field::new("height").reading(&["nowhere"]));
+            .with_layer(Layer::new("base").held(0.25))
+            .with_layer(Layer::new("height").reading(&["nowhere"]));
         terrain.bake_in_place().unwrap();
-        assert!(terrain.field("height").unwrap().baked().is_empty());
+        assert!(terrain.layer("height").unwrap().baked().is_empty());
 
         let mut document = Document::default();
         document.adopt(terrain);

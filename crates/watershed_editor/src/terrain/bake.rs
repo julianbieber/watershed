@@ -1,4 +1,4 @@
-//! Turning an authored document into evaluated grids: the order the fields have to
+//! Turning an authored document into evaluated grids: the order the layers have to
 //! be visited in, the ways of driving that order, and what the result is handed
 //! back as.
 
@@ -8,11 +8,11 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::terrain::{LayerId, LayerRole};
 use watershed::channel::{ChannelError, ChannelMeta, plan_layers};
-use watershed::field::{FieldId, FieldRole};
 
 use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
-use crate::terrain::field::Field;
+use crate::terrain::layer::Layer;
 use crate::terrain::water::{WaterError, WaterSpec, WaterState};
 use watershed::meta::WaterInfo;
 use watershed::raster::{Raster, raster_coord, resolution, texel_center};
@@ -22,45 +22,45 @@ use watershed::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 ///
 /// Planning is what these are for: a document that plans can be baked, and a bake
 /// that has started cannot fail any of these ways —
-/// [`PlanError::ShaderDispatch`] excepted, which is raised while a field is being
+/// [`PlanError::ShaderDispatch`] excepted, which is raised while a layer is being
 /// evaluated, because the raster a sampling shader reads is produced inside the bake.
 #[derive(Debug, Error)]
 pub enum PlanError {
     /// The document has no cells.
     #[error("terrain size has a zero component: {0} by {1}")]
     ZeroSize(u32, u32),
-    /// Two fields carry the same id, so a reference to it is ambiguous.
-    #[error("two fields share the id `{0}`")]
-    DuplicateField(String),
-    /// A shader's `@layer` names a field the document does not carry. Names both,
+    /// Two layers carry the same id, so a reference to it is ambiguous.
+    #[error("two layers share the id `{0}`")]
+    DuplicateLayer(String),
+    /// A shader's `@layer` names a layer the document does not carry. Names both,
     /// because the read is in the reader and the mistake may be in either.
-    #[error("field `{referenced}`, read by `{reader}`, is not in the document")]
-    UnknownField {
+    #[error("layer `{referenced}`, read by `{reader}`, is not in the document")]
+    UnknownLayer {
         /// The name that could not be resolved.
         referenced: String,
-        /// The field whose shader names it.
+        /// The layer whose shader names it.
         reader: String,
     },
-    /// The fields cannot be ordered. Carries the cycle as a `->` chain of names.
-    #[error("fields depend on each other in a cycle: {0}")]
+    /// The layers cannot be ordered. Carries the cycle as a `->` chain of names.
+    #[error("layers depend on each other in a cycle: {0}")]
     Cycle(String),
-    /// Two fields claim `Height` or two claim `Moisture`, so a role lookup would be
+    /// Two layers claim `Height` or two claim `Moisture`, so a role lookup would be
     /// ambiguous.
-    #[error("two fields claim the role `{0}`")]
-    DuplicateRole(FieldRole),
-    /// The document declares water and no field holds `Height` to solve it over.
-    #[error("water is declared and no field holds the role `height`")]
-    MissingHeightField,
-    /// The `Height` field is coarser than the document; the water solve reads one
+    #[error("two layers claim the role `{0}`")]
+    DuplicateRole(LayerRole),
+    /// The document declares water and no layer holds `Height` to solve it over.
+    #[error("water is declared and no layer holds the role `height`")]
+    MissingHeightLayer,
+    /// The `Height` layer is coarser than the document; the water solve reads one
     /// texel per cell and will not resample.
-    #[error("field `{0}` holds the role `height` at shift {1}")]
+    #[error("layer `{0}` holds the role `height` at shift {1}")]
     CoarseHeight(String, u8),
-    /// A field's shader could not be dispatched. The one fault here that is raised
+    /// A layer's shader could not be dispatched. The one fault here that is raised
     /// during evaluation rather than before it.
-    #[error("the shader of field `{field}` did not run: {reason}")]
+    #[error("the shader of layer `{layer}` did not run: {reason}")]
     ShaderDispatch {
-        /// The field whose shader it is.
-        field: String,
+        /// The layer whose shader it is.
+        layer: String,
         /// What the dispatch answered.
         reason: String,
     },
@@ -85,30 +85,30 @@ pub enum BakeError {
     /// The water step. See [`WaterError`].
     #[error(transparent)]
     WaterSolve(#[from] WaterError),
-    /// A field step. Reachable if the document was edited between planning and
+    /// A layer step. Reachable if the document was edited between planning and
     /// baking. See [`PlanError`].
     #[error(transparent)]
     Plan(#[from] PlanError),
-    /// A field's values could not be stored in the channel they were destined for.
+    /// A layer's values could not be stored in the channel they were destined for.
     /// See [`ChannelError`].
     #[error(transparent)]
     Channel(#[from] ChannelError),
 }
 
-/// An authored document: an extent, the fields in it, and optionally a description
+/// An authored document: an extent, the layers in it, and optionally a description
 /// of the water over them.
 ///
 /// This is the editable side of a terrain and the thing that is saved. Everything
-/// derived — a field's baked raster, the solved water — is held here too but is not
+/// derived — a layer's baked raster, the solved water — is held here too but is not
 /// part of the serialized form; the recipe that re-derives it is, which is why the
 /// water spec survives a save where the water itself does not.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerrainSpec {
-    /// The extent in cells. Every field covers all of it, whatever its own shift.
+    /// The extent in cells. Every layer covers all of it, whatever its own shift.
     pub size: UVec2,
-    /// The fields, in declaration order. Not bake order — see
+    /// The layers, in declaration order. Not bake order — see
     /// [`TerrainSpec::bake_order`] — but the order a consumer reads them back in.
-    pub fields: Vec<Field>,
+    pub layers: Vec<Layer>,
     /// What water this document wants, if any. Serialized, so a document reloaded
     /// without its solved water can solve it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,11 +124,11 @@ pub struct TerrainSpec {
 }
 
 impl TerrainSpec {
-    /// An empty document of that extent — no fields, no water.
+    /// An empty document of that extent — no layers, no water.
     pub fn new(size: UVec2) -> Self {
         Self {
             size,
-            fields: Vec::new(),
+            layers: Vec::new(),
             water_spec: None,
             seed: 0,
             water: None,
@@ -136,35 +136,35 @@ impl TerrainSpec {
         }
     }
 
-    /// Installs what a field's shader is dispatched through. Derived state: it is not
+    /// Installs what a layer's shader is dispatched through. Derived state: it is not
     /// part of what the document is, it is not saved, and installing it is not an
     /// edit.
     pub fn set_shader_runtime(&mut self, runtime: ShaderRuntime) {
         self.runtime = runtime;
     }
 
-    /// What a field's shader is currently dispatched through. A default runtime holds
-    /// no device, and every field under it reads the values its shader already holds.
+    /// What a layer's shader is currently dispatched through. A default runtime holds
+    /// no device, and every layer under it reads the values its shader already holds.
     pub fn shader_runtime(&self) -> &ShaderRuntime {
         &self.runtime
     }
 
-    /// Every field that cannot bake, with the reason, in declaration order.
+    /// Every layer that cannot bake, with the reason, in declaration order.
     ///
-    /// A field reading a name the document does not carry, a field reading one of
-    /// those, and every field of a cycle between fields that could otherwise bake. The
+    /// A layer reading a name the document does not carry, a layer reading one of
+    /// those, and every layer of a cycle between layers that could otherwise bake. The
     /// first two are left unbaked by [`TerrainSpec::bake_in_place`] while the rest of
-    /// document bakes; a cycle still fails the bake, and its fields' reason is
+    /// document bakes; a cycle still fails the bake, and its layers' reason is
     /// `cycle: ` followed by the chain. Derived from the document each
-    /// call, never stored. A document with two fields of one id answers no faults.
-    pub fn field_faults(&self) -> Vec<(FieldId, String)> {
-        let Ok(index_of) = self.index_fields() else {
+    /// call, never stored. A document with two layers of one id answers no faults.
+    pub fn layer_faults(&self) -> Vec<(LayerId, String)> {
+        let Ok(index_of) = self.index_layers() else {
             return Vec::new();
         };
         let mut faults = self.unreadable(&index_of);
         let blocked: Vec<bool> = faults.iter().map(Option::is_some).collect();
         let dependencies = self.resolve_readable(&index_of, &blocked);
-        if let Err(PlanError::Cycle(chain)) = topological_order(&dependencies, &self.fields) {
+        if let Err(PlanError::Cycle(chain)) = topological_order(&dependencies, &self.layers) {
             for name in chain.split(" -> ") {
                 if let Some(&at) = index_of.get(name)
                     && faults[at].is_none()
@@ -173,51 +173,51 @@ impl TerrainSpec {
                 }
             }
         }
-        self.fields
+        self.layers
             .iter()
             .zip(faults)
-            .filter_map(|(field, fault)| Some((field.id.clone(), fault?)))
+            .filter_map(|(layer, fault)| Some((layer.id.clone(), fault?)))
             .collect()
     }
 
-    /// Appends a field. Order here is declaration order, not evaluation order: a
-    /// field may reference one added after it.
-    pub fn with_field(mut self, field: Field) -> Self {
-        self.fields.push(field);
+    /// Appends a layer. Order here is declaration order, not evaluation order: a
+    /// layer may reference one added after it.
+    pub fn with_layer(mut self, layer: Layer) -> Self {
+        self.layers.push(layer);
         self
     }
 
-    /// The field of that exact name, or `None`. Case-sensitive.
-    pub fn field(&self, id: &str) -> Option<&Field> {
-        self.fields.iter().find(|field| field.id.as_str() == id)
+    /// The layer of that exact name, or `None`. Case-sensitive.
+    pub fn layer(&self, id: &str) -> Option<&Layer> {
+        self.layers.iter().find(|layer| layer.id.as_str() == id)
     }
 
-    /// As [`TerrainSpec::field`], mutable. Editing through this can invalidate the
+    /// As [`TerrainSpec::layer`], mutable. Editing through this can invalidate the
     /// bakes and the water; nothing here notices.
-    pub fn field_mut(&mut self, id: &str) -> Option<&mut Field> {
-        self.fields.iter_mut().find(|field| field.id.as_str() == id)
+    pub fn layer_mut(&mut self, id: &str) -> Option<&mut Layer> {
+        self.layers.iter_mut().find(|layer| layer.id.as_str() == id)
     }
 
-    /// A field's baked value at a position in document cells, where a cell centre is
+    /// A layer's baked value at a position in document cells, where a cell centre is
     /// at `x + 0.5`.
     ///
-    /// `None` means the document has no such field — a distinction worth keeping,
-    /// because a field that exists but is unbaked or released samples as `Some(0.0)`
+    /// `None` means the document has no such layer — a distinction worth keeping,
+    /// because a layer that exists but is unbaked or released samples as `Some(0.0)`
     /// and a caller that conflated the two could not tell a typo from a released
-    /// field.
+    /// layer.
     pub fn sample(&self, id: &str, x: f32, y: f32) -> Option<f32> {
-        self.field(id).map(|field| field.sample(x, y))
+        self.layer(id).map(|layer| layer.sample(x, y))
     }
 
-    /// Bakes every field over the whole document, in dependency order, leaving the
-    /// results on the fields. Does not solve water.
+    /// Bakes every layer over the whole document, in dependency order, leaving the
+    /// results on the layers. Does not solve water.
     ///
-    /// Fields are reallocated to their declared resolutions first, so this also
+    /// Layers are reallocated to their declared resolutions first, so this also
     /// fixes a document whose shifts have been edited.
     ///
-    /// A field reading a name the document does not carry, and every field reading
+    /// A layer reading a name the document does not carry, and every layer reading
     /// one of those, is left unbaked — sampling as `0.0` — while the rest bakes;
-    /// [`TerrainSpec::field_faults`] says which and why. A cycle between fields, a
+    /// [`TerrainSpec::layer_faults`] says which and why. A cycle between layers, a
     /// duplicate id, a zero extent and a shader that fails to dispatch still fail the
     /// whole bake.
     pub fn bake_in_place(&mut self) -> Result<(), PlanError> {
@@ -225,23 +225,23 @@ impl TerrainSpec {
             return Err(PlanError::ZeroSize(self.size.x, self.size.y));
         }
 
-        let index_of = self.index_fields()?;
+        let index_of = self.index_layers()?;
         let blocked: Vec<bool> = self
             .unreadable(&index_of)
             .iter()
             .map(Option::is_some)
             .collect();
         let dependencies = self.resolve_readable(&index_of, &blocked);
-        let order: Vec<usize> = topological_order(&dependencies, &self.fields)?
+        let order: Vec<usize> = topological_order(&dependencies, &self.layers)?
             .into_iter()
             .filter(|&index| !blocked[index])
             .collect();
         self.reallocate_rasters(&blocked);
 
         let mut baked: Vec<Raster<f32>> = self
-            .fields
+            .layers
             .iter_mut()
-            .map(|field| field.take_baked())
+            .map(|layer| layer.take_baked())
             .collect();
 
         let mut dispatched: Vec<(usize, (Raster<f32>, u64))> = Vec::new();
@@ -256,95 +256,95 @@ impl TerrainSpec {
             }
         }
 
-        for (field, raster) in self.fields.iter_mut().zip(baked) {
-            field.put_baked(raster);
+        for (layer, raster) in self.layers.iter_mut().zip(baked) {
+            layer.put_baked(raster);
         }
         for (target, (values, key)) in dispatched {
-            self.fields[target].shader.put_dispatch(values, key);
+            self.layers[target].shader.put_dispatch(values, key);
         }
         result
     }
 
-    /// The order a bake visits the fields in: every field after the ones it reads.
+    /// The order a bake visits the layers in: every layer after the ones it reads.
     ///
     /// This is the whole of what a caller needs to drive a bake a stage at a time, and it
     /// is a *plan* rather than a running bake — nothing is borrowed, so the document
     /// stays readable between stages and the caller decides the pacing. Anything that
-    /// would make a bake fail late (a cycle, a missing field, a duplicate id) fails here
+    /// would make a bake fail late (a cycle, a missing layer, a duplicate id) fails here
     /// instead, before a single texel is written.
     ///
     /// Ids rather than indices, because a caller driving a bake a stage at a time
-    /// may edit the document between stages, and an index into `fields` would not
-    /// survive a field being added or removed where a name does.
+    /// may edit the document between stages, and an index into `layers` would not
+    /// survive a layer being added or removed where a name does.
     ///
     /// The order is deterministic: the same document gives the same order on every
     /// machine and in every run.
-    pub fn bake_order(&self) -> Result<Vec<FieldId>, PlanError> {
-        let index_of = self.index_fields()?;
+    pub fn bake_order(&self) -> Result<Vec<LayerId>, PlanError> {
+        let index_of = self.index_layers()?;
         let dependencies = self.resolve_dependencies(&index_of)?;
-        let order = topological_order(&dependencies, &self.fields)?;
+        let order = topological_order(&dependencies, &self.layers)?;
         Ok(order
             .into_iter()
-            .map(|index| self.fields[index].id.clone())
+            .map(|index| self.layers[index].id.clone())
             .collect())
     }
-    /// Bake one field over the whole document, assuming everything it reads is baked.
+    /// Bake one layer over the whole document, assuming everything it reads is baked.
     ///
     /// **The assumption is the caller's to keep**, and [`TerrainSpec::bake_order`] is how:
-    /// walking that order calls this on a field only after its dependencies. Called out
-    /// of order it does not fail — it reads whatever those fields currently hold, which
+    /// walking that order calls this on a layer only after its dependencies. Called out
+    /// of order it does not fail — it reads whatever those layers currently hold, which
     /// for an unbaked one is zero. That is the same fallback a document has before any
     /// bake at all, and it is what makes a partially baked document *displayable* rather
     /// than an error state.
     ///
-    /// Only the named field is allocated, where [`TerrainSpec::bake_in_place`]
-    /// allocates every field. That is what makes [`TerrainSpec::release`] worth
-    /// anything: a released field stays released across the stages that follow it, so
+    /// Only the named layer is allocated, where [`TerrainSpec::bake_in_place`]
+    /// allocates every layer. That is what makes [`TerrainSpec::release`] worth
+    /// anything: a released layer stays released across the stages that follow it, so
     /// a staged bake peaks at its widest live set rather than at the sum of the
     /// document.
-    pub fn bake_field(&mut self, id: &str) -> Result<(), PlanError> {
+    pub fn bake_layer(&mut self, id: &str) -> Result<(), PlanError> {
         if self.size.x == 0 || self.size.y == 0 {
             return Err(PlanError::ZeroSize(self.size.x, self.size.y));
         }
-        let index_of = self.index_fields()?;
-        let reader = FieldId::from(id);
+        let index_of = self.index_layers()?;
+        let reader = LayerId::from(id);
         let target = lookup(&index_of, &reader, &reader)?;
-        let wanted = resolution(self.size, self.fields[target].shift);
-        if self.fields[target].baked().size() != wanted {
-            *self.fields[target].baked_mut() = Raster::new(wanted, 0.0);
+        let wanted = resolution(self.size, self.layers[target].shift);
+        if self.layers[target].baked().size() != wanted {
+            *self.layers[target].baked_mut() = Raster::new(wanted, 0.0);
         }
         let mut baked: Vec<Raster<f32>> = self
-            .fields
+            .layers
             .iter_mut()
-            .map(|field| field.take_baked())
+            .map(|layer| layer.take_baked())
             .collect();
 
         let result = self.evaluate(target, &index_of, &mut baked);
 
-        for (field, raster) in self.fields.iter_mut().zip(baked) {
-            field.put_baked(raster);
+        for (layer, raster) in self.layers.iter_mut().zip(baked) {
+            layer.put_baked(raster);
         }
         if let Some((values, key)) = result? {
-            self.fields[target].shader.put_dispatch(values, key);
+            self.layers[target].shader.put_dispatch(values, key);
         }
         Ok(())
     }
 
-    /// Drop a field's baked raster, keeping the shader values that would rebuild it.
+    /// Drop a layer's baked raster, keeping the shader values that would rebuild it.
     ///
     /// **This is what makes a staged bake affordable rather than merely visible.** A
-    /// document's fields do not all have to be resident at once: an intermediate is dead
+    /// document's layers do not all have to be resident at once: an intermediate is dead
     /// as soon as everything downstream of it has been baked, and at a whole-world size a
-    /// single shift-0 field is tens of megabytes. Releasing as the order advances turns
-    /// the peak from the sum of every field into the widest live set.
+    /// single shift-0 layer is tens of megabytes. Releasing as the order advances turns
+    /// the peak from the sum of every layer into the widest live set.
     ///
-    /// A released field samples as zero, exactly as one that has never been baked — so
+    /// A released layer samples as zero, exactly as one that has never been baked — so
     /// releasing something still to be read is not an error, it is a wrong answer, and
     /// the caller owns that distinction the same way it owns the bake order.
     pub fn release(&mut self, id: &str) -> bool {
-        match self.field_mut(id) {
-            Some(field) => {
-                *field.baked_mut() = Raster::default();
+        match self.layer_mut(id) {
+            Some(layer) => {
+                *layer.baked_mut() = Raster::default();
                 true
             }
             None => false,
@@ -353,13 +353,13 @@ impl TerrainSpec {
 
     /// How many bytes the baked rasters currently hold.
     ///
-    /// The bakes only: a field's shader values are not counted. This number is
+    /// The bakes only: a layer's shader values are not counted. This number is
     /// the part that [`TerrainSpec::release`] moves and is what a staged bake watches.
     pub fn baked_bytes(&self) -> usize {
-        self.fields
+        self.layers
             .iter()
-            .map(|field| {
-                let size = field.baked().size();
+            .map(|layer| {
+                let size = layer.baked().size();
                 size.x as usize * size.y as usize * size_of::<f32>()
             })
             .sum()
@@ -371,15 +371,15 @@ impl TerrainSpec {
         index_of: &HashMap<String, usize>,
         baked: &mut [Raster<f32>],
     ) -> Result<Option<(Raster<f32>, u64)>, PlanError> {
-        let field = &self.fields[target];
-        let texels = resolution(self.size, field.shift);
+        let layer = &self.layers[target];
+        let texels = resolution(self.size, layer.shift);
         let mut fresh = None;
-        if let Some(program) = self.runtime.program(&field.file()) {
-            let params = program.layout.pack(&field.shader.params);
+        if let Some(program) = self.runtime.program(&layer.file()) {
+            let params = program.layout.pack(&layer.shader.params);
             let key = dispatch_key(&program.source, &params, texels);
             let reusable = program.layers.is_empty()
-                && field.shader.stamp() == Some(key)
-                && field.shader.values().size() == texels;
+                && layer.shader.stamp() == Some(key)
+                && layer.shader.values().size() == texels;
             if !reusable {
                 let layers: Vec<Option<&Raster<f32>>> = program
                     .layers
@@ -390,7 +390,7 @@ impl TerrainSpec {
                     document: self.size,
                     texels,
                     origin: UVec2::ZERO,
-                    shift: field.shift as u32,
+                    shift: layer.shift as u32,
                     seed: self.runtime.seed().unwrap_or_default(),
                 };
                 let values = self
@@ -402,7 +402,7 @@ impl TerrainSpec {
                         })
                     })
                     .map_err(|reason| PlanError::ShaderDispatch {
-                        field: field.id.to_string(),
+                        layer: layer.id.to_string(),
                         reason,
                     })?;
                 fresh = Some((values, key));
@@ -411,9 +411,9 @@ impl TerrainSpec {
 
         let source = fresh
             .as_ref()
-            .map_or(field.shader.values(), |(values, _)| values);
-        let (low, high) = field.bounds();
-        let shift = field.shift;
+            .map_or(layer.shader.values(), |(values, _)| values);
+        let (low, high) = layer.bounds();
+        let shift = layer.shift;
         let target_raster = &mut baked[target];
         let size = target_raster.size();
         for j in 0..size.y {
@@ -426,11 +426,11 @@ impl TerrainSpec {
         Ok(fresh)
     }
 
-    fn index_fields(&self) -> Result<HashMap<String, usize>, PlanError> {
-        let mut index_of = HashMap::with_capacity(self.fields.len());
-        for (index, field) in self.fields.iter().enumerate() {
-            if index_of.insert(field.id.to_string(), index).is_some() {
-                return Err(PlanError::DuplicateField(field.id.to_string()));
+    fn index_layers(&self) -> Result<HashMap<String, usize>, PlanError> {
+        let mut index_of = HashMap::with_capacity(self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            if index_of.insert(layer.id.to_string(), index).is_some() {
+                return Err(PlanError::DuplicateLayer(layer.id.to_string()));
             }
         }
         Ok(index_of)
@@ -440,10 +440,10 @@ impl TerrainSpec {
         &self,
         index_of: &HashMap<String, usize>,
     ) -> Result<Vec<Vec<usize>>, PlanError> {
-        let mut dependencies = vec![Vec::new(); self.fields.len()];
-        for (index, field) in self.fields.iter().enumerate() {
-            for id in field.dependencies() {
-                let referenced = lookup(index_of, id, &field.id)?;
+        let mut dependencies = vec![Vec::new(); self.layers.len()];
+        for (index, layer) in self.layers.iter().enumerate() {
+            for id in layer.dependencies() {
+                let referenced = lookup(index_of, id, &layer.id)?;
                 if !dependencies[index].contains(&referenced) {
                     dependencies[index].push(referenced);
                 }
@@ -454,31 +454,31 @@ impl TerrainSpec {
 
     fn unreadable(&self, index_of: &HashMap<String, usize>) -> Vec<Option<String>> {
         let mut faults: Vec<Option<String>> = self
-            .fields
+            .layers
             .iter()
-            .map(|field| {
-                field
+            .map(|layer| {
+                layer
                     .dependencies()
-                    .find_map(|id| lookup(index_of, id, &field.id).err())
+                    .find_map(|id| lookup(index_of, id, &layer.id).err())
                     .map(|error| error.to_string())
             })
             .collect();
         let mut moved = true;
         while moved {
             moved = false;
-            for (index, field) in self.fields.iter().enumerate() {
+            for (index, layer) in self.layers.iter().enumerate() {
                 if faults[index].is_some() {
                     continue;
                 }
-                let stuck = field.dependencies().find(|id| {
+                let stuck = layer.dependencies().find(|id| {
                     index_of
                         .get(id.as_str())
                         .is_some_and(|&at| faults[at].is_some())
                 });
                 if let Some(name) = stuck {
                     faults[index] = Some(format!(
-                        "field `{}` reads `{name}`, which cannot bake",
-                        field.id
+                        "layer `{}` reads `{name}`, which cannot bake",
+                        layer.id
                     ));
                     moved = true;
                 }
@@ -492,12 +492,12 @@ impl TerrainSpec {
         index_of: &HashMap<String, usize>,
         blocked: &[bool],
     ) -> Vec<Vec<usize>> {
-        let mut dependencies = vec![Vec::new(); self.fields.len()];
-        for (index, field) in self.fields.iter().enumerate() {
+        let mut dependencies = vec![Vec::new(); self.layers.len()];
+        for (index, layer) in self.layers.iter().enumerate() {
             if blocked[index] {
                 continue;
             }
-            for id in field.dependencies() {
+            for id in layer.dependencies() {
                 if let Some(&referenced) = index_of.get(id.as_str())
                     && !dependencies[index].contains(&referenced)
                 {
@@ -510,14 +510,14 @@ impl TerrainSpec {
 
     fn reallocate_rasters(&mut self, blocked: &[bool]) {
         let size = self.size;
-        for (field, &blocked) in self.fields.iter_mut().zip(blocked) {
+        for (layer, &blocked) in self.layers.iter_mut().zip(blocked) {
             if blocked {
-                *field.baked_mut() = Raster::default();
+                *layer.baked_mut() = Raster::default();
                 continue;
             }
-            let wanted = resolution(size, field.shift);
-            if field.baked().size() != wanted {
-                *field.baked_mut() = Raster::new(wanted, 0.0);
+            let wanted = resolution(size, layer.shift);
+            if layer.baked().size() != wanted {
+                *layer.baked_mut() = Raster::new(wanted, 0.0);
             }
         }
     }
@@ -525,13 +525,13 @@ impl TerrainSpec {
 
 fn lookup(
     index_of: &HashMap<String, usize>,
-    referenced: &FieldId,
-    reader: &FieldId,
+    referenced: &LayerId,
+    reader: &LayerId,
 ) -> Result<usize, PlanError> {
     index_of
         .get(referenced.as_str())
         .copied()
-        .ok_or_else(|| PlanError::UnknownField {
+        .ok_or_else(|| PlanError::UnknownLayer {
             referenced: referenced.to_string(),
             reader: reader.to_string(),
         })
@@ -546,7 +546,7 @@ enum Mark {
 
 fn topological_order(
     dependencies: &[Vec<usize>],
-    fields: &[Field],
+    layers: &[Layer],
 ) -> Result<Vec<usize>, PlanError> {
     let mut marks = vec![Mark::Unvisited; dependencies.len()];
     let mut order = Vec::with_capacity(dependencies.len());
@@ -555,7 +555,7 @@ fn topological_order(
         visit(
             index,
             dependencies,
-            fields,
+            layers,
             &mut marks,
             &mut order,
             &mut stack,
@@ -567,7 +567,7 @@ fn topological_order(
 fn visit(
     index: usize,
     dependencies: &[Vec<usize>],
-    fields: &[Field],
+    layers: &[Layer],
     marks: &mut [Mark],
     order: &mut Vec<usize>,
     stack: &mut Vec<usize>,
@@ -578,9 +578,9 @@ fn visit(
             let start = stack.iter().position(|&i| i == index).unwrap_or(0);
             let mut names: Vec<String> = stack[start..]
                 .iter()
-                .map(|&i| fields[i].id.to_string())
+                .map(|&i| layers[i].id.to_string())
                 .collect();
-            names.push(fields[index].id.to_string());
+            names.push(layers[index].id.to_string());
             return Err(PlanError::Cycle(names.join(" -> ")));
         }
         Mark::Unvisited => {}
@@ -588,7 +588,7 @@ fn visit(
     marks[index] = Mark::InProgress;
     stack.push(index);
     for &referenced in &dependencies[index] {
-        visit(referenced, dependencies, fields, marks, order, stack)?;
+        visit(referenced, dependencies, layers, marks, order, stack)?;
     }
     stack.pop();
     marks[index] = Mark::Done;
@@ -598,14 +598,14 @@ fn visit(
 
 /// What one step of a plan does.
 ///
-/// A step is the smallest unit of work whose result is complete: a whole field, or
-/// the whole water solve. Nothing smaller is a step — a band of rows leaves a field
+/// A step is the smallest unit of work whose result is complete: a whole layer, or
+/// the whole water solve. Nothing smaller is a step — a band of rows leaves a layer
 /// half-written, which nothing downstream may read, so it would not be a point a
 /// caller could stop at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepKind {
-    /// Evaluate one field over the whole document.
-    Field,
+    /// Evaluate one layer over the whole document.
+    Layer,
     /// Solve the water. Always last, and only present if the document declares
     /// water.
     Water,
@@ -614,15 +614,15 @@ pub enum StepKind {
 /// One step of a [`BakePlan`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct BakeStep {
-    /// Whether this evaluates a field or solves the water.
+    /// Whether this evaluates a layer or solves the water.
     pub kind: StepKind,
-    /// The field this step bakes. For a water step, the `Height` field it is solved
+    /// The layer this step bakes. For a water step, the `Height` layer it is solved
     /// over — empty if the document has none.
-    pub field: String,
-    /// Fields to release once this step has run, freeing their baked rasters.
+    pub layer: String,
+    /// Layers to release once this step has run, freeing their baked rasters.
     ///
     /// Honoured by [`Bake::advance`], but [`TerrainSpec::plan_bake`] never populates
-    /// it: a finished [`Terrain`] has to answer at every cell of every field it
+    /// it: a finished [`Terrain`] has to answer at every cell of every layer it
     /// names, so nothing a plan produces may be released before the plan ends.
     pub releases: Vec<String>,
 }
@@ -630,12 +630,12 @@ pub struct BakeStep {
 /// The steps a document has to be taken through, settled before any of them runs.
 ///
 /// A plan is a value, not a running bake: it borrows nothing, so a caller can read
-/// off how many steps there are and which field each names — enough to size a
+/// off how many steps there are and which layer each names — enough to size a
 /// progress bar, or to decide the work is too large — while the document stays
 /// readable. It is a snapshot, and editing the document afterwards does not update
 /// it.
 ///
-/// Fields already baked at their declared resolution are left out, so a plan for a
+/// Layers already baked at their declared resolution are left out, so a plan for a
 /// partially baked document is shorter than one for a fresh one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BakePlan {
@@ -653,7 +653,7 @@ impl BakePlan {
         self.steps.len()
     }
 
-    /// Whether there is nothing to do — a document with no fields, or one already
+    /// Whether there is nothing to do — a document with no layers, or one already
     /// fully baked and wanting no water.
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
@@ -681,18 +681,18 @@ pub struct BakeReport {
     pub step: u32,
     /// Steps in the plan.
     pub total: u32,
-    /// The field the last completed step baked; empty before the first has run.
-    pub field: String,
-    /// How much the baked rasters currently hold. The bakes only — fields' shader
+    /// The layer the last completed step baked; empty before the first has run.
+    pub layer: String,
+    /// How much the baked rasters currently hold. The bakes only — layers' shader
     /// values and the solved water are not counted — so this is the number a staged
-    /// bake can actually move, and it falls when a field is released.
+    /// bake can actually move, and it falls when a layer is released.
     pub live_bytes: u64,
 }
 
 /// A document part way through being baked: it owns the spec, the plan, and
 /// whatever its completed steps have written.
 ///
-/// Constructing one allocates nothing — the plan is a list of names, and a field's
+/// Constructing one allocates nothing — the plan is a list of names, and a layer's
 /// raster is allocated by the step that fills it — so a caller may plan a bake it
 /// then decides not to run.
 #[derive(Debug)]
@@ -700,7 +700,7 @@ pub struct Bake {
     spec: TerrainSpec,
     plan: BakePlan,
     next_step: u32,
-    last_field: String,
+    last_layer: String,
 }
 
 impl Bake {
@@ -716,12 +716,12 @@ impl Bake {
     }
 
     /// Where the bake has got to. Valid at any point: before the first step it
-    /// reports step `0`, no field, and whatever the document was already holding.
+    /// reports step `0`, no layer, and whatever the document was already holding.
     pub fn report(&self) -> BakeReport {
         BakeReport {
             step: self.next_step,
             total: self.plan.steps.len() as u32,
-            field: self.last_field.clone(),
+            layer: self.last_layer.clone(),
             live_bytes: self.spec.baked_bytes() as u64,
         }
     }
@@ -739,7 +739,7 @@ impl Bake {
         };
 
         match step.kind {
-            StepKind::Field => self.spec.bake_field(&step.field)?,
+            StepKind::Layer => self.spec.bake_layer(&step.layer)?,
             StepKind::Water => {
                 let water_spec = self
                     .spec
@@ -755,7 +755,7 @@ impl Bake {
         }
 
         self.next_step += 1;
-        self.last_field = step.field;
+        self.last_layer = step.layer;
         if self.next_step as usize >= self.plan.steps.len() {
             Ok(BakeProgress::Finished)
         } else {
@@ -764,7 +764,7 @@ impl Bake {
     }
 
     /// The finished [`Terrain`], dropping the document that produced it — the
-    /// parameter values and the values the fields' shaders hold.
+    /// parameter values and the values the layers' shaders hold.
     ///
     /// For a consumer that will only read. A caller that will edit and re-bake wants
     /// [`Bake::finish_keeping_spec`], since nothing rebuilds a document from a
@@ -793,13 +793,13 @@ impl Bake {
 }
 
 fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
-    let readable: Vec<&Field> = spec
-        .fields
+    let readable: Vec<&Layer> = spec
+        .layers
         .iter()
-        .filter(|field| field.baked().size() == field.resolution(spec.size))
+        .filter(|authored| authored.baked().size() == authored.resolution(spec.size))
         .collect();
 
-    let shifts: Vec<u8> = readable.iter().map(|field| field.shift).collect();
+    let shifts: Vec<u8> = readable.iter().map(|authored| authored.shift).collect();
     let (placements, layer_shifts) = plan_layers(&shifts);
 
     let mut layers: Vec<LayerBuild> = layer_shifts
@@ -807,20 +807,24 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
         .map(|shift| LayerBuild::new(Some(*shift), resolution(spec.size, *shift)))
         .collect();
 
-    let mut fields = Vec::with_capacity(readable.len());
-    for (field, place) in readable.iter().zip(&placements) {
-        let meta = value_range(field.baked().data());
+    let mut infos = Vec::with_capacity(readable.len());
+    for (authored, place) in readable.iter().zip(&placements) {
+        let meta = value_range(authored.baked().data());
 
         let layer = &mut layers[place.layer as usize];
         layer.push(
             meta,
-            field.baked().data().iter().map(|value| meta.encode(*value)),
+            authored
+                .baked()
+                .data()
+                .iter()
+                .map(|value| meta.encode(*value)),
         );
 
-        fields.push(FieldInfo {
-            name: field.id.to_string(),
-            role: field.role,
-            shift: field.shift,
+        infos.push(FieldInfo {
+            name: authored.id.to_string(),
+            role: authored.role,
+            shift: authored.shift,
             categorical: false,
             layer: place.layer,
             channel: place.channel,
@@ -842,7 +846,7 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
 
     Ok(Terrain::new(
         spec.size,
-        fields,
+        infos,
         layers.into_iter().map(LayerBuild::finish).collect(),
         water,
     ))
@@ -953,19 +957,19 @@ impl TerrainSpec {
         }
         self.validate_roles()?;
 
-        let index_of = self.index_fields()?;
+        let index_of = self.index_layers()?;
         let dependencies = self.resolve_dependencies(&index_of)?;
-        let order = topological_order(&dependencies, &self.fields)?;
+        let order = topological_order(&dependencies, &self.layers)?;
 
         let mut steps: Vec<BakeStep> = Vec::with_capacity(order.len() + 1);
         for &index in &order {
-            let field = &self.fields[index];
-            if field.baked().size() == resolution(self.size, field.shift) {
+            let layer = &self.layers[index];
+            if layer.baked().size() == resolution(self.size, layer.shift) {
                 continue;
             }
             steps.push(BakeStep {
-                kind: StepKind::Field,
-                field: field.id.to_string(),
+                kind: StepKind::Layer,
+                layer: layer.id.to_string(),
                 releases: Vec::new(),
             });
         }
@@ -973,9 +977,9 @@ impl TerrainSpec {
         if self.water_spec.is_some() {
             steps.push(BakeStep {
                 kind: StepKind::Water,
-                field: self
-                    .field_with_role(FieldRole::Height)
-                    .map(|field| field.id.to_string())
+                layer: self
+                    .layer_with_role(LayerRole::Height)
+                    .map(|layer| layer.id.to_string())
                     .unwrap_or_default(),
                 releases: Vec::new(),
             });
@@ -995,7 +999,7 @@ impl TerrainSpec {
             spec: self,
             plan,
             next_step: 0,
-            last_field: String::new(),
+            last_layer: String::new(),
         })
     }
 
@@ -1012,35 +1016,35 @@ impl TerrainSpec {
         bake.finish()
     }
 
-    /// The field holding `role`. [`FieldRole::Custom`] always answers `None`,
-    /// because any number of fields may hold it.
-    pub fn field_with_role(&self, role: FieldRole) -> Option<&Field> {
-        if role == FieldRole::Custom {
+    /// The layer holding `role`. [`LayerRole::Custom`] always answers `None`,
+    /// because any number of layers may hold it.
+    pub fn layer_with_role(&self, role: LayerRole) -> Option<&Layer> {
+        if role == LayerRole::Custom {
             return None;
         }
-        self.fields.iter().find(|field| field.role == role)
+        self.layers.iter().find(|layer| layer.role == role)
     }
 
-    /// Checks the three things a role assignment has to satisfy: at most one field
-    /// per named role, a `Height` field at shift 0, and a `Height` field present if
+    /// Checks the three things a role assignment has to satisfy: at most one layer
+    /// per named role, a `Height` layer at shift 0, and a `Height` layer present if
     /// water is declared.
     ///
     /// Called by [`TerrainSpec::plan_bake`], and worth calling directly by anything
     /// that lets a role be changed, so the conflict is reported where it was made
     /// rather than at the next bake.
     pub fn validate_roles(&self) -> Result<(), PlanError> {
-        for role in [FieldRole::Height, FieldRole::Moisture] {
-            if self.fields.iter().filter(|f| f.role == role).count() > 1 {
+        for role in [LayerRole::Height, LayerRole::Moisture] {
+            if self.layers.iter().filter(|f| f.role == role).count() > 1 {
                 return Err(PlanError::DuplicateRole(role));
             }
         }
-        if let Some(height) = self.field_with_role(FieldRole::Height)
+        if let Some(height) = self.layer_with_role(LayerRole::Height)
             && height.shift != 0
         {
             return Err(PlanError::CoarseHeight(height.id.to_string(), height.shift));
         }
-        if self.water_spec.is_some() && self.field_with_role(FieldRole::Height).is_none() {
-            return Err(PlanError::MissingHeightField);
+        if self.water_spec.is_some() && self.layer_with_role(LayerRole::Height).is_none() {
+            return Err(PlanError::MissingHeightLayer);
         }
         Ok(())
     }
@@ -1061,28 +1065,28 @@ mod tests {
         .unwrap()
     }
 
-    fn two_field_document() -> TerrainSpec {
+    fn two_layer_document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(96, 80))
-            .with_field(
-                Field::new("moisture")
+            .with_layer(
+                Layer::new("moisture")
                     .with_shift(3)
                     .holding(ramp(UVec2::new(12, 10))),
             )
-            .with_field(
-                Field::new("height")
+            .with_layer(
+                Layer::new("height")
                     .with_shift(0)
                     .holding(ramp(UVec2::new(96, 80)))
                     .reading(&["moisture"]),
             )
     }
 
-    // The whole point of the staged bake: a caller that walks the order one field at a
+    // The whole point of the staged bake: a caller that walks the order one layer at a
     // time has to end up with exactly the document a single `bake()` would have written,
     // or the intermediate results it showed were of a different world.
     #[test]
     fn baking_a_stage_at_a_time_writes_what_one_bake_would_have() {
-        let mut whole = two_field_document().with_field(
-            Field::new("relief")
+        let mut whole = two_layer_document().with_layer(
+            Layer::new("relief")
                 .with_range((-1.0, 1.0))
                 .holding(ramp(UVec2::new(96, 80)))
                 .reading(&["height"]),
@@ -1091,26 +1095,26 @@ mod tests {
 
         whole.bake_in_place().unwrap();
         for id in staged.bake_order().unwrap() {
-            staged.bake_field(id.as_str()).unwrap();
+            staged.bake_layer(id.as_str()).unwrap();
         }
 
-        for field in &whole.fields {
-            let one = field.baked();
-            let other = staged.field(field.id.as_str()).unwrap().baked();
-            assert_eq!(one.size(), other.size(), "{} changed size", field.id);
+        for layer in &whole.layers {
+            let one = layer.baked();
+            let other = staged.layer(layer.id.as_str()).unwrap().baked();
+            assert_eq!(one.size(), other.size(), "{} changed size", layer.id);
             assert!(
                 one.data().iter().zip(other.data()).all(|(a, b)| a == b),
                 "{} differs between a staged bake and a whole one",
-                field.id
+                layer.id
             );
         }
     }
 
-    // Releasing is what keeps a staged bake's peak below the sum of its fields, and it
+    // Releasing is what keeps a staged bake's peak below the sum of its layers, and it
     // has to leave the document able to rebuild what it dropped.
     #[test]
-    fn a_released_field_reads_as_zero_and_bakes_back() {
-        let mut terrain = two_field_document();
+    fn a_released_layer_reads_as_zero_and_bakes_back() {
+        let mut terrain = two_layer_document();
         terrain.bake_in_place().unwrap();
 
         let before = terrain.baked_bytes();
@@ -1124,7 +1128,7 @@ mod tests {
         assert!(terrain.baked_bytes() < before);
         assert_eq!(terrain.sample("height", 12.5, 9.5), Some(0.0));
 
-        terrain.bake_field("height").unwrap();
+        terrain.bake_layer("height").unwrap();
         assert_eq!(terrain.baked_bytes(), before);
         assert_eq!(terrain.sample("height", 12.5, 9.5), Some(sampled));
     }
@@ -1134,40 +1138,40 @@ mod tests {
     // next stage.
     #[test]
     fn a_staged_bake_does_not_re_allocate_what_the_caller_released() {
-        let mut terrain = two_field_document();
+        let mut terrain = two_layer_document();
         let order = terrain.bake_order().unwrap();
-        terrain.bake_field(order[0].as_str()).unwrap();
+        terrain.bake_layer(order[0].as_str()).unwrap();
 
         let with_first = terrain.baked_bytes();
         terrain.release(order[0].as_str());
         let released = terrain.baked_bytes();
         assert!(released < with_first);
 
-        terrain.bake_field(order[1].as_str()).unwrap();
+        terrain.bake_layer(order[1].as_str()).unwrap();
         assert_eq!(
-            terrain.field(order[0].as_str()).unwrap().baked().size(),
+            terrain.layer(order[0].as_str()).unwrap().baked().size(),
             UVec2::ZERO,
-            "a released field came back when the next stage baked"
+            "a released layer came back when the next stage baked"
         );
     }
 
     // A staged bake releases by name, and the names come from a document the caller
     // may have edited since; a typo has to be a `false` it can notice, not a crash.
     #[test]
-    fn releasing_a_field_that_is_not_there_says_so_rather_than_panicking() {
-        let mut terrain = two_field_document();
+    fn releasing_a_layer_that_is_not_there_says_so_rather_than_panicking() {
+        let mut terrain = two_layer_document();
         assert!(!terrain.release("nowhere"));
     }
 
-    // A stage list has to be an order rather than a listing: a field that reads another
+    // A stage list has to be an order rather than a listing: a layer that reads another
     // cannot come first, or the caller walking it would bake against zeros.
     #[test]
-    fn the_stage_order_puts_a_field_after_everything_it_reads() {
-        let terrain = two_field_document();
+    fn the_stage_order_puts_a_layer_after_everything_it_reads() {
+        let terrain = two_layer_document();
         let order = terrain.bake_order().unwrap();
         let position = |id: &str| order.iter().position(|got| got.as_str() == id).unwrap();
         assert!(position("moisture") < position("height"));
-        assert_eq!(order.len(), terrain.fields.len());
+        assert_eq!(order.len(), terrain.layers.len());
     }
 
     // The failures a bake can only discover late are the ones a caller most wants early,
@@ -1175,40 +1179,40 @@ mod tests {
     #[test]
     fn a_stage_list_refuses_a_document_a_bake_would_refuse() {
         let cyclic = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("a").reading(&["b"]))
-            .with_field(Field::new("b").reading(&["a"]));
+            .with_layer(Layer::new("a").reading(&["b"]))
+            .with_layer(Layer::new("b").reading(&["a"]));
         assert!(matches!(cyclic.bake_order(), Err(PlanError::Cycle(_))));
 
         let dangling =
-            TerrainSpec::new(UVec2::splat(16)).with_field(Field::new("a").reading(&["gone"]));
+            TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("a").reading(&["gone"]));
         assert!(matches!(
             dangling.bake_order(),
-            Err(PlanError::UnknownField { .. })
+            Err(PlanError::UnknownLayer { .. })
         ));
     }
 
-    // Baking a field the document does not carry is the caller's mistake and has to say
+    // Baking a layer the document does not carry is the caller's mistake and has to say
     // so, rather than quietly doing nothing.
     #[test]
-    fn baking_a_field_that_is_not_there_says_which_one() {
-        let mut terrain = two_field_document();
+    fn baking_a_layer_that_is_not_there_says_which_one() {
+        let mut terrain = two_layer_document();
         assert!(matches!(
-            terrain.bake_field("nowhere"),
-            Err(PlanError::UnknownField { .. })
+            terrain.bake_layer("nowhere"),
+            Err(PlanError::UnknownLayer { .. })
         ));
     }
 
-    // The baseline the staging tests compare against: two fields
+    // The baseline the staging tests compare against: two layers
     // at different shifts, one reading the other, each allocated at its own resolution
     // and filled with finite values that actually vary.
     #[test]
-    fn a_two_field_document_bakes_each_field_at_its_own_resolution() {
-        let mut terrain = two_field_document();
+    fn a_two_layer_document_bakes_each_layer_at_its_own_resolution() {
+        let mut terrain = two_layer_document();
         terrain.bake_in_place().unwrap();
 
-        let moisture = terrain.field("moisture").unwrap();
+        let moisture = terrain.layer("moisture").unwrap();
         assert_eq!(moisture.baked().size(), UVec2::new(12, 10));
-        let height = terrain.field("height").unwrap();
+        let height = terrain.layer("height").unwrap();
         assert_eq!(height.baked().size(), UVec2::new(96, 80));
 
         let values = height.baked().data();
@@ -1218,15 +1222,15 @@ mod tests {
         assert!(highest - lowest > 0.05, "{lowest} to {highest}");
     }
     // Every test here, and any document baked before the editor has seen a render
-    // device, bakes without a runtime: a field whose shader has produced nothing has
+    // device, bakes without a runtime: a layer whose shader has produced nothing has
     // to read as `0.0` rather than failing the bake.
     #[test]
     fn a_shader_with_no_runtime_bakes_as_zero_rather_than_failing() {
-        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_field(Field::new("height"));
+        let mut terrain = TerrainSpec::new(UVec2::splat(8)).with_layer(Layer::new("height"));
         terrain.bake_in_place().expect("the bake was refused");
         assert!(
             terrain
-                .field("height")
+                .layer("height")
                 .unwrap()
                 .baked()
                 .data()
@@ -1237,39 +1241,39 @@ mod tests {
 
     // The failure mode a naive walk has here is non-termination, which is far worse
     // than a wrong answer; the error also names the cycle, because a document with
-    // several fields gives no other clue which reference to remove.
+    // several layers gives no other clue which reference to remove.
     #[test]
     fn a_dependency_cycle_is_an_error_rather_than_a_hang() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("a").reading(&["b"]))
-            .with_field(Field::new("b").reading(&["a"]));
+            .with_layer(Layer::new("a").reading(&["b"]))
+            .with_layer(Layer::new("b").reading(&["a"]));
         let error = terrain.bake_in_place().unwrap_err();
         assert!(matches!(error, PlanError::Cycle(_)), "{error}");
     }
 
     // Caught at plan time and named on both sides: the dangling reference lives in the
-    // reader, so an error naming only the missing field would not say where to look.
+    // reader, so an error naming only the missing layer would not say where to look.
     #[test]
-    fn a_reference_to_a_field_that_is_not_there_is_an_error() {
+    fn a_reference_to_a_layer_that_is_not_there_is_an_error() {
         let terrain =
-            TerrainSpec::new(UVec2::new(8, 8)).with_field(Field::new("a").reading(&["gone"]));
+            TerrainSpec::new(UVec2::new(8, 8)).with_layer(Layer::new("a").reading(&["gone"]));
         let error = terrain.plan_bake().unwrap_err();
         assert!(
-            matches!(&error, PlanError::UnknownField { referenced, reader }
+            matches!(&error, PlanError::UnknownLayer { referenced, reader }
                 if referenced == "gone" && reader == "a"),
             "{error}"
         );
     }
 
-    // References are by name, so two fields sharing one makes every reference to it
+    // References are by name, so two layers sharing one makes every reference to it
     // ambiguous — it has to be refused rather than resolved to whichever came first.
     #[test]
-    fn two_fields_may_not_share_an_id() {
+    fn two_layers_may_not_share_an_id() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height"))
-            .with_field(Field::new("height"));
+            .with_layer(Layer::new("height"))
+            .with_layer(Layer::new("height"));
         let error = terrain.bake_in_place().unwrap_err();
-        assert!(matches!(error, PlanError::DuplicateField(_)), "{error}");
+        assert!(matches!(error, PlanError::DuplicateLayer(_)), "{error}");
     }
 
     // A zero extent would make every allocation and every rectangle degenerate; it is
@@ -1285,9 +1289,9 @@ mod tests {
     // The clamp is applied once to what the shader produced, so a shader may leave the
     // range and still land inside it.
     #[test]
-    fn a_field_is_clamped_to_the_range_it_declares() {
+    fn a_layer_is_clamped_to_the_range_it_declares() {
         let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_field(Field::new("height").with_range((0.0, 1.0)).held(5.0));
+            .with_layer(Layer::new("height").with_range((0.0, 1.0)).held(5.0));
         terrain.bake_in_place().unwrap();
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
     }
@@ -1296,58 +1300,58 @@ mod tests {
     // row and column are only partly covered by the document; those texels still have
     // to be written, or a sample near the far edge reads whatever the allocation held.
     #[test]
-    fn a_bake_leaves_no_texel_of_a_field_untouched() {
+    fn a_bake_leaves_no_texel_of_a_layer_untouched() {
         let mut terrain = TerrainSpec::new(UVec2::new(37, 23))
-            .with_field(Field::new("height").with_shift(2).held(0.5));
+            .with_layer(Layer::new("height").with_shift(2).held(0.5));
         terrain.bake_in_place().unwrap();
-        let field = terrain.field("height").unwrap();
-        assert_eq!(field.baked().size(), UVec2::new(10, 6));
-        assert!(field.baked().data().iter().all(|value| *value == 0.5));
+        let layer = terrain.layer("height").unwrap();
+        assert_eq!(layer.baked().size(), UVec2::new(10, 6));
+        assert!(layer.baked().data().iter().all(|value| *value == 0.5));
     }
-    // The baked rasters, a shader's values and the fields its file reads are skipped by
+    // The baked rasters, a shader's values and the layers its file reads are skipped by
     // serde, so this pins that everything else survives and that a decoded document is
     // unbaked rather than half-baked.
     #[test]
     fn a_document_round_trips_through_serde_without_its_bakes() {
-        let terrain = two_field_document();
+        let terrain = two_layer_document();
         let encoded = serde_json::to_string(&terrain).unwrap();
         let decoded: TerrainSpec = serde_json::from_str(&encoded).unwrap();
 
         let mut expected = terrain.clone();
-        for field in &mut expected.fields {
-            *field = field.authored();
-            field.shader.layers.clear();
+        for layer in &mut expected.layers {
+            *layer = layer.authored();
+            layer.shader.layers.clear();
         }
         assert_eq!(decoded, expected);
-        assert!(decoded.field("height").unwrap().baked().is_empty());
+        assert!(decoded.layer("height").unwrap().baked().is_empty());
     }
 
     fn roled_document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(64, 64))
-            .with_field(
-                Field::new("moisture")
-                    .with_role(FieldRole::Moisture)
+            .with_layer(
+                Layer::new("moisture")
+                    .with_role(LayerRole::Moisture)
                     .with_shift(3)
                     .holding(ramp(UVec2::new(8, 8))),
             )
-            .with_field(
-                Field::new("height")
-                    .with_role(FieldRole::Height)
+            .with_layer(
+                Layer::new("height")
+                    .with_role(LayerRole::Height)
                     .holding(ramp(UVec2::new(64, 64))),
             )
     }
 
-    // The plan is what a caller reads before a texel is written, so a step per field in
+    // The plan is what a caller reads before a texel is written, so a step per layer in
     // dependency order is the whole of what it promises.
     #[test]
-    fn a_plan_carries_one_step_per_field_in_the_order_a_bake_visits_them() {
+    fn a_plan_carries_one_step_per_layer_in_the_order_a_bake_visits_them() {
         let plan = roled_document().plan_bake().unwrap();
-        let fields: Vec<_> = plan.steps().iter().map(|step| step.field.clone()).collect();
-        assert_eq!(fields, vec!["moisture", "height"]);
-        assert!(plan.steps().iter().all(|step| step.kind == StepKind::Field));
+        let layers: Vec<_> = plan.steps().iter().map(|step| step.layer.clone()).collect();
+        assert_eq!(layers, vec!["moisture", "height"]);
+        assert!(plan.steps().iter().all(|step| step.kind == StepKind::Layer));
     }
 
-    // Water reads a baked height, so its step has to come after every field step; a
+    // Water reads a baked height, so its step has to come after every layer step; a
     // plan that ordered it anywhere else would solve over an empty raster.
     #[test]
     fn a_spec_that_declares_water_plans_a_water_step_last() {
@@ -1372,21 +1376,21 @@ mod tests {
         ));
     }
 
-    // What a progress display reads. The field named is the one that has *finished*,
+    // What a progress display reads. The layer named is the one that has *finished*,
     // not the one about to start, which is the distinction an off-by-one here would
     // blur.
     #[test]
-    fn a_report_names_the_field_whose_step_ran_and_counts_the_rest() {
+    fn a_report_names_the_layer_whose_step_ran_and_counts_the_rest() {
         let mut bake = roled_document().begin_bake().unwrap();
         bake.advance().unwrap();
 
         let report = bake.report();
         assert_eq!((report.step, report.total), (1, 2));
-        assert_eq!(report.field, "moisture");
+        assert_eq!(report.layer, "moisture");
         assert!(report.live_bytes > 0);
     }
 
-    // A Terrain exists only when every step has run, or it would carry a field that reads
+    // A Terrain exists only when every step has run, or it would carry a layer that reads
     // as zero everywhere while looking exactly like one that was baked.
     #[test]
     fn finishing_before_every_step_has_run_is_refused() {
@@ -1417,24 +1421,24 @@ mod tests {
     }
 
     // Role validation is part of planning precisely so it costs nothing: a document
-    // with a role conflict must fail before it allocates a field's worth of memory.
+    // with a role conflict must fail before it allocates a layer's worth of memory.
     #[test]
-    fn two_fields_claiming_one_role_is_refused_before_a_raster_is_allocated() {
+    fn two_layers_claiming_one_role_is_refused_before_a_raster_is_allocated() {
         let mut spec = roled_document();
-        spec.fields[0].role = FieldRole::Height;
+        spec.layers[0].role = LayerRole::Height;
 
         assert!(matches!(
             spec.plan_bake().unwrap_err(),
-            PlanError::DuplicateRole(FieldRole::Height)
+            PlanError::DuplicateRole(LayerRole::Height)
         ));
     }
 
     // The solve reads its height one texel per cell and will not resample one, so a coarse
     // height is refused at plan time rather than discovered at the water step.
     #[test]
-    fn a_coarse_height_field_is_refused_at_plan_time() {
+    fn a_coarse_height_layer_is_refused_at_plan_time() {
         let mut spec = roled_document();
-        spec.fields[1].shift = 2;
+        spec.layers[1].shift = 2;
 
         assert!(matches!(
             spec.plan_bake().unwrap_err(),
@@ -1442,18 +1446,18 @@ mod tests {
         ));
     }
 
-    // The water step names the height field by role, so a document declaring water
-    // with no `Height` field would otherwise plan happily and fail part way through
+    // The water step names the height layer by role, so a document declaring water
+    // with no `Height` layer would otherwise plan happily and fail part way through
     // the bake.
     #[test]
-    fn declaring_water_without_a_height_field_is_refused_at_plan_time() {
+    fn declaring_water_without_a_height_layer_is_refused_at_plan_time() {
         let mut spec = roled_document();
-        spec.fields[1].role = FieldRole::Custom;
+        spec.layers[1].role = LayerRole::Custom;
         spec.water_spec = Some(WaterSpec::new("height"));
 
         assert!(matches!(
             spec.plan_bake().unwrap_err(),
-            PlanError::MissingHeightField
+            PlanError::MissingHeightLayer
         ));
     }
 
@@ -1467,31 +1471,31 @@ mod tests {
         assert!(spec.plan_bake().unwrap().is_empty());
     }
 
-    // A document written before roles existed loads with every field defaulted to Custom,
-    // so a water spec it carried names a height field the plan can no longer find.
+    // A document written before roles existed loads with every layer defaulted to Custom,
+    // so a water spec it carried names a height layer the plan can no longer find.
     #[test]
     fn a_document_that_carries_no_roles_refuses_to_plan_its_water() {
         let mut spec =
-            TerrainSpec::new(UVec2::new(32, 32)).with_field(Field::new("height").held(0.5));
+            TerrainSpec::new(UVec2::new(32, 32)).with_layer(Layer::new("height").held(0.5));
         spec.water_spec = Some(WaterSpec::new("height"));
 
         assert!(matches!(
             spec.plan_bake().unwrap_err(),
-            PlanError::MissingHeightField
+            PlanError::MissingHeightLayer
         ));
     }
 
-    // A file's `@layer` name is the only thing that says one field needs another, so
+    // A file's `@layer` name is the only thing that says one layer needs another, so
     // the order has to follow it even when the reader is declared first.
     #[test]
-    fn a_field_whose_shader_names_another_is_baked_after_it() {
+    fn a_layer_whose_shader_names_another_is_baked_after_it() {
         let terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(
-                Field::new("reader")
+            .with_layer(
+                Layer::new("reader")
                     .holding(ramp(UVec2::splat(8)))
                     .reading(&["source"]),
             )
-            .with_field(Field::new("source").held(0.5));
+            .with_layer(Layer::new("source").held(0.5));
         let order: Vec<_> = terrain
             .bake_order()
             .unwrap()
@@ -1504,7 +1508,7 @@ mod tests {
             .unwrap()
             .steps()
             .iter()
-            .map(|step| step.field.clone())
+            .map(|step| step.layer.clone())
             .collect();
         assert_eq!(steps, ["source", "reader"]);
     }
@@ -1512,44 +1516,44 @@ mod tests {
     // A mistyped name in one file must not stop the rest of the document from baking;
     // the reader alone is left unbaked, and the fault names what it could not find.
     #[test]
-    fn a_field_naming_no_field_is_left_unbaked_while_the_rest_bakes() {
+    fn a_layer_naming_no_layer_is_left_unbaked_while_the_rest_bakes() {
         let mut terrain = TerrainSpec::new(UVec2::new(96, 80))
-            .with_field(
-                Field::new("moisture")
+            .with_layer(
+                Layer::new("moisture")
                     .with_shift(3)
                     .holding(ramp(UVec2::new(12, 10))),
             )
-            .with_field(
-                Field::new("height")
+            .with_layer(
+                Layer::new("height")
                     .holding(ramp(UVec2::new(96, 80)))
                     .reading(&["nowhere"]),
             );
         terrain.bake_in_place().expect("the bake was refused");
 
         assert_eq!(
-            terrain.field("moisture").unwrap().baked().size(),
+            terrain.layer("moisture").unwrap().baked().size(),
             UVec2::new(12, 10)
         );
-        assert!(terrain.field("height").unwrap().baked().is_empty());
-        let faults = terrain.field_faults();
+        assert!(terrain.layer("height").unwrap().baked().is_empty());
+        let faults = terrain.layer_faults();
         assert_eq!(faults.len(), 1, "{faults:?}");
         assert_eq!(faults[0].0.as_str(), "height");
         assert!(faults[0].1.contains("nowhere"), "{}", faults[0].1);
     }
 
     // Two files naming each other cannot be ordered, so the bake fails rather than
-    // spinning, and both fields carry the chain that says which names to change.
+    // spinning, and both layers carry the chain that says which names to change.
     #[test]
     fn two_shaders_naming_each_other_fail_the_bake_and_both_carry_the_chain() {
         let mut terrain = TerrainSpec::new(UVec2::splat(8))
-            .with_field(Field::new("a").reading(&["b"]))
-            .with_field(Field::new("b").reading(&["a"]));
+            .with_layer(Layer::new("a").reading(&["b"]))
+            .with_layer(Layer::new("b").reading(&["a"]));
         let error = terrain.bake_in_place().unwrap_err();
         assert!(
             matches!(&error, PlanError::Cycle(chain) if chain == "a -> b -> a"),
             "{error}"
         );
-        let faults = terrain.field_faults();
+        let faults = terrain.layer_faults();
         assert_eq!(faults.len(), 2, "{faults:?}");
         assert!(
             faults

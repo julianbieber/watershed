@@ -1,9 +1,9 @@
-// A field's shader: one compute shader that produces every value of one field. The
-// file is the field — it lives in the document's `shaders` directory as
-// `<field>.wgsl`, and a file whose name begins with `_` is not a field. The editor
-// appends the entry point, which calls `value(p)` once per texel of the field's
+// A layer's shader: one compute shader that produces every value of one layer. The
+// file is the layer — it lives in the document's `shaders` directory as
+// `<layer>.wgsl`, and a file whose name begins with `_` is not a layer. The editor
+// appends the entry point, which calls `value(p)` once per texel of the layer's
 // raster. `value` takes a position and returns one number, and what lands, clamped to
-// the field's range, is the field.
+// the layer's range, is the layer.
 //
 // COORDINATES
 //
@@ -32,7 +32,7 @@
 //
 // THE LIBRARY
 //
-// From `field_lib.wgsl`, compiled ahead of this file.
+// From `layer_lib.wgsl`, compiled ahead of this file.
 //
 //   gradient_noise(p: vec2<f32>) -> f32
 //       one octave, roughly -1..1, exactly zero at every integer lattice point
@@ -41,7 +41,7 @@
 //   ridged_fbm(p, octaves: u32, persistence: f32, lacunarity: f32) -> f32
 //       0..1, creases high, never negative and with no midpoint
 //   fbm_unit(p, octaves: u32, persistence: f32, lacunarity: f32) -> f32
-//       `fbm` stretched onto 0..1, the reading a height field's range expects
+//       `fbm` stretched onto 0..1, the reading a height layer's range expects
 //   seed_offset(seed: u32, salt: u32) -> vec2<f32>
 //       a displacement to add to a noise position, distinct per seed and per salt
 //   uv(p: vec2<f32>) -> vec2<f32>
@@ -50,19 +50,19 @@
 //       the cells the document spans
 //   cell_position(id: vec2<u32>) -> vec2<f32>
 //       the document position a texel of this raster writes; the entry point's own
-//   field_texel(p: vec2<f32>) -> vec2<i32>
+//   layer_texel(p: vec2<f32>) -> vec2<i32>
 //       the texel of this raster a position falls in — the inverse of `cell_position`
 //   input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32
 //       one texel of a layer texture, clamped to its edge
 //   layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32
-//       another field's value at a document position, interpolated, whatever its shift
+//       another layer's value at a document position, interpolated, whatever its shift
 //   layer_shift(layer: texture_2d<f32>) -> u32
-//       the shift that field was baked at
+//       the shift that layer was baked at
 //
 // PARAMETERS — @ui
 //
 // One per field of `Params`, after the field's `//`. A field without one is a parse
-// error shown on the field's card, and the field keeps the values it had.
+// error shown on the layer's card, and the layer keeps the values it had.
 //
 //   @ui <default> [<min>, <max>]            f32, i32, u32 — a number
 //   @ui <default> [<min>, <max>] step <s>   the same, stepped
@@ -76,15 +76,15 @@
 //
 // LAYERS — @layer
 //
-// Another field of the document, read by naming it after the texture's `//`:
+// Another layer of the document, read by naming it after the texture's `//`:
 //
 //   @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 //
-// The binding holds that field's baked raster, at the field's own shift. Read it with
+// The binding holds that layer's baked raster, at the layer's own shift. Read it with
 // `layer_value(base, p)`, or one texel at a time with
-// `input_texel(base, field_texel(p))` when both fields share a shift. The field named
-// is baked first. A name that is no field, or one that makes fields read each other in
-// a circle, leaves this field unbaked with the reason on its card.
+// `input_texel(base, layer_texel(p))` when both layers share a shift. The layer named
+// is baked first. A name that is no layer, or one that makes layers read each other in
+// a circle, leaves this layer unbaked with the reason on its card.
 
 struct Params {
     // @group Shape
@@ -92,7 +92,7 @@ struct Params {
 }
 @group(0) @binding(2) var<uniform> params: Params;
 
-// Uncomment, and name a field of the document, to read that field with
+// Uncomment, and name a layer of the document, to read that layer with
 // `layer_value(base, p)`. Bindings start at 3.
 // @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 

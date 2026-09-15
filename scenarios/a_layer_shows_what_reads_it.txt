@@ -1,9 +1,9 @@
-# Read the dependency between fields from outside the process, both ways round: what a
-# field reads and what reads it, from `observe field` rather than from a person looking
+# Read the dependency between layers from outside the process, both ways round: what a
+# layer reads and what reads it, from `observe layer` rather than from a person looking
 # at the two rows the panel now carries. The same relation the canvas draws a reference
-# card from and the panel's buttons open a field through.
+# card from and the panel's buttons open a layer through.
 #
-# Run with:  just drive run scenarios/a_field_shows_what_reads_it.txt
+# Run with:  just drive run scenarios/a_layer_shows_what_reads_it.txt
 
 observe log
 
@@ -15,19 +15,19 @@ new 256 256 1 ridges
 wait bake
 
 # The reading end: `height` reads `base`, and nothing reads `height`.
-field height
-observe field
+layer height
+observe layer
 
 # The read end of the same edge: `base` is read by `height`, and reads nothing itself.
-field base
-observe field
+layer base
+observe layer
 
-# And a field at neither end, which reports both lists empty rather than omitting them.
-field moisture
-observe field
+# And a layer at neither end, which reports both lists empty rather than omitting them.
+layer moisture
+observe layer
 
 # Back to `height`, where the panel's `reads` row has `base` under it.
-field height
-observe field
+layer height
+observe layer
 
 observe log
