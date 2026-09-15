@@ -37,6 +37,12 @@ observe field
 # `rect`, because a live re-bake covers what is on screen and says so.
 node add height binary add
 node connect height n3 n5 0
+
+# Wiring the output into a node nothing reads carries the output onto it, from the socket
+# exactly as from a wire dragged on the canvas — so `output` has to read n5 here, before any
+# `node output` names it.
+observe nodes
+
 node connect height n4 n5 1
 node output height n5
 observe field

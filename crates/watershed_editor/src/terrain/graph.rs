@@ -489,19 +489,20 @@ impl FieldGraph {
     /// A node with exactly one connected input and exactly one reader is spliced out:
     /// the reader is reconnected to that input, so pulling a node out of a chain does
     /// not break the chain. In every other case each reader's pin is left
-    /// unconnected. If the node was the output, the graph is left with none.
+    /// unconnected.
+    ///
+    /// If the node was the output, the output passes to the first of these the graph
+    /// still holds once the node is gone: the input spliced in; the node on the removed
+    /// node's first pin, if nothing reads it any more; the highest-id node nothing
+    /// reads; the highest-id node. Only a graph left with no nodes has no output.
     pub fn remove_node(&mut self, id: NodeId) -> Result<(), GraphError> {
         let node = self.node(id).ok_or(GraphError::UnknownNode(id))?;
+        let first_input = node.inputs.first().copied().flatten();
         let only_source = match node.inputs.iter().flatten().collect::<Vec<_>>().as_slice() {
             [single] => Some(**single),
             _ => None,
         };
-        let readers: Vec<NodeId> = self
-            .nodes
-            .iter()
-            .filter(|other| other.sources().any(|source| source == id))
-            .map(|other| other.id)
-            .collect();
+        let readers: Vec<NodeId> = self.readers(id).collect();
         let splice = match (only_source, readers.as_slice()) {
             (Some(source), [_one]) => Some(source),
             _ => None,
@@ -515,9 +516,29 @@ impl FieldGraph {
         }
         self.nodes.retain(|node| node.id != id);
         if self.output == Some(id) {
-            self.output = splice;
+            self.output = self.successor(splice, first_input);
         }
         Ok(())
+    }
+
+    /// The nodes that read `id` on any pin, bypassed or not.
+    pub fn readers(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes
+            .iter()
+            .filter(move |other| other.sources().any(|source| source == id))
+            .map(|other| other.id)
+    }
+
+    fn successor(&self, splice: Option<NodeId>, first_input: Option<NodeId>) -> Option<NodeId> {
+        let read: Vec<NodeId> = self.nodes.iter().flat_map(GraphNode::sources).collect();
+        let held = |id: &NodeId| self.node(*id).is_some();
+        let unread = |id: &NodeId| !read.contains(id);
+        let ids = || self.nodes.iter().map(|node| node.id);
+        splice
+            .filter(held)
+            .or_else(|| first_input.filter(held).filter(unread))
+            .or_else(|| ids().filter(unread).max())
+            .or_else(|| ids().max())
     }
 
     /// Writes one input pin, replacing whatever was on it.
@@ -905,6 +926,87 @@ mod tests {
         graph.remove_node(only).unwrap();
         assert_eq!(graph.output, None);
         assert!(graph.effective_output().is_none());
+    }
+
+    // Deleting the end of a chain auto-chooses the node now at the end of the graph as
+    // the output, rather than leaving the field baking zero.
+    #[test]
+    fn removing_the_output_at_the_end_of_a_chain_hands_it_to_the_node_before() {
+        let mut graph = graph();
+        let first = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        let middle = graph.node_with(NodeOp::Scale(2.0), &[first]);
+        let last = graph.node_with(NodeOp::Scale(3.0), &[middle]);
+        graph.set_output(Some(last)).unwrap();
+        graph.remove_node(last).unwrap();
+        assert_eq!(graph.output, Some(middle));
+    }
+
+    // An output something reads is spliced out of its chain, and the input spliced in
+    // outranks every other successor.
+    #[test]
+    fn removing_an_output_that_is_read_hands_it_to_the_spliced_input() {
+        let mut graph = graph();
+        let source = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        let middle = graph.node_with(NodeOp::Scale(2.0), &[source]);
+        graph.node_with(NodeOp::Scale(3.0), &[middle]);
+        graph.set_output(Some(middle)).unwrap();
+        graph.remove_node(middle).unwrap();
+        assert_eq!(graph.output, Some(source));
+    }
+
+    // With the first pin empty there is no chain to step back along, so the output goes
+    // to the newest node nothing reads.
+    #[test]
+    fn removing_an_output_with_an_empty_first_pin_hands_it_to_the_newest_unread_node() {
+        let mut graph = graph();
+        let second_pin = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        let output = graph.add_node(NodeOp::Binary(Binary::Add), [0.0, 0.0]);
+        graph.connect(second_pin, output, 1).unwrap();
+        let newest = graph.add_node(NodeOp::Constant(2.0), [0.0, 0.0]);
+        graph.set_output(Some(output)).unwrap();
+        graph.remove_node(output).unwrap();
+        assert_eq!(graph.output, Some(newest));
+    }
+
+    // A first-pin node that still feeds another reader is not the end of the graph, so
+    // the output passes over it.
+    #[test]
+    fn removing_an_output_whose_input_is_read_elsewhere_skips_that_input() {
+        let mut graph = graph();
+        let source = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        let output = graph.node_with(NodeOp::Scale(2.0), &[source]);
+        let other = graph.node_with(NodeOp::Scale(3.0), &[source]);
+        graph.set_output(Some(output)).unwrap();
+        graph.remove_node(output).unwrap();
+        assert_eq!(graph.output, Some(other));
+    }
+
+    // A loaded graph can hold a cycle, in which every node is read; one with nodes left
+    // must still come out with an output.
+    #[test]
+    fn removing_the_output_beside_a_cycle_still_leaves_an_output() {
+        let mut graph = graph();
+        let a = graph.add_node(NodeOp::Scale(2.0), [0.0, 0.0]);
+        let b = graph.add_node(NodeOp::Scale(3.0), [0.0, 0.0]);
+        graph.node_mut(a).unwrap().inputs[0] = Some(b);
+        graph.node_mut(b).unwrap().inputs[0] = Some(a);
+        let output = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        graph.set_output(Some(output)).unwrap();
+        graph.remove_node(output).unwrap();
+        assert_eq!(graph.output, Some(b));
+    }
+
+    // A loaded node can read itself, which makes its own id the splice source; the output
+    // must never be left naming the node that was removed.
+    #[test]
+    fn removing_a_self_reading_output_never_leaves_the_removed_id() {
+        let mut graph = graph();
+        let looped = graph.add_node(NodeOp::Scale(2.0), [0.0, 0.0]);
+        graph.node_mut(looped).unwrap().inputs[0] = Some(looped);
+        let other = graph.add_node(NodeOp::Constant(1.0), [0.0, 0.0]);
+        graph.set_output(Some(looped)).unwrap();
+        graph.remove_node(looped).unwrap();
+        assert_eq!(graph.output, Some(other));
     }
 
     // A name is an address in a control path, so two nodes sharing one would make a

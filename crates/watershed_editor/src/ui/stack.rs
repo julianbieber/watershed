@@ -21,7 +21,7 @@ use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
 use bevy::prelude::*;
 use bevy::text::{EditableText, TextEdit, TextEditChange};
-use bevy::ui::{Checked, InteractionDisabled};
+use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
 use watershed::raster::Raster;
 use watershed::{FieldId, FieldRole};
@@ -318,7 +318,6 @@ fn contents(
             children.push(widgets::boxed(node_entry(
                 &active,
                 node,
-                field.graph.output == Some(node.id),
                 &names,
                 expanded.has(node.id),
                 library,
@@ -593,7 +592,6 @@ fn brush_section(document: &Document, brush: &BrushSettings, expanded: &Expanded
 fn node_entry(
     active: &str,
     node: &GraphNode,
-    is_output: bool,
     names: &[String],
     open: bool,
     library: &ShaderLibrary,
@@ -607,7 +605,6 @@ fn node_entry(
 
     let header = widgets::row(vec![
         one(bypass_checkbox(&active, id, node.bypassed)),
-        one(output_button(&active, id, is_output)),
         one(remove_button(&active, id)),
         one(widgets::text(title)),
     ]);
@@ -686,26 +683,6 @@ fn toggle_row(
     ];
     children.extend(beside);
     widgets::row(children)
-}
-
-fn output_button(active: &str, id: NodeId, is_output: bool) -> impl Scene {
-    let active = active.to_owned();
-    bsn! {
-        @FeathersToolButton {
-            @caption: bsn! { Text("=") ThemedText },
-            @variant: ButtonVariant::Plain,
-        }
-        {widgets::when(is_output, InteractionDisabled)}
-        on(move |_: On<Activate>, mut document: ResMut<Document>| {
-            let result = document
-                .apply(&Edit::SetOutput {
-                    field: active.clone(),
-                    node: Some(id.to_string()),
-                })
-                .map(|_| ());
-            report(&mut document, result);
-        })
-    }
 }
 
 fn remove_button(active: &str, id: NodeId) -> impl Scene {

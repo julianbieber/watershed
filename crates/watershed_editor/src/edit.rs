@@ -123,8 +123,8 @@ pub enum Edit {
     SetOutput {
         /// Field to write. Must exist.
         field: String,
-        /// The node, or `None` to leave the field with no output — it then bakes
-        /// zero rather than refusing the document.
+        /// The node, or `None` for no output — refused while the field has any node,
+        /// since only a field with no nodes is left without one.
         node: Option<String>,
     },
     /// Adds an empty field to the document and leaves every other field alone.
@@ -237,12 +237,21 @@ impl Edit {
                 }))
             }
 
-            Self::RemoveNode { field, node } => {
-                let field = field_mut(terrain, field)?;
+            Self::RemoveNode { field: name, node } => {
+                let field = field_mut(terrain, name)?;
                 let id = node_id(&field.graph, node)?;
                 let removed = op_name(&field.graph.node(id).expect("resolved above").op);
                 field.graph.remove_node(id).map_err(refusal)?;
-                Ok(json!({ "removed": removed, "nodes": field.graph.nodes.len() }))
+                if field.graph.nodes.is_empty() {
+                    tracing::warn!(
+                        "`{name}` has no nodes left, so it has no output and bakes zero"
+                    );
+                }
+                Ok(json!({
+                    "removed": removed,
+                    "nodes": field.graph.nodes.len(),
+                    "output": field.graph.output.map(node_path),
+                }))
             }
 
             Self::Connect {
@@ -254,8 +263,18 @@ impl Edit {
                 let field = field_mut(terrain, field)?;
                 let from = node_id(&field.graph, from)?;
                 let to = node_id(&field.graph, to)?;
+                let follows =
+                    field.graph.output == Some(from) && field.graph.readers(to).next().is_none();
                 field.graph.connect(from, to, *pin).map_err(refusal)?;
-                Ok(json!({ "from": node_path(from), "to": node_path(to), "pin": pin }))
+                if follows {
+                    field.graph.set_output(Some(to)).map_err(refusal)?;
+                }
+                Ok(json!({
+                    "from": node_path(from),
+                    "to": node_path(to),
+                    "pin": pin,
+                    "output": field.graph.output.map(node_path),
+                }))
             }
 
             Self::Disconnect { field, node, pin } => {
@@ -302,8 +321,7 @@ impl Edit {
                     Some(node) => Some(node_id(&field.graph, node)?),
                     None => None,
                 };
-                field.graph.set_output(id).map_err(refusal)?;
-                Ok(json!({ "output": id.map(node_path) }))
+                write_output(&mut field.graph, id)
             }
 
             Self::AddField { name } => {
@@ -721,6 +739,14 @@ pub fn is_solve_height(terrain: &TerrainSpec, name: &str) -> bool {
         .is_some_and(|field| field.id.as_str() == name)
 }
 
+fn write_output(graph: &mut FieldGraph, id: Option<NodeId>) -> Result<Value, String> {
+    if id.is_none() && !graph.nodes.is_empty() {
+        return Err("a field with nodes always has an output — name the node to read".to_owned());
+    }
+    graph.set_output(id).map_err(refusal)?;
+    Ok(json!({ "output": id.map(node_path) }))
+}
+
 fn set_other_field_property(
     terrain: &mut TerrainSpec,
     name: &str,
@@ -734,8 +760,7 @@ fn set_other_field_property(
             let id = (word != "none")
                 .then(|| node_id(&field.graph, word))
                 .transpose()?;
-            field.graph.set_output(id).map_err(refusal)?;
-            Ok(json!({ "output": id.map(node_path) }))
+            write_output(&mut field.graph, id)
         }
         Some("range") => {
             let low: f32 = number(first(words)?)?;
@@ -1335,6 +1360,124 @@ mod tests {
         .apply(&mut terrain)
         .unwrap();
         assert_eq!(terrain.field("height").unwrap().graph.nodes.len(), before);
+    }
+
+    fn output_of(terrain: &TerrainSpec) -> Option<NodeId> {
+        terrain.field("height").unwrap().graph.output
+    }
+
+    fn add(terrain: &mut TerrainSpec, op: NodeOp) -> NodeId {
+        let reply = Edit::AddNode {
+            field: "height".to_owned(),
+            op,
+            position: None,
+        }
+        .apply(terrain)
+        .unwrap();
+        node_of_path(reply["node"].as_str().unwrap()).unwrap()
+    }
+
+    fn connect(terrain: &mut TerrainSpec, from: NodeId, to: NodeId) -> Value {
+        Edit::Connect {
+            field: "height".to_owned(),
+            from: from.to_string(),
+            to: to.to_string(),
+            pin: 0,
+        }
+        .apply(terrain)
+        .unwrap()
+    }
+
+    // Wiring the output onward is how a field is extended; without the move the nodes
+    // added after the output have no effect on the field.
+    #[test]
+    fn wiring_the_output_into_a_node_nothing_reads_makes_that_node_the_output() {
+        let mut terrain = document();
+        let output = output_of(&terrain).unwrap();
+        let added = add(&mut terrain, NodeOp::Scale(2.0));
+        let reply = connect(&mut terrain, output, added);
+        assert_eq!(output_of(&terrain), Some(added));
+        assert_eq!(reply["output"], json!(node_path(added)));
+    }
+
+    // A node something already reads is not the end of the graph, so wiring the output
+    // into it leaves the output where it is.
+    #[test]
+    fn wiring_the_output_into_a_node_that_is_read_leaves_the_output() {
+        let mut terrain = document();
+        let output = output_of(&terrain).unwrap();
+        let middle = add(&mut terrain, NodeOp::Scale(2.0));
+        let reader = add(&mut terrain, NodeOp::Scale(3.0));
+        connect(&mut terrain, middle, reader);
+        connect(&mut terrain, output, middle);
+        assert_eq!(output_of(&terrain), Some(output));
+    }
+
+    // Only a wire leaving the output moves it.
+    #[test]
+    fn wiring_a_node_that_is_not_the_output_leaves_the_output() {
+        let mut terrain = document();
+        let output = output_of(&terrain).unwrap();
+        let source = add(&mut terrain, NodeOp::Constant(1.0));
+        let reader = add(&mut terrain, NodeOp::Scale(2.0));
+        connect(&mut terrain, source, reader);
+        assert_eq!(output_of(&terrain), Some(output));
+    }
+
+    // A field with nodes always has an output, and both socket spellings of clearing it
+    // reach the same refusal.
+    #[test]
+    fn clearing_the_output_of_a_field_with_nodes_is_refused() {
+        let mut terrain = document();
+        let output = output_of(&terrain);
+        let cleared = Edit::SetOutput {
+            field: "height".to_owned(),
+            node: None,
+        }
+        .apply(&mut terrain);
+        assert!(cleared.is_err());
+        let set = Edit::Set {
+            path: "height.output".to_owned(),
+            words: vec!["none".to_owned()],
+        }
+        .apply(&mut terrain);
+        assert!(set.is_err());
+        assert_eq!(output_of(&terrain), output);
+    }
+
+    // A field with no nodes is the one field that may have no output.
+    #[test]
+    fn a_field_with_no_nodes_accepts_no_output() {
+        let mut terrain = document();
+        Edit::AddField {
+            name: "empty".to_owned(),
+        }
+        .apply(&mut terrain)
+        .unwrap();
+        let cleared = Edit::SetOutput {
+            field: "empty".to_owned(),
+            node: None,
+        }
+        .apply(&mut terrain);
+        assert!(cleared.is_ok());
+    }
+
+    // The verbs behave the same as the UI so an agent can debug from the socket, so the
+    // reply to removing the output names the node that took it over.
+    #[test]
+    fn removing_the_output_answers_where_it_went() {
+        let mut terrain = document();
+        let output = output_of(&terrain).unwrap();
+        let added = add(&mut terrain, NodeOp::Scale(2.0));
+        connect(&mut terrain, output, added);
+        let reply = Edit::RemoveNode {
+            field: "height".to_owned(),
+            node: added.to_string(),
+        }
+        .apply(&mut terrain)
+        .unwrap();
+        assert_eq!(reply["output"], json!(node_path(output)));
+        assert_eq!(output_of(&terrain), Some(output));
     }
 
     // Every default the issue names: nothing in the graph, shift 0, the unit range,
