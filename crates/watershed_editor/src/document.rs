@@ -386,7 +386,7 @@ impl Document {
                 edit: edit.clone(),
                 slot: edit.slot(),
             });
-            return Ok(Value::Bool(true));
+            return Ok(Value::Object(Default::default()));
         }
         let active = self.active.clone();
         let terrain = self
@@ -1069,6 +1069,23 @@ mod tests {
 
         assert!(add(&mut document, "temperature").is_err());
         assert!(!document.shader_root().join("temperature.wgsl").exists());
+        std::fs::remove_dir_all(document.path.unwrap()).unwrap();
+    }
+
+    // A client waiting on an edit held for a running job is sent this reply, and the control server can send only an object.
+    #[test]
+    fn an_edit_held_while_a_job_runs_replies_with_an_object() {
+        let mut document = two_layer_document("held");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+
+        let reply = document
+            .apply(&Edit::Set {
+                path: "height.shift".to_owned(),
+                words: vec!["2".to_owned()],
+            })
+            .unwrap();
+        assert!(reply.is_object(), "{reply}");
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 

@@ -397,15 +397,19 @@ impl TerrainSpec {
                     .runtime
                     .run(program, &params, globals, &layers)
                     .and_then(|values| {
-                        Raster::from_vec(texels, values).ok_or_else(|| {
-                            "the dispatch produced the wrong number of texels".to_owned()
-                        })
+                        values
+                            .map(|values| {
+                                Raster::from_vec(texels, values).ok_or_else(|| {
+                                    "the dispatch produced the wrong number of texels".to_owned()
+                                })
+                            })
+                            .transpose()
                     })
                     .map_err(|reason| PlanError::ShaderDispatch {
                         layer: layer.id.to_string(),
                         reason,
                     })?;
-                fresh = Some((values, key));
+                fresh = values.map(|values| (values, key));
             }
         }
 

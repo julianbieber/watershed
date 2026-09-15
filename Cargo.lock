@@ -5654,7 +5654,6 @@ dependencies = [
  "bevy",
  "glam",
  "log",
- "naga",
  "rayon",
  "ron",
  "serde",
