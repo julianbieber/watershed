@@ -163,11 +163,11 @@ mod tests {
     // a compile failure is listed with the file and line the log gave it, unaltered.
     #[test]
     fn a_compile_failure_is_listed_with_its_file_and_line() {
-        let view = view(&["ridged.wgsl: line 9: parameter has no annotation"]);
+        let view = view(&["ridged.wesl: line 9: parameter has no annotation"]);
         let lines = lines_for(&view, ROWS);
         assert_eq!(
             lines,
-            vec!["WARN  ridged.wgsl: line 9: parameter has no annotation"]
+            vec!["WARN  ridged.wesl: line 9: parameter has no annotation"]
         );
     }
 

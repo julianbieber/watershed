@@ -42,14 +42,14 @@ impl Preset {
         Self::ALL.into_iter().find(|preset| preset.name() == word)
     }
     /// Each layer of this preset as `(layer, stock file)`: the layer's shader file is
-    /// `<layer>.wgsl`, a copy of that stock file, which is always in [`gpu::STOCK`].
+    /// `<layer>.wesl`, a copy of that stock file, which is always in [`gpu::STOCK`].
     pub fn files(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Continents => &[("moisture", "fbm.wgsl"), ("height", "continents.wgsl")],
+            Self::Continents => &[("moisture", "fbm.wesl"), ("height", "continents.wesl")],
             Self::Ridges => &[
-                ("moisture", "fbm.wgsl"),
-                ("base", "continents.wgsl"),
-                ("height", "mountains_over_base.wgsl"),
+                ("moisture", "fbm.wesl"),
+                ("base", "continents.wesl"),
+                ("height", "mountains_over_base.wesl"),
             ],
         }
     }
@@ -110,7 +110,7 @@ fn moisture(seed: u32) -> Layer {
     with_shader(
         Layer::new("moisture").with_shift(4),
         layer(
-            "fbm.wgsl",
+            "fbm.wesl",
             salted(seed, 11),
             &[("scale", 0.004), ("octaves", 4.0)],
         ),
@@ -122,7 +122,7 @@ fn continents(size: UVec2, seed: u32) -> TerrainSpec {
         .with_layer(moisture(seed))
         .with_layer(with_shader(
             Layer::new("height"),
-            layer("continents.wgsl", salted(seed, 1), &[]),
+            layer("continents.wesl", salted(seed, 1), &[]),
         ))
 }
 
@@ -132,14 +132,14 @@ fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
         .with_layer(with_shader(
             Layer::new("base"),
             layer(
-                "continents.wgsl",
+                "continents.wesl",
                 salted(seed, 1),
                 &[("land_scale", 0.0015), ("relief", 0.0)],
             ),
         ))
         .with_layer(with_shader(
             Layer::new("height"),
-            layer("mountains_over_base.wgsl", salted(seed, 3), &[]),
+            layer("mountains_over_base.wesl", salted(seed, 3), &[]),
         ))
 }
 

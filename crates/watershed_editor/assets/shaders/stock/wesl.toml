@@ -1,0 +1,4 @@
+# Written by the watershed editor beside lib.wesl, so a WESL language server
+# resolves `package::lib` to that file.
+edition = "2026_pre"
+root = "."

@@ -1,5 +1,5 @@
 # Read another layer from a shader by naming it in the file, from outside the process:
-# `ridges`' `height` is the file `height.wgsl`, which binds `base` with
+# `ridges`' `height` is the file `height.wesl`, which binds `base` with
 # `// @layer base`, and the read is reported by `observe shaders` and `observe layers`.
 #
 # Run with:  just drive run scenarios/a_shader_reads_a_layer_by_name.txt
@@ -15,7 +15,7 @@ fixed-delta 1/60
 new 256 256 7 ridges
 wait bake
 
-# Per file, the layers it reads by name: `height.wgsl` reads `base` at binding 3, and
+# Per file, the layers it reads by name: `height.wesl` reads `base` at binding 3, and
 # no other file reads one.
 observe shaders
 

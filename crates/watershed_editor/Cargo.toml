@@ -18,6 +18,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
 tracing.workspace = true
+wesl.workspace = true
 
 [lints]
 workspace = true

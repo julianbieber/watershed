@@ -1,9 +1,9 @@
 // What every layer's shader is compiled against: the bindings a dispatch supplies, and
 // the noise primitives a shader is expected to reach for.
 //
-// The Rust half of this file is `gpu.rs`, which writes `Globals` out as
-// `DispatchGlobals` and prepends this source to every shader. A change here is a
-// change there.
+// A layer imports what it uses from `package::lib`; nothing here is available to a
+// layer without that import. The Rust half of this file is `gpu.rs`, which writes
+// `Globals` out as `DispatchGlobals`. A change here is a change there.
 
 // Everything a shader is told about where it is being evaluated. Positions are in
 // document cells, not in a normalised coordinate, so a scale means the same thing at

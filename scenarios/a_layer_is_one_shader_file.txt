@@ -28,7 +28,7 @@ observe document
 observe layers
 observe shaders
 
-# The add writes `temperature.wgsl` from the template and puts the layer on screen. It
+# The add writes `temperature.wesl` from the template and puts the layer on screen. It
 # is a file operation, so the history does not grow; the document re-bakes whole.
 layer add temperature
 observe document

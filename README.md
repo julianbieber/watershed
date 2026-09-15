@@ -38,19 +38,21 @@ editor. `Terrain` is what baking one produces, and it is what a consuming projec
 
 ## Shaders
 
-A layer's values come from its WGSL compute shader. This is how a new way of making a
+A layer's values come from its WESL compute shader. This is how a new way of making a
 layer is added without touching Rust: write the file, and the editor reads what it
 declares and draws the panel for it.
 
 The shaders live in the document's own `shaders` directory, so a terrain stays portable,
 and they are hot-reloaded — save a file and the document re-bakes. Adding a layer copies
-the template into that directory as `<layer>.wgsl`, where it is then yours to edit, and
+the template into that directory as `<layer>.wesl`, where it is then yours to edit, and
 removing one deletes its file. A file added to or deleted from the directory by hand
 adds or removes its layer the same way; a file whose name begins with `_` is not a
 layer. Neither is an undo step: undo covers parameter values, layer settings and the
 water spec.
 
-```wgsl
+```wesl
+import package::lib::ridged_fbm;
+
 struct Params {
     // @group Shape
     scale: f32,     // @ui 0.02 [0.001, 0.2]
@@ -68,7 +70,14 @@ fn value(p: vec2<f32>) -> f32 {
 `p` is a position in **document cells**, not a normalised coordinate, so a scale means
 the same thing at every shift. The entry point is appended by the editor; the bindings,
 the noise, `cell_position`, and `uv` and `document_extent` — the 0..1 coordinate across
-the document, and the cells it spans — come from `assets/shaders/layer_lib.wgsl`.
+the document, and the cells it spans — come from the library, `lib.wesl`.
+
+The editor writes `lib.wesl` into `shaders/`, with a `wesl.toml` beside it, on every new
+document and every open, overwriting both each time. A layer imports what it uses from
+`package::lib` — `import package::lib::{fbm_unit, uv};`, or `import package::lib;` and
+then `lib::uv(p)` — and nothing in the library is available without the import. Because
+the library is a file on disk, a WESL language server resolves the import too. A `.wgsl`
+file in `shaders/` is not a layer, and the log names it.
 
 A new layer's file arrives with all of this in its own header: every library function,
 the bindings, the coordinate convention and the annotations below, so the file need
@@ -99,7 +108,9 @@ default.
 
 Another layer of the document, read by naming it after a texture binding's `//`:
 
-```wgsl
+```wesl
+import package::lib::layer_value;
+
 @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 
 fn value(p: vec2<f32>) -> f32 {
@@ -134,7 +145,9 @@ A terrain is a directory.
 | `terrain.ron` | the extent, the fields, the images, the water | both |
 | `layer_<n>.png` | the values, eight bits to a channel | both |
 | `recipe.ron` | the extent, the seed, the water spec, and per layer its role, shift, range and parameter values | the editor |
-| `shaders/*.wgsl` | one file per layer | the editor |
+| `shaders/*.wesl` | one file per layer | the editor |
+| `shaders/lib.wesl` | the library, overwritten by the editor | the editor |
+| `shaders/wesl.toml` | the package root, for a language server | a language server |
 
 A `layer_<n>.png` is not an authored layer: it is an image the library packs the values
 of every layer at one shift into, and `terrain.ron` calls the authored ones `fields`.

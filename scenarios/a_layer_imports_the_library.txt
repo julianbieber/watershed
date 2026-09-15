@@ -1,0 +1,25 @@
+# A layer imports the library, from outside the process: `ridges` writes `lib.wesl` and
+# one `.wesl` per layer into the scratch shader directory, each layer's file starting
+# with the import of what it calls, and `observe shaders` lists every import resolved
+# with no fault on any file.
+#
+# Run with:  just drive run scenarios/a_layer_imports_the_library.txt
+#
+# Dropping a copy of the template in as `dunes.wesl`, or a `.wgsl` file, is a hand
+# check: replay cannot copy a file into `shaders/`.
+
+observe log
+
+fixed-delta 1/60
+
+# `ridges` writes the library beside `moisture`, `base` and `height`, and bakes whole.
+new 256 256 7 ridges
+wait bake
+
+# One entry per layer file, each import resolved and no error; `lib.wesl` is not one.
+observe shaders
+
+# Three layers, none with a fault.
+observe layers
+
+observe log

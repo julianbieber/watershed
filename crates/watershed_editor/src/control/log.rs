@@ -244,14 +244,14 @@ mod tests {
     #[test]
     fn a_record_the_control_client_read_is_still_there_for_the_window() {
         let buffer = LogBuffer::default();
-        warn(&buffer, "ridged.wgsl: line 9: no annotation");
+        warn(&buffer, "ridged.wesl: line 9: no annotation");
 
         let read = buffer.since_last_read();
         assert_eq!(read["count"], 1);
 
         let view = buffer.newest(64);
         assert_eq!(view.lines.len(), 1);
-        assert_eq!(view.lines[0].message, "ridged.wgsl: line 9: no annotation");
+        assert_eq!(view.lines[0].message, "ridged.wesl: line 9: no annotation");
     }
 
     // The contract the scenarios/*.txt files depend on, and the one thing this must not

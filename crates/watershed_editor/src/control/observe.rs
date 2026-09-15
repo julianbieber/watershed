@@ -323,6 +323,14 @@ fn shaders(world: &mut World) -> Value {
                         "binding": read.binding,
                     }))
                     .collect::<Vec<_>>(),
+                "imports": entry
+                    .imports
+                    .iter()
+                    .map(|import| json!({
+                        "path": import.path,
+                        "resolved": import.resolved,
+                    }))
+                    .collect::<Vec<_>>(),
                 "error": entry.error,
             })
         })
@@ -377,7 +385,7 @@ mod tests {
         world.insert_resource(document);
 
         let base = layer(&world);
-        assert_eq!(base["file"], json!("base.wgsl"));
+        assert_eq!(base["file"], json!("base.wesl"));
         assert_eq!(base["params"], json!({ "value": [0.25] }));
     }
 
@@ -471,11 +479,33 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(document);
         world.insert_resource(ShaderLibrary::with_fault(
-            "height.wgsl",
+            "height.wesl",
             "line 3: expected `;`",
         ));
 
         let answer = layers(&world);
         assert_eq!(answer["layers"][0]["fault"], json!("line 3: expected `;`"));
+    }
+
+    // `observe shaders` is how a caller checks a layer's imports without an IDE, so each
+    // name imported has to be listed with whether it reached the library.
+    #[test]
+    fn observing_the_shaders_reports_each_import_and_whether_it_resolved() {
+        let mut world = World::new();
+        world.insert_resource(ShaderLibrary::reading(
+            "height.wesl",
+            "import package::lib::{fbm_unit, seed_offset};\n\nfn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(p + seed_offset(1u, 2u), 4u, 0.5, 2.0);\n}\n",
+        ));
+
+        let answer = shaders(&mut world);
+        let file = &answer["shaders"][0];
+        assert_eq!(
+            file["imports"],
+            json!([
+                { "path": "package::lib::fbm_unit", "resolved": true },
+                { "path": "package::lib::seed_offset", "resolved": true },
+            ])
+        );
+        assert_eq!(file["error"], Value::Null);
     }
 }

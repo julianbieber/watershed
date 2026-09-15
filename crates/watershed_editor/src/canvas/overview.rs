@@ -792,7 +792,7 @@ mod tests {
         let good = fingerprint(&document, &ShaderLibrary::default());
         let broken = fingerprint(
             &document,
-            &ShaderLibrary::with_fault("height.wgsl", "line 2: unknown type"),
+            &ShaderLibrary::with_fault("height.wesl", "line 2: unknown type"),
         );
         assert_ne!(good, broken);
     }
@@ -820,7 +820,7 @@ mod tests {
     fn a_layer_whose_shader_will_not_compile_carries_the_error_on_its_card() {
         let mut app = overview_app(
             height_reads_base_and_relief(),
-            ShaderLibrary::with_fault("height.wgsl", "line 2: unknown type: 'vec4'"),
+            ShaderLibrary::with_fault("height.wesl", "line 2: unknown type: 'vec4'"),
         );
         app.world_mut().run_system_once(rebuild_overview).unwrap();
         let texts = texts(&mut app);
