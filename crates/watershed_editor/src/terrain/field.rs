@@ -7,7 +7,6 @@ use watershed::field::{FieldId, FieldRole};
 use watershed::raster::{Raster, raster_coord, resolution};
 
 use crate::terrain::graph::{FieldGraph, NodeOp};
-use crate::terrain::regions::RegionOutput;
 
 /// A named graph of nodes together with everything needed to evaluate it onto its
 /// own raster, plus that raster once it has been baked.
@@ -135,30 +134,6 @@ impl Field {
         self
     }
 
-    /// A field whose value is the sum of `ops`, in the order given.
-    ///
-    /// What a stack of layers blending onto zero came to, and so what most of the
-    /// suite wants: the ops are added left to right and the field reads the total.
-    pub fn with_sum(mut self, ops: impl IntoIterator<Item = NodeOp>) -> Self {
-        let mut under: Option<crate::terrain::graph::NodeId> = None;
-        for op in ops {
-            let id = self.graph.node_with(op, &[]);
-            under = Some(match under {
-                None => id,
-                Some(under) => self.graph.node_with(
-                    NodeOp::Binary(crate::terrain::graph::Binary::Add),
-                    &[under, id],
-                ),
-            });
-        }
-        if let Some(output) = under {
-            self.graph
-                .set_output(Some(output))
-                .expect("the node was just added to this graph");
-        }
-        self
-    }
-
     /// Replaces the whole graph.
     pub fn with_graph(mut self, graph: FieldGraph) -> Self {
         self.graph = graph;
@@ -166,8 +141,7 @@ impl Field {
     }
 
     /// A copy of everything a person authored and nothing that was derived from it:
-    /// the graph with every shader node's values dropped, and no bake. A paint or
-    /// external raster is authored data and comes along.
+    /// the graph with every shader node's values dropped, and no bake.
     ///
     /// What a history snapshot is made of — the bake and the shader values are
     /// re-obtained by baking and dispatching, so a copy that carried them would cost
@@ -237,45 +211,16 @@ impl Field {
         self.baked = raster;
     }
 
-    /// Whether this field's values name a class rather than measure a quantity,
-    /// which is what decides how [`Field::sample`] interpolates.
-    ///
-    /// Derived from the graph, not declared: true when the node the field's value
-    /// actually comes from emits region ids or cover classes.
-    ///
-    /// It is the *effective* output that decides — a bypassed node at the output is
-    /// followed to what it passes through — so a `Regions` node under an arithmetic
-    /// node no longer switches the whole field to nearest sampling, where a `Regions`
-    /// layer anywhere in a stack once did.
-    pub fn is_categorical(&self) -> bool {
-        let Some(id) = self.graph.effective_output() else {
-            return false;
-        };
-        matches!(
-            self.graph.node(id).map(|node| &node.op),
-            Some(NodeOp::Regions {
-                output: RegionOutput::RegionId | RegionOutput::CoverClass,
-                ..
-            })
-        )
-    }
-
     /// The baked value at a position in document cells, where a cell centre is at
     /// `x + 0.5`. Reads `0.0` for an unbaked field, and clamps rather than failing
     /// outside the document.
     ///
     /// A coarse field is interpolated between its texels, so it reads as a smooth
-    /// surface and not as blocks. A [categorical](Field::is_categorical) field is
-    /// read to the nearest texel instead: halfway between two region ids is not a
-    /// third region, so it must be one of the two.
+    /// surface and not as blocks.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         let u = raster_coord(x, self.shift);
         let v = raster_coord(y, self.shift);
-        if self.is_categorical() {
-            self.baked.sample_nearest(u, v)
-        } else {
-            self.baked.sample_bilinear(u, v)
-        }
+        self.baked.sample_bilinear(u, v)
     }
 
     /// The fields this one reads, through the nodes reachable from its output only;
@@ -307,7 +252,7 @@ impl Field {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terrain::graph::{FieldGraph, NodeOp, Remap};
+    use crate::terrain::graph::{FieldGraph, NodeOp};
 
     // Shift 0 is what the `Height` field is pinned to, so a document's cell grid and
     // its height raster have to be the same grid.
@@ -341,11 +286,9 @@ mod tests {
     #[test]
     fn a_field_reports_the_dependencies_its_output_reaches_and_no_others() {
         let mut graph = FieldGraph::new();
-        let base = graph.node_with(NodeOp::Constant(0.5), &[]);
         let relief = graph.node_with(NodeOp::FieldRef(FieldId::from("relief")), &[]);
         let ridge = graph.node_with(NodeOp::FieldRef(FieldId::from("ridge")), &[]);
-        let weight = graph.node_with(NodeOp::Remap(Remap::IDENTITY), &[ridge]);
-        let mixed = graph.node_with(NodeOp::Lerp, &[base, relief, weight]);
+        let mixed = graph.node_with(NodeOp::piped(2), &[relief, ridge]);
         graph.node_with(NodeOp::FieldRef(FieldId::from("hidden")), &[]);
         graph.set_output(Some(mixed)).unwrap();
 

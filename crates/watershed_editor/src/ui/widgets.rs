@@ -91,7 +91,7 @@ pub fn captioned(caption: impl Into<String>, control: Box<dyn SceneList>) -> imp
     }
 }
 
-/// A number field bound to one place in the document, the brush or the dialog.
+/// A number field bound to one place in the document or the dialog.
 pub fn number(binding: NumberBinding) -> impl Scene {
     bsn! {
         @FeathersNumberInput {

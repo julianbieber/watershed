@@ -9,9 +9,8 @@ observe log
 
 fixed-delta 1/60
 
-# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` from two
-# separate reference nodes — so `reads` naming `base` once is the dedup, not a lucky
-# graph.
+# `ridges` builds `moisture`, `base` and `height`, with `height` reading `base` through
+# one reference node.
 new 256 256 1 ridges
 wait bake
 

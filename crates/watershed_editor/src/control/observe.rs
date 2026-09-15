@@ -1,9 +1,9 @@
 //! What a caller can ask the running editor about itself.
 //!
 //! Every answer is what the editor *acted on*, not something the caller could work out
-//! for itself: the fitted colour range, the rectangle a live re-bake covers, the layer
-//! a stroke would land in. A second derivation on the caller's side would part company
-//! with the editor the moment the camera moved.
+//! for itself: the fitted colour range, the rectangle a live re-bake covers. A second
+//! derivation on the caller's side would part company with the editor the moment the
+//! camera moved.
 //!
 //! Adding a topic is a change here; asking a new question of an existing one is not.
 //! That asymmetry is the point — it is what keeps a scenario per feature cheap enough
@@ -14,9 +14,8 @@ use bevy::prelude::*;
 use serde_json::{Value, json};
 
 use super::log::LogBuffer;
-use crate::brush::{BrushSettings, target_of};
 use crate::document::{Baked, Document};
-use crate::edit::{brush_summary, op_name, op_summary};
+use crate::edit::{op_name, op_summary};
 use crate::gpu::{STOCK, ShaderLibrary};
 use crate::view::{
     CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
@@ -29,12 +28,10 @@ pub(super) enum Topic {
     Document,
     /// A summary of the active field's baked values.
     Field,
-    /// Every field's whole stack, not just the active one's — an edit names a field,
-    /// so a caller has to be able to see the stack it is about to address without
+    /// Every field's whole graph, not just the active one's — an edit names a field,
+    /// so a caller has to be able to see the graph it is about to address without
     /// switching the view to it first.
     Nodes,
-    /// The brush's settings and where a stroke would land.
-    Brush,
     /// The solved water, counted, and the fields the water spec is over.
     Water,
     /// Where the camera is and what the ramp is fitted to.
@@ -56,7 +53,6 @@ impl Topic {
             "document" => Ok(Self::Document),
             "field" => Ok(Self::Field),
             "nodes" => Ok(Self::Nodes),
-            "brush" => Ok(Self::Brush),
             "water" => Ok(Self::Water),
             "view" => Ok(Self::View),
             "log" => Ok(Self::Log),
@@ -75,7 +71,6 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Document => document(world),
         Topic::Field => field(world),
         Topic::Nodes => nodes(world),
-        Topic::Brush => brush(world),
         Topic::Water => water(world),
         Topic::View => view(world),
         Topic::Log => log(world),
@@ -198,7 +193,6 @@ fn nodes(world: &World) -> Value {
                 "light_azimuth": field.light_azimuth,
                 "contours": field.contours,
                 "contour_interval": field.contour_interval,
-                "categorical": field.is_categorical(),
                 "output": field.graph.output.map(|id| id.to_string()),
                 "nodes": nodes,
             })
@@ -208,11 +202,6 @@ fn nodes(world: &World) -> Value {
     json!({ "available": true, "active": document.active(), "fields": fields })
 }
 
-/// Every field, in the order the bake visits them, with what each one reads.
-///
-/// The order is named rather than assumed: a document whose fields cannot be ordered
-/// is answered in declaration order with the cycle spelled out, which is the same
-/// thing the overview's cards and its status line say.
 fn fields(world: &World) -> Value {
     let document = world.resource::<Document>();
     let Some(terrain) = document.terrain() else {
@@ -257,30 +246,6 @@ fn fields(world: &World) -> Value {
         "cycle": cycle,
         "fields": fields,
     })
-}
-
-fn brush(world: &World) -> Value {
-    let settings = world.resource::<BrushSettings>();
-    let document = world.resource::<Document>();
-    let target = target_of(document);
-    let mut value = brush_summary(&settings.0);
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "field".to_owned(),
-            match &target {
-                Some((field, _)) => json!(field),
-                None => Value::Null,
-            },
-        );
-        object.insert(
-            "node".to_owned(),
-            match &target {
-                Some((_, id)) => json!(id.to_string()),
-                None => Value::Null,
-            },
-        );
-    }
-    value
 }
 
 fn water(world: &World) -> Value {
@@ -373,14 +338,6 @@ fn log(world: &World) -> Value {
     }
 }
 
-/// Every shader the document's directory holds, in name order: what it declares, and
-/// why it did not parse.
-///
-/// The parameters are named rather than counted, because a caller setting one has to
-/// know what it is called; the inputs likewise, because a caller wiring a pin has to
-/// know which pin it is. The reach is reported because it is what decides whether an
-/// edit under a wired node re-bakes by rectangle or whole, and a caller has no other
-/// way to see that the annotation was read; `null` is a file that declares none.
 fn shaders(world: &mut World) -> Value {
     let library = world.resource::<ShaderLibrary>();
     let files: Vec<Value> = library
@@ -433,7 +390,7 @@ mod tests {
     #[test]
     fn observing_a_field_reports_both_ends_of_the_relation() {
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
-            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
             .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
         terrain.bake_in_place().expect("a bake");
 
@@ -460,7 +417,7 @@ mod tests {
     fn observing_the_fields_reports_them_in_bake_order_with_what_each_reads() {
         let terrain = TerrainSpec::new(UVec2::splat(16))
             .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))))
-            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)));
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)));
 
         let mut document = Document::default();
         document.adopt(terrain);

@@ -1,10 +1,9 @@
 // @shader Template
 
-// A shader layer: one compute shader that produces the values of one field layer.
-// The editor appends the entry point, which calls `value(p)` once per texel of the
-// layer's raster. `value` takes a position and returns one number, and what lands is
-// read exactly as a painted raster is — the layer's own amplitude, mask and blend
-// compose it with the rest of the stack.
+// A shader node: one compute shader that produces the values of one node of a field's
+// graph. The editor appends the entry point, which calls `value(p)` once per texel of
+// the field's raster. `value` takes a position and returns one number, and what lands
+// is what the node answers to whatever reads it.
 //
 // COORDINATES
 //
@@ -33,8 +32,7 @@
 //
 // THE LIBRARY
 //
-// From `field_lib.wgsl`, compiled ahead of this file. The noise is the same algorithm
-// the CPU noise layers use, so one name does not mean two functions inside one stack.
+// From `field_lib.wgsl`, compiled ahead of this file.
 //
 //   gradient_noise(p: vec2<f32>) -> f32
 //       one octave, roughly -1..1, exactly zero at every integer lattice point
@@ -44,6 +42,8 @@
 //       0..1, creases high, never negative and with no midpoint
 //   fbm_unit(p, octaves: u32, persistence: f32, lacunarity: f32) -> f32
 //       `fbm` stretched onto 0..1, the reading a height field's range expects
+//   seed_offset(seed: u32, salt: u32) -> vec2<f32>
+//       a displacement to add to a noise position, distinct per seed and per salt
 //   uv(p: vec2<f32>) -> vec2<f32>
 //       a position as 0..1 across the document
 //   document_extent() -> vec2<f32>

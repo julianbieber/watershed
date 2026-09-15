@@ -245,8 +245,6 @@ fn sync_maps(
         let Some(field) = terrain.field(document.active()) else {
             return;
         };
-        // What the map shows is always named on the canvas: the soloed node when there
-        // is one, and the field's output otherwise.
         let baked = solo.raster.as_ref().unwrap_or(field.baked());
 
         if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
@@ -381,7 +379,6 @@ fn pan_zoom(
             MouseScrollUnit::Pixel => message.y / 32.0,
         };
     }
-    // The canvas zooms on its own camera, so a scroll over it is not the map's to take.
     let over_canvas = window
         .as_deref()
         .is_some_and(|window| crate::canvas::pointer_over_canvas(window, &frame));
@@ -534,31 +531,6 @@ pub fn fit_camera(
     transform.translation = (-free.centre * area * factor).extend(transform.translation.z);
 }
 
-/// The document cell under a window position, in the window's own coordinates —
-/// origin at the top left, y downwards, logical pixels.
-///
-/// The answer keeps its fraction: a stroke is written in continuous cells, and
-/// rounding here would make a brush jump between cells as the pointer crossed their
-/// boundaries. `None` for a window with no area, which is what a caller sees before
-/// the first layout.
-pub fn cell_at_cursor(
-    transform: &Transform,
-    projection: &Projection,
-    window: Vec2,
-    cursor: Vec2,
-    size: UVec2,
-) -> Option<Vec2> {
-    let Projection::Orthographic(projection) = projection else {
-        return None;
-    };
-    if window.x <= 0.0 || window.y <= 0.0 {
-        return None;
-    }
-    let view = visible_rect(transform, projection);
-    let across = Vec2::new(cursor.x / window.x, 1.0 - cursor.y / window.y);
-    Some(world_to_cell(view.min + view.size() * across, size))
-}
-
 /// Centres the view on a document cell. Absolute rather than relative, so a caller
 /// says where to look instead of how far to travel, and the zoom is left alone.
 pub fn look_at_cell(transform: &mut Transform, size: UVec2, cell: Vec2) {
@@ -594,69 +566,4 @@ pub fn cells_across(projection: &Projection) -> f32 {
 /// the camera has been panned off it.
 pub fn view_centre_cell(transform: &Transform, size: UVec2) -> Vec2 {
     world_to_cell(transform.translation.truncate(), size)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn view_of(cells_across: f32, centre: Vec2) -> (Transform, Projection) {
-        let half = cells_across * 0.5;
-        (
-            Transform::from_translation(centre.extend(0.0)),
-            Projection::Orthographic(OrthographicProjection {
-                area: Rect::from_corners(Vec2::splat(-half), Vec2::splat(half)),
-                ..OrthographicProjection::default_2d()
-            }),
-        )
-    }
-
-    // The window counts y downwards from its top left and the document counts it
-    // upwards from its lower left, so the one thing this can get wrong is silent: a
-    // brush that paints the mirror image of the stroke a person drew.
-    #[test]
-    fn the_top_left_of_the_window_is_the_top_left_of_what_is_on_screen() {
-        let size = UVec2::splat(256);
-        let (transform, projection) = view_of(256.0, Vec2::ZERO);
-        let window = Vec2::new(800.0, 600.0);
-        let at = |cursor: Vec2| cell_at_cursor(&transform, &projection, window, cursor, size);
-
-        assert_eq!(at(Vec2::ZERO), Some(Vec2::new(0.0, 256.0)));
-        assert_eq!(at(window), Some(Vec2::new(256.0, 0.0)));
-        assert_eq!(at(window * 0.5), Some(Vec2::splat(128.0)));
-    }
-
-    // Cells rather than pixels, so the answer has to follow the camera: the same pixel
-    // is a different cell once the view has moved, which is why a drag is remembered in
-    // cells.
-    #[test]
-    fn the_cell_under_a_pixel_follows_the_camera_and_the_zoom() {
-        let size = UVec2::splat(256);
-        let window = Vec2::new(800.0, 600.0);
-
-        let (transform, projection) = view_of(256.0, Vec2::new(64.0, 0.0));
-        let panned = cell_at_cursor(&transform, &projection, window, window * 0.5, size);
-        assert_eq!(panned, Some(Vec2::new(192.0, 128.0)));
-
-        let (transform, projection) = view_of(64.0, Vec2::ZERO);
-        let zoomed = cell_at_cursor(&transform, &projection, window, Vec2::ZERO, size);
-        assert_eq!(zoomed, Some(Vec2::new(96.0, 160.0)));
-    }
-
-    // A window with no area is what the first frames report, and dividing by it would
-    // hand back a NaN cell that a stroke would then paint at.
-    #[test]
-    fn a_window_with_no_area_has_no_cell_under_it() {
-        let (transform, projection) = view_of(256.0, Vec2::ZERO);
-        assert_eq!(
-            cell_at_cursor(
-                &transform,
-                &projection,
-                Vec2::ZERO,
-                Vec2::ZERO,
-                UVec2::splat(256)
-            ),
-            None
-        );
-    }
 }

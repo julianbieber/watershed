@@ -17,7 +17,7 @@ observe log
 # are polled per frame rather than driven by time, so they still land.
 fixed-delta 1/60
 
-# 512 square is large enough for the continent layer to make basins and small enough that a
+# 512 square is large enough for the continents shader to make basins and small enough that a
 # debug build is still bearable.
 new 512 512 7 continents
 wait bake
@@ -48,8 +48,8 @@ capture /tmp/watershed-scenario/moisture.png
 field height
 
 # A round trip through the terrain directory. The save writes the values as images and
-# the load re-bakes from the paint it reads back, so `observe water` after the load is a
-# statement about what survives eight-bit quantisation rather than about an exact copy.
+# the load re-bakes from the recipe and the shader files rather than reading those
+# images back.
 save /tmp/watershed-scenario/round-trip
 load /tmp/watershed-scenario/round-trip
 observe document

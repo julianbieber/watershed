@@ -7,17 +7,12 @@
 //! path that worked from one and not the other would make the two disagree about what
 //! a document even contains.
 
-use crate::terrain::brush::{Brush, BrushMode};
-use crate::terrain::graph::{Binary, Curve, CurvePoint, FieldGraph, NodeId, NodeOp};
-use crate::terrain::graph::{Remap, SlopeMode};
-use crate::terrain::noise::{NoiseKind, NoiseSpec, WarpSpec};
-use crate::terrain::regions::RegionOutput;
+use crate::terrain::graph::{FieldGraph, NodeId, NodeOp};
 use crate::terrain::shader::ShaderLayer;
 use crate::terrain::{Field, TerrainSpec};
 use serde_json::{Value, json};
 use watershed::FieldId;
 use watershed::FieldRole;
-use watershed::raster::Raster;
 
 /// The place in a document a change writes, for deciding whether a later change
 /// makes an earlier one pointless.
@@ -155,8 +150,8 @@ pub enum Edit {
         /// `field.property`, or `field.node.property`, where node is `n<id>` or the
         /// node's name.
         path: String,
-        /// The value, as words. Most properties take one; a remap or a warp takes
-        /// several.
+        /// The value, as words. Most properties take one; a range, or a shader
+        /// parameter with several components, takes several.
         words: Vec<String>,
     },
 }
@@ -800,49 +795,21 @@ fn set_other_field_property(
 
 fn set_op(op: &mut NodeOp, property: &str, words: &[String]) -> Result<(), String> {
     match (op, property) {
-        (NodeOp::Constant(value), "value") => *value = number(first(words)?)?,
-
-        (NodeOp::Noise(spec), "kind") => spec.kind = parse_noise_kind(first(words)?)?,
-        (NodeOp::Noise(spec), "scale") => spec.scale = number(first(words)?)?,
-        (NodeOp::Noise(spec), "octaves") => spec.octaves = number(first(words)?)?,
-        (NodeOp::Noise(spec), "seed") => spec.seed = number(first(words)?)?,
-        (NodeOp::Noise(spec), "strike") => {
-            spec.transform.strike_degrees = number(first(words)?)?;
-        }
-        (NodeOp::Noise(spec), "aspect") => spec.transform.aspect = number(first(words)?)?,
-        (NodeOp::Noise(spec), "warp") => spec.warp = parse_warp(words)?,
-
-        (NodeOp::Slope { sample_tiles, .. }, "sample_tiles") => {
-            *sample_tiles = number(first(words)?)?;
-        }
-        (NodeOp::Slope { mode, .. }, "mode") => *mode = parse_slope_mode(first(words)?)?,
-
         (NodeOp::FieldRef(id), "field") => *id = first(words)?.as_str().into(),
-
-        (NodeOp::Regions { output, .. }, "output") => *output = parse_region_output(first(words)?),
-        (NodeOp::Regions { spec, .. }, "seed") => spec.seed = number(first(words)?)?,
-        (NodeOp::Regions { spec, .. }, "cell_tiles") => spec.cell_tiles = number(first(words)?)?,
-        (NodeOp::Regions { spec, .. }, "blend_tiles") => spec.blend_tiles = number(first(words)?)?,
-        (NodeOp::Regions { spec, .. }, "warp") => spec.warp = parse_warp(words)?,
-
-        (NodeOp::Binary(binary), "mode") => *binary = parse_binary(first(words)?)?,
-        (NodeOp::Scale(factor), "factor") => *factor = number(first(words)?)?,
-
-        (NodeOp::Remap(remap), "from") => {
-            remap.from = (
-                number(first(words)?)?,
-                number(words.get(1).ok_or("a band needs two numbers")?)?,
-            );
+        (NodeOp::Shader(shader), name) if shader.params.contains_key(name) => {
+            let values = words
+                .iter()
+                .map(|word| number(word))
+                .collect::<Result<Vec<f32>, _>>()?;
+            let held = shader
+                .params
+                .get_mut(name)
+                .expect("the guard found the parameter");
+            if values.len() != held.len() {
+                return Err(format!("`{name}` takes {} numbers", held.len()));
+            }
+            *held = values;
         }
-        (NodeOp::Remap(remap), "to") => {
-            remap.to = (
-                number(first(words)?)?,
-                number(words.get(1).ok_or("a band needs two numbers")?)?,
-            );
-        }
-
-        (NodeOp::Curve(curve), "points") => *curve = parse_curve(words)?,
-
         (op, other) => {
             return Err(format!(
                 "a {} node has nothing called `{other}`",
@@ -853,265 +820,23 @@ fn set_op(op: &mut NodeOp, property: &str, words: &[String]) -> Result<(), Strin
     Ok(())
 }
 
-/// A region table is not a command line, so `regions` is deliberately absent: an existing
-/// one is edited through `op.output` and the rest of `op.*`, and a new one comes from a
-/// preset or a file.
+/// Reads an op from words: `fieldref <field>` or `shader <file>`. Refused, with a
+/// message naming the first word, for anything else.
 pub fn parse_op(words: &[String]) -> Result<NodeOp, String> {
     let kind = first(words)?;
     let rest = &words[1..];
     match kind.as_str() {
-        "constant" => Ok(NodeOp::Constant(number(first(rest)?)?)),
-        "noise" => {
-            let kind = parse_noise_kind(first(rest)?)?;
-            let scale = number(rest.get(1).ok_or("a noise op needs a scale")?)?;
-            let mut spec = NoiseSpec::new(0, kind, scale);
-            if let Some(octaves) = rest.get(2) {
-                spec.octaves = number(octaves)?;
-            }
-            if let Some(seed) = rest.get(3) {
-                spec.seed = number(seed)?;
-            }
-            Ok(NodeOp::Noise(spec))
-        }
         "fieldref" => Ok(NodeOp::FieldRef(first(rest)?.as_str().into())),
-        "slope" => Ok(NodeOp::Slope {
-            sample_tiles: number(first(rest).map_err(|_| "a slope op needs a sample distance")?)?,
-            mode: match rest.get(1) {
-                Some(mode) => parse_slope_mode(mode)?,
-                None => SlopeMode::default(),
-            },
-        }),
-        "paint" => Ok(NodeOp::Paint(Raster::default())),
         "shader" => Ok(NodeOp::Shader(ShaderLayer::new(first(rest)?.as_str()))),
-        "binary" => Ok(NodeOp::Binary(parse_binary(first(rest)?)?)),
-        "lerp" => Ok(NodeOp::Lerp),
-        "scale" => Ok(NodeOp::Scale(number(first(rest)?)?)),
-        "remap" => {
-            if rest.len() < 4 {
-                return Err("a remap op needs two bands, as four numbers".to_owned());
-            }
-            Ok(NodeOp::Remap(Remap::new(
-                (number(&rest[0])?, number(&rest[1])?),
-                (number(&rest[2])?, number(&rest[3])?),
-            )))
-        }
-        "curve" => Ok(NodeOp::Curve(parse_curve(rest)?)),
         other => Err(format!("no node op called `{other}`")),
     }
 }
 
-fn parse_curve(words: &[String]) -> Result<Curve, String> {
-    if !words.len().is_multiple_of(2) {
-        return Err("a curve is a list of input and output pairs".to_owned());
-    }
-    let mut points = Vec::with_capacity(words.len() / 2);
-    for pair in words.chunks_exact(2) {
-        points.push(CurvePoint {
-            input: number(&pair[0])?,
-            output: number(&pair[1])?,
-        });
-    }
-    Ok(Curve::new(points))
-}
-
-/// Every brush mode, in the order the panel offers them.
-pub const BRUSH_MODES: [BrushMode; 4] = [
-    BrushMode::Add,
-    BrushMode::Subtract,
-    BrushMode::Set,
-    BrushMode::Smooth,
-];
-
-/// The word this brush mode is named by, in the panel and on the command line.
-pub fn brush_mode_name(mode: BrushMode) -> &'static str {
-    match mode {
-        BrushMode::Add => "add",
-        BrushMode::Subtract => "sub",
-        BrushMode::Set => "set",
-        BrushMode::Smooth => "smooth",
-    }
-}
-
-fn parse_brush_mode(word: &str) -> Result<BrushMode, String> {
-    BRUSH_MODES
-        .into_iter()
-        .find(|mode| brush_mode_name(*mode) == word)
-        .ok_or_else(|| format!("no brush mode called `{word}`"))
-}
-
-/// A change to one of the brush's settings, named and read the way a node's
-/// properties are — so the panel's controls and the control client's words cannot come
-/// to mean different things.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum BrushChange {
-    /// Reach in document cells. Floored at zero on apply.
-    Radius(f32),
-    /// Fraction of the radius the weight falls off over. Clamped to `0.0..=1.0`.
-    Falloff(f32),
-    /// How hard the stroke pushes. Not clamped — what it means depends on the mode.
-    Strength(f32),
-    /// What `set` moves towards. Not clamped.
-    Value(f32),
-    /// What the stroke does to what it covers.
-    Mode(BrushMode),
-}
-
-impl BrushChange {
-    /// Reads `name` as one of the brush's settings and `word` as its value. Refused,
-    /// with a message fit to show, for an unknown name or an unreadable value.
-    pub fn parse(name: &str, word: &str) -> Result<Self, String> {
-        match name {
-            "radius" => Ok(Self::Radius(number(word)?)),
-            "falloff" => Ok(Self::Falloff(number(word)?)),
-            "strength" => Ok(Self::Strength(number(word)?)),
-            "value" => Ok(Self::Value(number(word)?)),
-            "mode" => Ok(Self::Mode(parse_brush_mode(word)?)),
-            other => Err(format!("a brush has nothing called `{other}`")),
-        }
-    }
-
-    /// Writes the change into `brush`, clamping where the setting has a range. Cannot
-    /// fail.
-    pub fn apply(self, brush: &mut Brush) {
-        match self {
-            Self::Radius(radius) => brush.radius_cells = radius.max(0.0),
-            Self::Falloff(falloff) => brush.falloff = falloff.clamp(0.0, 1.0),
-            Self::Strength(strength) => brush.strength = strength,
-            Self::Value(value) => brush.value = value,
-            Self::Mode(mode) => brush.mode = mode,
-        }
-    }
-}
-
-/// The brush as the control client reports it, keyed by the same names
-/// [`BrushChange::parse`] takes.
-pub fn brush_summary(brush: &Brush) -> Value {
-    json!({
-        "mode": brush_mode_name(brush.mode),
-        "radius": brush.radius_cells,
-        "falloff": brush.falloff,
-        "strength": brush.strength,
-        "value": brush.value,
-    })
-}
-
-fn parse_warp(words: &[String]) -> Result<Option<WarpSpec>, String> {
-    if first(words)? == "none" {
-        return Ok(None);
-    }
-    if words.len() < 4 {
-        return Err("a warp needs a seed, an amplitude, a scale and an octave count".to_owned());
-    }
-    Ok(Some(WarpSpec {
-        seed: number(&words[0])?,
-        amplitude: number(&words[1])?,
-        scale: number(&words[2])?,
-        octaves: number(&words[3])?,
-        salts: None,
-    }))
-}
-
-/// Every way a binary node combines its inputs, in the order the panel offers them.
-pub const BINARIES: [Binary; 4] = [Binary::Add, Binary::Mul, Binary::Max, Binary::Min];
-
-/// The word this binary mode is named by, in the panel and on the command line.
-pub fn binary_name(binary: Binary) -> &'static str {
-    match binary {
-        Binary::Add => "add",
-        Binary::Mul => "mul",
-        Binary::Max => "max",
-        Binary::Min => "min",
-    }
-}
-
-fn parse_binary(word: &str) -> Result<Binary, String> {
-    BINARIES
-        .into_iter()
-        .find(|binary| binary_name(*binary) == word)
-        .ok_or_else(|| format!("no binary mode called `{word}`"))
-}
-
-/// Every noise kind, in the order the panel offers them.
-pub const NOISE_KINDS: [NoiseKind; 3] = [NoiseKind::Fbm, NoiseKind::Signed, NoiseKind::Ridged];
-
-/// The word this noise kind is named by, in the panel and on the command line.
-pub fn noise_kind_name(kind: NoiseKind) -> &'static str {
-    match kind {
-        NoiseKind::Fbm => "fbm",
-        NoiseKind::Signed => "signed",
-        NoiseKind::Ridged => "ridged",
-    }
-}
-
-fn parse_noise_kind(word: &str) -> Result<NoiseKind, String> {
-    NOISE_KINDS
-        .into_iter()
-        .find(|kind| noise_kind_name(*kind) == word)
-        .ok_or_else(|| format!("no noise kind called `{word}`"))
-}
-
-/// The slope mode of that exact name. The error names both spellings, since there are
-/// only two and a caller that got it wrong wants to see them.
-pub fn parse_slope_mode(word: &str) -> Result<SlopeMode, String> {
-    match word {
-        "gradient" => Ok(SlopeMode::Gradient),
-        "steepest_axis" => Ok(SlopeMode::SteepestAxis),
-        other => Err(format!(
-            "no slope mode called `{other}` — it is `gradient` or `steepest_axis`"
-        )),
-    }
-}
-
-/// The word this slope mode is named by, and the only spelling
-/// [`parse_slope_mode`] accepts.
-pub fn slope_mode_name(mode: SlopeMode) -> &'static str {
-    match mode {
-        SlopeMode::Gradient => "gradient",
-        SlopeMode::SteepestAxis => "steepest_axis",
-    }
-}
-
-/// Every slope mode, in the order the panel offers them.
-pub const SLOPE_MODES: [SlopeMode; 2] = [SlopeMode::Gradient, SlopeMode::SteepestAxis];
-
-/// Reads a region output. Cannot fail: a bare word is taken as a column name, so the
-/// two categorical outputs take names no column would, and a column the table does not
-/// carry is caught at plan time where the table is known.
-pub fn parse_region_output(word: &str) -> RegionOutput {
-    match word {
-        "region_id" => RegionOutput::RegionId,
-        "cover_class" => RegionOutput::CoverClass,
-        column => RegionOutput::Blended(column.to_owned()),
-    }
-}
-
-/// The word this region output is named by, and the spelling
-/// [`parse_region_output`] reads back.
-pub fn region_output_name(output: &RegionOutput) -> String {
-    match output {
-        RegionOutput::Blended(column) => column.clone(),
-        RegionOutput::RegionId => "region_id".to_owned(),
-        RegionOutput::CoverClass => "cover_class".to_owned(),
-    }
-}
-
-/// The word this op is named by, and the spelling `parse_op` takes — except
-/// `regions` and `external`, which nothing builds from words.
+/// The word this op is named by, and the spelling [`parse_op`] takes.
 pub fn op_name(op: &NodeOp) -> &'static str {
     match op {
-        NodeOp::Constant(_) => "constant",
-        NodeOp::Noise(_) => "noise",
-        NodeOp::Paint(_) => "paint",
-        NodeOp::Slope { .. } => "slope",
         NodeOp::FieldRef(_) => "fieldref",
-        NodeOp::Regions { .. } => "regions",
-        NodeOp::External(_) => "external",
         NodeOp::Shader(_) => "shader",
-        NodeOp::Binary(_) => "binary",
-        NodeOp::Lerp => "lerp",
-        NodeOp::Scale(_) => "scale",
-        NodeOp::Remap(_) => "remap",
-        NodeOp::Curve(_) => "curve",
     }
 }
 
@@ -1121,29 +846,8 @@ pub fn op_name(op: &NodeOp) -> &'static str {
 /// Empty for an op that carries no parameters.
 pub fn op_params(op: &NodeOp) -> String {
     match op {
-        NodeOp::Constant(value) => format!("{value}"),
-        NodeOp::Noise(spec) => format!(
-            "{} scale {} x{}",
-            noise_kind_name(spec.kind),
-            spec.scale,
-            spec.octaves
-        ),
-        NodeOp::Paint(raster) => format!("{}x{}", raster.width(), raster.height()),
-        NodeOp::Slope { sample_tiles, mode } => {
-            format!("over {sample_tiles} by {}", slope_mode_name(*mode))
-        }
         NodeOp::FieldRef(id) => format!("{id}"),
-        NodeOp::Regions { output, .. } => region_output_name(output),
-        NodeOp::External(raster) => format!("{}x{}", raster.width(), raster.height()),
         NodeOp::Shader(shader) => shader.params_line(None),
-        NodeOp::Binary(binary) => binary_name(*binary).to_owned(),
-        NodeOp::Lerp => String::new(),
-        NodeOp::Scale(factor) => format!("{factor}"),
-        NodeOp::Remap(remap) => format!(
-            "{}..{} -> {}..{}",
-            remap.from.0, remap.from.1, remap.to.0, remap.to.1
-        ),
-        NodeOp::Curve(curve) => format!("of {} points", curve.points.len()),
     }
 }
 
@@ -1151,10 +855,8 @@ pub fn op_params(op: &NodeOp) -> String {
 /// and the control client's listing. Not a path, and nothing reads it back.
 pub fn op_summary(op: &NodeOp) -> String {
     match op {
-        NodeOp::Noise(_) => op_params(op),
-        NodeOp::Lerp => "lerp".to_owned(),
         NodeOp::Shader(shader) => format!("shader {}", shader.file),
-        _ => format!("{} {}", op_name(op), op_params(op)),
+        NodeOp::FieldRef(_) => format!("{} {}", op_name(op), op_params(op)),
     }
 }
 
@@ -1195,11 +897,18 @@ mod tests {
 
     fn document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(64, 64))
-            .with_field(Field::new("base").with_op(NodeOp::Constant(0.25)))
-            .with_field(Field::new("height").with_role(FieldRole::Height).with_sum([
-                NodeOp::FieldRef(FieldId::from("base")),
-                NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02)),
-            ]))
+            .with_field(Field::new("base").with_op(NodeOp::held(0.25)))
+            .with_field(
+                Field::new("height")
+                    .with_role(FieldRole::Height)
+                    .with_graph({
+                        let mut graph = FieldGraph::new();
+                        let read = graph.node_with(NodeOp::FieldRef(FieldId::from("base")), &[]);
+                        let piped = graph.node_with(NodeOp::piped(1), &[read]);
+                        graph.set_output(Some(piped)).unwrap();
+                        graph
+                    }),
+            )
     }
 
     // The overview's drag reads the new node's id back out of an `AddNode` reply, which
@@ -1208,7 +917,7 @@ mod tests {
     #[test]
     fn a_node_path_reads_back_as_the_id_that_spelled_it() {
         assert_eq!(node_of_path(&node_path(NodeId(7))), Some(NodeId(7)));
-        assert_eq!(node_of_path("noise"), None);
+        assert_eq!(node_of_path("ground"), None);
         assert_eq!(node_of_path("n"), None);
     }
 
@@ -1219,64 +928,11 @@ mod tests {
     // to the spelling it replaced.
     #[test]
     fn every_op_summarises_to_the_words_it_always_did() {
-        use crate::terrain::regions::{Region, RegionSpec};
-
-        let regions = RegionSpec::new(7, 128, 16, ["base"]).with_region(Region::new(4, [0.5]));
         let cases = [
-            (NodeOp::Constant(0.25), "constant 0.25"),
-            (
-                NodeOp::Noise(NoiseSpec::new(1, NoiseKind::Fbm, 0.02).with_octaves(4)),
-                "fbm scale 0.02 x4",
-            ),
-            (
-                NodeOp::Paint(Raster::new(UVec2::new(4, 2), 0u8)),
-                "paint 4x2",
-            ),
-            (
-                NodeOp::External(Raster::new(UVec2::new(8, 3), 0.0f32)),
-                "external 8x3",
-            ),
-            (
-                NodeOp::Slope {
-                    sample_tiles: 2.0,
-                    mode: SlopeMode::Gradient,
-                },
-                "slope over 2 by gradient",
-            ),
             (NodeOp::FieldRef(FieldId::from("base")), "fieldref base"),
-            (
-                NodeOp::Regions {
-                    spec: regions,
-                    output: RegionOutput::Blended("base".to_owned()),
-                },
-                "regions base",
-            ),
             (
                 NodeOp::Shader(ShaderLayer::new("warped.wgsl")),
                 "shader warped.wgsl",
-            ),
-            (NodeOp::Binary(Binary::Add), "binary add"),
-            (NodeOp::Lerp, "lerp"),
-            (NodeOp::Scale(1.5), "scale 1.5"),
-            (
-                NodeOp::Remap(Remap {
-                    from: (0.0, 1.0),
-                    to: (2.0, 3.0),
-                }),
-                "remap 0..1 -> 2..3",
-            ),
-            (
-                NodeOp::Curve(Curve::new(vec![
-                    CurvePoint {
-                        input: 0.0,
-                        output: 0.0,
-                    },
-                    CurvePoint {
-                        input: 1.0,
-                        output: 1.0,
-                    },
-                ])),
-                "curve of 2 points",
             ),
         ];
         for (op, expected) in cases {
@@ -1307,7 +963,7 @@ mod tests {
 
         Edit::AddNode {
             field: "height".to_owned(),
-            op: NodeOp::Scale(2.0),
+            op: NodeOp::piped(1),
             position: None,
         }
         .apply(&mut terrain)
@@ -1394,7 +1050,7 @@ mod tests {
     fn wiring_the_output_into_a_node_nothing_reads_makes_that_node_the_output() {
         let mut terrain = document();
         let output = output_of(&terrain).unwrap();
-        let added = add(&mut terrain, NodeOp::Scale(2.0));
+        let added = add(&mut terrain, NodeOp::piped(1));
         let reply = connect(&mut terrain, output, added);
         assert_eq!(output_of(&terrain), Some(added));
         assert_eq!(reply["output"], json!(node_path(added)));
@@ -1406,8 +1062,8 @@ mod tests {
     fn wiring_the_output_into_a_node_that_is_read_leaves_the_output() {
         let mut terrain = document();
         let output = output_of(&terrain).unwrap();
-        let middle = add(&mut terrain, NodeOp::Scale(2.0));
-        let reader = add(&mut terrain, NodeOp::Scale(3.0));
+        let middle = add(&mut terrain, NodeOp::piped(1));
+        let reader = add(&mut terrain, NodeOp::piped(1));
         connect(&mut terrain, middle, reader);
         connect(&mut terrain, output, middle);
         assert_eq!(output_of(&terrain), Some(output));
@@ -1418,8 +1074,8 @@ mod tests {
     fn wiring_a_node_that_is_not_the_output_leaves_the_output() {
         let mut terrain = document();
         let output = output_of(&terrain).unwrap();
-        let source = add(&mut terrain, NodeOp::Constant(1.0));
-        let reader = add(&mut terrain, NodeOp::Scale(2.0));
+        let source = add(&mut terrain, NodeOp::held(1.0));
+        let reader = add(&mut terrain, NodeOp::piped(1));
         connect(&mut terrain, source, reader);
         assert_eq!(output_of(&terrain), Some(output));
     }
@@ -1468,7 +1124,7 @@ mod tests {
     fn removing_the_output_answers_where_it_went() {
         let mut terrain = document();
         let output = output_of(&terrain).unwrap();
-        let added = add(&mut terrain, NodeOp::Scale(2.0));
+        let added = add(&mut terrain, NodeOp::piped(1));
         connect(&mut terrain, output, added);
         let reply = Edit::RemoveNode {
             field: "height".to_owned(),
@@ -1776,7 +1432,7 @@ mod tests {
     }
 
     // The panel's `reads` row and `observe field`'s `reads` list are this one answer,
-    // and `ridges`/`height` names `base` from two nodes — so the dedup is the whole
+    // and a graph may name one field from several nodes — so the dedup is the whole
     // point: a field that reads another twice reads it once.
     #[test]
     fn reads_of_names_each_field_read_once() {
@@ -1855,20 +1511,17 @@ mod tests {
     #[test]
     fn an_edge_that_would_close_a_cycle_is_refused() {
         let mut terrain = document();
-        let graph = &terrain.field("height").unwrap().graph;
-        let output = graph.output.unwrap();
-        let source = graph.nodes[0].id;
+        let output = terrain.field("height").unwrap().graph.output.unwrap();
 
-        assert!(
-            Edit::Connect {
-                field: "height".to_owned(),
-                from: output.to_string(),
-                to: source.to_string(),
-                pin: 0,
-            }
-            .apply(&mut terrain)
-            .is_err()
-        );
+        let error = Edit::Connect {
+            field: "height".to_owned(),
+            from: output.to_string(),
+            to: output.to_string(),
+            pin: 0,
+        }
+        .apply(&mut terrain)
+        .unwrap_err();
+        assert!(error.contains("cycle"), "{error}");
     }
 
     // The assertion the scenario exists for, made where it can be made numerically: the
@@ -1882,22 +1535,15 @@ mod tests {
         let previous = terrain.field("height").unwrap().graph.output.unwrap();
         let added = {
             let graph = &mut terrain.field_mut("height").unwrap().graph;
-            let value = graph.node_with(NodeOp::Constant(0.25), &[]);
-            let total = graph.node_with(NodeOp::Binary(Binary::Add), &[previous, value]);
-            graph.set_output(Some(total)).unwrap();
-            total
+            let value = graph.node_with(NodeOp::held(0.25), &[]);
+            graph.set_output(Some(value)).unwrap();
+            value
         };
         terrain.bake_in_place().unwrap();
         let after = terrain.field("height").unwrap().baked().data().to_vec();
 
         assert_ne!(before, after);
-        assert!(
-            before
-                .iter()
-                .zip(&after)
-                .all(|(before, after)| after >= before),
-            "a texel fell after a value was added onto the output"
-        );
+        assert!(after.iter().all(|value| *value == 0.25));
 
         Edit::SetOutput {
             field: "height".to_owned(),
@@ -1915,19 +1561,19 @@ mod tests {
     #[test]
     fn bypassing_a_node_reads_what_it_passes_through() {
         let mut terrain = document();
-        let output = terrain.field("height").unwrap().graph.output.unwrap();
-        let scaled = {
+        let piped = {
             let graph = &mut terrain.field_mut("height").unwrap().graph;
-            let scaled = graph.node_with(NodeOp::Scale(3.0), &[output]);
-            graph.set_output(Some(scaled)).unwrap();
-            scaled
+            let value = graph.node_with(NodeOp::held(0.75), &[]);
+            let piped = graph.node_with(NodeOp::piped(1), &[value]);
+            graph.set_output(Some(piped)).unwrap();
+            piped
         };
         terrain.bake_in_place().unwrap();
-        let tripled = terrain.field("height").unwrap().baked().data().to_vec();
+        let evaluated = terrain.field("height").unwrap().baked().data().to_vec();
 
         Edit::Bypass {
             field: "height".to_owned(),
-            node: scaled.to_string(),
+            node: piped.to_string(),
             bypassed: Some(true),
         }
         .apply(&mut terrain)
@@ -1935,7 +1581,8 @@ mod tests {
         terrain.bake_in_place().unwrap();
         let passed = terrain.field("height").unwrap().baked().data().to_vec();
 
-        assert_ne!(tripled, passed);
+        assert!(evaluated.iter().all(|value| *value == 0.0));
+        assert!(passed.iter().all(|value| *value == 0.75));
     }
 
     // Every one of these arrives from a caller working against a document that has
@@ -1947,7 +1594,7 @@ mod tests {
         assert!(
             Edit::AddNode {
                 field: "nowhere".to_owned(),
-                op: NodeOp::Constant(0.5),
+                op: NodeOp::held(0.5),
                 position: None,
             }
             .apply(&mut terrain)
@@ -1971,21 +1618,23 @@ mod tests {
     #[test]
     fn every_node_property_is_reachable_by_its_path() {
         let mut terrain = document();
-        let sum = terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .output
-            .expect("the fixture reads a node");
+        let id = terrain.field("base").unwrap().graph.output.unwrap();
 
-        set_line(&mut terrain, &format!("height.{sum}.bypassed on")).unwrap();
-        set_line(&mut terrain, &format!("height.{sum}.name total")).unwrap();
-        set_line(&mut terrain, "height.total.mode mul").unwrap();
+        set_line(&mut terrain, &format!("base.{id}.bypassed on")).unwrap();
+        set_line(&mut terrain, &format!("base.{id}.name ground")).unwrap();
+        set_line(&mut terrain, "base.ground.value 0.75").unwrap();
 
-        let node = terrain.field("height").unwrap().graph.node(sum).unwrap();
+        let node = terrain.field("base").unwrap().graph.node(id).unwrap();
         assert!(node.bypassed);
-        assert_eq!(node.name.as_deref(), Some("total"));
-        assert_eq!(node.op, NodeOp::Binary(Binary::Mul));
+        assert_eq!(node.name.as_deref(), Some("ground"));
+        assert_eq!(param(&node.op, "value"), vec![0.75]);
+    }
+
+    fn param(op: &NodeOp, name: &str) -> Vec<f32> {
+        match op {
+            NodeOp::Shader(shader) => shader.params[name].clone(),
+            other => panic!("{other:?} carries no parameters"),
+        }
     }
 
     // A node is addressable by its id or by the name it was given, and the two have to
@@ -1999,43 +1648,37 @@ mod tests {
         set_line(&mut terrain, "base.ground.value 0.75").unwrap();
 
         let node = terrain.field("base").unwrap().graph.node(id).unwrap();
-        assert_eq!(node.op, NodeOp::Constant(0.75));
+        assert_eq!(param(&node.op, "value"), vec![0.75]);
     }
 
-    // The reason op parameters are addressable one at a time: the seed here comes from
-    // the document rather than from any of the three edits, where rewriting the op
-    // wholesale would have to restate every parameter and would silently reset the ones
-    // it forgot.
+    // The reason op parameters are addressable one at a time: the seed here was written
+    // by none of the edits, where rewriting the op wholesale would have to restate every
+    // parameter and would silently reset the ones it forgot. A parameter given a count
+    // of numbers it does not have is refused rather than stored.
     #[test]
     fn an_op_parameter_can_be_moved_without_rewriting_the_op_around_it() {
         let mut terrain = document();
-        let noise = terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .nodes
-            .iter()
-            .find(|node| matches!(node.op, NodeOp::Noise(_)))
-            .map(|node| node.id)
-            .expect("the fixture carries a noise node");
-        set_line(&mut terrain, &format!("height.{noise}.op.scale 0.004")).unwrap();
-        set_line(&mut terrain, &format!("height.{noise}.op.octaves 6")).unwrap();
-        set_line(&mut terrain, &format!("height.{noise}.op.kind ridged")).unwrap();
+        let mut layer = ShaderLayer::new("fbm.wgsl");
+        layer.params.insert("scale".to_owned(), vec![0.02]);
+        layer.params.insert("octaves".to_owned(), vec![4.0]);
+        layer.params.insert("seed".to_owned(), vec![1.0]);
+        let noise = add(&mut terrain, NodeOp::Shader(layer));
 
-        let NodeOp::Noise(spec) = &terrain
+        set_line(&mut terrain, &format!("height.{noise}.op.scale 0.004")).unwrap();
+        set_line(&mut terrain, &format!("height.{noise}.octaves 6")).unwrap();
+        let refused = set_line(&mut terrain, &format!("height.{noise}.scale 1 2")).unwrap_err();
+        assert!(refused.contains("scale"), "{refused}");
+
+        let op = &terrain
             .field("height")
             .unwrap()
             .graph
             .node(noise)
             .unwrap()
-            .op
-        else {
-            panic!("the op stopped being noise");
-        };
-        assert_eq!(spec.scale, 0.004);
-        assert_eq!(spec.octaves, 6);
-        assert_eq!(spec.kind, NoiseKind::Ridged);
-        assert_eq!(spec.seed, 1);
+            .op;
+        assert_eq!(param(op, "scale"), vec![0.004]);
+        assert_eq!(param(op, "octaves"), vec![6.0]);
+        assert_eq!(param(op, "seed"), vec![1.0]);
     }
 
     // `height.shift` and `height.1.blend` are one grammar with no marker segment
@@ -2084,18 +1727,10 @@ mod tests {
         let spec = terrain.water_spec.clone().unwrap();
         terrain.solve_water(&spec).unwrap();
 
-        let noise = terrain
-            .field("height")
-            .unwrap()
-            .graph
-            .nodes
-            .iter()
-            .find(|node| matches!(node.op, NodeOp::Noise(_)))
-            .map(|node| node.id)
-            .expect("the fixture carries a noise node");
+        let value = terrain.field("base").unwrap().graph.output.unwrap();
         Edit::Set {
-            path: format!("height.{noise}.op.scale"),
-            words: vec!["0.05".to_owned()],
+            path: format!("base.{value}.value"),
+            words: vec!["0.5".to_owned()],
         }
         .apply(&mut terrain)
         .unwrap();
@@ -2181,30 +1816,26 @@ mod tests {
 
     // The add button and the control client build ops from the same words, so a
     // spelling that parsed to the wrong op would give the two different documents from
-    // the same instruction.
+    // the same instruction — and every op this build no longer has is refused with a
+    // message naming it, so a script written against the old vocabulary is told which
+    // word it used.
     #[test]
     fn every_op_a_command_line_can_write_parses_to_the_op_it_names() {
         for (line, name) in [
-            ("constant 0.5", "constant"),
-            ("noise fbm 0.01", "noise"),
-            ("noise ridged 0.01 5 42", "noise"),
             ("fieldref base", "fieldref"),
-            ("slope 4", "slope"),
-            ("binary mul", "binary"),
-            ("lerp", "lerp"),
-            ("scale 2", "scale"),
-            ("remap 0 1 0 2", "remap"),
-            ("curve 0 0 1 2", "curve"),
+            ("shader ridged.wgsl", "shader"),
         ] {
             let op = parse_op(&words(line)).unwrap_or_else(|error| panic!("{line}: {error}"));
             assert_eq!(op_name(&op), name, "{line}");
         }
-        assert!(parse_op(&words("regions")).is_err());
-        assert!(parse_op(&words("noise sideways 0.01")).is_err());
-        assert!(parse_op(&words("noise fbm")).is_err());
-        assert!(parse_op(&words("binary sideways")).is_err());
-        assert!(parse_op(&words("remap 0 1")).is_err());
-        assert!(parse_op(&words("curve 0 0 1")).is_err());
+        for removed in [
+            "noise", "constant", "paint", "slope", "binary", "lerp", "scale", "remap", "curve",
+            "regions", "external",
+        ] {
+            let error = parse_op(&words(&format!("{removed} 1"))).unwrap_err();
+            assert!(error.contains(removed), "{removed}: {error}");
+        }
+        assert!(parse_op(&words("shader")).is_err());
     }
 
     // The display properties are the only field properties the panel writes that a
@@ -2256,34 +1887,6 @@ mod tests {
         assert!(exempt("height.n3.hillshade"));
     }
 
-    // Naming and parsing are written out separately for each enum, so nothing but this
-    // forces them to agree; a name that does not parse back makes a value the panel can
-    // display and no script can set.
-    #[test]
-    fn every_binary_mode_and_noise_kind_parses_back_from_the_name_it_prints() {
-        for binary in BINARIES {
-            assert_eq!(parse_binary(binary_name(binary)).unwrap(), binary);
-        }
-        for kind in NOISE_KINDS {
-            assert_eq!(parse_noise_kind(noise_kind_name(kind)).unwrap(), kind);
-        }
-        assert!(parse_binary("sideways").is_err());
-    }
-
-    // The two categorical outputs have to be unreachable as column names, or a table with
-    // a column called `region_id` would make one of them unsayable.
-    #[test]
-    fn a_region_output_parses_back_from_the_name_it_prints() {
-        for output in [
-            RegionOutput::RegionId,
-            RegionOutput::CoverClass,
-            RegionOutput::Blended("base".to_owned()),
-        ] {
-            let name = region_output_name(&output);
-            assert_eq!(parse_region_output(&name), output);
-        }
-    }
-
     // `hold` drops an earlier held change only when a later one writes the same place,
     // so the slot has to separate two values for one property from two values for two
     // — and has to keep every structural edit apart from every other.
@@ -2298,7 +1901,7 @@ mod tests {
 
         let add = Edit::AddNode {
             field: "base".to_owned(),
-            op: NodeOp::Constant(0.5),
+            op: NodeOp::held(0.5),
             position: None,
         };
         let connect = Edit::Connect {

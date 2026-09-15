@@ -240,7 +240,6 @@ fn fault_of(
             .terrain()
             .filter(|terrain| terrain.field(id.as_str()).is_none())
             .map(|_| format!("no field named `{id}`")),
-        _ => None,
     }
 }
 
@@ -298,7 +297,6 @@ pub(super) fn thumb_centre() -> Vec2 {
     )
 }
 
-/// What a card is called: the name a person gave it, or the op it carries.
 fn caption(node: &GraphNode) -> String {
     match &node.name {
         Some(name) => name.clone(),
@@ -306,13 +304,6 @@ fn caption(node: &GraphNode) -> String {
     }
 }
 
-/// The colour of a card's title bar, which is where a card says what it is.
-///
-/// The output node and the soloed one are marked here, and the mark is on the bar
-/// rather than on a label so it survives the zoom at which labels are dropped. A broken
-/// node outranks all three, so clicking the card to find out what is wrong with it does
-/// not take the mark away — broken being a shader that will not compile or a reference
-/// to a field the document does not carry.
 fn title_colour(
     document: &Document,
     graph: &FieldGraph,
@@ -524,10 +515,6 @@ fn spawn_card(
     entity
 }
 
-/// What the canvas is drawn from, as one string.
-///
-/// Everything that decides how many entities there are and what each one is, and
-/// nothing that only decides where they sit or what they are called.
 fn fingerprint(document: &Document) -> String {
     let mut key = String::new();
     key.push_str("graph|");
@@ -550,9 +537,6 @@ fn fingerprint(document: &Document) -> String {
             node.bypassed,
             node.inputs,
         ));
-        if let NodeOp::Regions { output, .. } = &node.op {
-            key.push_str(&crate::edit::region_output_name(output));
-        }
     }
     key
 }
@@ -568,13 +552,11 @@ mod tests {
     use crate::terrain::{Field, TerrainSpec};
     use watershed::FieldId;
 
-    /// A world holding one field of one node, with that node's card on the canvas at
-    /// `dragged_to`, and a drag holding that card when `held`.
     fn world_with(held: bool, dragged_to: Vec2) -> (World, Entity) {
         let mut document = Document::default();
         document.adopt(
             TerrainSpec::new(UVec2::splat(16))
-                .with_field(Field::new("height").with_op(NodeOp::Constant(0.5))),
+                .with_field(Field::new("height").with_op(NodeOp::held(0.5))),
         );
         let node = document
             .terrain()
@@ -668,7 +650,7 @@ mod tests {
         let mut terrain = TerrainSpec::new(UVec2::splat(16))
             .with_field(Field::new("height").with_op(NodeOp::FieldRef(FieldId::from("base"))));
         if target_exists {
-            terrain = terrain.with_field(Field::new("base").with_op(NodeOp::Constant(0.25)));
+            terrain = terrain.with_field(Field::new("base").with_op(NodeOp::held(0.25)));
         }
         let mut document = Document::default();
         document.adopt(terrain);
