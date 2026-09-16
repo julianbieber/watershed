@@ -353,7 +353,9 @@ fn write(store: &mut impl Store, terrain: &Terrain, pruning: bool) -> Result<(),
     Ok(())
 }
 
-fn is_layer_file(name: &str) -> bool {
+/// Whether `name` is one of the images a terrain's values are written as:
+/// `layer_<n>.png` with at least one digit.
+pub fn is_layer_file(name: &str) -> bool {
     name.strip_prefix("layer_")
         .and_then(|rest| rest.strip_suffix(".png"))
         .is_some_and(|digits| {
@@ -558,8 +560,6 @@ mod tests {
         }
     }
 
-    // A ramp rather than a constant, so a quantisation that dropped a texel or
-    // transposed the rows would move a value rather than land on the same one twice.
     fn layer_of(shift: u8, channels: usize) -> TerrainLayer {
         let texels = resolution(SIZE, shift);
         let meta: Vec<ChannelMeta> = (0..channels)

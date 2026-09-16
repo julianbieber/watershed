@@ -184,8 +184,9 @@ directory unopenable.
 
 A project is opened by starting the editor on its directory — `watershed_editor <dir>`,
 or no argument for the working directory — or, in a running editor, with `open <dir>`
-on the socket. A directory holding no `terrain.ron` opens empty; the first save fills
-it.
+on the socket. A directory holding no terrain opens on the New dialog; Create writes
+`shaders/` and `recipe.ron` into it at once. A project that already holds a terrain has
+no New…: starting over is deleting the files by hand.
 
 The split is what makes the boundary real: a reader of values never parses a shader,
 so it never needs the types a layer's shader is made of. A directory whose recipe has

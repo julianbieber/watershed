@@ -420,7 +420,9 @@ impl Document {
 
     fn apply_file_operation(&mut self, edit: &Edit) -> Result<Value, String> {
         self.busy_check()?;
-        let root = self.shader_root();
+        let root = self
+            .shader_root()
+            .ok_or("there is no project to write a layer file into")?;
         let active = self.active.clone();
         let terrain = self
             .terrain
@@ -496,16 +498,19 @@ impl Document {
     }
 
     /// The directory the open document's shader files live in: `shaders` inside its
-    /// path once it has one, and the scratch directory before that.
+    /// path, once a project has been opened. `None` before that — which in the editor
+    /// is before startup.
     ///
     /// The answer is absolute, so it can be handed to a program outside this process;
     /// it falls back to the path as given when the working directory cannot be read.
-    pub fn shader_root(&self) -> PathBuf {
-        let root = self
-            .path
-            .as_ref()
-            .map_or_else(gpu::scratch_root, |path| path.join(SHADER_DIR));
-        std::path::absolute(&root).unwrap_or(root)
+    pub fn shader_root(&self) -> Option<PathBuf> {
+        let root = self.path.as_ref()?.join(SHADER_DIR);
+        Some(std::path::absolute(&root).unwrap_or(root))
+    }
+
+    /// Points the document at the project directory, without reading anything there.
+    pub fn look_at(&mut self, dir: PathBuf) {
+        self.path = Some(dir);
     }
 
     /// Writes one layer in place through `write`, as one change in the history: the
@@ -742,38 +747,49 @@ impl Document {
         Ok(())
     }
 
-    /// Starts building a preset and baking it whole, dropping whatever was open.
+    /// Starts building a preset and baking it whole into `dir`, dropping whatever was
+    /// open.
     ///
-    /// The preset's layer files are written into the scratch shader directory first,
-    /// **deleting every other `.wesl` file there**, and the bake dispatches them through
-    /// programs built from those sources on the device the document last had.
+    /// The preset's files and the recipe are in `dir` before this returns: the shader
+    /// files as [`gpu::write_preset`] writes them, **deleting every other `.wesl`
+    /// file already there**, then `recipe.ron` from the built (unbaked) spec. Refused
+    /// at the first write that fails, leaving what was done before it. The bake runs
+    /// afterwards, off the main thread, dispatching through programs built from the
+    /// preset's own sources on the device the document last had.
     ///
-    /// Refused while a save or another `new` or `load` is running, and when the
-    /// directory cannot be written. A bake or a solve is cancelled rather than waited
-    /// for — see [`JobKind::is_derived`]. The document is emptied immediately, so the
-    /// view goes blank on the frame this is called rather than showing the old terrain
-    /// under the new size in the toolbar.
-    pub fn start_new(&mut self, size: UVec2, seed: u32, preset: Preset) -> Result<(), String> {
+    /// Refused while a save or another `new` or `load` is running. A bake or a solve
+    /// is cancelled rather than waited for — see [`JobKind::is_derived`]. The
+    /// document is emptied immediately, so the view goes blank on the frame this is
+    /// called rather than showing the old terrain under the new size in the toolbar.
+    pub fn start_new(
+        &mut self,
+        dir: PathBuf,
+        size: UVec2,
+        seed: u32,
+        preset: Preset,
+    ) -> Result<(), String> {
         self.replace_check()?;
-        gpu::write_preset(&gpu::scratch_root(), preset)?;
+        gpu::write_preset(&dir.join(SHADER_DIR), preset)?;
         let runtime = self.runtime.with_sources(
             seed,
             preset.files().iter().filter_map(|(layer, stock)| {
                 gpu::stock_source(stock).map(|source| (format!("{layer}.wesl"), source.to_owned()))
             }),
         );
+        let mut terrain = preset.build(size, seed);
+        terrain.set_shader_runtime(runtime);
+        crate::terrain::recipe::write_recipe(&dir, &terrain).map_err(|error| error.to_string())?;
+
         self.size = size;
         self.seed = seed;
         self.preset = preset;
-        self.path = None;
+        self.path = Some(dir);
         self.terrain = None;
         self.baked = Baked::Nothing;
         self.history.clear();
         self.held.clear();
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            let mut terrain = preset.build(size, seed);
-            terrain.set_shader_runtime(runtime);
             let error = terrain.bake_in_place().err().map(|error| error.to_string());
             Outcome {
                 terrain: Some(terrain),
@@ -905,7 +921,10 @@ impl Document {
         }
     }
 
-    fn replace_check(&self) -> Result<(), String> {
+    /// Whether starting a `new` or a `load` would be refused: while a save is
+    /// running, or while another `new` or `load` is running. A bake or a solve in
+    /// flight is cancelled rather than waited for — see [`JobKind::is_derived`].
+    pub fn replace_check(&self) -> Result<(), String> {
         match self.job() {
             Some(kind) if !kind.is_derived() => {
                 Err(format!("a {} is already running", kind.name()))
@@ -1049,7 +1068,7 @@ mod tests {
         document.dirty = false;
         document.baked = Baked::Whole;
         document.path = Some(scratch(name));
-        let root = document.shader_root();
+        let root = document.shader_root().unwrap();
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("base.wesl"), "base").unwrap();
         std::fs::write(root.join("height.wesl"), "height").unwrap();
@@ -1082,7 +1101,7 @@ mod tests {
         let mut document = two_layer_document("add");
         add(&mut document, "temperature").unwrap();
 
-        let file = document.shader_root().join("temperature.wesl");
+        let file = document.shader_root().unwrap().join("temperature.wesl");
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             gpu::template_source()
@@ -1103,7 +1122,13 @@ mod tests {
         document.start_bake().unwrap();
 
         assert!(add(&mut document, "temperature").is_err());
-        assert!(!document.shader_root().join("temperature.wesl").exists());
+        assert!(
+            !document
+                .shader_root()
+                .unwrap()
+                .join("temperature.wesl")
+                .exists()
+        );
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 
@@ -1139,10 +1164,16 @@ mod tests {
 
         let root = document.path.clone().expect("the fixture has a directory");
         document
-            .start_new(UVec2::splat(32), 7, Preset::Continents)
+            .start_new(
+                scratch("new-target"),
+                UVec2::splat(32),
+                7,
+                Preset::Continents,
+            )
             .unwrap();
         assert_eq!(document.job(), Some(JobKind::New));
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(document.path.as_ref().unwrap());
     }
 
     // Which jobs may be cancelled is the whole of the rule above, and a save is the one
@@ -1183,7 +1214,7 @@ mod tests {
 
         let error = remove(&mut document, "base").unwrap_err();
         assert!(error.contains("height"), "{error}");
-        assert!(document.shader_root().join("base.wesl").is_file());
+        assert!(document.shader_root().unwrap().join("base.wesl").is_file());
         assert_eq!(document.layer_names(), ["base", "height"]);
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
@@ -1197,7 +1228,7 @@ mod tests {
         document.set_active("height").unwrap();
 
         remove(&mut document, "height").unwrap();
-        assert!(!document.shader_root().join("height.wesl").exists());
+        assert!(!document.shader_root().unwrap().join("height.wesl").exists());
         assert_eq!(document.layer_names(), ["base"]);
         assert_eq!(document.active(), "base");
         assert_eq!(document.history().undo, 0);
@@ -1582,14 +1613,16 @@ mod tests {
         let mut document = one_layer_document();
         set(&mut document, "height.value", "0.75").unwrap();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let root = scratch("new-empty-history");
         document
-            .start_new(UVec2::splat(16), 1, Preset::default())
+            .start_new(root.clone(), UVec2::splat(16), 1, Preset::default())
             .unwrap();
 
         assert_eq!(
             document.history(),
             crate::history::HistoryDepth { undo: 0, redo: 0 }
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // The decision the editor makes every frame: an open document that is not wholly

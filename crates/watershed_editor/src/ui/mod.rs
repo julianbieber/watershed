@@ -33,6 +33,9 @@ mod stack;
 mod toolbar;
 mod widgets;
 
+pub use dialog::DialogRoot;
+pub use toolbar::NewButton;
+
 /// Spawns the editor's chrome and runs the systems that keep it in step with the
 /// document.
 pub struct UiPlugin;

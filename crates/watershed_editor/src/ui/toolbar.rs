@@ -21,7 +21,8 @@ use crate::ui::widgets::{self, one, set_text};
 use crate::ui::{NewDialog, report};
 use crate::view::{EditorCamera, FreeView, fit_camera};
 
-/// Opens the new-terrain dialog. Disabled while a job is running.
+/// Opens the new-terrain dialog. Shown only while the project holds no terrain, and
+/// disabled while a job is running.
 #[derive(Component, Default, Clone)]
 pub struct NewButton;
 
@@ -181,11 +182,12 @@ fn separator() -> impl Scene {
 /// changed", so it takes precedence over everything else the line could say.
 pub fn sync(
     document: Res<Document>,
+    project: Res<Project>,
     mut commands: Commands,
     mut status: Single<&mut Text, With<StatusLabel>>,
     mut caption: Single<&mut Text, (With<LayerMenuCaption>, Without<StatusLabel>)>,
     disabled: Query<(), With<InteractionDisabled>>,
-    new_button: Single<Entity, With<NewButton>>,
+    new_button: Single<(Entity, &mut Node), With<NewButton>>,
     save_button: Single<Entity, With<SaveButton>>,
     bake_button: Single<Entity, With<BakeAllButton>>,
     solve_button: Single<Entity, With<SolveButton>>,
@@ -198,7 +200,16 @@ pub fn sync(
         .is_some_and(|terrain| terrain.water().is_some());
     let whole = document.baked() == Baked::Whole && !document.is_dirty();
 
-    enable(&mut commands, &disabled, *new_button, !busy);
+    let (new_button, mut new_node) = new_button.into_inner();
+    let display = if project.holds_terrain() {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    if new_node.display != display {
+        new_node.display = display;
+    }
+    enable(&mut commands, &disabled, new_button, !busy);
     enable(
         &mut commands,
         &disabled,

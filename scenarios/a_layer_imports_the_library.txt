@@ -1,5 +1,5 @@
 # A layer imports the library, from outside the process: `ridges` writes `lib.wesl` and
-# one `.wesl` per layer into the scratch shader directory, each layer's file starting
+# one `.wesl` per layer into the project's shader directory, each layer's file starting
 # with the import of what it calls, and `observe shaders` lists every import resolved
 # with no fault on any file.
 #

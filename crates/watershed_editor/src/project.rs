@@ -1,19 +1,80 @@
-//! Which directory the editor is working in, and how it comes to be that one.
+//! Which directory the editor is working in, what makes it hold a terrain, and how
+//! the editor comes to be working in that one.
+
+use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
 
 use crate::document::Document;
+use crate::terrain::recipe::RECIPE_FILE;
+use crate::terrain::shader::SHADER_DIR;
 
 /// The directory the editor works in. Absolute, always — the type is what keeps it so:
 /// the only constructors absolutise.
 #[derive(Resource)]
-pub struct Project(std::path::PathBuf);
+pub struct Project {
+    dir: PathBuf,
+    terrain: bool,
+}
 
 impl Project {
     /// The project directory, absolute.
-    pub fn dir(&self) -> &std::path::Path {
-        &self.0
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
+
+    /// Whether the project directory holds a terrain, as last read. See
+    /// [`holds_terrain`].
+    pub fn holds_terrain(&self) -> bool {
+        self.terrain
+    }
+
+    /// Re-reads whether the directory holds a terrain, for a caller that changed it —
+    /// a `new` that wrote or cleared one. `look_again` does not watch the filesystem:
+    /// a change made by hand while the editor is running is not seen until this is
+    /// called.
+    pub fn look_again(&mut self) {
+        self.terrain = holds_terrain(&self.dir);
+    }
+}
+
+/// Whether `dir` holds a terrain: `recipe.ron` is a file there, or `shaders` is a
+/// directory there. The issue's own definition of a project with a terrain, so
+/// nothing else in the editor is entitled to disagree with it.
+pub fn holds_terrain(dir: &Path) -> bool {
+    dir.join(RECIPE_FILE).is_file() || dir.join(SHADER_DIR).is_dir()
+}
+
+/// Removes exactly what makes `dir` a project holding a terrain: `shaders/` whole,
+/// `recipe.ron`, `terrain.ron`, and every `layer_<n>.png`. Nothing else in the
+/// directory is touched, and a file that is already missing is not a failure.
+pub fn clear_terrain(dir: &Path) -> Result<(), String> {
+    let shaders = dir.join(SHADER_DIR);
+    if shaders.is_dir() {
+        std::fs::remove_dir_all(&shaders)
+            .map_err(|error| format!("{}: {error}", shaders.display()))?;
+    }
+    for name in [RECIPE_FILE, watershed::io::META_FILE] {
+        let path = dir.join(name);
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return Err(format!("{}: {error}", dir.display())),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if watershed::io::is_layer_file(name) {
+            std::fs::remove_file(entry.path())
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn argument(args: &[String]) -> Result<Option<&str>, String> {
@@ -43,7 +104,8 @@ fn absolutise(dir: std::path::PathBuf) -> Result<Project, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let dir = std::path::absolute(&dir).map_err(|error| error.to_string())?;
-    Ok(Project(dir))
+    let terrain = holds_terrain(&dir);
+    Ok(Project { dir, terrain })
 }
 
 /// The window title for `project`. Plain ASCII: winit's legacy `WM_NAME` X11 property
@@ -70,6 +132,7 @@ pub fn open(
         Ok(true)
     } else {
         warn!("{} holds no terrain; New… makes one", dir.display());
+        document.look_at(dir);
         Ok(false)
     }
 }
@@ -84,10 +147,15 @@ impl Plugin for ProjectPlugin {
     }
 }
 
-fn open_on_start(mut project: ResMut<Project>, mut document: ResMut<Document>) {
+fn open_on_start(
+    mut project: ResMut<Project>,
+    mut document: ResMut<Document>,
+    mut dialog: ResMut<crate::ui::NewDialog>,
+) {
     let dir = project.dir().to_path_buf();
     let result = open(&mut project, &mut document, dir).map(|_| ());
     crate::ui::report(&mut document, result);
+    dialog.open = !project.holds_terrain();
 }
 
 fn follow_project(
@@ -155,6 +223,59 @@ mod tests {
         assert!(!loaded);
         assert!(document.terrain().is_none());
         assert_eq!(project.dir(), std::path::absolute(&dir).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("watershed-project-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // The issue's own definition, over the four shapes a directory can be in: neither
+    // file present is no terrain, and either one alone is already enough.
+    #[test]
+    fn holds_terrain_is_true_when_either_file_is_there() {
+        let dir = scratch("shapes");
+        assert!(!holds_terrain(&dir));
+
+        std::fs::write(dir.join(RECIPE_FILE), "recipe only").unwrap();
+        assert!(holds_terrain(&dir));
+        std::fs::remove_file(dir.join(RECIPE_FILE)).unwrap();
+
+        std::fs::create_dir_all(dir.join(SHADER_DIR)).unwrap();
+        assert!(holds_terrain(&dir));
+
+        std::fs::write(dir.join(RECIPE_FILE), "both").unwrap();
+        assert!(holds_terrain(&dir));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The destructive half: every kind of file a project is made of goes, and nothing
+    // else in the directory is touched.
+    #[test]
+    fn clear_terrain_removes_exactly_the_four_kinds_and_leaves_the_rest() {
+        let dir = scratch("clear");
+        std::fs::create_dir_all(dir.join(SHADER_DIR)).unwrap();
+        std::fs::write(dir.join(SHADER_DIR).join("height.wesl"), "height").unwrap();
+        std::fs::write(dir.join(RECIPE_FILE), "recipe").unwrap();
+        std::fs::write(dir.join(watershed::io::META_FILE), "values").unwrap();
+        std::fs::write(dir.join("layer_000.png"), "layer").unwrap();
+        std::fs::write(dir.join("notes.txt"), "mine").unwrap();
+        std::fs::write(dir.join("layers.png"), "mine").unwrap();
+
+        clear_terrain(&dir).unwrap();
+
+        assert!(!dir.join(SHADER_DIR).exists());
+        assert!(!dir.join(RECIPE_FILE).exists());
+        assert!(!dir.join(watershed::io::META_FILE).exists());
+        assert!(!dir.join("layer_000.png").exists());
+        assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(dir.join("layers.png")).unwrap(), b"mine");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

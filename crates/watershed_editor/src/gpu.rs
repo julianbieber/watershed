@@ -21,7 +21,7 @@ use glam::UVec2;
 use watershed::raster::Raster;
 use wesl::syntax::{GlobalDeclaration, ImportContent, ModulePath, PathOrigin, TranslationUnit};
 
-use crate::document::{Document, EditorSystems, JobKind};
+use crate::document::{Document, EditorSystems};
 use crate::preset::Preset;
 use crate::terrain::TerrainSpec;
 use crate::terrain::shader::{
@@ -371,9 +371,8 @@ impl DispatchGlobals {
 
 /// Every shader a document carries, and where they live.
 ///
-/// The root is the document's own `shaders` directory once it has been saved, and a
-/// scratch directory before that — so a layer can be added to a document that has
-/// never been written, and the first save moves the directory in whole.
+/// The root is the project's `shaders` directory, and empty before a project has
+/// been opened.
 #[derive(Resource, Debug)]
 pub struct ShaderLibrary {
     root: PathBuf,
@@ -387,7 +386,7 @@ pub struct ShaderLibrary {
 impl Default for ShaderLibrary {
     fn default() -> Self {
         Self {
-            root: scratch_root(),
+            root: PathBuf::new(),
             entries: BTreeMap::new(),
             ignored: BTreeSet::new(),
             generation: 0,
@@ -395,12 +394,6 @@ impl Default for ShaderLibrary {
             present: false,
         }
     }
-}
-
-/// The directory a document's shaders live in before it has been saved: one per
-/// editor process, under the system temp directory.
-pub fn scratch_root() -> PathBuf {
-    std::env::temp_dir().join(format!("watershed-shaders-{}", std::process::id()))
 }
 
 /// The source of the stock shader of that file name, or `None` for a name this build
@@ -753,36 +746,13 @@ fn follow_document(document: Res<Document>, mut library: ResMut<ShaderLibrary>) 
     if !document.is_changed() {
         return;
     }
-    let root = document.shader_root();
+    let Some(root) = document.shader_root() else {
+        return;
+    };
     if library.root() == root {
         return;
     }
-    if document.job() == Some(JobKind::Save) {
-        let moving = library.root() == scratch_root();
-        carry_shaders(library.root(), &root, moving);
-        if let Err(error) = write_library(&root) {
-            warn!("{error}");
-        }
-    }
     library.look_at(root);
-}
-
-fn carry_shaders(from: &Path, to: &Path, moving: bool) {
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return;
-    };
-    if std::fs::create_dir_all(to).is_err() {
-        return;
-    }
-    for entry in entries.flatten() {
-        let destination = to.join(entry.file_name());
-        if destination.exists() {
-            continue;
-        }
-        if !moving || std::fs::rename(entry.path(), &destination).is_err() {
-            let _ = std::fs::copy(entry.path(), &destination);
-        }
-    }
 }
 
 fn scan(
@@ -1561,28 +1531,6 @@ mod tests {
         );
         assert!(dir.join("height.wesl").is_file() && dir.join("moisture.wesl").is_file());
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    // Saving a document that already has a directory to a second one must leave the
-    // first directory's shaders where they were, and must not overwrite a shader the
-    // destination already carries.
-    #[test]
-    fn carrying_by_copy_keeps_the_source_and_leaves_an_existing_destination_file() {
-        let base = std::env::temp_dir().join(format!("watershed-carry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let from = base.join("from");
-        let to = base.join("to");
-        std::fs::create_dir_all(&from).unwrap();
-        std::fs::create_dir_all(&to).unwrap();
-        std::fs::write(from.join("a.wesl"), "a").unwrap();
-        std::fs::write(from.join("b.wesl"), "b").unwrap();
-        std::fs::write(to.join("b.wesl"), "kept").unwrap();
-
-        carry_shaders(&from, &to, false);
-        assert!(from.join("a.wesl").is_file() && from.join("b.wesl").is_file());
-        assert_eq!(std::fs::read_to_string(to.join("a.wesl")).unwrap(), "a");
-        assert_eq!(std::fs::read_to_string(to.join("b.wesl")).unwrap(), "kept");
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     // The uniform is read by the shader through a struct with a fixed layout, so its

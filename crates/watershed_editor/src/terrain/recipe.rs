@@ -150,11 +150,7 @@ impl TerrainSpec {
         let terrain = baked.clone().bake()?;
         terrain.save_to_dir(&root)?;
 
-        let text =
-            ron::ser::to_string_pretty(&recipe_of(&baked), ron::ser::PrettyConfig::default())
-                .map_err(|error| RecipeError::Meta(error.to_string()))?;
-        std::fs::write(root.join(RECIPE_FILE), text.as_bytes())?;
-        Ok(())
+        write_recipe(&root, &baked)
     }
     /// Reads a document from a directory and re-bakes it from its recipe, dispatching
     /// each layer's shader from the directory's `shaders` through `base`'s device at
@@ -214,6 +210,17 @@ impl TerrainSpec {
         }
         Ok(spec)
     }
+}
+
+/// Writes `recipe.ron` for `spec` into `root`, creating `root` if it is not there.
+///
+/// Writes no values and no images, and does not bake `spec` first.
+pub fn write_recipe(root: &Path, spec: &TerrainSpec) -> Result<(), RecipeError> {
+    std::fs::create_dir_all(root)?;
+    let text = ron::ser::to_string_pretty(&recipe_of(spec), ron::ser::PrettyConfig::default())
+        .map_err(|error| RecipeError::Meta(error.to_string()))?;
+    std::fs::write(root.join(RECIPE_FILE), text.as_bytes())?;
+    Ok(())
 }
 
 fn read_recipe(root: &Path) -> Result<Option<RecipeMeta>, RecipeError> {
@@ -312,6 +319,20 @@ mod tests {
 
         assert!(root.join(RECIPE_FILE).is_file());
         assert!(!text.contains("params"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // A recipe written on its own, with no values beside it, still has to be
+    // readable back as the recipe of the spec it was written from.
+    #[test]
+    fn a_recipe_written_on_its_own_is_readable_back() {
+        let root = scratch("recipe-only");
+        let spec = baked_document();
+        write_recipe(&root, &spec).unwrap();
+
+        let recipe = read_recipe(&root).unwrap().unwrap();
+        assert_eq!(recipe.size, spec.size);
+        assert_eq!(recipe.layers.len(), spec.layers.len());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
