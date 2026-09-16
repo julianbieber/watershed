@@ -202,6 +202,9 @@ fn contents(
     expanded: &Expanded,
     library: &ShaderLibrary,
 ) -> Vec<Box<dyn Scene>> {
+    let Some(root) = document.shader_root() else {
+        return vec![widgets::boxed(widgets::text("no project"))];
+    };
     let active = document.active().to_owned();
     let Some(layer) = layer_of(document) else {
         return vec![widgets::boxed(widgets::text("no document"))];
@@ -218,7 +221,6 @@ fn contents(
         .map(|terrain| crate::edit::readers_of(terrain, &active))
         .unwrap_or_default();
     children.push(widgets::boxed(properties(&active, layer, &reads, &read_by)));
-    let root = document.shader_root();
     children.push(widgets::boxed(shader_section(layer, library, &root)));
     children.push(widgets::boxed(reference_section(expanded.reference)));
     children.push(widgets::boxed(layer_row(&active)));

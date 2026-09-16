@@ -70,6 +70,12 @@ pub(super) enum Command {
     Layer(String),
     /// Hands the active layer's shader file to the person's editor.
     OpenLayerFile,
+    /// Opens or closes the new-terrain dialog. Opening is refused on a project that
+    /// holds a terrain — the reason the toolbar hides its button for.
+    NewDialog {
+        /// Whether the dialog should be open.
+        open: bool,
+    },
     /// An edit and the re-bake that answers it, held together: the reply says the
     /// effect has happened, and for an edit the effect is the bake rather than the
     /// changed number. A document that no longer bakes reports that error here rather
@@ -172,6 +178,7 @@ impl Command {
             Self::Wait { .. } => "wait",
             Self::New { .. } => "new",
             Self::Layer(_) | Self::OpenLayerFile => "layer",
+            Self::NewDialog { .. } => "new-dialog",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
                 _ => "layer",
@@ -256,6 +263,11 @@ impl Command {
                     applied: None,
                 })
             }
+            "new-dialog" => match rest.as_slice() {
+                ["open", ..] => Ok(Self::NewDialog { open: true }),
+                ["close", ..] => Ok(Self::NewDialog { open: false }),
+                _ => Err("new-dialog needs open or close".to_owned()),
+            },
             "bake" => Ok(Self::Bake { started: false }),
             "solve-water" => Ok(Self::SolveWater { started: false }),
             "reset-water" => Ok(Self::ResetWater),
@@ -338,8 +350,19 @@ impl Command {
             } => {
                 if !*started {
                     *started = true;
-                    let mut document = world.resource_mut::<Document>();
-                    if let Err(error) = document.start_new(*size, *seed, *preset) {
+                    if let Err(error) = world.resource::<Document>().replace_check() {
+                        return Poll::Failed(error);
+                    }
+                    let dir = world.resource::<Project>().dir().to_path_buf();
+                    if let Err(error) = project::clear_terrain(&dir) {
+                        return Poll::Failed(error);
+                    }
+                    let result = world
+                        .resource_mut::<Document>()
+                        .start_new(dir, *size, *seed, *preset);
+                    world.resource_mut::<Project>().look_again();
+                    world.resource_mut::<crate::ui::NewDialog>().open = false;
+                    if let Err(error) = result {
                         return Poll::Failed(error);
                     }
                     return Poll::Running;
@@ -362,6 +385,9 @@ impl Command {
 
             Self::OpenLayerFile => {
                 let document = world.resource::<Document>();
+                let Some(root) = document.shader_root() else {
+                    return Poll::Failed("there is no project to open a layer file in".to_owned());
+                };
                 let Some(file) = document
                     .terrain()
                     .and_then(|terrain| terrain.layer(document.active()))
@@ -369,7 +395,7 @@ impl Command {
                 else {
                     return Poll::Failed("there is no layer to open".to_owned());
                 };
-                let path = document.shader_root().join(file);
+                let path = root.join(file);
                 match crate::open::open(&path) {
                     Ok(program) => Poll::Done(json!({
                         "path": path.display().to_string(),
@@ -377,6 +403,16 @@ impl Command {
                     })),
                     Err(error) => Poll::Failed(error),
                 }
+            }
+
+            Self::NewDialog { open } => {
+                if *open && world.resource::<Project>().holds_terrain() {
+                    return Poll::Failed(
+                        "the project already holds a terrain; New… is gone".to_owned(),
+                    );
+                }
+                world.resource_mut::<crate::ui::NewDialog>().open = *open;
+                Poll::Done(json!({ "new_dialog": open }))
             }
 
             Self::Edit { edit, applied } => {
@@ -484,7 +520,7 @@ impl Command {
                         Err(error) => return Poll::Failed(error),
                     }
                 }
-                finished(world, |document| {
+                let done = finished(world, |document| {
                     json!({
                         "size": [document.size.x, document.size.y],
                         "layers": document.layer_names(),
@@ -492,7 +528,12 @@ impl Command {
                             .terrain()
                             .is_some_and(|terrain| terrain.water().is_some()),
                     })
-                })
+                });
+                if !matches!(done, Poll::Running) {
+                    let holds_terrain = world.resource::<Project>().holds_terrain();
+                    world.resource_mut::<crate::ui::NewDialog>().open = !holds_terrain;
+                }
+                done
             }
 
             Self::Pan(cell) => {
@@ -712,6 +753,8 @@ mod tests {
             ("layer add biomes", "layer"),
             ("layer rm base", "layer"),
             ("layer open", "layer"),
+            ("new-dialog open", "new-dialog"),
+            ("new-dialog close", "new-dialog"),
             ("set height.scale 0.004", "set"),
             ("set height.offset 0.5 0.25", "set"),
             ("set height.ridge 1.2", "set"),

@@ -40,6 +40,10 @@ pub(super) enum Topic {
     /// Every layer of the document in bake order, what each one reads, and the cycle
     /// that stopped the order from being computed.
     Layers,
+    /// Whether the new-terrain dialog and its toolbar button are shown, read from the
+    /// nodes themselves rather than from the resources they follow — the picture a
+    /// person actually sees, a frame after the resource that drives it changes.
+    Chrome,
 }
 
 impl Topic {
@@ -53,6 +57,7 @@ impl Topic {
             "log" => Ok(Self::Log),
             "shaders" => Ok(Self::Shaders),
             "layers" => Ok(Self::Layers),
+            "chrome" => Ok(Self::Chrome),
             other => Err(format!("nothing to observe called {other}")),
         }
     }
@@ -70,6 +75,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Log => log(world),
         Topic::Shaders => shaders(world),
         Topic::Layers => layers(world),
+        Topic::Chrome => chrome(world),
     }
 }
 
@@ -98,6 +104,9 @@ fn document(world: &World) -> Value {
 
 fn layer(world: &World) -> Value {
     let document = world.resource::<Document>();
+    let Some(root) = document.shader_root() else {
+        return json!({ "available": false, "reason": "no project" });
+    };
     let Some(terrain) = document.terrain() else {
         return json!({ "available": false });
     };
@@ -109,7 +118,7 @@ fn layer(world: &World) -> Value {
     let read_by = crate::edit::readers_of(terrain, document.active());
 
     let file = layer.file();
-    let path = document.shader_root().join(&file);
+    let path = root.join(&file);
     let params = &layer.shader.params;
 
     let (low, high) = layer.bounds();
@@ -356,6 +365,18 @@ fn shaders(world: &mut World) -> Value {
     })
 }
 
+fn chrome(world: &mut World) -> Value {
+    let dialog_open = world
+        .query_filtered::<&Node, With<crate::ui::DialogRoot>>()
+        .single(world)
+        .is_ok_and(|node| node.display != Display::None);
+    let new_button = world
+        .query_filtered::<&Node, With<crate::ui::NewButton>>()
+        .single(world)
+        .is_ok_and(|node| node.display != Display::None);
+    json!({ "new_dialog": dialog_open, "new_button": new_button })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +392,7 @@ mod tests {
             .with_layer(Layer::new("height").reading(&["base"]));
 
         let mut document = Document::default();
+        document.path = Some(std::path::PathBuf::from("/tmp/watershed-observe-layer"));
         document.adopt(terrain);
         document.set_active("height").unwrap();
         let mut world = World::new();
@@ -393,6 +415,7 @@ mod tests {
         let terrain = TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("base").held(0.25));
 
         let mut document = Document::default();
+        document.path = Some(std::path::PathBuf::from("/tmp/watershed-observe-layer"));
         document.adopt(terrain);
         document.set_active("base").unwrap();
         let mut world = World::new();
@@ -411,6 +434,7 @@ mod tests {
             TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("height").held(0.25));
 
         let mut document = Document::default();
+        document.path = Some(std::path::PathBuf::from("/tmp/watershed-observe-layer"));
         document.adopt(terrain);
         document.set_active("height").unwrap();
         let mut world = World::new();
@@ -432,6 +456,7 @@ mod tests {
         let terrain = TerrainSpec::new(UVec2::splat(16)).with_layer(moisture);
 
         let mut document = Document::default();
+        document.path = Some(std::path::PathBuf::from("/tmp/watershed-observe-layer"));
         document.adopt(terrain);
         document.set_active("moisture").unwrap();
         let mut world = World::new();

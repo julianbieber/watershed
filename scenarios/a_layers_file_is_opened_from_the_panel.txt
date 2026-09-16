@@ -12,7 +12,7 @@ observe log
 
 fixed-delta 1/60
 
-# `ridges` writes `base.wesl`, `height.wesl` and `moisture.wesl` into the scratch
+# `ridges` writes `base.wesl`, `height.wesl` and `moisture.wesl` into the project's
 # shader directory, and bakes whole.
 new 256 256 7 ridges
 wait bake

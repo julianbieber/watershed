@@ -1,5 +1,5 @@
 # A layer is one shader file, from outside the process: `ridges` writes one file per
-# layer into the scratch shader directory, a layer added from the socket arrives as a
+# layer into the project's shader directory, a layer added from the socket arrives as a
 # copy of the template, a parameter set on it is one undo step, removing it takes the
 # file with it, and every edit re-bakes the whole document — `observe document` reports
 # `baked` as `whole` after each one and never a rectangle.

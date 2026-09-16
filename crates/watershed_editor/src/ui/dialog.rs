@@ -13,6 +13,7 @@ use bevy::ui_widgets::Activate;
 
 use crate::document::Document;
 use crate::preset::Preset;
+use crate::project::Project;
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{NewDialog, report};
@@ -123,13 +124,16 @@ pub fn dialog() -> impl Scene {
                     CreateButton
                     on(|_: On<Activate>,
                         mut document: ResMut<Document>,
+                        mut project: ResMut<Project>,
                         mut dialog: ResMut<NewDialog>| {
                         let result = document.start_new(
+                            project.dir().to_path_buf(),
                             UVec2::new(dialog.width, dialog.height),
                             dialog.seed,
                             dialog.preset,
                         );
                         report(&mut document, result);
+                        project.look_again();
                         dialog.open = false;
                     })
                     --
