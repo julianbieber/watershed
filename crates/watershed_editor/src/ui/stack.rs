@@ -21,14 +21,12 @@ use bevy::text::{EditableText, TextEdit, TextEditChange};
 use bevy::ui::Checked;
 use bevy::ui_widgets::{Activate, ValueChange};
 
-use std::path::Path;
-
 use crate::canvas::OpenLayer;
 use crate::document::{Baked, Document};
 use crate::edit::Edit;
 use crate::gpu::{ShaderLibrary, shader_reference};
 use crate::terrain::Layer;
-use crate::terrain::shader::{ParamsLayout, ShaderLayer, Widget};
+use crate::terrain::shader::{ParamsLayout, SHADER_DIR, ShaderLayer, Widget};
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{Expanded, NewLayer, PANEL_WIDTH, report};
@@ -153,13 +151,11 @@ fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary
     key.push('|');
     key.push_str(if expanded.reference { "ref" } else { "noref" });
     key.push('|');
-    key.push_str(
-        &document
-            .path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-    );
+    key.push_str(if document.path.is_some() {
+        "project"
+    } else {
+        "no project"
+    });
     key.push('|');
 
     if let Some(terrain) = document.terrain() {
@@ -202,9 +198,9 @@ fn contents(
     expanded: &Expanded,
     library: &ShaderLibrary,
 ) -> Vec<Box<dyn Scene>> {
-    let Some(root) = document.shader_root() else {
+    if document.shader_root().is_none() {
         return vec![widgets::boxed(widgets::text("no project"))];
-    };
+    }
     let active = document.active().to_owned();
     let Some(layer) = layer_of(document) else {
         return vec![widgets::boxed(widgets::text("no document"))];
@@ -221,7 +217,7 @@ fn contents(
         .map(|terrain| crate::edit::readers_of(terrain, &active))
         .unwrap_or_default();
     children.push(widgets::boxed(properties(&active, layer, &reads, &read_by)));
-    children.push(widgets::boxed(shader_section(layer, library, &root)));
+    children.push(widgets::boxed(shader_section(layer, library)));
     children.push(widgets::boxed(reference_section(expanded.reference)));
     children.push(widgets::boxed(layer_row(&active)));
     children
@@ -395,22 +391,13 @@ fn toggle_row(
     widgets::row(children)
 }
 
-fn shader_section(layer: &Layer, library: &ShaderLibrary, root: &Path) -> impl Scene {
+fn shader_caption(layer: &Layer) -> String {
+    format!("{SHADER_DIR}/{}", layer.file())
+}
+
+fn shader_section(layer: &Layer, library: &ShaderLibrary) -> impl Scene {
     let file = layer.file();
-    let path = root.join(&file);
-    let open = path.clone();
-    let mut rows: Vec<Box<dyn SceneList>> = vec![
-        one(widgets::small(path.display().to_string())),
-        one(bsn! {
-            @FeathersButton {
-                @caption: bsn! { Text("Open") ThemedText },
-            }
-            on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                let result = crate::open::open(&open).map(|_| ());
-                report(&mut document, result);
-            })
-        }),
-    ];
+    let mut rows: Vec<Box<dyn SceneList>> = vec![one(widgets::small(shader_caption(layer)))];
     match library.entry(&file) {
         None => rows.push(one(widgets::small("no such file in shaders/"))),
         Some(entry) => {
@@ -567,15 +554,23 @@ mod tests {
         assert_ne!(key(&document), before, "`read by` went stale");
     }
 
-    // The path is a caption now, so a save that moves the shader directory has to
-    // rebuild the panel — nothing else about the document would ever redraw it.
+    // The panel reads `no project` until a document has a path, so a project that
+    // opened outside the shape key would leave that text on screen.
     #[test]
-    fn saving_the_document_elsewhere_rebuilds_the_panel() {
+    fn opening_a_project_rebuilds_the_panel() {
         let mut document = document_with(0.5);
         let before = key(&document);
 
         document.path = Some(std::path::PathBuf::from("/tmp/watershed-test"));
         assert_ne!(key(&document), before, "the path went stale");
+    }
+
+    // The panel's only name for the file is this caption, and the person's own editor is
+    // already open on the project directory — so it has to be the name from there, not an
+    // absolute path they cannot use.
+    #[test]
+    fn the_panel_names_the_file_relative_to_the_project() {
+        assert_eq!(shader_caption(&Layer::new("height")), "shaders/height.wesl");
     }
 
     // The rule the panel is built on, from the side that would break it quietly: a
