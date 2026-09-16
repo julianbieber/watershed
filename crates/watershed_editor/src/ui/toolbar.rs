@@ -1,6 +1,5 @@
-//! The strip along the top: the actions that apply to a document as a whole, the path
-//! it is read from and written to, which layer is on screen, and what the run is
-//! doing.
+//! The strip along the top: the actions that apply to a document as a whole, which
+//! layer is on screen, and what the run is doing.
 //!
 //! The toolbar's shape does not depend on the document, so it is built once and only
 //! dressed afterwards — captions rewritten, buttons enabled and disabled. The one
@@ -9,30 +8,25 @@
 
 use bevy::feathers::controls::{
     ButtonVariant, FeathersButton, FeathersMenu, FeathersMenuButton, FeathersMenuPopup,
-    FeathersTextInput, FeathersTextInputContainer,
 };
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemedText};
 use bevy::feathers::tokens;
 use bevy::prelude::*;
-use bevy::text::{EditableText, TextEdit, TextEditChange};
 use bevy::ui::InteractionDisabled;
 use bevy::ui_widgets::Activate;
 
 use crate::document::{Baked, Document};
+use crate::project::Project;
 use crate::ui::widgets::{self, one, set_text};
-use crate::ui::{FilePath, NewDialog, report};
+use crate::ui::{NewDialog, report};
 use crate::view::{EditorCamera, FreeView, fit_camera};
 
 /// Opens the new-terrain dialog. Disabled while a job is running.
 #[derive(Component, Default, Clone)]
 pub struct NewButton;
 
-/// Loads the document at the path in the layer. Disabled while a job is running.
-#[derive(Component, Default, Clone)]
-pub struct OpenButton;
-
-/// Writes the document to the path in the layer. Disabled while a job is running or
-/// there is no document.
+/// Writes the document into the project. Disabled while a job is running or there is
+/// no document.
 #[derive(Component, Default, Clone)]
 pub struct SaveButton;
 
@@ -54,10 +48,6 @@ pub struct ResetWaterButton;
 #[derive(Component, Default, Clone)]
 pub struct StatusLabel;
 
-/// The text field holding the path to load from and save to.
-#[derive(Component, Default, Clone)]
-pub struct PathInput;
-
 /// The layer menu's button caption, which names the layer on screen.
 #[derive(Component, Default, Clone)]
 pub struct LayerMenuCaption;
@@ -72,7 +62,7 @@ pub struct LayerMenuPopup;
 pub struct LayerChoices(Vec<String>);
 
 /// The toolbar's scene. Built once; everything document-dependent about it is filled
-/// in afterwards by [`sync`], [`rebuild_layer_menu`] and [`seed_path`].
+/// in afterwards by [`sync`] and [`rebuild_layer_menu`].
 pub fn toolbar() -> impl Scene {
     bsn! {
         Node {
@@ -96,35 +86,12 @@ pub fn toolbar() -> impl Scene {
             --
             @separator()
             --
-            @FeathersTextInputContainer
-            Node { width: px(220) }
-            Children [
-                @FeathersTextInput
-                PathInput
-                on(|change: On<TextEditChange>,
-                    texts: Query<&EditableText>,
-                    mut path: ResMut<FilePath>| {
-                    if let Ok(text) = texts.get(change.event_target()) {
-                        path.0 = text.value().to_string();
-                    }
-                })
-            ]
-            --
-            @FeathersButton {
-                @caption: bsn! { Text("Open") ThemedText },
-            }
-            OpenButton
-            on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
-                let result = document.start_load(path.0.clone().into());
-                report(&mut document, result);
-            })
-            --
             @FeathersButton {
                 @caption: bsn! { Text("Save") ThemedText },
             }
             SaveButton
-            on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
-                let result = document.start_save(path.0.clone().into());
+            on(|_: On<Activate>, mut document: ResMut<Document>, project: Res<Project>| {
+                let result = document.start_save(project.dir().to_path_buf());
                 report(&mut document, result);
             })
             --
@@ -219,7 +186,6 @@ pub fn sync(
     mut caption: Single<&mut Text, (With<LayerMenuCaption>, Without<StatusLabel>)>,
     disabled: Query<(), With<InteractionDisabled>>,
     new_button: Single<Entity, With<NewButton>>,
-    open_button: Single<Entity, With<OpenButton>>,
     save_button: Single<Entity, With<SaveButton>>,
     bake_button: Single<Entity, With<BakeAllButton>>,
     solve_button: Single<Entity, With<SolveButton>>,
@@ -233,7 +199,6 @@ pub fn sync(
     let whole = document.baked() == Baked::Whole && !document.is_dirty();
 
     enable(&mut commands, &disabled, *new_button, !busy);
-    enable(&mut commands, &disabled, *open_button, !busy);
     enable(
         &mut commands,
         &disabled,
@@ -322,13 +287,4 @@ pub fn rebuild_layer_menu(
         .entity(*popup)
         .despawn_related::<Children>()
         .queue_spawn_related_scenes::<Children>(items);
-}
-
-/// Puts the starting path into the text field the frame it appears. A text input owns
-/// a buffer that cannot be given a value at spawn time, so it is written once here.
-pub fn seed_path(path: Res<FilePath>, mut inputs: Query<&mut EditableText, Added<PathInput>>) {
-    for mut text in inputs.iter_mut() {
-        text.queue_edit(TextEdit::SelectAll);
-        text.queue_edit(TextEdit::Insert(path.0.clone().into()));
-    }
 }

@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use super::log::LogBuffer;
 use crate::document::Document;
 use crate::gpu::{STOCK, ShaderLibrary};
+use crate::project::Project;
 use crate::view::{
     CHANNEL_THRESHOLD, EditorCamera, FreeView, ViewRange, VisibleCells, cells_across,
     view_centre_cell,
@@ -86,7 +87,7 @@ fn document(world: &World) -> Value {
         "redo": document.history().redo,
         "seed": document.seed,
         "preset": document.preset.name(),
-        "path": document.path.as_ref().map(|path| path.display().to_string()),
+        "project": world.resource::<Project>().dir().display().to_string(),
         "active": document.active(),
         "layers": document.layer_names(),
         "water": document

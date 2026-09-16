@@ -11,6 +11,7 @@ RUSTFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 RUSTDOCFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 WASM_TARGET := "wasm32-unknown-unknown"
 CONTROL_SOCKET := "/tmp/watershed-control.sock"
+PROJECT := "/tmp/watershed-project"
 
 # Default: list recipes
 default:
@@ -72,21 +73,23 @@ all: fmt docs clippy bevy-lints test check-web check-goals
 clean:
 	@cargo clean
 
-# Run the editor
-run:
+# Run the editor on a project directory
+run DIR:
 	@env \
 	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
-	cargo run --package watershed_editor
+	cargo run --package watershed_editor -- {{DIR}}
 
-# Start the editor with its control socket open. Release, because a scenario solves water
-# over a whole document and a debug solve is minutes rather than seconds.
+# Start the editor with its control socket open, on a scratch project directory so the
+# repository root is never made a project by accident. Release, because a scenario
+# solves water over a whole document and a debug solve is minutes rather than seconds.
 drive-start:
+	@mkdir -p {{PROJECT}}
 	@env \
 	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
 	WATERSHED_CONTROL="{{CONTROL_SOCKET}}" \
-	cargo run --release --package watershed_editor
+	cargo run --release --package watershed_editor -- {{PROJECT}}
 
 # Send one command to a running editor:
 #   just drive observe water

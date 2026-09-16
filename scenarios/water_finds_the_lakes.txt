@@ -17,6 +17,9 @@ observe log
 # are polled per frame rather than driven by time, so they still land.
 fixed-delta 1/60
 
+# Opening the round-trip directory first is what makes the `save` below land in it.
+open /tmp/watershed-scenario/round-trip
+
 # 512 square is large enough for the continents shader to make basins and small enough that a
 # debug build is still bearable.
 new 512 512 7 continents
@@ -48,10 +51,10 @@ capture /tmp/watershed-scenario/moisture.png
 layer height
 
 # A round trip through the terrain directory. The save writes the values as images and
-# the load re-bakes from the recipe and the shader files rather than reading those
+# the open re-bakes from the recipe and the shader files rather than reading those
 # images back.
-save /tmp/watershed-scenario/round-trip
-load /tmp/watershed-scenario/round-trip
+save
+open /tmp/watershed-scenario/round-trip
 observe document
 observe water
 
