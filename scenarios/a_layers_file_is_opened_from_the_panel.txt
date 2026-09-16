@@ -1,0 +1,28 @@
+# A layer's file is named by its absolute path, from outside the process: every
+# `observe layer` reply carries `path`, it is absolute, it ends in `<layer>.wesl`, and
+# two layers' paths differ only in the stem — which is what lets the panel's **Open**
+# button and a caller on the socket name the same file.
+#
+# Run with:  just drive run scenarios/a_layers_file_is_opened_from_the_panel.txt
+#
+# Pressing **Open** is a hand check, and so is `layer open`: replay must not start an
+# editor, so neither is in this file.
+
+observe log
+
+fixed-delta 1/60
+
+# `ridges` writes `base.wesl`, `height.wesl` and `moisture.wesl` into the scratch
+# shader directory, and bakes whole.
+new 256 256 7 ridges
+wait bake
+
+# `path` is absolute and ends in `height.wesl`.
+layer height
+observe layer
+
+# The same directory, a different stem.
+layer base
+observe layer
+
+observe log

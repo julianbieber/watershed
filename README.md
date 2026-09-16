@@ -53,6 +53,9 @@ layer. Neither is an undo step: undo covers parameter values, the display settin
 the water spec — not the four the file declares, which the next read of the file would
 put back anyway.
 
+The panel names the layer's file by its absolute path and carries an **Open** button
+that hands it to `$VISUAL`, or to `xdg-open` when that is not set.
+
 ```wesl
 import package::lib::ridged_fbm;
 
