@@ -178,9 +178,9 @@ A terrain is a directory.
 A `layer_<n>.png` is not an authored layer: it is an image the library packs the values
 of every layer at one shift into, and `terrain.ron` calls the authored ones `fields`.
 
-The values are always written; the recipe only when the editor saves a *document*. An
-export writes the values alone, and removes a recipe already in the directory — one
-left behind would claim to describe values it no longer produced.
+Every save writes both: the values and the recipe beside them. A terrain directory is
+a project the editor is opened on, so a save that left the recipe out would make the
+directory unopenable.
 
 The split is what makes the boundary real: a reader of values never parses a shader,
 so it never needs the types a layer's shader is made of. A directory whose recipe has

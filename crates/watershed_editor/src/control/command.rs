@@ -6,7 +6,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::terrain::SaveOptions;
 use bevy::{
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
@@ -100,8 +99,6 @@ pub(super) enum Command {
     Save {
         /// Where to write.
         path: PathBuf,
-        /// What to put in the file.
-        options: SaveOptions,
         /// Whether the job has been asked for yet.
         started: bool,
     },
@@ -262,15 +259,18 @@ impl Command {
             "bake" => Ok(Self::Bake { started: false }),
             "solve-water" => Ok(Self::SolveWater { started: false }),
             "reset-water" => Ok(Self::ResetWater),
-            "save" => Ok(Self::Save {
-                path: PathBuf::from(rest.first().ok_or("save needs a path")?),
-                options: match rest.get(1) {
-                    Some(&"document") | None => SaveOptions::document(),
-                    Some(&"export") => SaveOptions::export(),
-                    Some(word) => return Err(format!("no save option named `{word}`")),
-                },
-                started: false,
-            }),
+            "save" => {
+                let path = rest.first().ok_or("save needs a path")?;
+                if let Some(word) = rest.get(1) {
+                    return Err(format!(
+                        "save takes a path and nothing else; there is no `{word}`"
+                    ));
+                }
+                Ok(Self::Save {
+                    path: PathBuf::from(path),
+                    started: false,
+                })
+            }
             "load" => Ok(Self::Load {
                 path: PathBuf::from(rest.first().ok_or("load needs a path")?),
                 started: false,
@@ -460,15 +460,11 @@ impl Command {
                 }
             }
 
-            Self::Save {
-                path,
-                options,
-                started,
-            } => {
+            Self::Save { path, started } => {
                 if !*started {
                     *started = true;
                     let mut document = world.resource_mut::<Document>();
-                    if let Err(error) = document.start_save(path.clone(), *options) {
+                    if let Err(error) = document.start_save(path.clone()) {
                         return Poll::Failed(error);
                     }
                     return Poll::Running;
@@ -724,7 +720,6 @@ mod tests {
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),
             ("save /tmp/a-terrain", "save"),
-            ("save /tmp/a-terrain export", "save"),
             ("load /tmp/a-terrain", "load"),
             ("pan 100 200", "pan"),
             ("zoom fit", "zoom"),
@@ -767,6 +762,20 @@ mod tests {
         assert!(Command::parse("layer").is_err());
         assert!(Command::parse("layer rm").is_err());
         assert!(Command::parse("set").is_err());
+    }
+
+    // A save is one kind now, so a script still asking for an export or spelling
+    // out `document` has to be told the word does not exist rather than have a
+    // save half happen under it.
+    #[test]
+    fn a_save_option_is_refused_by_name() {
+        for word in ["export", "document"] {
+            let line = format!("save /tmp/watershed-scenario/x {word}");
+            let Err(error) = Command::parse(&line) else {
+                panic!("`{line}` parsed");
+            };
+            assert!(error.contains(word), "{error}");
+        }
     }
 
     // The brush is gone rather than hidden: a script still written against it has to be
