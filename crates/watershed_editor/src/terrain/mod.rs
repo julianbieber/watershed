@@ -16,5 +16,4 @@ pub mod water;
 
 pub use bake::TerrainSpec;
 pub use layer::{Layer, LayerId, LayerRole};
-pub use recipe::SaveOptions;
 pub use water::{WaterSpec, WaterState};

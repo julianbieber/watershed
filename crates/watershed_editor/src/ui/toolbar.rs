@@ -7,7 +7,6 @@
 //! part that does depend on the document, the layer menu, is rebuilt when the list of
 //! layers changes and not otherwise.
 
-use crate::terrain::SaveOptions;
 use bevy::feathers::controls::{
     ButtonVariant, FeathersButton, FeathersMenu, FeathersMenuButton, FeathersMenuPopup,
     FeathersTextInput, FeathersTextInputContainer,
@@ -125,8 +124,7 @@ pub fn toolbar() -> impl Scene {
             }
             SaveButton
             on(|_: On<Activate>, mut document: ResMut<Document>, path: Res<FilePath>| {
-                let result =
-                    document.start_save(path.0.clone().into(), SaveOptions::document());
+                let result = document.start_save(path.0.clone().into());
                 report(&mut document, result);
             })
             --

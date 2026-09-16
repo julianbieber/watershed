@@ -72,39 +72,6 @@ pub enum RecipeError {
     Water(#[from] WaterError),
 }
 
-/// What a save writes, beyond the values every terrain carries.
-///
-/// The values are always written — a terrain without them is one no consumer can
-/// read — so the only choice left is whether the recipe goes with them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SaveOptions {
-    /// Write `recipe.ron`. Without it the terrain has values but no recipe, and cannot
-    /// be opened for editing again.
-    pub recipe: bool,
-}
-
-impl Default for SaveOptions {
-    fn default() -> Self {
-        Self::document()
-    }
-}
-
-impl SaveOptions {
-    /// Everything: the values and the recipe that produced them. What an editor
-    /// saves, and the only form that can be opened for editing again.
-    pub fn document() -> Self {
-        Self { recipe: true }
-    }
-
-    /// Values without the recipe, for a consumer that reads a terrain and never
-    /// authors one.
-    ///
-    /// **Removes a recipe already in the directory**, because one left behind would
-    /// claim to describe values it no longer produced.
-    pub fn export() -> Self {
-        Self { recipe: false }
-    }
-}
 /// The recipe for one layer: everything needed to bake it again beside its shader
 /// file, which is the layer's `shaders/<name>.wesl`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -167,15 +134,10 @@ impl TerrainSpec {
     /// carries no values is one no consumer can open.
     ///
     /// **Deletes files.** The values half removes any `layer_<n>.png` it no longer
-    /// names, and [`SaveOptions::export`] removes the recipe itself. Nothing else is
-    /// touched.
+    /// names. Nothing else is touched.
     ///
     /// Nothing about the document is changed by saving it.
-    pub fn save_to_dir(
-        &self,
-        path: impl AsRef<Path>,
-        options: SaveOptions,
-    ) -> Result<(), RecipeError> {
+    pub fn save_to_dir(&self, path: impl AsRef<Path>) -> Result<(), RecipeError> {
         let root = path.as_ref().to_path_buf();
         let mut baked = self.clone();
         if baked
@@ -188,15 +150,10 @@ impl TerrainSpec {
         let terrain = baked.clone().bake()?;
         terrain.save_to_dir(&root)?;
 
-        let recipe = root.join(RECIPE_FILE);
-        if options.recipe {
-            let text =
-                ron::ser::to_string_pretty(&recipe_of(&baked), ron::ser::PrettyConfig::default())
-                    .map_err(|error| RecipeError::Meta(error.to_string()))?;
-            std::fs::write(recipe, text.as_bytes())?;
-        } else if recipe.exists() {
-            std::fs::remove_file(recipe)?;
-        }
+        let text =
+            ron::ser::to_string_pretty(&recipe_of(&baked), ron::ser::PrettyConfig::default())
+                .map_err(|error| RecipeError::Meta(error.to_string()))?;
+        std::fs::write(root.join(RECIPE_FILE), text.as_bytes())?;
         Ok(())
     }
     /// Reads a document from a directory and re-bakes it from its recipe, dispatching
@@ -335,9 +292,9 @@ mod tests {
         root
     }
 
-    fn saved(spec: &TerrainSpec, options: SaveOptions, name: &str) -> PathBuf {
+    fn saved(spec: &TerrainSpec, name: &str) -> PathBuf {
         let root = scratch(name);
-        spec.save_to_dir(&root, options).unwrap();
+        spec.save_to_dir(&root).unwrap();
         root
     }
 
@@ -350,7 +307,7 @@ mod tests {
     // the values name no parameters, and the recipe is a file of its own beside them.
     #[test]
     fn the_values_carry_no_recipe_and_the_recipe_is_a_file_beside_them() {
-        let root = saved(&reading_document(), SaveOptions::document(), "split");
+        let root = saved(&reading_document(), "split");
         let text = std::fs::read_to_string(root.join("terrain.ron")).unwrap();
 
         assert!(root.join(RECIPE_FILE).is_file());
@@ -358,13 +315,13 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // The recipe is what separates a document from an export, and an export has to be
-    // readable while being unable to pose as something that can be edited again.
+    // A recipe can still go missing by hand, and that has to stay readable: the
+    // values carry enough to load layers by name even with no recipe beside them.
     #[test]
-    fn an_export_carries_the_values_but_no_recipe() {
-        let root = saved(&baked_document(), SaveOptions::export(), "export");
+    fn a_directory_whose_recipe_was_deleted_loads_its_layers_from_the_values() {
+        let root = saved(&baked_document(), "no-recipe");
+        std::fs::remove_file(root.join(RECIPE_FILE)).unwrap();
 
-        assert!(!root.join(RECIPE_FILE).exists());
         assert!(Terrain::load_from_dir(&root).is_ok());
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.layers.len(), 2);
@@ -377,18 +334,19 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // Exporting over a document has to take the recipe with it: one left behind would
-    // claim to describe values it no longer produced.
+    // A save over a project directory has to leave the project's own recipe there,
+    // rewritten, because that directory is the only place a save goes.
     #[test]
-    fn exporting_over_a_document_removes_the_recipe_it_replaces() {
-        let root = saved(&reading_document(), SaveOptions::document(), "replace");
+    fn a_save_over_a_document_rewrites_the_recipe_it_replaces() {
+        let root = saved(&reading_document(), "replace");
         assert!(root.join(RECIPE_FILE).is_file());
 
-        baked_document()
-            .save_to_dir(&root, SaveOptions::export())
-            .unwrap();
+        let mut second = baked_document();
+        second.seed = 7;
+        second.save_to_dir(&root).unwrap();
 
-        assert!(!root.join(RECIPE_FILE).exists());
+        assert!(root.join(RECIPE_FILE).is_file());
+        assert_eq!(load(&root).unwrap().seed, 7);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -398,7 +356,7 @@ mod tests {
     fn a_baked_value_survives_the_round_trip_within_a_step() {
         let spec = baked_document();
         let before = spec.clone().bake().unwrap();
-        let root = saved(&spec, SaveOptions::export(), "quantise");
+        let root = saved(&spec, "quantise");
         let after = Terrain::load_from_dir(&root).unwrap();
 
         for view in before.fields() {
@@ -421,7 +379,7 @@ mod tests {
     // this is the packing rule as the format actually applies it.
     #[test]
     fn layers_sharing_a_shift_share_an_image() {
-        let root = saved(&reading_document(), SaveOptions::document(), "packing");
+        let root = saved(&reading_document(), "packing");
         let meta = values_meta(&root);
 
         assert_eq!(meta.layers.len(), 2);
@@ -440,7 +398,7 @@ mod tests {
     fn a_document_keeps_its_water_spec_through_a_save() {
         let mut spec = baked_document();
         spec.solve_water(&WaterSpec::new("height")).unwrap();
-        let root = saved(&spec, SaveOptions::document(), "water");
+        let root = saved(&spec, "water");
 
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.water_spec, Some(WaterSpec::new("height")));
@@ -452,7 +410,7 @@ mod tests {
     // never wanted water would acquire some on its first load.
     #[test]
     fn a_document_with_no_water_spec_loads_with_no_water() {
-        let root = saved(&baked_document(), SaveOptions::document(), "dry");
+        let root = saved(&baked_document(), "dry");
         assert!(load(&root).unwrap().water().is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -462,9 +420,9 @@ mod tests {
     // one did not already move.
     #[test]
     fn a_second_round_trip_moves_nothing_further() {
-        let first_root = saved(&reading_document(), SaveOptions::document(), "trip-one");
+        let first_root = saved(&reading_document(), "trip-one");
         let first = load(&first_root).unwrap();
-        let second_root = saved(&first, SaveOptions::document(), "trip-two");
+        let second_root = saved(&first, "trip-two");
         let second = load(&second_root).unwrap();
 
         for (left, right) in first.layers.iter().zip(&second.layers) {
@@ -489,7 +447,7 @@ mod tests {
         height.shader.params.insert("scale".to_owned(), vec![0.03]);
         let mut spec = TerrainSpec::new(SIZE).with_layer(height);
         spec.seed = 42;
-        let root = saved(&spec, SaveOptions::document(), "shader");
+        let root = saved(&spec, "shader");
 
         let written = std::fs::read_to_string(root.join(RECIPE_FILE)).unwrap();
         for key in ["role", "shift", "range", "categorical"] {
@@ -514,7 +472,7 @@ mod tests {
     // not read is refused rather than parsed as far as it happens to agree.
     #[test]
     fn a_recipe_from_another_version_is_refused() {
-        let root = saved(&baked_document(), SaveOptions::document(), "version");
+        let root = saved(&baked_document(), "version");
         let text = std::fs::read_to_string(root.join(RECIPE_FILE)).unwrap();
         let mut recipe: RecipeMeta = ron::from_str(&text).unwrap();
         recipe.version = 99;
@@ -532,7 +490,7 @@ mod tests {
     // the rest is parsed, and the message says which version it was.
     #[test]
     fn a_version_four_recipe_is_refused_naming_its_version() {
-        let root = saved(&baked_document(), SaveOptions::document(), "version-four");
+        let root = saved(&baked_document(), "version-four");
         std::fs::write(
             root.join(RECIPE_FILE),
             "(version: 4, size: (64, 64), seed: 0, water_spec: None, \

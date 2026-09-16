@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use crate::terrain::{SaveOptions, TerrainSpec};
+use crate::terrain::TerrainSpec;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use serde_json::Value;
@@ -838,12 +838,12 @@ impl Document {
     ///
     /// The save removes images in that directory it no longer names; see
     /// [`TerrainSpec::save_to_dir`] for when that sweep runs.
-    pub fn start_save(&mut self, path: PathBuf, options: SaveOptions) -> Result<(), String> {
+    pub fn start_save(&mut self, path: PathBuf) -> Result<(), String> {
         let terrain = self.take_terrain()?;
         self.path = Some(path.clone());
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let error = terrain
-                .save_to_dir(&path, options)
+                .save_to_dir(&path)
                 .err()
                 .map(|error| error.to_string());
             Outcome {
@@ -905,10 +905,6 @@ impl Document {
         }
     }
 
-    /// As [`Document::busy_check`], for the two verbs that replace the open document.
-    ///
-    /// A job [`JobKind::is_derived`] does not refuse them: it is cancelled, and
-    /// whatever it was computing is dropped with the document it was computing for.
     fn replace_check(&self) -> Result<(), String> {
         match self.job() {
             Some(kind) if !kind.is_derived() => {
