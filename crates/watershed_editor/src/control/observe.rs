@@ -86,6 +86,7 @@ fn document(world: &World) -> Value {
         "settled": document.is_settled(),
         "job": document.job().map(|kind| kind.name()),
         "error": document.error(),
+        "recipe_error": document.recipe_error(),
         "bake_failed": document.bake_failed(),
         "baked": document.baked().name(),
         "size": [document.size.x, document.size.y],

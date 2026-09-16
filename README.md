@@ -171,7 +171,7 @@ A terrain is a directory.
 |---|---|---|
 | `terrain.ron` | the extent, the fields, the images, the water | both |
 | `layer_<n>.png` | the values, eight bits to a channel | both |
-| `recipe.ron` | the extent, the seed, the water spec, and per layer its parameter values | the editor |
+| `recipe.ron` | the extent, the seed, the water spec, and per layer its parameter values — written after every edit, not only on Save | the editor |
 | `shaders/*.wesl` | one file per layer | the editor |
 | `shaders/lib.wesl` | the library, overwritten by the editor | the editor |
 | `shaders/wesl.toml` | the package root, for a language server | a language server |
@@ -179,15 +179,18 @@ A terrain is a directory.
 A `layer_<n>.png` is not an authored layer: it is an image the library packs the values
 of every layer at one shift into, and `terrain.ron` calls the authored ones `fields`.
 
-Every save writes both: the values and the recipe beside them. A terrain directory is
-a project the editor is opened on, so a save that left the recipe out would make the
-directory unopenable.
+The two files move at two speeds: the recipe is rewritten after every edit that
+settles, so quitting without Save loses nothing authored, and the values are written
+only on Save.
+A terrain directory is a project the editor is opened on, so a save that left the
+recipe out would make the directory unopenable.
 
 A project is opened by starting the editor on its directory — `watershed_editor <dir>`,
 or no argument for the working directory — or, in a running editor, with `open <dir>`
 on the socket. A directory holding no terrain opens on the New dialog; Create writes
-`shaders/` and `recipe.ron` into it at once. A project that already holds a terrain has
-no New…: starting over is deleting the files by hand.
+`shaders/` and `recipe.ron` into it at once. A directory holding a recipe and no values
+— quit before its first Save — opens from the recipe alone. A project that already
+holds a terrain has no New…: starting over is deleting the files by hand.
 
 The split is what makes the boundary real: a reader of values never parses a shader,
 so it never needs the types a layer's shader is made of. A directory whose recipe has

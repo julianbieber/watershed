@@ -52,6 +52,10 @@ pub enum RecipeError {
     /// The underlying reader or writer.
     #[error("io: {0}")]
     File(#[from] std::io::Error),
+    /// `recipe.ron` itself could not be written — a full disk, a permission refusal,
+    /// or the like.
+    #[error("{RECIPE_FILE} could not be written: {0}")]
+    Write(std::io::Error),
     /// `recipe.ron` is not readable as a recipe.
     #[error("{RECIPE_FILE} is not readable: {0}")]
     Meta(String),
@@ -108,7 +112,9 @@ struct RecipeVersion {
     version: u32,
 }
 
-fn recipe_of(spec: &TerrainSpec) -> RecipeMeta {
+/// The recipe a spec would be written as, for a caller that wants to compare before
+/// writing rather than write unconditionally.
+pub fn recipe_of(spec: &TerrainSpec) -> RecipeMeta {
     RecipeMeta {
         version: RECIPE_VERSION,
         size: spec.size,
@@ -168,14 +174,24 @@ impl TerrainSpec {
     ///
     /// A directory carrying no `recipe.ron` loads its layers' names from the values,
     /// at seed 0 and with no parameter values.
+    ///
+    /// A directory carrying a recipe and no `terrain.ron` loads from the recipe alone:
+    /// the bake is redone from the shader files either way, so the values are not
+    /// needed to open it.
     pub fn load_from_dir(path: impl AsRef<Path>, base: ShaderRuntime) -> Result<Self, RecipeError> {
         let root = path.as_ref().to_path_buf();
-        let terrain = Terrain::load_from_dir(&root)?;
         let recipe = read_recipe(&root)?;
+        let has_values = root.join(watershed::io::META_FILE).is_file();
 
-        let mut spec = TerrainSpec::new(terrain.size());
-        match &recipe {
+        let mut spec;
+        match recipe {
             Some(meta) => {
+                let size = if has_values {
+                    Terrain::load_from_dir(&root)?.size()
+                } else {
+                    meta.size
+                };
+                spec = TerrainSpec::new(size);
                 spec.size = meta.size;
                 spec.seed = meta.seed;
                 spec.water_spec = meta.water_spec.clone();
@@ -186,6 +202,8 @@ impl TerrainSpec {
                 }
             }
             None => {
+                let terrain = Terrain::load_from_dir(&root)?;
+                spec = TerrainSpec::new(terrain.size());
                 for view in terrain.fields() {
                     spec.layers.push(Layer::new(view.name().to_owned()));
                 }
@@ -216,10 +234,17 @@ impl TerrainSpec {
 ///
 /// Writes no values and no images, and does not bake `spec` first.
 pub fn write_recipe(root: &Path, spec: &TerrainSpec) -> Result<(), RecipeError> {
+    write_recipe_meta(root, &recipe_of(spec))
+}
+
+/// Writes `meta` as `recipe.ron` into `root`, creating `root` if it is not there.
+///
+/// Writes no values and no images.
+pub fn write_recipe_meta(root: &Path, meta: &RecipeMeta) -> Result<(), RecipeError> {
     std::fs::create_dir_all(root)?;
-    let text = ron::ser::to_string_pretty(&recipe_of(spec), ron::ser::PrettyConfig::default())
+    let text = ron::ser::to_string_pretty(meta, ron::ser::PrettyConfig::default())
         .map_err(|error| RecipeError::Meta(error.to_string()))?;
-    std::fs::write(root.join(RECIPE_FILE), text.as_bytes())?;
+    std::fs::write(root.join(RECIPE_FILE), text.as_bytes()).map_err(RecipeError::Write)?;
     Ok(())
 }
 
@@ -352,6 +377,40 @@ mod tests {
                 .iter()
                 .all(|layer| layer.shader.params.is_empty())
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // A project quit before its first Save holds a recipe and no values, and has to
+    // stay openable from the recipe alone, parameters and all.
+    #[test]
+    fn a_directory_holding_a_recipe_and_no_values_loads_its_layers_and_their_parameter_values() {
+        let root = scratch("recipe-only-load");
+        let mut height = Layer::new("height")
+            .with_role(LayerRole::Height)
+            .holding(Raster::new(SIZE, 0.5));
+        height.shader.params.insert("scale".to_owned(), vec![0.03]);
+        let spec = TerrainSpec::new(SIZE).with_layer(height);
+        write_recipe(&root, &spec).unwrap();
+
+        assert!(!root.join(watershed::io::META_FILE).is_file());
+        let loaded = load(&root).unwrap();
+        assert_eq!(loaded.layers.len(), 1);
+        assert_eq!(
+            loaded.layers[0].shader.params.get("scale"),
+            Some(&vec![0.03])
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // A directory holding neither file is not a terrain under construction, it is
+    // nothing at all, and has to be refused on the values file rather than quietly
+    // producing an empty document.
+    #[test]
+    fn a_directory_holding_neither_file_is_refused() {
+        let root = scratch("neither");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(matches!(load(&root), Err(RecipeError::Io(IoError::Io(_)))));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -31,6 +31,7 @@ use crate::gpu::{self, ShaderRuntime};
 use crate::history::{History, HistoryDepth, Restored, Snapshot};
 use crate::preset::Preset;
 use crate::terrain::Layer;
+use crate::terrain::recipe::{self, RecipeMeta};
 use crate::terrain::shader::SHADER_DIR;
 
 /// Holds the document and runs the two systems that land finished jobs and open the
@@ -41,7 +42,7 @@ impl Plugin for DocumentPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Document>().add_systems(
             Update,
-            (finish_job, start_pending_bake)
+            (finish_job, start_pending_bake, keep_recipe_on_disk)
                 .chain()
                 .in_set(EditorSystems::Document),
         );
@@ -191,6 +192,9 @@ pub struct Document {
     /// What the document can go back to. Every change a person makes goes through
     /// [`Document::apply`] or [`Document::write`], which is what puts it here.
     history: History,
+    recipe_on_disk: Option<RecipeMeta>,
+    recipe_seen: Option<(u64, u64)>,
+    recipe_error: Option<String>,
     runtime: ShaderRuntime,
     pub size: UVec2,
     pub seed: u32,
@@ -215,6 +219,9 @@ impl Default for Document {
             bake_failed: false,
             logged_faults: Vec::new(),
             pending_solve: false,
+            recipe_on_disk: None,
+            recipe_seen: None,
+            recipe_error: None,
             runtime: ShaderRuntime::default(),
             size: UVec2::splat(1024),
             seed: 1,
@@ -257,6 +264,17 @@ impl Document {
     /// the next edit, exactly as a job's own error is.
     pub fn refuse(&mut self, error: String) {
         self.error = Some(error);
+    }
+
+    /// The message from the last failed [`Document::keep_recipe`], until the next
+    /// settled edit writes the recipe successfully.
+    ///
+    /// Separate from [`Document::error`]: that field is also what a control command
+    /// reply waits on ([`Document::is_settled`] and no error), and a recipe write
+    /// runs in the same settling frame as whatever edit provoked it — folding the two
+    /// together would fail that edit's own reply over a write it never asked for.
+    pub fn recipe_error(&self) -> Option<&str> {
+        self.recipe_error.as_deref()
     }
 
     /// What is running, if anything.
@@ -778,7 +796,7 @@ impl Document {
         );
         let mut terrain = preset.build(size, seed);
         terrain.set_shader_runtime(runtime);
-        crate::terrain::recipe::write_recipe(&dir, &terrain).map_err(|error| error.to_string())?;
+        recipe::write_recipe(&dir, &terrain).map_err(|error| error.to_string())?;
 
         self.size = size;
         self.seed = seed;
@@ -788,6 +806,8 @@ impl Document {
         self.baked = Baked::Nothing;
         self.history.clear();
         self.held.clear();
+        self.recipe_on_disk = Some(recipe::recipe_of(&terrain));
+        self.recipe_seen = None;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let error = terrain.bake_in_place().err().map(|error| error.to_string());
@@ -848,6 +868,41 @@ impl Document {
         Ok(())
     }
 
+    /// Writes `recipe.ron` into the project directory when the document has settled
+    /// on something the file does not already carry, and answers whether it wrote.
+    ///
+    /// Does nothing while a job holds the terrain or an edit is waiting for its bake
+    /// ([`Document::is_settled`]), nothing with no project directory and no open
+    /// document, and nothing for a recipe equal to the one last written. A write that
+    /// fails is returned as the message and recorded in [`Document::recipe_error`];
+    /// the recipe it failed to write is not recorded in [`Document::recipe_on_disk`],
+    /// so the next settled edit tries again.
+    pub fn keep_recipe(&mut self) -> Result<bool, String> {
+        if !self.is_settled() {
+            return Ok(false);
+        }
+        let seen = (self.revision, self.water_revision);
+        if self.recipe_seen == Some(seen) {
+            return Ok(false);
+        }
+        self.recipe_seen = Some(seen);
+        let (Some(path), Some(terrain)) = (self.path.as_ref(), self.terrain.as_ref()) else {
+            return Ok(false);
+        };
+        let meta = recipe::recipe_of(terrain);
+        if self.recipe_on_disk.as_ref() == Some(&meta) {
+            return Ok(false);
+        }
+        if let Err(error) = recipe::write_recipe_meta(path, &meta) {
+            let error = error.to_string();
+            self.recipe_error = Some(error.clone());
+            return Err(error);
+        }
+        self.recipe_on_disk = Some(meta);
+        self.recipe_error = None;
+        Ok(true)
+    }
+
     /// Starts writing the document to the directory at `path`, creating it if it is
     /// not there. The terrain comes back unchanged when the job lands. Refused while
     /// a job is running or with no document open.
@@ -895,6 +950,8 @@ impl Document {
         self.baked = Baked::Nothing;
         self.history.clear();
         self.held.clear();
+        self.recipe_on_disk = None;
+        self.recipe_seen = None;
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
             match TerrainSpec::load_from_dir(&path, base) {
@@ -1026,6 +1083,12 @@ fn start_pending_bake(mut document: ResMut<Document>) {
 
 fn wants_bake(bake_failed: bool, baked: Baked, open: bool) -> bool {
     open && !bake_failed && baked != Baked::Whole
+}
+
+fn keep_recipe_on_disk(mut document: ResMut<Document>) {
+    if let Err(error) = document.keep_recipe() {
+        error!("{error}");
+    }
 }
 
 #[cfg(test)]
@@ -1649,6 +1712,163 @@ mod tests {
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(first[0].contains("nowhere"), "{first:?}");
         assert!(document.unlogged_faults().is_empty());
+    }
+
+    // The issue's own headline: a landed edit rewrites the recipe with the new value,
+    // and asking again with nothing changed writes nothing further.
+    #[test]
+    fn a_landed_edit_rewrites_the_recipe_and_an_unchanged_value_does_not() {
+        let mut document = two_layer_document("keep-recipe");
+        document.keep_recipe().unwrap();
+
+        set(&mut document, "height.value", "0.75").unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+
+        assert_eq!(document.keep_recipe(), Ok(true));
+        let path = document.path.clone().unwrap();
+        let text = std::fs::read_to_string(path.join(recipe::RECIPE_FILE)).unwrap();
+        assert!(text.contains("0.75"), "{text}");
+
+        assert_eq!(document.keep_recipe(), Ok(false));
+
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
+    // The write follows the edit landing, not the edit itself: nothing is put on disk
+    // while the job that will answer it still holds the terrain.
+    #[test]
+    fn keep_recipe_does_nothing_while_a_job_holds_the_terrain() {
+        let mut document = two_layer_document("keep-recipe-busy");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+
+        assert_eq!(document.keep_recipe(), Ok(false));
+        assert!(
+            !document
+                .path
+                .as_ref()
+                .unwrap()
+                .join(recipe::RECIPE_FILE)
+                .exists()
+        );
+
+        let root = document.path.clone().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Editing alone must never produce `terrain.ron` — that is Save's job, and only
+    // Save's.
+    #[test]
+    fn editing_without_saving_never_writes_the_values() {
+        let mut document = two_layer_document("no-terrain-ron");
+        set(&mut document, "height.value", "0.75").unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+
+        document.keep_recipe().unwrap();
+        let path = document.path.clone().unwrap();
+        assert!(!path.join(watershed::io::META_FILE).exists());
+
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
+    // `layer add` and `layer rm` are file operations, not history entries, but they
+    // still have to reach the recipe once the bake they ask for lands.
+    #[test]
+    fn layer_add_and_remove_put_the_name_in_the_recipe_and_take_it_out() {
+        let mut document = two_layer_document("layer-recipe");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        add(&mut document, "temperature").unwrap();
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+
+        assert_eq!(document.keep_recipe(), Ok(true));
+        let path = document.path.clone().unwrap();
+        let text = std::fs::read_to_string(path.join(recipe::RECIPE_FILE)).unwrap();
+        assert!(text.contains("temperature"), "{text}");
+
+        remove(&mut document, "temperature").unwrap();
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+        assert_eq!(document.keep_recipe(), Ok(true));
+        let text = std::fs::read_to_string(path.join(recipe::RECIPE_FILE)).unwrap();
+        assert!(!text.contains("temperature"), "{text}");
+
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
+    // A shader file re-read reconciles a parameter through `terrain_mut` and
+    // `note_edit` rather than through `apply` — the file watcher's own path — and it
+    // has to reach the recipe on the same terms as every other edit.
+    #[test]
+    fn a_parameter_reconciled_through_terrain_mut_is_in_the_recipe_once_settled() {
+        let mut document = two_layer_document("reconcile-recipe");
+        document
+            .terrain_mut()
+            .unwrap()
+            .layer_mut("height")
+            .unwrap()
+            .shader
+            .params
+            .insert("scale".to_owned(), vec![0.321]);
+        document.note_edit();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+
+        assert_eq!(document.keep_recipe(), Ok(true));
+        let path = document.path.clone().unwrap();
+        let text = std::fs::read_to_string(path.join(recipe::RECIPE_FILE)).unwrap();
+        assert!(text.contains("0.321"), "{text}");
+
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
+    // A refusal is named rather than silently dropped, leaves the file as it was, does
+    // not stick — the next settled edit tries again rather than being skipped as
+    // "already written" — and does not fail the edit that provoked it: `document.error`
+    // is what a control command's own reply waits on, and a recipe write runs in the
+    // same settling frame as the edit, so folding the two together would fail that
+    // edit's reply over a write it never asked for.
+    #[test]
+    fn a_refused_write_is_named_and_the_next_settled_edit_tries_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut document = two_layer_document("readonly-recipe");
+        document.keep_recipe().unwrap();
+        let path = document.path.clone().unwrap();
+        let recipe_path = path.join(recipe::RECIPE_FILE);
+        std::fs::set_permissions(&recipe_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        set(&mut document, "height.value", "0.6").unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+
+        let error = document.keep_recipe().unwrap_err();
+        assert!(error.contains(recipe::RECIPE_FILE), "{error}");
+        assert_eq!(document.recipe_error(), Some(error.as_str()));
+        assert_eq!(
+            document.error(),
+            None,
+            "a recipe refusal must not fail the reply of the edit that provoked it"
+        );
+
+        std::fs::set_permissions(&recipe_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        set(&mut document, "height.value", "0.7").unwrap();
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+
+        assert_eq!(document.keep_recipe(), Ok(true));
+        assert_eq!(document.recipe_error(), None);
+        let text = std::fs::read_to_string(&recipe_path).unwrap();
+        assert!(text.contains("0.7"), "{text}");
+
+        std::fs::remove_dir_all(&path).unwrap();
     }
 
     // An IDE resolves a layer's import against `shaders/lib.wesl`, so opening a document

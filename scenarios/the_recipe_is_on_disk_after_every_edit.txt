@@ -1,0 +1,49 @@
+# The recipe is kept on disk after every edit that settles: a parameter set, an undo
+# and a redo, a layer added and removed, and the water spec reset — each one leaves
+# `recipe.ron` rewritten by the time the document goes idle again, not only after Save.
+# This is the repository's own by-hand reproduction of #73's acceptance;
+# `build-task.json`'s acceptance checks run the same sequence over the socket and grep
+# the file itself after each step, which a scenario cannot do.
+#
+# Run with:  just drive run scenarios/the_recipe_is_on_disk_after_every_edit.txt
+
+observe log
+
+fixed-delta 1/60
+
+open /tmp/watershed-scenario/recipe-on-disk
+
+new 256 256 7 continents
+wait idle
+observe document
+
+# A parameter set, then undone, then redone — the headline's socket half.
+set moisture.scale 0.05
+wait idle
+observe layer
+
+undo
+wait idle
+observe layer
+
+redo
+wait idle
+observe layer
+
+# A layer added and removed.
+layer add scratchpad
+wait idle
+observe document
+
+layer rm scratchpad
+wait idle
+observe document
+
+# The water spec `continents` set on `new` is already in the recipe; resetting it
+# clears it. There is no verb that hands the document a fresh spec once reset has
+# cleared the one it had, so this is the one direction the socket can drive.
+reset-water
+wait idle
+observe water
+
+observe log

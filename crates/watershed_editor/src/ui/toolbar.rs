@@ -231,7 +231,10 @@ pub fn sync(
     enable(&mut commands, &disabled, *reset_button, !busy && has_water);
 
     set_text(&mut caption, document.active());
-    let report = match (document.job(), document.error()) {
+    let report = match (
+        document.job(),
+        document.error().or_else(|| document.recipe_error()),
+    ) {
         (Some(kind), _) => format!("{}…", kind.name()),
         (None, Some(error)) => error.to_owned(),
         (None, None) => match document.terrain() {

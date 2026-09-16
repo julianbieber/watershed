@@ -118,7 +118,9 @@ pub fn title(project: &Project) -> String {
 /// Absolutises and creates `dir`, puts it in `project`, and either loads the terrain
 /// there (`Ok(true)`) or leaves the document empty and warns (`Ok(false)`) — a
 /// directory holding no terrain is not a failure, it is a project waiting for New… or
-/// Save. The project is switched either way.
+/// Save. Loaded whenever `dir` holds either half — the values, or a recipe quit left
+/// behind with no Save after it — since a load re-derives whichever one is missing.
+/// The project is switched either way.
 pub fn open(
     project: &mut Project,
     document: &mut Document,
@@ -127,7 +129,7 @@ pub fn open(
     let opened = absolutise(dir)?;
     let dir = opened.dir().to_path_buf();
     *project = opened;
-    if dir.join(watershed::io::META_FILE).is_file() {
+    if dir.join(watershed::io::META_FILE).is_file() || dir.join(RECIPE_FILE).is_file() {
         document.start_load(dir)?;
         Ok(true)
     } else {
@@ -223,6 +225,24 @@ mod tests {
         assert!(!loaded);
         assert!(document.terrain().is_none());
         assert_eq!(project.dir(), std::path::absolute(&dir).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A project quit before its first Save holds a recipe and no values, and has to
+    // open from the recipe rather than being warned about as one holding no terrain.
+    #[test]
+    fn opening_a_directory_holding_only_a_recipe_loads_it() {
+        let dir = scratch("recipe-only");
+        std::fs::write(dir.join(RECIPE_FILE), "recipe only").unwrap();
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+
+        let mut project = absolutise(dir.clone()).unwrap();
+        let mut document = Document::default();
+        let loaded = open(&mut project, &mut document, dir.clone()).unwrap();
+
+        assert!(loaded);
+        assert_eq!(document.job(), Some(crate::document::JobKind::Load));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
