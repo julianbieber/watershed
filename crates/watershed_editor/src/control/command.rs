@@ -68,6 +68,8 @@ pub(super) enum Command {
     /// Puts a layer on screen. `layer add <name>` is a different thing — an
     /// [`Edit`] — and parses to [`Command::Edit`].
     Layer(String),
+    /// Hands the active layer's shader file to the person's editor.
+    OpenLayerFile,
     /// An edit and the re-bake that answers it, held together: the reply says the
     /// effect has happened, and for an edit the effect is the bake rather than the
     /// changed number. A document that no longer bakes reports that error here rather
@@ -172,7 +174,7 @@ impl Command {
             Self::Step(_) => "step",
             Self::Wait { .. } => "wait",
             Self::New { .. } => "new",
-            Self::Layer(_) => "layer",
+            Self::Layer(_) | Self::OpenLayerFile => "layer",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
                 _ => "layer",
@@ -243,6 +245,7 @@ impl Command {
                     Err("layer rename is gone: rename the file in shaders/ instead".to_owned())
                 }
                 ["rm"] => Err("layer rm needs a name".to_owned()),
+                ["open", ..] => Ok(Self::OpenLayerFile),
                 [name, ..] => Ok(Self::Layer((*name).to_owned())),
                 [] => Err("layer needs a name".to_owned()),
             },
@@ -359,6 +362,25 @@ impl Command {
                 let mut document = world.resource_mut::<Document>();
                 match document.set_active(name) {
                     Ok(()) => Poll::Done(json!({ "layer": name })),
+                    Err(error) => Poll::Failed(error),
+                }
+            }
+
+            Self::OpenLayerFile => {
+                let document = world.resource::<Document>();
+                let Some(file) = document
+                    .terrain()
+                    .and_then(|terrain| terrain.layer(document.active()))
+                    .map(crate::terrain::Layer::file)
+                else {
+                    return Poll::Failed("there is no layer to open".to_owned());
+                };
+                let path = document.shader_root().join(file);
+                match crate::open::open(&path) {
+                    Ok(program) => Poll::Done(json!({
+                        "path": path.display().to_string(),
+                        "program": program,
+                    })),
                     Err(error) => Poll::Failed(error),
                 }
             }
@@ -694,6 +716,7 @@ mod tests {
             ("layer height", "layer"),
             ("layer add biomes", "layer"),
             ("layer rm base", "layer"),
+            ("layer open", "layer"),
             ("set height.scale 0.004", "set"),
             ("set height.offset 0.5 0.25", "set"),
             ("set height.ridge 1.2", "set"),
@@ -719,6 +742,16 @@ mod tests {
             let command = Command::parse(line).unwrap_or_else(|error| panic!("{line}: {error}"));
             assert_eq!(command.verb(), verb, "{line}");
         }
+    }
+
+    // The verb has to be reachable as `layer open` and not be swallowed by the arm that
+    // puts a layer on screen, which takes any first word at all.
+    #[test]
+    fn layer_open_parses_to_the_command_that_starts_an_editor() {
+        assert!(matches!(
+            Command::parse("layer open").unwrap(),
+            Command::OpenLayerFile
+        ));
     }
 
     // A caller writes these by hand, so a mistyped word or a missing argument has to

@@ -18,6 +18,7 @@ mod edit;
 mod gpu;
 mod history;
 mod material;
+mod open;
 mod preset;
 mod terrain;
 mod ui;

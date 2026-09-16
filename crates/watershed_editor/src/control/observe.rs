@@ -108,6 +108,7 @@ fn layer(world: &World) -> Value {
     let read_by = crate::edit::readers_of(terrain, document.active());
 
     let file = layer.file();
+    let path = document.shader_root().join(&file);
     let params = &layer.shader.params;
 
     let (low, high) = layer.bounds();
@@ -122,6 +123,7 @@ fn layer(world: &World) -> Value {
             "range": [low, high],
             "categorical": layer.categorical,
             "file": file,
+            "path": path.display().to_string(),
             "params": params,
             "reads": reads,
             "read_by": read_by,
@@ -152,6 +154,7 @@ fn layer(world: &World) -> Value {
         "p90": at(0.90),
         "max": at(1.0),
         "file": file,
+        "path": path.display().to_string(),
         "params": params,
         "reads": reads,
         "read_by": read_by,
@@ -397,6 +400,25 @@ mod tests {
         let base = layer(&world);
         assert_eq!(base["file"], json!("base.wesl"));
         assert_eq!(base["params"], json!({ "value": [0.25] }));
+    }
+
+    // The panel's Open button and the socket have to name the same file, and only an
+    // absolute path means anything to a program outside the process.
+    #[test]
+    fn observing_a_layer_reports_an_absolute_path_to_its_file() {
+        let terrain =
+            TerrainSpec::new(UVec2::splat(16)).with_layer(Layer::new("height").held(0.25));
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        document.set_active("height").unwrap();
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let height = layer(&world);
+        let path = std::path::PathBuf::from(height["path"].as_str().unwrap());
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.ends_with("height.wesl"), "{}", path.display());
     }
 
     // Editing a header line and reading the result back is how every property this task

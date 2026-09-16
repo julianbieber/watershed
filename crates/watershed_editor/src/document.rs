@@ -497,10 +497,15 @@ impl Document {
 
     /// The directory the open document's shader files live in: `shaders` inside its
     /// path once it has one, and the scratch directory before that.
+    ///
+    /// The answer is absolute, so it can be handed to a program outside this process;
+    /// it falls back to the path as given when the working directory cannot be read.
     pub fn shader_root(&self) -> PathBuf {
-        self.path
+        let root = self
+            .path
             .as_ref()
-            .map_or_else(gpu::scratch_root, |path| path.join(SHADER_DIR))
+            .map_or_else(gpu::scratch_root, |path| path.join(SHADER_DIR));
+        std::path::absolute(&root).unwrap_or(root)
     }
 
     /// Writes one layer in place through `write`, as one change in the history: the
