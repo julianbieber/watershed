@@ -426,8 +426,8 @@ mod tests {
         assert_eq!(base["params"], json!({ "value": [0.25] }));
     }
 
-    // The panel's Open button and the socket have to name the same file, and only an
-    // absolute path means anything to a program outside the process.
+    // A caller outside the process has nothing but this path to name the file by, and
+    // a relative one means nothing to it.
     #[test]
     fn observing_a_layer_reports_an_absolute_path_to_its_file() {
         let terrain =

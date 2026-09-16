@@ -1,12 +1,9 @@
 # A layer's file is named by its absolute path, from outside the process: every
 # `observe layer` reply carries `path`, it is absolute, it ends in `<layer>.wesl`, and
-# two layers' paths differ only in the stem — which is what lets the panel's **Open**
-# button and a caller on the socket name the same file.
+# two layers' paths differ only in the stem — which is what a caller on the socket
+# names the file by.
 #
-# Run with:  just drive run scenarios/a_layers_file_is_opened_from_the_panel.txt
-#
-# Pressing **Open** is a hand check, and so is `layer open`: replay must not start an
-# editor, so neither is in this file.
+# Run with:  just drive run scenarios/a_layers_file_is_named_from_outside_the_process.txt
 
 observe log
 
