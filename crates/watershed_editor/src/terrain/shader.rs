@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::terrain::LayerId;
+use crate::terrain::{LayerId, LayerRole};
 use serde::{Deserialize, Serialize};
 use watershed::raster::Raster;
 
@@ -526,6 +526,109 @@ pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
     Ok(layers)
 }
 
+/// The largest resolution shift a header may declare. A header declaring more is a
+/// fault naming the line, rather than a layer allocated down to nothing.
+pub const MAX_SHIFT: u8 = 8;
+
+/// What a layer's own file says the layer is: its role in the bake, the resolution it
+/// bakes at, the interval its values are clamped into, and whether those values are
+/// class indices rather than a quantity.
+///
+/// The defaults are what a file that declares nothing means, not a placeholder — a
+/// shader with no header lines is a custom layer at one texel per cell over
+/// `0.0..=1.0` holding a quantity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerHeader {
+    /// What the bake may do with the layer.
+    pub role: LayerRole,
+    /// Resolution, as the [`raster`](watershed::raster) shift. At most [`MAX_SHIFT`].
+    pub shift: u8,
+    /// The interval baked values are clamped into, in the order the file wrote it.
+    pub range: (f32, f32),
+    /// Whether the layer holds whole-numbered class indices, which are read to the
+    /// nearest texel and exported as a class channel.
+    pub categorical: bool,
+}
+
+impl Default for LayerHeader {
+    fn default() -> Self {
+        Self {
+            role: LayerRole::Custom,
+            shift: 0,
+            range: (0.0, 1.0),
+            categorical: false,
+        }
+    }
+}
+
+/// What a layer's file declares about the layer itself, read out of its header lines.
+///
+/// A declaration is a whole line whose trimmed form starts with `// @`, the shape
+/// [`parse_retired`] reads `@reach` at — so a commented-out or indented-in-prose form
+/// declares nothing and the template's own prose can spell all four. The forms are
+/// `// @role height|moisture|custom`, `// @shift <n>`, `// @range <lo> <hi>` and
+/// `// @categorical`. Each may be declared at most once; anything the header does not
+/// declare takes its [`LayerHeader::default`].
+///
+/// Fails on the first fault and reports the line it is on.
+pub fn parse_header(source: &str) -> Result<LayerHeader, ParamError> {
+    let mut header = LayerHeader::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let number = index + 1;
+        let Some(rest) = line.trim().strip_prefix("// @") else {
+            continue;
+        };
+        let (word, argument) = match rest.split_once(char::is_whitespace) {
+            Some((word, argument)) => (word, argument.trim()),
+            None => (rest, ""),
+        };
+        if !matches!(word, "role" | "shift" | "range" | "categorical") {
+            continue;
+        }
+        if seen.contains(&word) {
+            return Err(fault(number, format!("`@{word}` is declared twice")));
+        }
+        seen.push(word);
+        match word {
+            "role" => {
+                header.role = LayerRole::parse(argument).ok_or_else(|| {
+                    fault(
+                        number,
+                        format!("`{argument}` is not a role: height, moisture or custom"),
+                    )
+                })?;
+            }
+            "shift" => {
+                let shift = argument
+                    .parse::<u8>()
+                    .map_err(|_| fault(number, format!("`{argument}` is not a shift")))?;
+                if shift > MAX_SHIFT {
+                    return Err(fault(
+                        number,
+                        format!("shift {shift} is over the {MAX_SHIFT} limit"),
+                    ));
+                }
+                header.shift = shift;
+            }
+            "range" => {
+                let bounds = parse_numbers(number, &argument.replace(char::is_whitespace, ","))?;
+                let [low, high] = bounds[..] else {
+                    return Err(fault(number, "a range is written as `@range <low> <high>`"));
+                };
+                header.range = (low, high);
+            }
+            _ => {
+                if !argument.is_empty() {
+                    return Err(fault(number, "`@categorical` takes no argument"));
+                }
+                header.categorical = true;
+            }
+        }
+    }
+    Ok(header)
+}
+
 /// The annotations a layer's shader used to declare and no longer may, as a fault on
 /// the first line that still declares one.
 ///
@@ -990,5 +1093,80 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    // The four header lines are the whole of what a file says about the layer itself,
+    // so each form has to reach the field the panel and the bake read.
+    #[test]
+    fn a_header_declares_the_role_shift_range_and_class() {
+        let header =
+            parse_header("// @role moisture\n// @shift 2\n// @range 0 2\n// @categorical\n")
+                .unwrap();
+        assert_eq!(header.role, LayerRole::Moisture);
+        assert_eq!(header.shift, 2);
+        assert_eq!(header.range, (0.0, 2.0));
+        assert!(header.categorical);
+    }
+
+    // Most files declare nothing, and what they mean by that is a custom quantity at
+    // one texel per cell over the unit interval — not a layer waiting to be told.
+    #[test]
+    fn a_file_with_no_header_is_a_custom_quantity_at_shift_zero() {
+        let header = parse_header("fn main() {}\n").unwrap();
+        assert_eq!(header, LayerHeader::default());
+        assert_eq!(header.role, LayerRole::Custom);
+        assert_eq!(header.shift, 0);
+        assert_eq!(header.range, (0.0, 1.0));
+        assert!(!header.categorical);
+    }
+
+    // The template documents all four in prose, so a file copied from it must declare
+    // none of them: only the exact `// @` opening counts.
+    #[test]
+    fn a_commented_out_or_indented_header_declares_nothing() {
+        let header = parse_header("// // @role height\n//   @shift 4\n//! @categorical\n").unwrap();
+        assert_eq!(header, LayerHeader::default());
+    }
+
+    // A misspelled role would otherwise leave the layer custom and the document
+    // silently unbaked, which is the fault this whole task exists to make visible.
+    #[test]
+    fn an_unknown_role_is_a_fault_on_its_line() {
+        let error = parse_header("\n// @role elevation\n").unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.reason.contains("elevation"), "{}", error.reason);
+    }
+
+    // A shift past the limit allocates a layer down to nothing; the bound is the one
+    // the panel's number field clamped to before the file owned it.
+    #[test]
+    fn a_shift_over_the_limit_is_a_fault() {
+        let error = parse_header("// @shift 12\n").unwrap_err();
+        assert_eq!(error.line, 1);
+        assert!(error.reason.contains("12"), "{}", error.reason);
+    }
+
+    // A range with one number would clamp against a bound that was never written.
+    #[test]
+    fn a_range_of_one_number_is_a_fault() {
+        let error = parse_header("// @range 2\n").unwrap_err();
+        assert_eq!(error.line, 1);
+    }
+
+    // Two declarations of one property leave which of them won up to line order, so
+    // the second is refused the way a duplicate parameter is.
+    #[test]
+    fn a_property_declared_twice_is_a_fault_on_the_second_line() {
+        let error = parse_header("// @shift 1\n// @shift 2\n").unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.reason.contains("@shift"), "{}", error.reason);
+    }
+
+    // `@categorical` is the one form with no argument, so a word after it is a
+    // misspelling of something else rather than a value it quietly drops.
+    #[test]
+    fn a_categorical_line_with_an_argument_is_a_fault() {
+        let error = parse_header("// @categorical true\n").unwrap_err();
+        assert_eq!(error.line, 1);
     }
 }

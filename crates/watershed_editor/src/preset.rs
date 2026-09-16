@@ -6,8 +6,7 @@
 //! cover the ways layers can read each other, not to be a library of landscapes.
 
 use crate::gpu;
-use crate::terrain::LayerRole;
-use crate::terrain::shader::{ShaderLayer, parse_layers, parse_params};
+use crate::terrain::shader::{ShaderLayer, parse_header, parse_layers, parse_params};
 use crate::terrain::{Layer, TerrainSpec, WaterSpec};
 use bevy::prelude::*;
 
@@ -48,7 +47,7 @@ impl Preset {
             Self::Continents => &[("moisture", "fbm.wesl"), ("height", "continents.wesl")],
             Self::Ridges => &[
                 ("moisture", "fbm.wesl"),
-                ("base", "continents.wesl"),
+                ("base", "base.wesl"),
                 ("height", "mountains_over_base.wesl"),
             ],
         }
@@ -57,25 +56,20 @@ impl Preset {
     /// The document, unbaked and unsolved.
     ///
     /// Whatever the preset, the result has a layer named `height` holding
-    /// [`LayerRole::Height`], one named `moisture` holding [`LayerRole::Moisture`],
-    /// and a water spec over the two — so every preset exercises the water overlay
-    /// and the role lookups, and none of them opens on an editor with half its
-    /// display inert.
-    ///    /// Every layer carries a value for every parameter its file declares, its hidden
-    /// `seed` drawn from `seed`, and the document's seed is `seed`. Two calls with the
-    /// same arguments give equal documents.
+    /// `Height`, one named `moisture` holding `Moisture`, and a water spec over the
+    /// two — so every preset exercises the water overlay and the role lookups, and
+    /// none of them opens on an editor with half its display inert. The roles come
+    /// from the stock files the preset copies, as every layer's do.
+    ///
+    /// Every layer carries a value for every parameter its file declares and the four
+    /// properties its header declares, its hidden `seed` drawn from `seed`, and the
+    /// document's seed is `seed`. Two calls with the same arguments give equal
+    /// documents.
     pub fn build(self, size: UVec2, seed: u32) -> TerrainSpec {
         let mut terrain = match self {
             Self::Continents => continents(size, seed),
             Self::Ridges => ridges(size, seed),
         };
-        for layer in &mut terrain.layers {
-            layer.role = match layer.id.as_str() {
-                "height" => LayerRole::Height,
-                "moisture" => LayerRole::Moisture,
-                _ => LayerRole::Custom,
-            };
-        }
         terrain.water_spec = Some(WaterSpec::new("height").with_moisture("moisture"));
         terrain.seed = seed;
         terrain
@@ -89,7 +83,7 @@ fn salted(seed: u32, salt: u32) -> u32 {
     hash ^= hash >> 12;
     hash & 0x00ff_ffff
 }
-fn layer(file: &str, seed: u32, values: &[(&str, f32)]) -> ShaderLayer {
+fn shader(file: &str, seed: u32, values: &[(&str, f32)]) -> ShaderLayer {
     let source = gpu::stock_source(file).expect("a preset names only shaders this build ships");
     let mut layer = ShaderLayer::default();
     layer.reconcile(&parse_params(source).expect("a stock shader declares readable parameters"));
@@ -101,45 +95,40 @@ fn layer(file: &str, seed: u32, values: &[(&str, f32)]) -> ShaderLayer {
     layer
 }
 
-fn with_shader(mut layer: Layer, shader: ShaderLayer) -> Layer {
-    layer.shader = shader;
+fn built(name: &str, file: &str, seed: u32, values: &[(&str, f32)]) -> Layer {
+    let source = gpu::stock_source(file).expect("a preset names only shaders this build ships");
+    let mut layer = Layer::new(name);
+    layer.reconcile_header(
+        &parse_header(source).expect("a stock shader declares a readable header"),
+    );
+    layer.shader = shader(file, seed, values);
     layer
 }
 
 fn moisture(seed: u32) -> Layer {
-    with_shader(
-        Layer::new("moisture").with_shift(4),
-        layer(
-            "fbm.wesl",
-            salted(seed, 11),
-            &[("scale", 0.004), ("octaves", 4.0)],
-        ),
+    built(
+        "moisture",
+        "fbm.wesl",
+        salted(seed, 11),
+        &[("scale", 0.004), ("octaves", 4.0)],
     )
 }
 
 fn continents(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
         .with_layer(moisture(seed))
-        .with_layer(with_shader(
-            Layer::new("height"),
-            layer("continents.wesl", salted(seed, 1), &[]),
-        ))
+        .with_layer(built("height", "continents.wesl", salted(seed, 1), &[]))
 }
 
 fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
     TerrainSpec::new(size)
         .with_layer(moisture(seed))
-        .with_layer(with_shader(
-            Layer::new("base"),
-            layer(
-                "continents.wesl",
-                salted(seed, 1),
-                &[("land_scale", 0.0015), ("relief", 0.0)],
-            ),
-        ))
-        .with_layer(with_shader(
-            Layer::new("height"),
-            layer("mountains_over_base.wesl", salted(seed, 3), &[]),
+        .with_layer(built("base", "base.wesl", salted(seed, 1), &[]))
+        .with_layer(built(
+            "height",
+            "mountains_over_base.wesl",
+            salted(seed, 3),
+            &[],
         ))
 }
 
@@ -229,6 +218,26 @@ mod tests {
                 let mut copy = layer.shader.clone();
                 assert!(
                     !copy.reconcile(&parse_params(source).unwrap()),
+                    "{} leaves {} to be reconciled",
+                    preset.name(),
+                    layer.id
+                );
+            }
+        }
+    }
+
+    // A preset's layers are written to disk as copies of their stock files, so a preset
+    // whose layer disagreed with the file beside it would be corrected by the first
+    // sweep — a document that moves under the person who has just opened it.
+    #[test]
+    fn every_preset_layer_carries_what_its_stock_file_declares() {
+        for preset in Preset::ALL {
+            for layer in &preset.build(SIZE, 7).layers {
+                let source = gpu::stock_source(stock_of(preset, layer.id.as_str())).unwrap();
+                let header = parse_header(source).unwrap();
+                let mut copy = layer.clone();
+                assert!(
+                    !copy.reconcile_header(&header),
                     "{} leaves {} to be reconciled",
                     preset.name(),
                     layer.id

@@ -1,13 +1,12 @@
 //! The editor's whole vocabulary for naming and changing a document: the paths that
-//! address a layer and a property, the words every enum is spelled with, and the
-//! edits themselves.
+//! address a layer and a property, the words a value is spelled with, and the edits
+//! themselves.
 //!
 //! The panel and the control client both go through here rather than each writing
 //! their own. Two spellings of one property would be two things to keep in step, and
 //! a path that worked from one and not the other would make the two disagree about
 //! what a document even contains.
 
-use crate::terrain::LayerRole;
 use crate::terrain::{Layer, TerrainSpec};
 use serde_json::{Value, json};
 
@@ -58,11 +57,12 @@ pub enum Edit {
     },
     /// Writes one property, named by a dotted path. See the module's grammar.
     Set {
-        /// `layer.property`, where property is a layer setting or a parameter the
-        /// layer's shader declares.
+        /// `layer.property`, where property is a display setting or a parameter the
+        /// layer's shader declares. The role, shift, range and class flag are not
+        /// here — the layer's shader file declares those.
         path: String,
-        /// The value, as words. Most properties take one; a range, or a shader
-        /// parameter with several components, takes several.
+        /// The value, as words. Most properties take one; a shader parameter with
+        /// several components takes several.
         words: Vec<String>,
     },
 }
@@ -243,96 +243,14 @@ fn set(terrain: &mut TerrainSpec, path: &str, words: &[String]) -> Result<Value,
     let name = *parts.first().ok_or("a path needs a layer name")?;
     match parts.len() {
         0 | 1 => Err(format!("`{path}` names a layer and nothing on it")),
-        2 => set_layer(terrain, name, parts[1], words),
+        2 => set_layer_property(terrain, name, parts[1], words),
         _ => Err(format!(
             "`{path}` names more than a layer and a property — a path is `layer.property`"
         )),
     }
 }
 
-fn set_layer(
-    terrain: &mut TerrainSpec,
-    name: &str,
-    property: &str,
-    words: &[String],
-) -> Result<Value, String> {
-    match property {
-        "shift" => {
-            let shift: u8 = number(first(words)?)?;
-            if shift != 0 && is_solve_height(terrain, name) {
-                return Err(format!(
-                    "`{name}` is the water spec's height layer and has to stay at shift 0"
-                ));
-            }
-            let layer = layer_mut(terrain, name)?;
-            layer.shift = shift;
-            Ok(json!({ "shift": layer.shift }))
-        }
-        "role" => set_layer_role(terrain, name, words),
-        _ => set_other_layer_property(terrain, name, property, words),
-    }
-}
-
-fn set_layer_role(
-    terrain: &mut TerrainSpec,
-    name: &str,
-    words: &[String],
-) -> Result<Value, String> {
-    let word = first(words)?;
-    let role =
-        LayerRole::parse(word).ok_or_else(|| format!("a layer has no role called `{word}`"))?;
-
-    let layer = layer_mut(terrain, name)?;
-    let previous = layer.role;
-    if previous == role {
-        return Ok(json!({ "role": role.as_str() }));
-    }
-    if role == LayerRole::Height && layer.shift != 0 {
-        return Err(format!(
-            "`{name}` is at shift {} and a height layer has to stay at shift 0",
-            layer.shift
-        ));
-    }
-
-    let displaced: Vec<String> = if role == LayerRole::Custom {
-        Vec::new()
-    } else {
-        terrain
-            .layers
-            .iter_mut()
-            .filter(|layer| layer.role == role && layer.id.as_str() != name)
-            .map(|layer| {
-                layer.role = LayerRole::Custom;
-                layer.id.to_string()
-            })
-            .collect()
-    };
-
-    layer_mut(terrain, name)?.role = role;
-
-    if terrain.water_spec.is_some() && terrain.layer_with_role(LayerRole::Height).is_none() {
-        layer_mut(terrain, name)?.role = previous;
-        for id in &displaced {
-            layer_mut(terrain, id)?.role = role;
-        }
-        return Err(format!(
-            "`{name}` is the height layer of a terrain that declares water — reset the water first"
-        ));
-    }
-
-    Ok(json!({ "role": role.as_str(), "displaced": displaced }))
-}
-
-/// Whether the water solve would read this layer as its height.
-///
-/// The one thing that pins a layer's resolution: such a layer is refused a non-zero
-/// shift, because the solve reads its height one texel per cell and will not resample.
-pub fn is_solve_height(terrain: &TerrainSpec, name: &str) -> bool {
-    terrain
-        .layer_with_role(LayerRole::Height)
-        .is_some_and(|layer| layer.id.as_str() == name)
-}
-fn set_other_layer_property(
+fn set_layer_property(
     terrain: &mut TerrainSpec,
     name: &str,
     property: &str,
@@ -340,12 +258,6 @@ fn set_other_layer_property(
 ) -> Result<Value, String> {
     let layer = layer_mut(terrain, name)?;
     match property {
-        "range" => {
-            let low: f32 = number(first(words)?)?;
-            let high: f32 = number(words.get(1).ok_or("a range needs two numbers")?)?;
-            layer.range = (low, high);
-            Ok(json!({ "range": [low, high] }))
-        }
         "hillshade" => {
             let on = boolean(first(words)?)?;
             layer.hillshade = on;
@@ -422,6 +334,7 @@ fn boolean(word: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::LayerRole;
     use crate::terrain::WaterSpec;
     use bevy::math::UVec2;
 
@@ -660,37 +573,6 @@ mod tests {
         assert_eq!(terrain, before);
     }
 
-    // The settings of a layer are reachable by the same two-segment path the
-    // parameters are.
-    #[test]
-    fn a_layer_setting_is_written_by_its_path() {
-        let mut terrain = document();
-        set_line(&mut terrain, "base.shift 2").unwrap();
-        set_line(&mut terrain, "base.range -1 1").unwrap();
-        let layer = terrain.layer("base").unwrap();
-        assert_eq!(layer.shift, 2);
-        assert_eq!(layer.range, (-1.0, 1.0));
-    }
-
-    // The defect this guards was reachable from the panel in one drag: `solve_water`
-    // reads its height one texel per cell and refuses to resample, so a coarse height
-    // layer is a document that can never solve — and the refusal names the shift rather
-    // than the edit that set it. The moisture layer is checked too, in the other
-    // direction: the solve samples it rather than indexing it, so it is free to be
-    // coarse, which is what every preset does with it.
-    #[test]
-    fn the_water_specs_height_layer_cannot_be_made_coarse() {
-        let mut terrain = document();
-        terrain.water_spec = Some(WaterSpec::new("height").with_moisture("base"));
-
-        let refused = set_line(&mut terrain, "height.shift 2").unwrap_err();
-        assert!(refused.contains("shift 0"), "{refused}");
-        assert_eq!(terrain.layer("height").unwrap().shift, 0);
-
-        set_line(&mut terrain, "base.shift 4").unwrap();
-        assert_eq!(terrain.layer("base").unwrap().shift, 4);
-    }
-
     // The defect this guards was reported from the running editor as "solve water does
     // nothing; it only works on a fresh document". An edit invalidates the *state* the
     // solve produced; it must not take away the *spec* the solve is run from, or the
@@ -719,75 +601,20 @@ mod tests {
         );
     }
 
-    // Zero has to stay reachable, or a document that arrived at a coarse height some other
-    // way — a file written before the guard existed — could never be put back.
+    // A layer's role, shift and range are declared in its shader file, so the verbs
+    // that used to write them have to be gone rather than quietly overwritten by the
+    // next read of the file: a `set` that appeared to work and then reverted is worse
+    // than one that was never offered.
     #[test]
-    fn a_height_layer_can_always_be_returned_to_one_texel_per_cell() {
+    fn the_properties_the_shader_file_declares_are_refused_as_unknown() {
         let mut terrain = document();
-        terrain.layer_mut("height").unwrap().shift = 3;
-        terrain.water_spec = Some(WaterSpec::new("height"));
+        let before = terrain.clone();
 
-        set_line(&mut terrain, "height.shift 0").unwrap();
-        assert_eq!(terrain.layer("height").unwrap().shift, 0);
-    }
-
-    // A role is what the bake reads, so the panel cannot be allowed to leave two layers
-    // claiming one: taking it takes it from whoever held it.
-    #[test]
-    fn taking_a_role_takes_it_from_the_layer_that_held_it() {
-        let mut terrain = document();
-        set_line(&mut terrain, "base.role height").unwrap();
-
-        assert_eq!(terrain.layer("base").unwrap().role, LayerRole::Height);
-        assert_eq!(terrain.layer("height").unwrap().role, LayerRole::Custom);
-    }
-
-    // The same rule the shift control carries, arrived at from the other side: a coarse
-    // layer cannot become the height layer either.
-    #[test]
-    fn a_coarse_layer_cannot_take_the_height_role() {
-        let mut terrain = document();
-        terrain.layer_mut("base").unwrap().shift = 4;
-
-        let refused = set_line(&mut terrain, "base.role height").unwrap_err();
-        assert!(refused.contains("shift 0"), "{refused}");
-        assert_eq!(terrain.layer("base").unwrap().role, LayerRole::Custom);
-    }
-
-    // Resetting the water is how a terrain stops having a height layer. An edit that took
-    // the last one away would leave a document that can never solve.
-    #[test]
-    fn a_terrain_that_declares_water_cannot_be_left_without_a_height_layer() {
-        let mut terrain = document();
-        terrain.water_spec = Some(WaterSpec::new("height"));
-
-        let refused = set_line(&mut terrain, "height.role custom").unwrap_err();
-        assert!(refused.contains("reset the water"), "{refused}");
-        assert_eq!(terrain.layer("height").unwrap().role, LayerRole::Height);
-    }
-
-    // The refusal has to put back everything it moved, or a rejected edit leaves the
-    // document holding a role the panel never showed being taken.
-    #[test]
-    fn a_refused_role_change_leaves_every_other_layer_as_it_was() {
-        let mut terrain = document();
-        terrain.layer_mut("base").unwrap().role = LayerRole::Moisture;
-        terrain.water_spec = Some(WaterSpec::new("height"));
-
-        set_line(&mut terrain, "height.role moisture").unwrap_err();
-
-        assert_eq!(terrain.layer("height").unwrap().role, LayerRole::Height);
-        assert_eq!(terrain.layer("base").unwrap().role, LayerRole::Moisture);
-    }
-
-    // Roles are spelled the same way everywhere, so an unknown word has to be refused
-    // rather than fall back to `custom` — which would silently take a document's height
-    // away.
-    #[test]
-    fn a_role_the_vocabulary_does_not_have_is_refused() {
-        let mut terrain = document();
-        let refused = set_line(&mut terrain, "height.role elevation").unwrap_err();
-        assert!(refused.contains("elevation"), "{refused}");
+        for line in ["base.shift 2", "base.role height", "base.range -1 1"] {
+            let refused = set_line(&mut terrain, line).unwrap_err();
+            assert!(refused.contains("nothing called"), "{line}: {refused}");
+        }
+        assert_eq!(terrain, before);
     }
 
     // The display properties are the only layer properties the panel writes that a

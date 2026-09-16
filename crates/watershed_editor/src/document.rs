@@ -1087,8 +1087,8 @@ mod tests {
 
         let reply = document
             .apply(&Edit::Set {
-                path: "height.shift".to_owned(),
-                words: vec!["2".to_owned()],
+                path: "height.contour_interval".to_owned(),
+                words: vec!["0.25".to_owned()],
             })
             .unwrap();
         assert!(reply.is_object(), "{reply}");
@@ -1283,12 +1283,7 @@ mod tests {
 
         set(&mut document, "height.value", "0.6").unwrap();
         set(&mut document, "height.value", "0.7").unwrap();
-        document
-            .apply(&Edit::Set {
-                path: "height.range".to_owned(),
-                words: vec!["0".to_owned(), "2".to_owned()],
-            })
-            .unwrap();
+        set(&mut document, "height.value", "0.8").unwrap();
         let edited = authored_of(&document);
         assert_ne!(edited, original);
         assert_eq!(document.history().undo, 3);

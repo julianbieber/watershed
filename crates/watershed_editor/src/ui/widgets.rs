@@ -5,9 +5,7 @@
 //! closures because a panel's children are counted and assembled at run time, and a
 //! list of boxes is the one form that can be built up and handed over.
 
-use bevy::feathers::controls::{
-    FeathersMenu, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup, FeathersNumberInput,
-};
+use bevy::feathers::controls::{FeathersMenuItem, FeathersNumberInput};
 use bevy::feathers::display::{label, label_small};
 use bevy::feathers::theme::ThemedText;
 use bevy::prelude::*;
@@ -104,26 +102,6 @@ pub fn number(binding: NumberBinding) -> impl Scene {
 /// A caption and the number field it names.
 pub fn number_row(caption: impl Into<String>, binding: NumberBinding) -> impl Scene {
     captioned(caption, one(number(binding)))
-}
-
-/// A menu standing in for a combo box: the button shows the choice, the popup offers the
-/// rest. The caption is not synced — a choice is part of the panel's shape, so making one
-/// rebuilds the panel that shows it.
-pub fn menu(caption: impl Into<String>, items: Vec<Box<dyn SceneList>>) -> impl Scene {
-    let caption = caption.into();
-    bsn! {
-        @FeathersMenu
-        Node { flex_grow: 1.0 }
-        Children [
-            @FeathersMenuButton {
-                @caption: bsn! { Text({caption}) ThemedText },
-            }
-            Node { flex_grow: 1.0 }
-            --
-            @FeathersMenuPopup
-            Children [ {items} ]
-        ]
-    }
 }
 
 /// Plain text, for the things a panel says rather than the things it offers.

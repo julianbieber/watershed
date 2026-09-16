@@ -3,7 +3,7 @@
 //!
 //! An entry does not cost the size of the document. It is kept as the authored state of
 //! every layer and nothing derived from it, so it costs the settings and parameter
-//! values.
+//! values. Not everything it holds is put back — see [`Snapshot::restore`].
 
 use crate::terrain::{Layer, TerrainSpec, WaterSpec};
 
@@ -36,21 +36,22 @@ impl Snapshot {
             reaches_bake,
         }
     }
-    /// Puts each held layer's settings and parameter values back onto the live layer
-    /// of the same name, and the water spec back into `terrain`.
+    /// Puts each held layer's display settings and parameter values back onto the live
+    /// layer of the same name, and the water spec back into `terrain`.
     ///
     /// Never adds or removes a layer: a live layer the snapshot does not hold is left
     /// as it is, and a held layer no live layer matches is dropped. Everything the
     /// history does not own — bakes, shader values, the layers a file reads — stays
     /// with the live layer.
+    ///
+    /// The role, shift, range and class flag are among what it does not own: the
+    /// shader file declares them, and an undo that put an old one back would be
+    /// overwritten by the next read of the file.
     pub fn restore(self, terrain: &mut TerrainSpec) {
         for held in self.layers {
             let Some(live) = terrain.layer_mut(held.id.as_str()) else {
                 continue;
             };
-            live.role = held.role;
-            live.shift = held.shift;
-            live.range = held.range;
             live.export = held.export;
             live.hillshade = held.hillshade;
             live.light_azimuth = held.light_azimuth;
@@ -208,13 +209,13 @@ mod tests {
         let mut terrain = held(8);
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.layer_mut("height").unwrap().range = (0.0, 2.0);
+        terrain.layer_mut("height").unwrap().export = true;
         history.record(before);
         terrain.layers.push(Layer::new("temperature"));
 
         history.undo(&mut terrain, "height").unwrap();
         assert!(terrain.layer("temperature").is_some());
-        assert_eq!(terrain.layer("height").unwrap().range, (0.0, 1.0));
+        assert!(!terrain.layer("height").unwrap().export);
     }
 
     // Removing a layer deleted its file, so an undo must not bring back a layer whose
@@ -224,7 +225,7 @@ mod tests {
         let mut terrain = held(8).with_layer(Layer::new("temperature"));
         let mut history = History::default();
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.layer_mut("height").unwrap().range = (0.0, 2.0);
+        terrain.layer_mut("height").unwrap().export = true;
         history.record(before);
         terrain
             .layers
@@ -242,7 +243,7 @@ mod tests {
         let mut history = History::default();
         for step in 0..(HISTORY_DEPTH + 5) {
             let before = Snapshot::take(&terrain, true, "height");
-            terrain.layer_mut("height").unwrap().range = (0.0, step as f32);
+            terrain.layer_mut("height").unwrap().contour_interval = 1.0 + step as f32;
             history.record(before);
         }
         assert_eq!(history.depth().undo, HISTORY_DEPTH);
@@ -251,7 +252,7 @@ mod tests {
         history.undo(&mut terrain, "height").unwrap();
         assert_eq!(history.depth().redo, 2);
         let before = Snapshot::take(&terrain, true, "height");
-        terrain.layer_mut("height").unwrap().range = (0.0, 1.0);
+        terrain.layer_mut("height").unwrap().contour_interval = 0.5;
         history.record(before);
         assert_eq!(history.depth().redo, 0);
         assert!(history.redo(&mut terrain, "height").is_none());

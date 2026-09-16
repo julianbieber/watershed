@@ -1,3 +1,5 @@
+// @role height
+
 import package::lib::{fbm_unit, layer_value, ridged_fbm, seed_offset};
 
 struct Params {

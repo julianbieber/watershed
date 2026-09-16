@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::terrain::{LayerId, LayerRole};
-use watershed::channel::{ChannelError, ChannelMeta, plan_layers};
+use watershed::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
 
 use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
 use crate::terrain::layer::Layer;
@@ -152,11 +152,16 @@ impl TerrainSpec {
     /// Every layer that cannot bake, with the reason, in declaration order.
     ///
     /// A layer reading a name the document does not carry, a layer reading one of
-    /// those, and every layer of a cycle between layers that could otherwise bake. The
-    /// first two are left unbaked by [`TerrainSpec::bake_in_place`] while the rest of
-    /// document bakes; a cycle still fails the bake, and its layers' reason is
+    /// those, every layer of a cycle between layers that could otherwise bake, and
+    /// every layer whose declared role breaks one of the three rules
+    /// [`TerrainSpec::validate_roles`] states. The first two are left unbaked by
+    /// [`TerrainSpec::bake_in_place`] while the rest of the document bakes; a cycle
+    /// and a role fault still fail the bake, and a cycle's layers' reason is
     /// `cycle: ` followed by the chain. Derived from the document each
     /// call, never stored. A document with two layers of one id answers no faults.
+    ///
+    /// A role is declared by the layer's own shader file, so a role fault names the
+    /// file a person has to edit to mend it.
     pub fn layer_faults(&self) -> Vec<(LayerId, String)> {
         let Ok(index_of) = self.index_layers() else {
             return Vec::new();
@@ -173,6 +178,7 @@ impl TerrainSpec {
                 }
             }
         }
+        self.note_role_faults(&index_of, &mut faults);
         self.layers
             .iter()
             .zip(faults)
@@ -428,6 +434,45 @@ impl TerrainSpec {
             }
         }
         Ok(fresh)
+    }
+
+    fn note_role_faults(&self, index_of: &HashMap<String, usize>, faults: &mut [Option<String>]) {
+        let mut note = |at: usize, reason: String| {
+            if faults[at].is_none() {
+                faults[at] = Some(reason);
+            }
+        };
+        for role in [LayerRole::Height, LayerRole::Moisture] {
+            let claiming: Vec<usize> = self
+                .layers
+                .iter()
+                .enumerate()
+                .filter(|(_, layer)| layer.role == role)
+                .map(|(at, _)| at)
+                .collect();
+            if claiming.len() > 1 {
+                for at in claiming {
+                    note(at, PlanError::DuplicateRole(role).to_string());
+                }
+            }
+        }
+        if let Some((at, height)) = self
+            .layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| layer.role == LayerRole::Height)
+        {
+            if height.shift != 0 {
+                note(
+                    at,
+                    PlanError::CoarseHeight(height.id.to_string(), height.shift).to_string(),
+                );
+            }
+        } else if let Some(spec) = &self.water_spec
+            && let Some(&at) = index_of.get(spec.height.as_str())
+        {
+            note(at, PlanError::MissingHeightLayer.to_string());
+        }
     }
 
     fn index_layers(&self) -> Result<HashMap<String, usize>, PlanError> {
@@ -813,7 +858,18 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
 
     let mut infos = Vec::with_capacity(readable.len());
     for (authored, place) in readable.iter().zip(&placements) {
-        let meta = value_range(authored.baked().data());
+        let meta = if authored.categorical {
+            if let Some(value) = stray_class(authored.baked().data()) {
+                return Err(ChannelError::StrayClass {
+                    field: authored.id.to_string(),
+                    value,
+                }
+                .into());
+            }
+            ChannelMeta::categorical()
+        } else {
+            value_range(authored.baked().data())
+        };
 
         let layer = &mut layers[place.layer as usize];
         layer.push(
@@ -829,7 +885,7 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
             name: authored.id.to_string(),
             role: authored.role,
             shift: authored.shift,
-            categorical: false,
+            categorical: authored.categorical,
             layer: place.layer,
             channel: place.channel,
         });
@@ -1033,9 +1089,10 @@ impl TerrainSpec {
     /// per named role, a `Height` layer at shift 0, and a `Height` layer present if
     /// water is declared.
     ///
-    /// Called by [`TerrainSpec::plan_bake`], and worth calling directly by anything
-    /// that lets a role be changed, so the conflict is reported where it was made
-    /// rather than at the next bake.
+    /// Called by [`TerrainSpec::plan_bake`], which is what keeps a document with a
+    /// role conflict unbaked. [`TerrainSpec::layer_faults`] reports the same three
+    /// against the layers they belong to, so the conflict also reaches the cards and
+    /// the log rather than only failing the bake.
     pub fn validate_roles(&self) -> Result<(), PlanError> {
         for role in [LayerRole::Height, LayerRole::Moisture] {
             if self.layers.iter().filter(|f| f.role == role).count() > 1 {
@@ -1463,6 +1520,81 @@ mod tests {
             spec.plan_bake().unwrap_err(),
             PlanError::MissingHeightLayer
         ));
+    }
+
+    // The role is declared in each layer's own file, so a conflict has to reach both
+    // cards: pointing at one of the two would name a file that is no more wrong than
+    // the other.
+    #[test]
+    fn two_layers_claiming_one_role_fault_on_both_cards() {
+        let mut spec = roled_document();
+        spec.layers[0].role = LayerRole::Height;
+
+        let faults = spec.layer_faults();
+        assert_eq!(faults.len(), 2, "{faults:?}");
+        for (_, reason) in &faults {
+            assert!(reason.contains("claim the role `height`"), "{reason}");
+        }
+    }
+
+    // A coarse height layer is one file's mistake, and the card is where the person who
+    // wrote `@shift` is looking.
+    #[test]
+    fn a_coarse_height_layer_faults_on_its_own_card() {
+        let mut spec = roled_document();
+        spec.layers[1].shift = 2;
+
+        let faults = spec.layer_faults();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert_eq!(faults[0].0.as_str(), "height");
+        assert!(faults[0].1.contains("shift 2"), "{}", faults[0].1);
+    }
+
+    // Removing `@role height` from a file leaves the water spec pointing at a layer
+    // that no longer claims it; that layer's card is the one place the removal can be
+    // undone.
+    #[test]
+    fn water_without_a_height_layer_faults_on_the_layer_the_water_spec_names() {
+        let mut spec = roled_document();
+        spec.layers[1].role = LayerRole::Custom;
+        spec.water_spec = Some(WaterSpec::new("height"));
+
+        let faults = spec.layer_faults();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert_eq!(faults[0].0.as_str(), "height");
+        assert!(faults[0].1.contains("no layer holds"), "{}", faults[0].1);
+    }
+
+    // The whole point of declaring a layer categorical is that its indices survive the
+    // byte a channel stores them in, rather than being spread over a measured range.
+    #[test]
+    fn a_categorical_layer_keeps_its_class_indices_through_the_channel() {
+        let mut spec = TerrainSpec::new(UVec2::new(2, 2));
+        let mut layer = Layer::new("biome");
+        layer.categorical = true;
+        layer.put_baked(Raster::from_vec(UVec2::new(2, 2), vec![0.0, 3.0, 7.0, 3.0]).unwrap());
+        spec.layers.push(layer);
+
+        let terrain = quantize(&spec).unwrap();
+        let field = terrain.field("biome").unwrap();
+        assert!(field.is_categorical());
+        assert_eq!(field.bytes(), [0, 3, 7, 3]);
+    }
+
+    // A shader that computes a class as a fraction would otherwise be rounded into a
+    // class it never meant; the save is the last point at which that can be said.
+    #[test]
+    fn a_categorical_layer_holding_a_fraction_is_refused_naming_the_field_and_the_value() {
+        let mut spec = TerrainSpec::new(UVec2::new(2, 1));
+        let mut layer = Layer::new("biome");
+        layer.categorical = true;
+        layer.put_baked(Raster::from_vec(UVec2::new(2, 1), vec![1.0, 3.4]).unwrap());
+        spec.layers.push(layer);
+
+        let error = quantize(&spec).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("biome"), "{message}");
+        assert!(message.contains("3.4"), "{message}");
     }
 
     // A spec whose file carried every bake plans no steps at all — that is what a

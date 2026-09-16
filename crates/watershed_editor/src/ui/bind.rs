@@ -22,9 +22,6 @@ pub enum NumberBinding {
     /// needs a binding to be able to be before one is written over it.
     #[default]
     Unbound,
-    Shift,
-    RangeLow,
-    RangeHigh,
     LightAzimuth,
     ContourInterval,
     /// One component of one parameter of the active layer's shader: the parameter's
@@ -44,13 +41,12 @@ impl NumberBinding {
     fn is_integer(self) -> bool {
         matches!(
             self,
-            Self::Shift | Self::DialogWidth | Self::DialogHeight | Self::DialogSeed
+            Self::DialogWidth | Self::DialogHeight | Self::DialogSeed
         )
     }
 
     fn range(self) -> Option<(f32, f32)> {
         match self {
-            Self::Shift => Some((0.0, 8.0)),
             Self::LightAzimuth => Some((0.0, 360.0)),
             Self::ContourInterval => Some((crate::edit::MIN_CONTOUR_INTERVAL, f32::MAX)),
             Self::DialogSeed => Some((0.0, u32::MAX as f32)),
@@ -73,9 +69,6 @@ impl NumberBinding {
     pub fn read(self, document: &Document, dialog: &NewDialog) -> Option<NumberInputValue> {
         let value = match self {
             Self::Unbound => return None,
-            Self::Shift => layer(document)?.shift as f32,
-            Self::RangeLow => layer(document)?.range.0,
-            Self::RangeHigh => layer(document)?.range.1,
             Self::LightAzimuth => layer(document)?.light_azimuth,
             Self::ContourInterval => layer(document)?.contour_interval,
             Self::DialogWidth => dialog.width as f32,
@@ -103,15 +96,6 @@ impl NumberBinding {
     ) -> Result<(), String> {
         let value = self.clamp(value);
         match self {
-            Self::Shift => {
-                let active = document.active().to_owned();
-                document
-                    .apply(&Edit::Set {
-                        path: format!("{active}.shift"),
-                        words: vec![(value as u8).to_string()],
-                    })
-                    .map(|_| ())
-            }
             Self::LightAzimuth => {
                 let active = document.active().to_owned();
                 document
@@ -150,36 +134,30 @@ impl NumberBinding {
     }
 
     fn slot(self) -> Slot {
-        let property = match self {
-            Self::RangeLow => "range.low",
-            Self::RangeHigh => "range.high",
-            Self::ShaderParam(..) => "shader.param",
-            _ => return Slot::Once,
+        let Self::ShaderParam(param, component) = self else {
+            return Slot::Once;
         };
-        let index = match self {
-            Self::ShaderParam(param, component) => [param, component],
-            _ => [0, 0],
-        };
-        Slot::Control { property, index }
+        Slot::Control {
+            property: "shader.param",
+            index: [param, component],
+        }
     }
 
     fn write_document(self, value: f32, document: &mut Document) {
+        let Self::ShaderParam(param, component) = self else {
+            return;
+        };
         let active = document.active().to_owned();
-        document.write(&active, self.slot(), move |layer| match self {
-            Self::RangeLow => layer.range.0 = value,
-            Self::RangeHigh => layer.range.1 = value,
-            Self::ShaderParam(param, component) => {
-                if let Some(slot) = layer
-                    .shader
-                    .params
-                    .values_mut()
-                    .nth(param)
-                    .and_then(|value| value.get_mut(component))
-                {
-                    *slot = value;
-                }
+        document.write(&active, self.slot(), move |layer| {
+            if let Some(slot) = layer
+                .shader
+                .params
+                .values_mut()
+                .nth(param)
+                .and_then(|value| value.get_mut(component))
+            {
+                *slot = value;
             }
-            _ => {}
         });
     }
 }

@@ -19,11 +19,11 @@ use watershed::io::IoError;
 use watershed::terrain::Terrain;
 
 use crate::gpu::ShaderRuntime;
+use crate::terrain::LayerId;
 use crate::terrain::bake::{BakeError, PlanError, TerrainSpec};
 use crate::terrain::layer::Layer;
 use crate::terrain::shader::SHADER_DIR;
 use crate::terrain::water::{WaterError, WaterSpec};
-use crate::terrain::{LayerId, LayerRole};
 
 /// The recipe file a terrain directory carries when it was saved as a document, and
 /// the only name this reader knows without being told it.
@@ -38,7 +38,7 @@ pub const RECIPE_FILE: &str = "recipe.ron";
 ///
 /// A recipe carrying any other version is refused outright; there is no migration
 /// path.
-pub const RECIPE_VERSION: u32 = 4;
+pub const RECIPE_VERSION: u32 = 5;
 
 /// The largest `recipe.ron` this build will read, checked before the file is read.
 pub const MAX_RECIPE_BYTES: u64 = 64 * 1024 * 1024;
@@ -111,14 +111,6 @@ impl SaveOptions {
 pub struct LayerRecipe {
     /// The layer's name, and the stem of its shader file.
     pub name: LayerId,
-    /// What the bake may do with the layer.
-    pub role: LayerRole,
-    /// The layer's resolution shift.
-    pub shift: u8,
-    /// The interval a bake clamps into. Not the same number as the range of the
-    /// channel the layer's values are stored in, which is what the byte spreads
-    /// over.
-    pub range: (f32, f32),
     /// Carried through and never read by the bake.
     #[serde(default)]
     pub export: bool,
@@ -160,9 +152,6 @@ fn recipe_of(spec: &TerrainSpec) -> RecipeMeta {
             .iter()
             .map(|layer| LayerRecipe {
                 name: layer.id.clone(),
-                role: layer.role,
-                shift: layer.shift,
-                range: layer.range,
                 export: layer.export,
                 params: layer.shader.params.clone(),
             })
@@ -220,8 +209,12 @@ impl TerrainSpec {
     /// the first time part of it was re-baked. Under a runtime holding no device every
     /// layer reads `0.0`.
     ///
-    /// A directory carrying no `recipe.ron` loads its layers' names, roles and shifts
-    /// from the values, at seed 0 and with no parameter values.
+    /// A layer's role, shift, range and class come from its shader file either way —
+    /// the recipe carries none of the four — so a directory whose shaders cannot be
+    /// read loads its layers at their defaults.
+    ///
+    /// A directory carrying no `recipe.ron` loads its layers' names from the values,
+    /// at seed 0 and with no parameter values.
     pub fn load_from_dir(path: impl AsRef<Path>, base: ShaderRuntime) -> Result<Self, RecipeError> {
         let root = path.as_ref().to_path_buf();
         let terrain = Terrain::load_from_dir(&root)?;
@@ -234,22 +227,14 @@ impl TerrainSpec {
                 spec.seed = meta.seed;
                 spec.water_spec = meta.water_spec.clone();
                 for entry in &meta.layers {
-                    let mut layer = Layer::new(entry.name.clone())
-                        .with_role(entry.role)
-                        .with_shift(entry.shift)
-                        .with_range(entry.range)
-                        .with_export(entry.export);
+                    let mut layer = Layer::new(entry.name.clone()).with_export(entry.export);
                     layer.shader.params = entry.params.clone();
                     spec.layers.push(layer);
                 }
             }
             None => {
                 for view in terrain.fields() {
-                    spec.layers.push(
-                        Layer::new(view.name().to_owned())
-                            .with_role(view.role())
-                            .with_shift(view.shift()),
-                    );
+                    spec.layers.push(Layer::new(view.name().to_owned()));
                 }
             }
         }
@@ -259,6 +244,7 @@ impl TerrainSpec {
             if let Some(program) = runtime.program(&layer.file()) {
                 layer.shader.reconcile(&program.layout);
                 layer.shader.reconcile_layers(&program.layers);
+                layer.reconcile_header(&program.header);
             }
         }
         spec.set_shader_runtime(runtime);
@@ -298,6 +284,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::terrain::LayerRole;
     use watershed::meta::TerrainMeta;
     use watershed::raster::Raster;
 
@@ -489,11 +476,12 @@ mod tests {
         std::fs::remove_dir_all(&first_root).unwrap();
         std::fs::remove_dir_all(&second_root).unwrap();
     }
-    // A layer's recipe is its settings, the document's seed and the values for its
-    // parameters — and not the raster, which is derived from the file and re-made on
-    // the way in rather than saved.
+    // A layer's recipe is its export flag, the document's seed and the values for its
+    // parameters — not the raster, which is derived from the file and re-made on the
+    // way in, and not the four properties the shader file now declares, which would
+    // be a second copy for the file to disagree with.
     #[test]
-    fn a_layer_carries_its_settings_parameters_and_seed_and_no_values() {
+    fn a_layer_carries_its_parameters_and_seed_and_no_values_or_declared_properties() {
         let mut height = Layer::new("height")
             .with_role(LayerRole::Height)
             .with_range((-2.0, 3.0))
@@ -503,11 +491,17 @@ mod tests {
         spec.seed = 42;
         let root = saved(&spec, SaveOptions::document(), "shader");
 
+        let written = std::fs::read_to_string(root.join(RECIPE_FILE)).unwrap();
+        for key in ["role", "shift", "range", "categorical"] {
+            assert!(
+                !written.contains(key),
+                "the recipe carries `{key}`:\n{written}"
+            );
+        }
+
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.seed, 42);
         let layer = &loaded.layers[0];
-        assert_eq!(layer.role, LayerRole::Height);
-        assert_eq!(layer.range, (-2.0, 3.0));
         assert_eq!(layer.shader.params.get("scale"), Some(&vec![0.03]));
         assert!(
             layer.shader.values().is_empty(),
@@ -533,24 +527,25 @@ mod tests {
         ));
         std::fs::remove_dir_all(&root).unwrap();
     }
-    // A document saved while a layer was a graph of nodes has no reading here, so it
-    // is refused by its version before the unknown shape of the rest is parsed, and
-    // the message says which version it was.
+    // A document saved while a layer carried its own role, shift and range has no
+    // reading here, so it is refused by its version before the disagreeing shape of
+    // the rest is parsed, and the message says which version it was.
     #[test]
-    fn a_version_three_recipe_is_refused_naming_its_version() {
-        let root = saved(&baked_document(), SaveOptions::document(), "version-three");
+    fn a_version_four_recipe_is_refused_naming_its_version() {
+        let root = saved(&baked_document(), SaveOptions::document(), "version-four");
         std::fs::write(
             root.join(RECIPE_FILE),
-            "(version: 3, water_spec: None, stacks: [])",
+            "(version: 4, size: (64, 64), seed: 0, water_spec: None, \
+             fields: [(name: (\"height\"), role: Height, shift: 0, range: (0.0, 1.0), params: {})])",
         )
         .unwrap();
 
         let error = load(&root).unwrap_err();
         assert!(
-            matches!(error, RecipeError::UnsupportedVersion(3)),
+            matches!(error, RecipeError::UnsupportedVersion(4)),
             "{error}"
         );
-        assert!(error.to_string().contains('3'), "{error}");
+        assert!(error.to_string().contains('4'), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -568,7 +563,7 @@ mod tests {
 
         let text = format!(
             "(version: {RECIPE_VERSION}, size: (64, 64), seed: 0, water_spec: None, \
-             fields: [(name: (\"height\"), role: Height, shift: 0, range: (0.0, 1.0), params: {{}})])"
+             fields: [(name: (\"height\"), params: {{}})])"
         );
         let meta: RecipeMeta = ron::from_str(&text).unwrap();
         assert_eq!(meta.layers.len(), 1);
