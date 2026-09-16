@@ -78,6 +78,17 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    /// Whether opening another document replaces this job instead of being refused.
+    ///
+    /// True for the jobs that only re-derive what the open document already describes:
+    /// a `new` or a `load` throws that document away, so the answer in flight is
+    /// worthless and the task is dropped. False for a save, which is writing a
+    /// directory that would be left half-written, and for a new or a load, which are
+    /// themselves replacing the document and would otherwise race each other.
+    pub fn is_derived(self) -> bool {
+        matches!(self, Self::Bake | Self::Solve)
+    }
+
     /// The lowercase word the status line and the control client name this by.
     pub fn name(self) -> &'static str {
         match self {
@@ -732,11 +743,13 @@ impl Document {
     /// **deleting every other `.wesl` file there**, and the bake dispatches them through
     /// programs built from those sources on the device the document last had.
     ///
-    /// Refused while a job is running, or when the directory cannot be written. The
-    /// document is emptied immediately, so the view goes blank on the frame this is
-    /// called rather than showing the old terrain under the new size in the toolbar.
+    /// Refused while a save or another `new` or `load` is running, and when the
+    /// directory cannot be written. A bake or a solve is cancelled rather than waited
+    /// for — see [`JobKind::is_derived`]. The document is emptied immediately, so the
+    /// view goes blank on the frame this is called rather than showing the old terrain
+    /// under the new size in the toolbar.
     pub fn start_new(&mut self, size: UVec2, seed: u32, preset: Preset) -> Result<(), String> {
-        self.busy_check()?;
+        self.replace_check()?;
         gpu::write_preset(&gpu::scratch_root(), preset)?;
         let runtime = self.runtime.with_sources(
             seed,
@@ -839,9 +852,11 @@ impl Document {
 
     /// Starts reading a document from `path`, dropping whatever was open.
     ///
-    /// Refused while a job is running. What lands is wholly baked whatever the file
-    /// carried, because the reader re-derives what the file left out; on a failure the
-    /// editor is left with no document rather than the old one.
+    /// Refused while a save or another `new` or `load` is running; a bake or a solve is
+    /// cancelled rather than waited for — see [`JobKind::is_derived`]. What lands is
+    /// wholly baked whatever the file carried, because the reader re-derives what the
+    /// file left out; on a failure the editor is left with no document rather than the
+    /// old one.
     ///
     /// The bake dispatches each layer's shader through programs built from the
     /// document's own `shaders` directory, on the device the document last had.
@@ -849,7 +864,7 @@ impl Document {
     /// Before the read starts, **overwrites that directory's `lib.wesl` and `wesl.toml`**
     /// with this build's library. A write that fails is logged and the load goes on.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
-        self.busy_check()?;
+        self.replace_check()?;
         if let Err(error) = gpu::write_library(&path.join(SHADER_DIR)) {
             warn!("{error}");
         }
@@ -882,6 +897,19 @@ impl Document {
         match self.job() {
             Some(kind) => Err(format!("a {} is already running", kind.name())),
             None => Ok(()),
+        }
+    }
+
+    /// As [`Document::busy_check`], for the two verbs that replace the open document.
+    ///
+    /// A job [`JobKind::is_derived`] does not refuse them: it is cancelled, and
+    /// whatever it was computing is dropped with the document it was computing for.
+    fn replace_check(&self) -> Result<(), String> {
+        match self.job() {
+            Some(kind) if !kind.is_derived() => {
+                Err(format!("a {} is already running", kind.name()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1076,6 +1104,56 @@ mod tests {
         assert!(add(&mut document, "temperature").is_err());
         assert!(!document.shader_root().join("temperature.wesl").exists());
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
+    }
+
+    // The defect this guards was reported from the scenarios: `save` then `load` back to
+    // back answered "a bake is already running", because a save leaves the library
+    // looking at its new directory and the bake that follows was still in flight when
+    // the load arrived. A load throws that bake's document away, so waiting for it is
+    // waiting for an answer nobody reads.
+    #[test]
+    fn a_load_replaces_a_running_bake_rather_than_being_refused() {
+        let mut document = two_layer_document("supersede-load");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+        assert_eq!(document.job(), Some(JobKind::Bake));
+
+        let root = document.path.clone().expect("the fixture has a directory");
+        let target = scratch("supersede-load-target");
+        document.start_load(target.clone()).unwrap();
+        assert_eq!(document.job(), Some(JobKind::Load));
+
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The same for `new`, which the water scenario reaches by the other route: it too
+    // drops whatever is open, so a bake in flight is work for a document that is about
+    // to stop existing.
+    #[test]
+    fn a_new_replaces_a_running_bake_rather_than_being_refused() {
+        let mut document = two_layer_document("supersede-new");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.start_bake().unwrap();
+
+        let root = document.path.clone().expect("the fixture has a directory");
+        document
+            .start_new(UVec2::splat(32), 7, Preset::Continents)
+            .unwrap();
+        assert_eq!(document.job(), Some(JobKind::New));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Which jobs may be cancelled is the whole of the rule above, and a save is the one
+    // that must not be: it is writing a directory, and half a terrain on disk is worse
+    // than a refusal. Two opens racing each other is the other case worth refusing.
+    #[test]
+    fn only_a_bake_and_a_solve_are_cancelled_by_opening_another_document() {
+        assert!(JobKind::Bake.is_derived());
+        assert!(JobKind::Solve.is_derived());
+        assert!(!JobKind::Save.is_derived());
+        assert!(!JobKind::New.is_derived());
+        assert!(!JobKind::Load.is_derived());
     }
 
     // A client waiting on an edit held for a running job is sent this reply, and the control server can send only an object.
