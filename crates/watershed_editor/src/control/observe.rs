@@ -110,11 +110,17 @@ fn layer(world: &World) -> Value {
     let file = layer.file();
     let params = &layer.shader.params;
 
+    let (low, high) = layer.bounds();
+
     let baked = layer.baked();
     if baked.is_empty() {
         return json!({
             "available": false,
             "reason": "not baked",
+            "role": layer.role.as_str(),
+            "shift": layer.shift,
+            "range": [low, high],
+            "categorical": layer.categorical,
             "file": file,
             "params": params,
             "reads": reads,
@@ -134,7 +140,10 @@ fn layer(world: &World) -> Value {
     json!({
         "available": true,
         "name": layer.id.to_string(),
+        "role": layer.role.as_str(),
         "shift": layer.shift,
+        "range": [low, high],
+        "categorical": layer.categorical,
         "resolution": [baked.width(), baked.height()],
         "cells": values.len(),
         "min": at(0.0),
@@ -183,6 +192,7 @@ fn layers(world: &World) -> Value {
                 "name": layer.id.to_string(),
                 "role": layer.role.as_str(),
                 "shift": layer.shift,
+                "categorical": layer.categorical,
                 "reads": crate::edit::reads_of(layer),
                 "fault": faults
                     .iter()
@@ -389,6 +399,43 @@ mod tests {
         assert_eq!(base["params"], json!({ "value": [0.25] }));
     }
 
+    // Editing a header line and reading the result back is how every property this task
+    // moved into the file is checked, and an unbaked layer is exactly the state a file
+    // that has just been saved is in — so the four have to be on both replies.
+    #[test]
+    fn observing_a_layer_reports_the_four_its_file_declares_baked_or_not() {
+        let mut moisture = Layer::new("moisture").with_shift(2).with_range((0.0, 2.0));
+        moisture.categorical = true;
+        let terrain = TerrainSpec::new(UVec2::splat(16)).with_layer(moisture);
+
+        let mut document = Document::default();
+        document.adopt(terrain);
+        document.set_active("moisture").unwrap();
+        let mut world = World::new();
+        world.insert_resource(document);
+
+        let unbaked = layer(&world);
+        assert_eq!(unbaked["reason"], json!("not baked"));
+        assert_eq!(unbaked["shift"], json!(2));
+        assert_eq!(unbaked["range"], json!([0.0, 2.0]));
+        assert_eq!(unbaked["categorical"], json!(true));
+
+        world
+            .resource_mut::<Document>()
+            .terrain_mut()
+            .expect("a document")
+            .bake_in_place()
+            .unwrap();
+
+        let baked = layer(&world);
+        assert_eq!(baked["available"], json!(true));
+        assert_eq!(baked["role"], json!("custom"));
+        assert_eq!(baked["shift"], json!(2));
+        assert_eq!(baked["range"], json!([0.0, 2.0]));
+        assert_eq!(baked["categorical"], json!(true));
+        assert_eq!(baked["resolution"], json!([4, 4]));
+    }
+
     // Acceptance criterion seven: the whole document's shape over the socket, in the
     // order the bake visits the layers in, so a caller sees the same picture the
     // overview draws without opening every file itself.
@@ -411,6 +458,7 @@ mod tests {
         assert_eq!(listed[0]["reads"], json!([]));
         assert_eq!(listed[0]["role"], json!("custom"));
         assert_eq!(listed[0]["shift"], json!(0));
+        assert_eq!(listed[0]["categorical"], json!(false));
         assert_eq!(listed[1]["name"], json!("height"));
         assert_eq!(listed[1]["reads"], json!(["base"]));
     }

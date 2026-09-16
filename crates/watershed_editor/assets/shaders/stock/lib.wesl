@@ -184,3 +184,11 @@ fn layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
     let d = textureLoad(layer, i1, 0).r;
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
+
+// Another layer's value at a document position read whole, to the nearest texel —
+// what a layer declaring `@categorical` holds, where a blend of two class indices
+// would be a third class the layer never had.
+fn layer_class(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
+    let step = f32(1u << layer_shift(layer));
+    return input_texel(layer, vec2<i32>(floor(p / step)));
+}

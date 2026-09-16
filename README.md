@@ -24,7 +24,9 @@ time.
 
 A terrain is an extent in cells and a set of named layers over it. A layer is one WGSL
 file in the document's `shaders` directory, named after the layer, and its values are
-what that shader produces, clamped to the layer's declared range. A layer reads another
+what that shader produces, clamped to the layer's declared range. The file declares the
+layer as well as its values: its role in the bake, its resolution shift, that range and
+whether it holds classes are four header lines in the file itself. A layer reads another
 by naming it in its file with `@layer`, so baking is ordered: every layer after the ones
 it reads. Every edit re-bakes the whole document.
 
@@ -47,8 +49,9 @@ and they are hot-reloaded — save a file and the document re-bakes. Adding a la
 the template into that directory as `<layer>.wesl`, where it is then yours to edit, and
 removing one deletes its file. A file added to or deleted from the directory by hand
 adds or removes its layer the same way; a file whose name begins with `_` is not a
-layer. Neither is an undo step: undo covers parameter values, layer settings and the
-water spec.
+layer. Neither is an undo step: undo covers parameter values, the display settings and
+the water spec — not the four the file declares, which the next read of the file would
+put back anyway.
 
 ```wesl
 import package::lib::ridged_fbm;
@@ -124,6 +127,26 @@ The binding holds the named layer's baked raster at that layer's own shift, and
 baked first; a name that is no layer, or files that read each other in a circle, leave
 the reading layer unbaked with the reason on its card.
 
+### Header lines
+
+What the layer itself is, as lines of their own anywhere in the file. Each may be
+written once; a line the file does not declare takes the default.
+
+| line | what it says | default |
+| --- | --- | --- |
+| `// @role height\|moisture\|custom` | what the bake does with the layer | `custom` |
+| `// @shift <n>` | one texel per `2^n` cells, 0 to 8 | `0` |
+| `// @range <low> <high>` | what baked values are clamped into | `0 1` |
+| `// @categorical` | the layer holds whole class indices, not a quantity | a quantity |
+
+A categorical layer is read to the nearest texel rather than interpolated — `layer_class`
+is the library's read of one — and is exported as a class channel; a value in it that is
+not whole is refused when the document is saved.
+
+A document has at most one height layer and at most one moisture layer, and the height
+layer is at shift 0. A water spec needs a height layer. Breaking one of those is a fault
+on the layer's card and in the log, and the document is not baked until it is mended.
+
 ## The water solve
 
 Water is a whole-grid answer over one layer — the one holding the `Height` role, at
@@ -144,7 +167,7 @@ A terrain is a directory.
 |---|---|---|
 | `terrain.ron` | the extent, the fields, the images, the water | both |
 | `layer_<n>.png` | the values, eight bits to a channel | both |
-| `recipe.ron` | the extent, the seed, the water spec, and per layer its role, shift, range and parameter values | the editor |
+| `recipe.ron` | the extent, the seed, the water spec, and per layer its parameter values | the editor |
 | `shaders/*.wesl` | one file per layer | the editor |
 | `shaders/lib.wesl` | the library, overwritten by the editor | the editor |
 | `shaders/wesl.toml` | the package root, for a language server | a language server |

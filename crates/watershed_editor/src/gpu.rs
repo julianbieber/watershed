@@ -24,7 +24,9 @@ use wesl::syntax::{GlobalDeclaration, ImportContent, ModulePath, PathOrigin, Tra
 use crate::document::{Document, EditorSystems, JobKind};
 use crate::preset::Preset;
 use crate::terrain::TerrainSpec;
-use crate::terrain::shader::{LayerRead, ParamsLayout, parse_layers, parse_params, parse_retired};
+use crate::terrain::shader::{
+    LayerHeader, LayerRead, ParamsLayout, parse_header, parse_layers, parse_params, parse_retired,
+};
 
 use dispatch::{DispatchBridge, DispatchSender, LayerInput};
 
@@ -53,7 +55,7 @@ fn generate(@builtin(global_invocation_id) id: vec3<u32>) {
 ///
 /// A name beginning with `_` is a template: it is what a new layer is copied from, and a
 /// file of that name in a document's directory is not a layer.
-pub const STOCK: [(&str, &str); 7] = [
+pub const STOCK: [(&str, &str); 8] = [
     ("_template.wesl", TEMPLATE_SOURCE),
     (
         "ridged.wesl",
@@ -71,6 +73,10 @@ pub const STOCK: [(&str, &str); 7] = [
     (
         "continents.wesl",
         include_str!("../assets/shaders/stock/continents.wesl"),
+    ),
+    (
+        "base.wesl",
+        include_str!("../assets/shaders/stock/base.wesl"),
     ),
     (
         "mountains_over_base.wesl",
@@ -230,11 +236,13 @@ fn read_imports(source: &str) -> Vec<LibraryImport> {
 struct Declared {
     layout: ParamsLayout,
     layers: Vec<LayerRead>,
+    header: LayerHeader,
 }
 
 fn declare(source: &str) -> Result<Declared, String> {
     let layout = parse_params(source).map_err(|error| error.to_string())?;
     let layers = parse_layers(source).map_err(|error| error.to_string())?;
+    let header = parse_header(source).map_err(|error| error.to_string())?;
     parse_retired(source).map_err(|error| error.to_string())?;
     if let Some(import) = read_imports(source)
         .into_iter()
@@ -245,7 +253,11 @@ fn declare(source: &str) -> Result<Declared, String> {
             import.path
         ));
     }
-    Ok(Declared { layout, layers })
+    Ok(Declared {
+        layout,
+        layers,
+        header,
+    })
 }
 
 fn compile_fault(file: &str, description: &str) -> String {
@@ -292,6 +304,10 @@ pub struct ShaderEntry {
     /// The layers the file reads by name, in declaration order. As with the layout,
     /// the last list that parsed.
     pub layers: Vec<LayerRead>,
+    /// What the file declares about the layer itself. As with the layout, the last
+    /// header that parsed, so a file half-way through an edit does not put a layer
+    /// back to shift 0.
+    pub header: LayerHeader,
     /// Why the file does not run: its annotations did not parse, or its source did not
     /// compile. `line N: message` against the file's own lines, or the bare message when
     /// the fault is not on a line the file owns. `None` when it is good.
@@ -521,6 +537,8 @@ pub struct ShaderProgram {
     pub layout: ParamsLayout,
     /// The layers it reads by name, in declaration order.
     pub layers: Vec<LayerRead>,
+    /// What its header lines declare about the layer itself.
+    pub header: LayerHeader,
     /// The fingerprint of `source`: which compiled pipeline a dispatch of this program
     /// runs on.
     pub key: u64,
@@ -532,12 +550,14 @@ fn program(
     source: String,
     layout: ParamsLayout,
     layers: Vec<LayerRead>,
+    header: LayerHeader,
 ) -> ShaderProgram {
     ShaderProgram {
         key: fingerprint(source.as_bytes()),
         source,
         layout,
         layers,
+        header,
         file: file.to_owned(),
     }
 }
@@ -601,6 +621,7 @@ impl ShaderRuntime {
                         entry.source.clone(),
                         entry.layout.clone(),
                         entry.layers.clone(),
+                        entry.header,
                     ),
                 )
             })
@@ -716,7 +737,13 @@ fn programs(
         .into_iter()
         .filter_map(|(name, source)| {
             let declared = declare(&source).ok()?;
-            let program = program(&name, source, declared.layout, declared.layers);
+            let program = program(
+                &name,
+                source,
+                declared.layout,
+                declared.layers,
+                declared.header,
+            );
             Some((name, program))
         })
         .collect()
@@ -889,6 +916,7 @@ fn read_entry(
                 source,
                 layout: declared.layout,
                 layers: declared.layers,
+                header: declared.header,
                 error,
                 imports,
                 modified,
@@ -903,11 +931,12 @@ fn read_entry(
         }
         Err(reason) => {
             let settled = previous.as_ref().is_some_and(|held| held.settled);
-            let (layout, layers, handle, asset_path, key) = previous
+            let (layout, layers, header, handle, asset_path, key) = previous
                 .map(|held| {
                     (
                         held.layout,
                         held.layers,
+                        held.header,
                         held.handle,
                         held.asset_path,
                         held.key,
@@ -918,6 +947,7 @@ fn read_entry(
                 source,
                 layout,
                 layers,
+                header,
                 error: Some(reason),
                 imports,
                 modified,
@@ -976,6 +1006,7 @@ fn attend_shaders(
         };
         touched |= layer.shader.reconcile(&entry.layout);
         touched |= layer.shader.reconcile_layers(&entry.layers);
+        touched |= layer.reconcile_header(&entry.header);
     }
     if touched {
         document.note_edit();
@@ -1016,6 +1047,7 @@ impl ShaderLibrary {
                 source: String::new(),
                 layout: ParamsLayout::default(),
                 layers: Vec::new(),
+                header: LayerHeader::default(),
                 error: Some(fault.to_owned()),
                 imports: Vec::new(),
                 modified: None,
@@ -1525,7 +1557,7 @@ mod tests {
         assert!(dir.join("wesl.toml").is_file());
         assert_eq!(
             std::fs::read_to_string(dir.join("base.wesl")).unwrap(),
-            stock_source("continents.wesl").unwrap()
+            stock_source("base.wesl").unwrap()
         );
         assert!(dir.join("height.wesl").is_file() && dir.join("moisture.wesl").is_file());
         std::fs::remove_dir_all(&dir).unwrap();

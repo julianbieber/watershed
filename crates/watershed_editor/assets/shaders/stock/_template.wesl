@@ -74,6 +74,29 @@ import package::lib::fbm_unit;
 //       another layer's value at a document position, interpolated, whatever its shift
 //   layer_shift(layer: texture_2d<f32>) -> u32
 //       the shift that layer was baked at
+//   layer_class(layer: texture_2d<f32>, p: vec2<f32>) -> f32
+//       another layer's value read whole, to the nearest texel — how a `@categorical`
+//       layer is read, where an interpolated class index is a class nothing holds
+//
+// HEADER LINES
+//
+// What the layer itself is, as lines of their own anywhere in the file. Each may be
+// written once; a line this file does not declare takes the default shown. Only the
+// exact `// @` opening declares anything, so the forms written indented below declare
+// nothing and neither does a copy of this file.
+//
+//   @role height|moisture|custom   what the bake does with the layer; custom
+//   @shift <n>                     one texel per 2^n cells, 0 to 8; 0
+//   @range <low> <high>            what baked values are clamped into; 0 1
+//   @categorical                   the layer holds whole class indices, not a
+//                                  quantity: it is read to the nearest texel and
+//                                  exported as a class channel, and a value in it
+//                                  that is not whole is refused at save
+//
+// A document has at most one height layer and at most one moisture layer, and the
+// height layer is at shift 0. A water spec needs a height layer. Breaking one of
+// those is a fault on the layer's card, and the document is not baked until it is
+// mended.
 //
 // PARAMETERS — @ui
 //

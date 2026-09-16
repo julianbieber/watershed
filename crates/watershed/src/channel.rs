@@ -283,10 +283,11 @@ impl ChannelTable {
 
 /// The first value that could not be stored as a class index, if there is one.
 ///
-/// A field is categorical because of the layers in it, but what reaches a texel has
-/// been through an amplitude, a blend and a mask weight, so a class index can
-/// arrive scaled or part-way between two others. Storing that would smear one class
-/// into its neighbour, so a terrain carrying it is refused when it is written.
+/// A field is categorical because its shader file declares it so, but what reaches a
+/// texel has been through that shader's arithmetic and the field's clamp range, so a
+/// class index can arrive scaled or part-way between two others. Storing that would
+/// smear one class into its neighbour, so a terrain carrying it is refused when it is
+/// written.
 pub fn stray_class(values: &[f32]) -> Option<f32> {
     values.iter().copied().find(|value| {
         !value.is_finite() || value.fract() != 0.0 || !(0.0..=MAX_CLASS).contains(value)

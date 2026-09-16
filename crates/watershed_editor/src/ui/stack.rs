@@ -9,7 +9,6 @@
 //! leaving a choice out of it would leave a menu showing what it used to say over a
 //! document that had already changed.
 
-use crate::terrain::LayerRole;
 use bevy::feathers::containers::{group, group_body, group_header};
 use bevy::feathers::controls::{
     FeathersButton, FeathersCheckbox, FeathersDisclosureToggle, FeathersTextInput,
@@ -140,15 +139,6 @@ pub fn sync(document: Res<Document>, mut preview: Query<&mut Text, With<PreviewT
     }
 }
 
-fn shift_is_pinned(document: &Document) -> bool {
-    document
-        .terrain()
-        .zip(layer_of(document))
-        .is_some_and(|(terrain, layer)| {
-            crate::edit::is_solve_height(terrain, document.active()) && layer.shift == 0
-        })
-}
-
 fn layer_of(document: &Document) -> Option<&Layer> {
     document.terrain()?.layer(document.active())
 }
@@ -161,12 +151,6 @@ fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary
     key.push('|');
     key.push_str(if expanded.reference { "ref" } else { "noref" });
     key.push('|');
-    key.push_str(if shift_is_pinned(document) {
-        "pinned"
-    } else {
-        "free"
-    });
-    key.push('|');
 
     if let Some(terrain) = document.terrain() {
         key.push_str(&crate::edit::readers_of(terrain, document.active()).join(","));
@@ -177,6 +161,10 @@ fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary
         return key + "empty";
     };
     key.push_str(layer.role.as_str());
+    key.push_str(&format!("|shift:{}", layer.shift));
+    let (low, high) = layer.bounds();
+    key.push_str(&format!("|range:{low}..{high}"));
+    key.push_str(&format!("|categorical:{}", layer.categorical));
     key.push_str(&format!("|hillshade:{}", layer.hillshade));
     key.push_str(&format!("|contours:{}", layer.contours));
     key.push('|');
@@ -219,13 +207,7 @@ fn contents(
         .terrain()
         .map(|terrain| crate::edit::readers_of(terrain, &active))
         .unwrap_or_default();
-    children.push(widgets::boxed(properties(
-        &active,
-        layer,
-        shift_is_pinned(document),
-        &reads,
-        &read_by,
-    )));
+    children.push(widgets::boxed(properties(&active, layer, &reads, &read_by)));
     children.push(widgets::boxed(shader_section(layer, library)));
     children.push(widgets::boxed(reference_section(expanded.reference)));
     children.push(widgets::boxed(layer_row(&active)));
@@ -325,53 +307,30 @@ fn layer_links(caption: &str, names: &[String]) -> impl Scene {
     }
 }
 
-fn properties(
-    active: &str,
-    layer: &Layer,
-    pinned: bool,
-    reads: &[String],
-    read_by: &[String],
-) -> impl Scene {
+fn properties(active: &str, layer: &Layer, reads: &[String], read_by: &[String]) -> impl Scene {
     let active = active.to_owned();
-    let role = layer.role;
-    let role_items: Vec<Box<dyn SceneList>> = LayerRole::ALL
-        .into_iter()
-        .map(|choice| {
-            let active = active.clone();
-            one(bsn! {
-                @widgets::item_caption(choice.as_str())
-                on(move |_: On<Activate>, mut document: ResMut<Document>| {
-                    let result = document
-                        .apply(&Edit::Set {
-                            path: format!("{active}.role"),
-                            words: vec![choice.as_str().to_owned()],
-                        })
-                        .map(|_| ());
-                    report(&mut document, result);
-                })
-            })
-        })
-        .collect();
+    let (low, high) = layer.bounds();
 
     widgets::column(vec![
         one(widgets::captioned(
-            "shift",
-            if pinned {
-                one(widgets::small(layer.shift.to_string()))
-            } else {
-                one(widgets::number(NumberBinding::Shift))
-            },
+            "role",
+            one(widgets::small(layer.role.as_str())),
         )),
         one(widgets::captioned(
-            "role",
-            one(widgets::menu(role.as_str(), role_items)),
+            "shift",
+            one(widgets::small(layer.shift.to_string())),
         )),
         one(widgets::captioned(
             "range",
-            one(widgets::row(vec![
-                one(widgets::number(NumberBinding::RangeLow)),
-                one(widgets::number(NumberBinding::RangeHigh)),
-            ])),
+            one(widgets::small(format!("{low} {high}"))),
+        )),
+        one(widgets::captioned(
+            "class",
+            one(widgets::small(if layer.categorical {
+                "categorical"
+            } else {
+                "quantity"
+            })),
         )),
         one(toggle_row(
             &active,
@@ -539,6 +498,7 @@ fn reference_body() -> impl Scene {
 mod tests {
     use super::*;
     use crate::terrain::LayerId;
+    use crate::terrain::LayerRole;
     use crate::terrain::TerrainSpec;
 
     fn document_with(value: f32) -> Document {
@@ -609,29 +569,31 @@ mod tests {
         let mut document = document_with(0.5);
         let before = key(&document);
 
-        let layer = height(&mut document);
-        layer.range = (-1.0, 2.0);
-        layer.shader.params.get_mut("value").expect("a held value")[0] = 0.9;
+        height(&mut document)
+            .shader
+            .params
+            .get_mut("value")
+            .expect("a held value")[0] = 0.9;
         assert_eq!(key(&document), before);
     }
 
-    // The shift is a number field or a plain label depending on this, so it decides how
-    // many widgets there are and belongs in the shape however numeric it looks. It is
-    // pinned only while the height layer is already at shift 0, so a document that
-    // arrived coarse some other way can still be repaired from the panel.
+    // The four the file declares are drawn as text, so a file edited under the panel
+    // has to rebuild it: nothing else would ever redraw the label.
     #[test]
-    fn whether_the_shift_is_pinned_is_part_of_the_shape() {
+    fn the_properties_the_file_declares_are_part_of_the_shape() {
         let mut document = document_with(0.5);
-        height(&mut document).role = LayerRole::Height;
-        assert!(
-            shift_is_pinned(&document),
-            "the solve height sits at shift 0"
-        );
-        let pinned = key(&document);
+        let before = key(&document);
 
         height(&mut document).shift = 2;
-        assert!(!shift_is_pinned(&document), "a coarse height is not pinned");
-        assert_ne!(key(&document), pinned);
+        let after_shift = key(&document);
+        assert_ne!(after_shift, before, "the shift is a label");
+
+        height(&mut document).range = (0.0, 2.0);
+        let after_range = key(&document);
+        assert_ne!(after_range, after_shift, "so is the range");
+
+        height(&mut document).categorical = true;
+        assert_ne!(key(&document), after_range, "so is the class");
     }
 
     // The toggle is a choice, and a choice is shape: a Reference flag outside the key

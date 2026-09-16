@@ -696,7 +696,7 @@ mod tests {
             ("layer rm base", "layer"),
             ("set height.scale 0.004", "set"),
             ("set height.offset 0.5 0.25", "set"),
-            ("set height.shift 2", "set"),
+            ("set height.ridge 1.2", "set"),
             ("bake", "bake"),
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),

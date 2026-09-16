@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use watershed::raster::{Raster, raster_coord, resolution};
 
-use crate::terrain::shader::ShaderLayer;
+use crate::terrain::shader::{LayerHeader, ShaderLayer};
 
 /// A layer's name: the library's [`FieldId`](watershed::field::FieldId) under the editor's
 /// word. Any string is accepted; uniqueness is checked when a document is planned.
@@ -30,14 +30,24 @@ pub struct Layer {
     pub id: LayerId,
     /// What the bake may do with the layer. See [`LayerRole`] for the constraints
     /// a document carrying this has to satisfy.
+    ///
+    /// Declared by the layer's shader file and written here by the sweep that reads
+    /// it; an edit that sets it any other way is overwritten at the next read.
     #[serde(default)]
     pub role: LayerRole,
     /// Resolution, as the [`raster`](watershed::raster) shift: one texel per cell at 0,
-    /// per `2^shift` cells above that.
+    /// per `2^shift` cells above that. Declared by the shader file, as [`Layer::role`]
+    /// is.
     pub shift: u8,
     /// The interval baked values are clamped into. Accepted in either order; read
-    /// it through [`Layer::bounds`] rather than directly.
+    /// it through [`Layer::bounds`] rather than directly. Declared by the shader
+    /// file, as [`Layer::role`] is.
     pub range: (f32, f32),
+    /// Whether the layer holds class indices rather than a quantity: it is read to
+    /// the nearest texel, exported as a class channel, and a value in it that is not
+    /// whole is refused at save. Declared by the shader file, as [`Layer::role`] is.
+    #[serde(default)]
+    pub categorical: bool,
     /// Carried through the document and never read by this crate. It is for
     /// whatever consumes a baked terrain to decide what an exported layer means.
     #[serde(default)]
@@ -85,15 +95,19 @@ fn default_contour_interval() -> f32 {
 
 impl Layer {
     /// A layer named `id` with no parameter values: role `Custom`, shift 0, range
-    /// `0.0..=1.0`, not exported, not hillshaded, lit from the northwest, without
-    /// contours at a tenth-unit interval, and unbaked — so it samples as `0.0`
-    /// until it is baked.
+    /// `0.0..=1.0`, a quantity rather than classes, not exported, not hillshaded, lit
+    /// from the northwest, without contours at a tenth-unit interval, and unbaked —
+    /// so it samples as `0.0` until it is baked.
+    ///
+    /// The first four are what a shader file declaring no header lines means, so a
+    /// layer keeps them until its file is read.
     pub fn new(id: impl Into<LayerId>) -> Self {
         Self {
             id: id.into(),
             role: LayerRole::Custom,
             shift: 0,
             range: (0.0, 1.0),
+            categorical: false,
             export: false,
             hillshade: false,
             light_azimuth: DEFAULT_LIGHT_AZIMUTH,
@@ -104,8 +118,10 @@ impl Layer {
         }
     }
 
-    /// Sets the role. Does not check the document-wide constraints on
-    /// [`LayerRole`]; a conflict surfaces at plan time.
+    /// Sets the role, as though the shader file had declared it. The file is what
+    /// owns the role, so this states what a test's or a preset's file says rather
+    /// than overriding it; the next read of the file wins. Does not check the
+    /// document-wide constraints on [`LayerRole`]; a conflict surfaces at plan time.
     pub fn with_role(mut self, role: LayerRole) -> Self {
         self.role = role;
         self
@@ -117,17 +133,37 @@ impl Layer {
         self
     }
 
-    /// Sets the resolution shift. A shift on the `Height` layer is rejected at plan
-    /// time, not here.
+    /// Sets the resolution shift, as though the shader file had declared it — see
+    /// [`Layer::with_role`]. A shift on the `Height` layer is rejected at plan time,
+    /// not here.
     pub fn with_shift(mut self, shift: u8) -> Self {
         self.shift = shift;
         self
     }
 
-    /// Sets the clamp interval. Either order is accepted — see [`Layer::bounds`].
+    /// Sets the clamp interval, as though the shader file had declared it — see
+    /// [`Layer::with_role`]. Either order is accepted — see [`Layer::bounds`].
     pub fn with_range(mut self, range: (f32, f32)) -> Self {
         self.range = range;
         self
+    }
+
+    /// Takes the four properties `header` declares, answering whether any of them
+    /// moved.
+    ///
+    /// `true` means the layer's resolution, clamp, role or class flag has changed and
+    /// whatever was baked from the old ones is stale. Called for every layer on every
+    /// read of the shader directory, so it has to be cheap and idempotent.
+    pub fn reconcile_header(&mut self, header: &LayerHeader) -> bool {
+        let moved = self.role != header.role
+            || self.shift != header.shift
+            || self.range != header.range
+            || self.categorical != header.categorical;
+        self.role = header.role;
+        self.shift = header.shift;
+        self.range = header.range;
+        self.categorical = header.categorical;
+        moved
     }
 
     /// The shader file this layer's values come from: a plain name inside the
@@ -150,6 +186,7 @@ impl Layer {
             role: self.role,
             shift: self.shift,
             range: self.range,
+            categorical: self.categorical,
             export: self.export,
             hillshade: self.hillshade,
             light_azimuth: self.light_azimuth,
@@ -208,11 +245,17 @@ impl Layer {
     /// outside the document.
     ///
     /// A coarse layer is interpolated between its texels, so it reads as a smooth
-    /// surface and not as blocks.
+    /// surface and not as blocks — unless it is [`categorical`](Layer::categorical),
+    /// where the nearest texel is read whole, because a blend of two class indices is
+    /// a third class the layer does not hold.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         let u = raster_coord(x, self.shift);
         let v = raster_coord(y, self.shift);
-        self.baked.sample_bilinear(u, v)
+        if self.categorical {
+            self.baked.sample_nearest(u, v)
+        } else {
+            self.baked.sample_bilinear(u, v)
+        }
     }
 
     /// The layers this one's shader file reads by name, in declaration order, with
@@ -324,5 +367,50 @@ mod tests {
     fn an_unbaked_layer_samples_as_zero() {
         let layer = Layer::new("height");
         assert_eq!(layer.sample(12.5, 3.5), 0.0);
+    }
+
+    // A blend of class 0 and class 2 is class 1, which the layer never held. A
+    // categorical layer has to read the texel it lands in and nothing of its
+    // neighbours.
+    #[test]
+    fn a_categorical_layer_reads_the_texel_it_lands_in() {
+        let mut raster = Raster::new(UVec2::new(2, 1), 0.0);
+        raster.set(1, 0, 2.0);
+        let mut layer = Layer::new("biome");
+        layer.put_baked(raster);
+        assert_eq!(layer.sample(1.0, 0.5), 1.0, "a quantity blends");
+
+        layer.categorical = true;
+        assert_eq!(layer.sample(1.0, 0.5), 2.0);
+    }
+
+    // The sweep runs this for every layer every frame; a `true` it did not have to
+    // report re-bakes the whole document on a frame in which no file moved.
+    #[test]
+    fn reconciling_a_header_reports_only_a_property_that_moved() {
+        let mut layer = Layer::new("moisture");
+        let header = LayerHeader {
+            role: LayerRole::Moisture,
+            shift: 4,
+            range: (0.0, 2.0),
+            categorical: false,
+        };
+        assert!(layer.reconcile_header(&header));
+        assert_eq!(layer.role, LayerRole::Moisture);
+        assert_eq!(layer.shift, 4);
+        assert_eq!(layer.range, (0.0, 2.0));
+        assert!(!layer.reconcile_header(&header));
+    }
+
+    // The file owns the four, so a file that declares none of them has to put a layer
+    // back to the defaults rather than leave the last header's values on it.
+    #[test]
+    fn reconciling_an_empty_header_puts_the_properties_back_to_their_defaults() {
+        let mut layer = Layer::new("moisture")
+            .with_shift(4)
+            .with_role(LayerRole::Moisture);
+        assert!(layer.reconcile_header(&LayerHeader::default()));
+        assert_eq!(layer.shift, 0);
+        assert_eq!(layer.role, LayerRole::Custom);
     }
 }
