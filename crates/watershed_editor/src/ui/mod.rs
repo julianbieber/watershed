@@ -40,7 +40,6 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NewDialog>()
-            .init_resource::<FilePath>()
             .init_resource::<NewLayer>()
             .init_resource::<Expanded>()
             .init_resource::<toolbar::LayerChoices>()
@@ -52,7 +51,6 @@ impl Plugin for UiPlugin {
                 (
                     toolbar::sync,
                     toolbar::rebuild_layer_menu,
-                    toolbar::seed_path,
                     stack::rebuild,
                     stack::sync,
                     stack::seed_layer_name,
@@ -102,17 +100,6 @@ impl Default for NewDialog {
             seed: 1,
             preset: Preset::default(),
         }
-    }
-}
-
-/// The path Open and Save use, as typed. Never validated here — a bad path is a
-/// refusal from the job that tried to use it.
-#[derive(Resource)]
-pub struct FilePath(pub String);
-
-impl Default for FilePath {
-    fn default() -> Self {
-        Self("terrain".to_owned())
     }
 }
 

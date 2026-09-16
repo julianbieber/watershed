@@ -17,6 +17,7 @@ use super::observe::{self, Topic};
 use crate::document::Document;
 use crate::edit::Edit;
 use crate::preset::Preset;
+use crate::project::{self, Project};
 use crate::ui::report;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
 
@@ -95,18 +96,17 @@ pub(super) enum Command {
     },
     /// Drops the water and its spec. Synchronous.
     ResetWater,
-    /// Writes the document and waits for it.
+    /// Writes the document into the project and waits for it.
     Save {
-        /// Where to write.
-        path: PathBuf,
         /// Whether the job has been asked for yet.
         started: bool,
     },
-    /// Reads a document and waits for it.
-    Load {
-        /// Where to read from.
+    /// Switches the project to `path`, loading the terrain there if it holds one, and
+    /// waits for it.
+    Open {
+        /// The directory to switch the project to.
         path: PathBuf,
-        /// Whether the job has been asked for yet.
+        /// Whether the switch has been asked for yet.
         started: bool,
     },
     /// Moves the camera by a number of cells.
@@ -180,7 +180,7 @@ impl Command {
             Self::SolveWater { .. } => "solve-water",
             Self::ResetWater => "reset-water",
             Self::Save { .. } => "save",
-            Self::Load { .. } => "load",
+            Self::Open { .. } => "open",
             Self::Pan(_) => "pan",
             Self::Zoom(_) => "zoom",
             Self::Capture { .. } => "capture",
@@ -260,19 +260,13 @@ impl Command {
             "solve-water" => Ok(Self::SolveWater { started: false }),
             "reset-water" => Ok(Self::ResetWater),
             "save" => {
-                let path = rest.first().ok_or("save needs a path")?;
-                if let Some(word) = rest.get(1) {
-                    return Err(format!(
-                        "save takes a path and nothing else; there is no `{word}`"
-                    ));
+                if rest.first().is_some() {
+                    return Err("save takes no path; it writes the project".to_owned());
                 }
-                Ok(Self::Save {
-                    path: PathBuf::from(path),
-                    started: false,
-                })
+                Ok(Self::Save { started: false })
             }
-            "load" => Ok(Self::Load {
-                path: PathBuf::from(rest.first().ok_or("load needs a path")?),
+            "open" => Ok(Self::Open {
+                path: PathBuf::from(rest.first().ok_or("open needs a directory")?),
                 started: false,
             }),
             "pan" => {
@@ -460,30 +454,35 @@ impl Command {
                 }
             }
 
-            Self::Save { path, started } => {
+            Self::Save { started } => {
                 if !*started {
                     *started = true;
+                    let dir = world.resource::<Project>().dir().to_path_buf();
                     let mut document = world.resource_mut::<Document>();
-                    if let Err(error) = document.start_save(path.clone()) {
+                    if let Err(error) = document.start_save(dir) {
                         return Poll::Failed(error);
                     }
                     return Poll::Running;
                 }
-                let path = path.clone();
+                let path = world.resource::<Project>().dir().to_path_buf();
                 finished(world, move |_| {
                     let bytes = directory_bytes(&path);
                     json!({ "path": path.display().to_string(), "bytes": bytes })
                 })
             }
 
-            Self::Load { path, started } => {
+            Self::Open { path, started } => {
                 if !*started {
                     *started = true;
-                    let mut document = world.resource_mut::<Document>();
-                    if let Err(error) = document.start_load(path.clone()) {
-                        return Poll::Failed(error);
+                    let result = world.resource_scope(|world, mut project: Mut<Project>| {
+                        let mut document = world.resource_mut::<Document>();
+                        project::open(&mut project, &mut document, path.clone())
+                    });
+                    match result {
+                        Ok(true) => return Poll::Running,
+                        Ok(false) => {}
+                        Err(error) => return Poll::Failed(error),
                     }
-                    return Poll::Running;
                 }
                 finished(world, |document| {
                     json!({
@@ -719,8 +718,8 @@ mod tests {
             ("bake", "bake"),
             ("solve-water", "solve-water"),
             ("reset-water", "reset-water"),
-            ("save /tmp/a-terrain", "save"),
-            ("load /tmp/a-terrain", "load"),
+            ("save", "save"),
+            ("open /tmp/a-terrain", "open"),
             ("pan 100 200", "pan"),
             ("zoom fit", "zoom"),
             ("zoom 512", "zoom"),
@@ -750,7 +749,9 @@ mod tests {
     }
 
     // A caller writes these by hand, so a mistyped word or a missing argument has to
-    // come back as a message rather than as a command that half happened.
+    // come back as a message rather than as a command that half happened. `load` and
+    // a `save` with a path are the grammar this task changed: `save` writes the
+    // project and takes nothing, and `load` is gone in favour of `open`.
     #[test]
     fn a_command_that_is_not_a_verb_is_refused() {
         assert!(Command::parse("wander about").is_err());
@@ -758,24 +759,11 @@ mod tests {
         assert!(Command::parse("new 256").is_err());
         assert!(Command::parse("new 256 256 1 nothing-like-this").is_err());
         assert!(Command::parse("zoom").is_err());
-        assert!(Command::parse("save /tmp/a-terrain sideways").is_err());
         assert!(Command::parse("layer").is_err());
         assert!(Command::parse("layer rm").is_err());
         assert!(Command::parse("set").is_err());
-    }
-
-    // A save is one kind now, so a script still asking for an export or spelling
-    // out `document` has to be told the word does not exist rather than have a
-    // save half happen under it.
-    #[test]
-    fn a_save_option_is_refused_by_name() {
-        for word in ["export", "document"] {
-            let line = format!("save /tmp/watershed-scenario/x {word}");
-            let Err(error) = Command::parse(&line) else {
-                panic!("`{line}` parsed");
-            };
-            assert!(error.contains(word), "{error}");
-        }
+        assert!(Command::parse("load /tmp/a").is_err());
+        assert!(Command::parse("save /tmp/a").is_err());
     }
 
     // The brush is gone rather than hidden: a script still written against it has to be

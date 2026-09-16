@@ -182,6 +182,11 @@ Every save writes both: the values and the recipe beside them. A terrain directo
 a project the editor is opened on, so a save that left the recipe out would make the
 directory unopenable.
 
+A project is opened by starting the editor on its directory — `watershed_editor <dir>`,
+or no argument for the working directory — or, in a running editor, with `open <dir>`
+on the socket. A directory holding no `terrain.ron` opens empty; the first save fills
+it.
+
 The split is what makes the boundary real: a reader of values never parses a shader,
 so it never needs the types a layer's shader is made of. A directory whose recipe has
 been deleted is still a terrain.
@@ -192,7 +197,7 @@ been deleted is still a terrain.
 
 | | |
 |---|---|
-| `just run` | run the editor |
+| `just run <dir>` | run the editor on a project directory (no argument to `just run` is an error; the editor itself takes the working directory) |
 | `just test` | `cargo test --locked --workspace` |
 | `just clippy` | Clippy over all targets/features on the `ci` profile |
 | `just bevy-lints` | Bevy-specific lints over the editor (needs `bevy_lint`; install via `just bevy-lint-install`) |

@@ -14,6 +14,9 @@ observe log
 
 fixed-delta 1/60
 
+# Opening the added-layer directory first is what makes the `save` below land in it.
+open /tmp/watershed-scenario/added-layer
+
 # 256 square and fitted. `continents` builds `moisture` and `height`.
 new 256 256 7 continents
 wait bake
@@ -42,8 +45,8 @@ observe document
 
 # A round trip through the terrain directory. Saving carries the shader directory with
 # it, so the layer comes back from its file.
-save /tmp/watershed-scenario/added-layer
-load /tmp/watershed-scenario/added-layer
+save
+open /tmp/watershed-scenario/added-layer
 observe document
 layer biomes
 observe layer
