@@ -196,12 +196,69 @@ The split is what makes the boundary real: a reader of values never parses a sha
 so it never needs the types a layer's shader is made of. A directory whose recipe has
 been deleted is still a terrain.
 
+## Installing
+
+```console
+$ just install          # cargo install --locked --path crates/watershed_editor
+```
+
+That puts `watershed_editor` and `watershed-ctl` in `~/.cargo/bin`. Both are
+self-contained: every stock shader, the library, the template and `wesl.toml` are
+compiled into the editor, so it reads nothing from an `assets` directory beside the
+executable and needs no checkout to run from.
+
+### A terrain inside a game
+
+Make a directory in the game, run the editor in it, and edit the `.wesl` files
+beside it. With no argument the editor takes the working directory:
+
+```console
+$ mkdir -p ~/games/lakes/assets/terrain
+$ cd ~/games/lakes/assets/terrain
+$ watershed_editor
+```
+
+It opens on the New dialog, because the directory holds no terrain. Create writes
+`shaders/` and `recipe.ron` into it; the shaders are edited there, in the game's own
+tree, and the editor re-bakes as they are saved. Save writes the values. The game
+ends up with:
+
+```text
+lakes/
+  Cargo.toml
+  src/
+    main.rs           <- Terrain::load_from_dir("assets/terrain")
+  assets/
+    terrain/          <- the editor is run in this directory
+      terrain.ron     <- the extent, the fields, the water
+      layer_000.png   <- the values
+      recipe.ron      <- what the editor authors from
+      shaders/
+        height.wesl   <- edited in the game's tree, re-baked as it is saved
+        moisture.wesl
+        lib.wesl      <- overwritten by the editor
+        wesl.toml
+```
+
+The game depends on the `watershed` library and reads that directory; it never
+builds a terrain at run time. `crates/watershed/examples/load_terrain.rs` is the
+worked example.
+
+`watershed-ctl` drives a running editor over the socket named by
+`WATERSHED_CONTROL`, and the editor opens one only when that variable is set:
+
+```console
+$ WATERSHED_CONTROL=/tmp/watershed-control.sock watershed_editor &
+$ WATERSHED_CONTROL=/tmp/watershed-control.sock watershed-ctl observe document
+```
+
 ## Commands
 
 `just --list` is the entry point.
 
 | | |
 |---|---|
+| `just install` | put `watershed_editor` and `watershed-ctl` on `PATH` |
 | `just run <dir>` | run the editor on a project directory (no argument to `just run` is an error; the editor itself takes the working directory) |
 | `just test` | `cargo test --locked --workspace` |
 | `just clippy` | Clippy over all targets/features on the `ci` profile |
