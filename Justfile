@@ -22,6 +22,13 @@ deps:
 	@sudo apt-get update
 	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev clang mesa-vulkan-drivers
 
+# Put `watershed_editor` and `watershed-ctl` on PATH, built from this checkout.
+install:
+	@env \
+	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
+	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
+	cargo install --locked --path crates/watershed_editor
+
 # Format check
 fmt:
 	@env \
