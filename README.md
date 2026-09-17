@@ -151,6 +151,39 @@ A document has at most one height layer and at most one moisture layer, and the 
 layer is at shift 0. A water spec needs a height layer. Breaking one of those is a fault
 on the layer's card and in the log, and the document is not baked until it is mended.
 
+### A language server
+
+`shaders/wesl.toml` is what makes the directory a WESL package, so a language server
+resolves `package::lib` to the `lib.wesl` beside it. wgsl-analyzer looks for a manifest
+twice: walking up from the file it is asked about, which finds that one, and once at
+whatever directory the editor hands it as the project root. The second is the game's own
+root, and there it takes the first of `wesl-project.json`, `wesl.toml` and `Cargo.toml`
+it meets — a `Cargo.toml` with no `[package.metadata.wgsl-analyzer]` table is a failed
+discovery, and a workspace's virtual manifest makes the analyzer panic and the server
+exit, after which nothing resolves, `shaders/wesl.toml` or not.
+
+Either point the language server at the shaders directory, which in Helix is one line
+under the `wgsl` language:
+
+```toml
+[[language]]
+name = "wgsl"
+roots = ["wesl.toml"]
+```
+
+or answer the analyzer where it looks. A game that is one crate declares the shaders in
+its own `Cargo.toml`:
+
+```toml
+[package.metadata.wgsl-analyzer]
+edition = "2026_pre"
+root = "assets/terrain/shaders"
+```
+
+A game that is a workspace cannot — the table is read only on a package's manifest — and
+puts a `wesl.toml` beside the workspace `Cargo.toml` instead. This repository carries one,
+which is what lets a terrain made inside it be edited.
+
 ## The water solve
 
 Water is a whole-grid answer over one layer — the one holding the `Height` role, at
