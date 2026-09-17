@@ -1,0 +1,4 @@
+# The repository's WESL package root, for a language server: what a shader in this tree
+# that is not inside a package of its own is resolved against.
+edition = "2026_pre"
+root = "crates"
