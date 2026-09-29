@@ -9,8 +9,8 @@ use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::terrain::LayerId;
 use crate::terrain::bake::TerrainSpec;
+use crate::terrain::{LayerId, LayerRole};
 use watershed::raster::Raster;
 
 /// Why a document could not be solved. Every variant is about the document's state
@@ -304,13 +304,31 @@ impl TerrainSpec {
     }
 
     /// Removes the water from the document entirely — the solved state *and* the
-    /// spec that produced it, so nothing will re-solve it.
+    /// spec that produced it, so opening the document does not re-solve it.
     ///
     /// This is "this document has no water", not "this answer is stale"; for the
     /// latter use [`TerrainSpec::invalidate_water`].
     pub fn clear_water(&mut self) {
         self.water = None;
         self.water_spec = None;
+    }
+
+    /// The spec a document carrying none is solved from: over the layer declaring
+    /// [`LayerRole::Height`], weighted by the layer declaring [`LayerRole::Moisture`]
+    /// when there is one, at the default lake threshold. `None` when no layer declares
+    /// the height role.
+    pub fn water_spec_from_roles(&self) -> Option<WaterSpec> {
+        let declaring = |role| {
+            self.layers
+                .iter()
+                .find(|layer| layer.role == role)
+                .map(|layer| layer.id.clone())
+        };
+        let spec = WaterSpec::new(declaring(LayerRole::Height)?);
+        Some(match declaring(LayerRole::Moisture) {
+            Some(moisture) => spec.with_moisture(moisture),
+            None => spec,
+        })
     }
 
     /// Drops the solved state and **keeps the spec**, which is the difference between
@@ -945,6 +963,23 @@ mod tests {
         terrain.clear_water();
         assert!(terrain.water().is_none());
         assert!(terrain.water_spec.is_none());
+    }
+
+    // A document whose water was reset carries no spec, and this is what the next solve
+    // falls back to; it has to find the layers by the roles their files declare, not by
+    // name, or a document whose height is not called `height` is never solvable again.
+    #[test]
+    fn a_spec_is_derived_from_the_height_and_moisture_roles() {
+        let terrain = TerrainSpec::new(UVec2::new(16, 16))
+            .with_layer(Layer::new("wet").with_role(LayerRole::Moisture))
+            .with_layer(Layer::new("ground").with_role(LayerRole::Height));
+        assert_eq!(
+            terrain.water_spec_from_roles(),
+            Some(WaterSpec::new("ground").with_moisture("wet"))
+        );
+
+        let unroled = TerrainSpec::new(UVec2::new(16, 16)).with_layer(Layer::new("height"));
+        assert_eq!(unroled.water_spec_from_roles(), None);
     }
 
     // The moisture layer is sampled per cell and multiplies what that cell
