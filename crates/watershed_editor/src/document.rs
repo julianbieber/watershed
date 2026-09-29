@@ -829,16 +829,24 @@ impl Document {
     /// its shaders gives a drainage network for a landscape that no longer exists. Use
     /// [`Document::solve_with_bake`] to bake first.
     ///
-    /// Also refused when the document carries no water spec, which is what a document
-    /// that has had its water reset is being told.
+    /// A document carrying no water spec — one whose water was reset — is solved from
+    /// [`TerrainSpec::water_spec_from_roles`], and the solve gives it that spec back.
+    /// Refused when it carries none and no layer declares the height role.
     pub fn start_solve(&mut self) -> Result<(), String> {
         if self.baked != Baked::Whole || self.dirty {
             return Err("the document is only partly baked; bake it before solving".to_owned());
         }
         let mut terrain = self.take_terrain()?;
-        let Some(spec) = terrain.water_spec.clone() else {
+        let Some(spec) = terrain
+            .water_spec
+            .clone()
+            .or_else(|| terrain.water_spec_from_roles())
+        else {
             self.terrain = Some(terrain);
-            return Err("the document carries no water spec".to_owned());
+            return Err(
+                "the document carries no water spec and no layer declares the height role"
+                    .to_owned(),
+            );
         };
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
@@ -852,7 +860,8 @@ impl Document {
         Ok(())
     }
 
-    /// Removes the water and its spec, so nothing will re-solve it. Refused while a
+    /// Removes the water and its spec, so opening the document does not re-solve it; a
+    /// later solve derives a spec from the layers' roles. Refused while a
     /// job is running or with no document open.
     ///
     /// Synchronous, unlike solving: dropping a solved state is a deallocation and
@@ -1265,6 +1274,28 @@ mod tests {
             })
             .unwrap();
         assert!(reply.is_object(), "{reply}");
+        std::fs::remove_dir_all(document.path.unwrap()).unwrap();
+    }
+
+    // The defect this guards was reported from the running editor as "I used solve water
+    // once and reset; since then I can't generate water again": reset drops the spec, and
+    // the solve refused any document without one, so the first reset was permanent.
+    #[test]
+    fn a_document_whose_water_was_reset_solves_again() {
+        let mut document = two_layer_document("reset-then-solve");
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        document.reset_water().unwrap();
+        assert!(document.terrain().unwrap().water_spec.is_none());
+
+        document.start_solve().unwrap();
+        let Job::Running { task, .. } = std::mem::replace(&mut document.job, Job::Idle) else {
+            panic!("the solve did not start");
+        };
+        let outcome = block_on(task);
+        assert_eq!(outcome.error, None);
+        let terrain = outcome.terrain.unwrap();
+        assert!(terrain.water().is_some());
+        assert_eq!(terrain.water_spec, Some(WaterSpec::new("height")));
         std::fs::remove_dir_all(document.path.unwrap()).unwrap();
     }
 

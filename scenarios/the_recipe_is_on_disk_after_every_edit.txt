@@ -40,9 +40,12 @@ wait idle
 observe document
 
 # The water spec `continents` set on `new` is already in the recipe; resetting it
-# clears it. There is no verb that hands the document a fresh spec once reset has
-# cleared the one it had, so this is the one direction the socket can drive.
+# clears it, and solving again writes back the spec the layers' roles describe.
 reset-water
+wait idle
+observe water
+
+solve-water
 wait idle
 observe water
 
