@@ -55,7 +55,7 @@ bevy-lints:
 	@env \
 	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
-	bevy_lint --locked --package watershed_editor --all-targets --profile ci --all-features
+	bevy_lint --locked --ignore-rust-version --package watershed_editor --all-targets --profile ci --all-features
 
 # Install Bevy linter via the Bevy CLI installer, then ensure bevy_lint exists
 bevy-lint-install:

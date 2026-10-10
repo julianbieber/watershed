@@ -95,9 +95,10 @@ jobs:
 
       - uses: extractions/setup-just@v3
 
-      # Pinned to a bevy_cli main commit rather than a release tag: the workspace
-      # builds against a commit of Bevy main, and no bevy_lint release runs on
-      # Bevy main. Re-pin to a release tag together with the Bevy 0.20 re-pin.
+      # Pinned to a bevy_cli main commit rather than a release tag: the latest
+      # bevy_lint release (lint-v0.6.0) runs nightly-2026-01-22 and cannot lint
+      # Bevy 0.20. The Justfile passes --ignore-rust-version because this
+      # bevy_lint's nightly is 1.97.0 while Bevy 0.20 declares 1.97.1.
       - name: Install Rust toolchain (plus bevy_lint)
         uses: TheBevyFlock/bevy_cli/bevy_lint@1cccc95a22aae532cefd7d9a1e92a6073c221930
         with:

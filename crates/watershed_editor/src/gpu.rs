@@ -287,6 +287,20 @@ fn compile_fault(file: &str, description: &str) -> String {
             (path.starts_with("watershed/layers/") && path.ends_with(&format!("/{file}")))
                 .then_some(line)
         });
+    let own = own.or_else(|| {
+        lines()
+            .any(|line| line.starts_with("= note:") && line.ends_with("in unknown module"))
+            .then(|| {
+                lines().find_map(|line| {
+                    let (number, rest) = line.split_once('|')?;
+                    let number = number.trim();
+                    (rest.is_empty() || rest.starts_with(' '))
+                        .then(|| number.parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .flatten()
+    });
     match own {
         Some(line) => format!("line {line}: {message}"),
         None => message.to_owned(),
