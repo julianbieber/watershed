@@ -30,6 +30,7 @@ use crate::edit::{Edit, Slot, check_add, check_remove};
 use crate::gpu::{self, ShaderRuntime};
 use crate::history::{History, HistoryDepth, Restored, Snapshot};
 use crate::preset::Preset;
+use crate::shaders;
 use crate::terrain::Layer;
 use crate::terrain::recipe::{self, RecipeMeta};
 use crate::terrain::shader::SHADER_DIR;
@@ -770,7 +771,8 @@ impl Document {
     ///
     /// The preset's files and the recipe are in `dir` before this returns: the shader
     /// files as [`gpu::write_preset`] writes them, **deleting every other `.wesl`
-    /// file already there**, then `recipe.ron` from the built (unbaked) spec. Refused
+    /// file already there**, the package as [`shaders::prepare`] writes it, then
+    /// `recipe.ron` from the built (unbaked) spec. Refused
     /// at the first write that fails, leaving what was done before it. The bake runs
     /// afterwards, off the main thread, dispatching through programs built from the
     /// preset's own sources on the device the document last had.
@@ -788,6 +790,7 @@ impl Document {
     ) -> Result<(), String> {
         self.replace_check()?;
         gpu::write_preset(&dir.join(SHADER_DIR), preset)?;
+        shaders::prepare(&dir)?;
         let runtime = self.runtime.with_sources(
             seed,
             preset.files().iter().filter_map(|(layer, stock)| {
@@ -946,11 +949,12 @@ impl Document {
     /// The bake dispatches each layer's shader through programs built from the
     /// document's own `shaders` directory, on the device the document last had.
     ///
-    /// Before the read starts, **overwrites that directory's `lib.wesl` and `wesl.toml`**
-    /// with this build's library. A write that fails is logged and the load goes on.
+    /// Before the read starts, **overwrites the package** in `path` as
+    /// [`shaders::prepare`] does, carrying a terrain from before the package across. A
+    /// write that fails is logged and the load goes on.
     pub fn start_load(&mut self, path: PathBuf) -> Result<(), String> {
         self.replace_check()?;
-        if let Err(error) = gpu::write_library(&path.join(SHADER_DIR)) {
+        if let Err(error) = shaders::prepare(&path) {
             warn!("{error}");
         }
         let base = self.runtime.clone();
@@ -1902,21 +1906,20 @@ mod tests {
         std::fs::remove_dir_all(&path).unwrap();
     }
 
-    // An IDE resolves a layer's import against `shaders/lib.wesl`, so opening a document
-    // has to put this build's library there whatever the file held before.
+    // A language server resolves a layer's import against the package copy, so opening a document has to put this build's library there whatever the copy held before.
     #[test]
-    fn opening_a_document_overwrites_its_library_file() {
+    fn opening_a_document_overwrites_its_package_copy() {
         let path = scratch("library");
-        let shaders = path.join(SHADER_DIR);
-        std::fs::create_dir_all(&shaders).unwrap();
-        std::fs::write(shaders.join(gpu::LIBRARY_FILE), "edited").unwrap();
+        let copy = path.join(shaders::PACKAGE_DIR).join("lib.wesl");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, "edited").unwrap();
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
 
         let mut document = Document::default();
         document.start_load(path.clone()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(shaders.join(gpu::LIBRARY_FILE)).unwrap(),
-            gpu::library_source()
+            std::fs::read_to_string(&copy).unwrap(),
+            shaders::library_source()
         );
         let _ = std::fs::remove_dir_all(&path);
     }

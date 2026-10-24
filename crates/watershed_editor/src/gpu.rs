@@ -23,6 +23,7 @@ use wesl::syntax::{GlobalDeclaration, ImportContent, ModulePath, PathOrigin, Tra
 
 use crate::document::{Document, EditorSystems};
 use crate::preset::Preset;
+use crate::shaders;
 use crate::terrain::TerrainSpec;
 use crate::terrain::shader::{
     LayerHeader, LayerRead, ParamsLayout, parse_header, parse_layers, parse_params, parse_retired,
@@ -30,24 +31,15 @@ use crate::terrain::shader::{
 
 use dispatch::{DispatchBridge, DispatchSender, LayerInput};
 
-const LAYER_LIB: &str = include_str!("../assets/shaders/stock/lib.wesl");
-
-const WESL_TOML: &str = include_str!("../assets/shaders/stock/wesl.toml");
-
 const TEMPLATE_SOURCE: &str = include_str!("../assets/shaders/stock/_template.wesl");
-
-const LIBRARY_HEADER: &str = "// The watershed editor overwrites this file whenever a document is opened or created; edits here are lost.";
-
-/// The library's file in a document's shader directory. It is never a layer.
-pub const LIBRARY_FILE: &str = "lib.wesl";
 
 const ENTRY_POINT: &str = r#"
 @compute @workgroup_size(8, 8, 1)
 fn generate(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= package::lib::globals.texels.x || id.y >= package::lib::globals.texels.y {
+    if id.x >= watershed::lib::globals.texels.x || id.y >= watershed::lib::globals.texels.y {
         return;
     }
-    package::lib::layer_out[id.y * package::lib::globals.texels.x + id.x] = value(package::lib::cell_position(id.xy));
+    watershed::lib::layer_out[id.y * watershed::lib::globals.texels.x + id.x] = value(watershed::lib::cell_position(id.xy));
 }
 "#;
 
@@ -112,29 +104,6 @@ fn strip_header(source: &str) -> String {
     prose.trim_matches('\n').to_owned()
 }
 
-/// The library as the editor writes it into a document's shader directory: its first
-/// line says the editor overwrites the file.
-pub fn library_source() -> &'static str {
-    static SOURCE: LazyLock<String> = LazyLock::new(|| format!("{LIBRARY_HEADER}\n{LAYER_LIB}"));
-    &SOURCE
-}
-
-/// Writes the library into `dir` as [`LIBRARY_FILE`], with the `wesl.toml` that lets a
-/// WESL language server resolve `package::lib` to it, **overwriting both** whatever they
-/// held. Creates the directory.
-///
-/// Refused at the first write that fails.
-pub fn write_library(dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    std::fs::write(dir.join(LIBRARY_FILE), library_source())
-        .map_err(|error| format!("{LIBRARY_FILE}: {error}"))?;
-    std::fs::write(dir.join("wesl.toml"), WESL_TOML).map_err(|error| format!("wesl.toml: {error}"))
-}
-
-fn library_shader() -> Shader {
-    Shader::from_wesl(library_source(), LIBRARY_FILE)
-}
-
 fn layer_shader(source: &str, asset_path: &str) -> Shader {
     Shader::from_wesl(assemble(source), asset_path.to_owned())
 }
@@ -147,18 +116,18 @@ fn assemble(source: &str) -> String {
 /// reported as one import per name in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibraryImport {
-    /// The full path of the item or module, as `package::lib::fbm_unit`.
+    /// The full path of the item or module, as `watershed::lib::fbm_unit`.
     pub path: String,
-    /// Whether the path names the library module itself or an item `lib.wesl`
+    /// Whether the path names the library module itself or an item the library
     /// declares. An unresolved import keeps the file from running.
     pub resolved: bool,
 }
 
 fn library_items() -> &'static BTreeSet<String> {
     static ITEMS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
-        let unit = LAYER_LIB
+        let unit = shaders::LIBRARY
             .parse::<TranslationUnit>()
-            .expect("lib.wesl does not parse");
+            .expect("the library does not parse");
         unit.global_declarations
             .iter()
             .filter_map(|declaration| match &**declaration {
@@ -174,10 +143,12 @@ fn library_items() -> &'static BTreeSet<String> {
 }
 
 fn resolves(path: &ModulePath) -> bool {
-    path.origin == PathOrigin::Absolute
+    path.origin == PathOrigin::Package(shaders::PACKAGE.to_owned())
         && match path.components.as_slice() {
-            [module] => module == "lib",
-            [module, item] => module == "lib" && library_items().contains(item),
+            [module] => module == shaders::LIBRARY_MODULE,
+            [module, item] => {
+                module == shaders::LIBRARY_MODULE && library_items().contains(item)
+            }
             _ => false,
         }
 }
@@ -249,8 +220,10 @@ fn declare(source: &str) -> Result<Declared, String> {
         .find(|import| !import.resolved)
     {
         return Err(format!(
-            "`{}` is not in {LIBRARY_FILE}; a layer imports from `package::lib`",
-            import.path
+            "`{}` is not in the library; a layer imports from `{}::{}`",
+            import.path,
+            shaders::PACKAGE,
+            shaders::LIBRARY_MODULE
         ));
     }
     Ok(Declared {
@@ -425,8 +398,8 @@ pub fn template_source() -> &'static str {
 }
 
 /// Makes `dir` hold exactly the shader files of `preset`: creates the directory,
-/// **deletes every `.wesl` file already in it**, writes the library as in
-/// [`write_library`], then writes each layer's `<layer>.wesl` from its stock file.
+/// **deletes every `.wesl` file already in it**, then writes each layer's
+/// `<layer>.wesl` from its stock file.
 ///
 /// Refused at the first removal or write that fails, leaving what was done before it.
 pub fn write_preset(dir: &Path, preset: Preset) -> Result<(), String> {
@@ -441,7 +414,6 @@ pub fn write_preset(dir: &Path, preset: Preset) -> Result<(), String> {
             std::fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         }
     }
-    write_library(dir)?;
     for (layer, stock) in preset.files() {
         let source = stock_source(stock)
             .ok_or_else(|| format!("`{stock}` is not a shader this build ships"))?;
@@ -486,11 +458,11 @@ impl ShaderLibrary {
     }
 
     /// The layers the directory stands for: the stem of every `.wesl` file not
-    /// beginning with `_` and not the library's, in name order.
+    /// beginning with `_`, in name order.
     pub fn layer_names(&self) -> Vec<String> {
         self.entries
             .keys()
-            .filter(|name| !name.starts_with('_') && name.as_str() != LIBRARY_FILE)
+            .filter(|name| !name.starts_with('_'))
             .filter_map(|name| name.strip_suffix(".wesl"))
             .map(str::to_owned)
             .collect()
@@ -507,7 +479,7 @@ fn add_library_shader(mut commands: Commands, shaders: Option<ResMut<Assets<Shad
         return;
     };
     commands.insert_resource(LibraryShader {
-        _handle: shaders.add(library_shader()),
+        _handle: shaders.add(shaders::library_shader()),
     });
 }
 
@@ -662,8 +634,7 @@ impl ShaderRuntime {
         })))
     }
 
-    /// As [`ShaderRuntime::with_sources`], over every `.wesl` file in `dir` but the
-    /// library's. A directory that does not exist, or a file that cannot be read,
+    /// As [`ShaderRuntime::with_sources`], over every `.wesl` file in `dir`. A directory that does not exist, or a file that cannot be read,
     /// contributes no source.
     pub fn with_directory(&self, seed: u32, dir: &Path) -> Self {
         if self.0.is_none() {
@@ -675,7 +646,7 @@ impl ShaderRuntime {
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".wesl") || name == LIBRARY_FILE {
+                if !name.ends_with(".wesl") {
                     return None;
                 }
                 let source = std::fs::read_to_string(entry.path()).ok()?;
@@ -795,7 +766,7 @@ fn scan(
             wgsl.insert(name);
             continue;
         }
-        if !name.ends_with(".wesl") || name == LIBRARY_FILE {
+        if !name.ends_with(".wesl") {
             continue;
         }
         seen.push(name.clone());
@@ -1116,7 +1087,7 @@ mod tests {
             uuid: Uuid::from_u128(n),
         };
         let mut cache = ShaderCache::<(), ()>::new((), validated);
-        cache.set_shader(id(1), library_shader());
+        cache.set_shader(id(1), shaders::library_shader());
         cache.set_shader(
             id(2),
             layer_shader(source, &format!("watershed/layers/v0/{file}")),
@@ -1179,7 +1150,7 @@ mod tests {
             "the reference still carries comment markers"
         );
         for needle in [
-            "import package::lib",
+            "import watershed::lib",
             "uv(",
             "document_extent(",
             "@ui",
@@ -1200,7 +1171,7 @@ mod tests {
     fn every_library_function_is_named_in_the_reference() {
         let reference = shader_reference();
         let internal = ["hash2", "gradient", "fade"];
-        for line in LAYER_LIB.lines() {
+        for line in shaders::LIBRARY.lines() {
             let Some(rest) = line.strip_prefix("fn ") else {
                 continue;
             };
@@ -1220,8 +1191,8 @@ mod tests {
     // layer example would make every layer copied from the template read `base`.
     #[test]
     fn the_headers_worked_examples_compile_and_its_examples_declare_nothing() {
-        let items = "import package::lib::{fbm_unit, uv};\n\nfn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(uv(p) * 4.0, 4u, 0.5, 2.0);\n}\n";
-        let module = "import package::lib;\n\nfn value(p: vec2<f32>) -> f32 {\n    return lib::fbm_unit(lib::uv(p) * 4.0, 4u, 0.5, 2.0);\n}\n";
+        let items = "import watershed::lib::{fbm_unit, uv};\n\nfn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(uv(p) * 4.0, 4u, 0.5, 2.0);\n}\n";
+        let module = "import watershed::lib;\n\nfn value(p: vec2<f32>) -> f32 {\n    return lib::fbm_unit(lib::uv(p) * 4.0, 4u, 0.5, 2.0);\n}\n";
         for source in [items, module] {
             if let Err(error) = compiles("height.wesl", source) {
                 panic!("the header's worked example does not compile: {error}\n{source}");
@@ -1239,7 +1210,7 @@ mod tests {
     // read no shader can make.
     #[test]
     fn a_shader_reading_a_layer_through_the_helper_compiles() {
-        let source = "import package::lib::{layer_shift, layer_value};\n\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) + f32(layer_shift(base));\n}\n";
+        let source = "import watershed::lib::{layer_shift, layer_value};\n\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) + f32(layer_shift(base));\n}\n";
         assert_eq!(parse_layers(source).unwrap().len(), 1);
         if let Err(error) = compiles("height.wesl", source) {
             panic!("a read of a named layer does not compile: {error}");
@@ -1311,19 +1282,20 @@ mod tests {
 
     // The check that keeps a bad import off the pipeline is only as good as its reading
     // of the import grammar: collections and the module form reach the library, and
-    // nothing else does.
+    // nothing else does — `package::lib` included, which is where it used to be.
     #[test]
     fn imports_resolve_only_to_the_library_module_and_what_it_declares() {
-        let source = "import package::lib::{fbm_unit, uv};\nimport package::lib;\nimport package::lib::nonesuch;\nimport super::lib::uv;\nimport other::x;\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
+        let source = "import watershed::lib::{fbm_unit, uv};\nimport watershed::lib;\nimport watershed::lib::nonesuch;\nimport package::lib::uv;\nimport super::lib::uv;\nimport other::x;\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
         let read: Vec<(String, bool)> = read_imports(source)
             .into_iter()
             .map(|import| (import.path, import.resolved))
             .collect();
         let expected = [
-            ("package::lib::fbm_unit", true),
-            ("package::lib::uv", true),
-            ("package::lib", true),
-            ("package::lib::nonesuch", false),
+            ("watershed::lib::fbm_unit", true),
+            ("watershed::lib::uv", true),
+            ("watershed::lib", true),
+            ("watershed::lib::nonesuch", false),
+            ("package::lib::uv", false),
             ("super::lib::uv", false),
             ("other::x", false),
         ]
@@ -1335,11 +1307,11 @@ mod tests {
     // that never arrives, so the file is refused before it reaches one.
     #[test]
     fn a_file_importing_what_the_library_does_not_declare_is_refused_naming_the_import() {
-        let source = "import package::lib::{fbm_unit, nonesuch};\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
+        let source = "import watershed::lib::{fbm_unit, nonesuch};\n\nfn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n";
         let error = declare(source)
             .err()
             .expect("an unresolved import was accepted");
-        assert!(error.contains("`package::lib::nonesuch`"), "{error}");
+        assert!(error.contains("`watershed::lib::nonesuch`"), "{error}");
     }
 
     // A `.wgsl` left in the directory is seen on every scan, and the log has to name it
@@ -1354,19 +1326,20 @@ mod tests {
         assert_eq!(note_ignored(&mut ignored, old()), ["old.wgsl"]);
     }
 
-    // `lib.wesl` and a template sit beside the layers in one directory, and neither may
-    // come back as a layer of the document.
+    // A template sits beside the layers in one directory and may not come back as a
+    // layer of the document; a `lib.wesl` there is a layer like any other, since the
+    // library is no longer a file of the document.
     #[test]
-    fn neither_the_library_nor_a_template_is_a_layer() {
+    fn a_template_is_not_a_layer_and_lib_is() {
         let mut library = ShaderLibrary::reading(
             "height.wesl",
             "fn value(p: vec2<f32>) -> f32 {\n    return 0.0;\n}\n",
         );
         let entry = library.entries["height.wesl"].clone();
-        for file in [LIBRARY_FILE, "_template.wesl"] {
+        for file in ["lib.wesl", "_template.wesl"] {
             library.entries.insert(file.to_owned(), entry.clone());
         }
-        assert_eq!(library.layer_names(), ["height"]);
+        assert_eq!(library.layer_names(), ["height", "lib"]);
     }
 
     // Programs are built before the GPU has compiled anything, so only a declaration can keep a file out; a compile fault is the dispatch's to answer.
@@ -1400,8 +1373,8 @@ mod tests {
     fn a_file_keeps_its_shader_asset_only_while_its_layer_bindings_stay_the_same() {
         let mut shaders = Assets::<Shader>::default();
         let mut next = 0;
-        let reads = "import package::lib::layer_value;\n\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p);\n}\n";
-        let tuned = "import package::lib::layer_value;\n\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) * 0.5;\n}\n";
+        let reads = "import watershed::lib::layer_value;\n\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p);\n}\n";
+        let tuned = "import watershed::lib::layer_value;\n\n@group(0) @binding(3) var base: texture_2d<f32>; // @layer base\n\nfn value(p: vec2<f32>) -> f32 {\n    return layer_value(base, p) * 0.5;\n}\n";
         let first = read_entry(
             "height.wesl",
             reads.to_owned(),
@@ -1522,23 +1495,18 @@ mod tests {
 
     // A preset's `new` has to leave exactly its own layers' files on disk, as this
     // build ships them: a file left from an earlier document would become a layer of
-    // this one, and a library edited by hand would not be the one that compiles.
+    // this one.
     #[test]
-    fn writing_a_preset_removes_stale_files_and_writes_the_library_and_one_file_per_layer() {
+    fn writing_a_preset_removes_stale_files_and_writes_one_file_per_layer() {
         let dir = std::env::temp_dir().join(format!("watershed-preset-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("stale.wesl"), "edited").unwrap();
-        std::fs::write(dir.join(LIBRARY_FILE), "edited").unwrap();
         std::fs::write(dir.join("notes.txt"), "kept").unwrap();
 
         write_preset(&dir, Preset::Ridges).unwrap();
         assert!(!dir.join("stale.wesl").exists());
         assert!(dir.join("notes.txt").is_file());
-        let library = std::fs::read_to_string(dir.join(LIBRARY_FILE)).unwrap();
-        assert_eq!(library.lines().next(), Some(LIBRARY_HEADER));
-        assert_eq!(library, library_source());
-        assert!(dir.join("wesl.toml").is_file());
         assert_eq!(
             std::fs::read_to_string(dir.join("base.wesl")).unwrap(),
             stock_source("base.wesl").unwrap()

@@ -591,7 +591,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(ShaderLibrary::reading(
             "height.wesl",
-            "import package::lib::{fbm_unit, seed_offset};\n\nfn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(p + seed_offset(1u, 2u), 4u, 0.5, 2.0);\n}\n",
+            "import watershed::lib::{fbm_unit, seed_offset};\n\nfn value(p: vec2<f32>) -> f32 {\n    return fbm_unit(p + seed_offset(1u, 2u), 4u, 0.5, 2.0);\n}\n",
         ));
 
         let answer = shaders(&mut world);
@@ -599,8 +599,8 @@ mod tests {
         assert_eq!(
             file["imports"],
             json!([
-                { "path": "package::lib::fbm_unit", "resolved": true },
-                { "path": "package::lib::seed_offset", "resolved": true },
+                { "path": "watershed::lib::fbm_unit", "resolved": true },
+                { "path": "watershed::lib::seed_offset", "resolved": true },
             ])
         );
         assert_eq!(file["error"], Value::Null);

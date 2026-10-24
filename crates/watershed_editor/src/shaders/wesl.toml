@@ -1,0 +1,4 @@
+# The WESL package `watershed` that every layer imports. The editor writes this file,
+# with lib.wesl beside it, into a terrain's `.watershed/` directory.
+edition = "2026_pre"
+root = "."

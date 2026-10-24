@@ -1,4 +1,4 @@
-import package::lib::ridged_fbm;
+import watershed::lib::ridged_fbm;
 
 struct Params {
     // @group Shape

@@ -174,3 +174,33 @@ jobs:
 
       - name: Check web
         run: just check-web
+
+  # Tag every push to main that passes as v0.<n+1>, so a project can pin the editor
+  # with mise.
+  tag:
+    name: Tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [format, docs, clippy-lints, bevy-lints, tests, check-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: tag-main
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag the build v0.<n+1>
+        run: |
+          if git tag --points-at "$GITHUB_SHA" | grep -q '^v0\.'; then
+            echo "$GITHUB_SHA is already tagged"
+            exit 0
+          fi
+          last=$(git tag --list 'v0.*' --sort=-v:refname | head -1)
+          next="v0.$(( ${last:+${last#v0.}} + 1 ))"
+          git tag "$next" "$GITHUB_SHA"
+          git push origin "$next"
+          echo "Tagged $GITHUB_SHA as $next" >> "$GITHUB_STEP_SUMMARY"

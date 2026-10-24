@@ -1,4 +1,7 @@
-# Written by the watershed editor beside lib.wesl, so a WESL language server
-# resolves `package::lib` to that file.
+# The stock shaders, as a package of their own so a language server resolves their
+# `watershed::lib` imports against the package in this checkout.
 edition = "2026_pre"
 root = "."
+
+[dependencies]
+watershed = { path = "../../../src/shaders" }

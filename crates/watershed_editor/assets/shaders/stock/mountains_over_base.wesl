@@ -1,6 +1,6 @@
 // @role height
 
-import package::lib::{fbm_unit, layer_value, ridged_fbm, seed_offset};
+import watershed::lib::{fbm_unit, layer_value, ridged_fbm, seed_offset};
 
 struct Params {
     // @group Ridges

@@ -1,4 +1,4 @@
-import package::lib::fbm_unit;
+import watershed::lib::fbm_unit;
 
 // A layer's shader: one compute shader that produces every value of one layer. The
 // file is the layer — it lives in the document's `shaders` directory as
@@ -14,7 +14,7 @@ import package::lib::fbm_unit;
 // `document_extent()`, the cells the document spans; on a document wider than it is
 // tall that stretches, because it runs 0..1 on both axes.
 //
-//   import package::lib::{fbm_unit, uv};
+//   import watershed::lib::{fbm_unit, uv};
 //
 //   fn value(p: vec2<f32>) -> f32 {
 //       return fbm_unit(uv(p) * 4.0, 4u, 0.5, 2.0);
@@ -36,15 +36,16 @@ import package::lib::fbm_unit;
 //
 // THE LIBRARY
 //
-// `lib.wesl`, which the editor writes beside this file and overwrites whenever a
+// The module `lib` of the WESL package `watershed`, which the editor provides. A copy
+// for a language server is in `.watershed/` beside `shaders/`, overwritten whenever a
 // document is opened or created. Nothing in it is available without an import, at the
 // top of the file and before any declaration. Import the items a file calls:
 //
-//   import package::lib::{fbm_unit, uv};
+//   import watershed::lib::{fbm_unit, uv};
 //
 // or the module, and name each item through it:
 //
-//   import package::lib;
+//   import watershed::lib;
 //
 //   ... lib::uv(p) ...
 //

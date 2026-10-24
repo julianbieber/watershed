@@ -1,2 +1,5 @@
 /target
 /.cargo/config.toml
+/example/.watershed/
+/example/terrain.ron
+/example/layer_*.png

@@ -1,8 +1,8 @@
 // What every layer's shader is compiled against: the bindings a dispatch supplies, and
 // the noise primitives a shader is expected to reach for.
 //
-// A layer imports what it uses from `package::lib`; nothing here is available to a
-// layer without that import. The Rust half of this file is `gpu.rs`, which writes
+// A layer imports what it uses from `watershed::lib`; nothing here is available to
+// a layer without that import. The Rust half of this file is `gpu.rs`, which writes
 // `Globals` out as `DispatchGlobals`. A change here is a change there.
 
 // Everything a shader is told about where it is being evaluated. Positions are in

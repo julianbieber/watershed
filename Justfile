@@ -1,4 +1,6 @@
-# Every way this repository is built, checked, run and driven.
+# Developing this repository: every way it is built, checked, run and driven. A path
+# argument resolves against the directory just is called from, as it does for the
+# installed binaries. Other projects use those binaries, pinned with mise, not this file.
 #
 # `all` is CI's order and CI runs nothing else, so a check that is not reachable from it
 # is a check that does not happen.
@@ -12,6 +14,7 @@ RUSTDOCFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 WASM_TARGET := "wasm32-unknown-unknown"
 CONTROL_SOCKET := "/tmp/watershed-control.sock"
 PROJECT := "/tmp/watershed-project"
+EXAMPLE := justfile_directory() / "example"
 
 # Default: list recipes
 default:
@@ -21,13 +24,6 @@ default:
 deps:
 	@sudo apt-get update
 	@sudo apt-get install --no-install-recommends -y libasound2-dev libudev-dev libwayland-dev clang mesa-vulkan-drivers
-
-# Put `watershed_editor` and `watershed-ctl` on PATH, built from this checkout.
-install:
-	@env \
-	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
-	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
-	cargo install --locked --path crates/watershed_editor
 
 # Format check
 fmt:
@@ -80,12 +76,12 @@ all: fmt docs clippy bevy-lints test check-web check-goals
 clean:
 	@cargo clean
 
-# Run the editor on a project directory
-run DIR:
+# Run this checkout's editor on a terrain directory, by default example/
+run DIR=EXAMPLE:
 	@env \
 	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
-	cargo run --package watershed_editor -- {{DIR}}
+	cargo run --package watershed_editor -- {{quote(join(invocation_directory(), DIR))}}
 
 # Start the editor with its control socket open, on a scratch project directory so the
 # repository root is never made a project by accident. Release, because a scenario

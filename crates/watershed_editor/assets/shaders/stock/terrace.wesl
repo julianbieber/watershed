@@ -1,4 +1,4 @@
-import package::lib::fbm_unit;
+import watershed::lib::fbm_unit;
 
 struct Params {
     // @group Shape

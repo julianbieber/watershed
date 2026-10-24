@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 
 use crate::document::Document;
+use crate::shaders;
 use crate::terrain::recipe::RECIPE_FILE;
 use crate::terrain::shader::SHADER_DIR;
 
@@ -45,16 +46,19 @@ pub fn holds_terrain(dir: &Path) -> bool {
     dir.join(RECIPE_FILE).is_file() || dir.join(SHADER_DIR).is_dir()
 }
 
-/// Removes exactly what makes `dir` a project holding a terrain: `shaders/` whole,
+/// Removes exactly what makes `dir` a project holding a terrain, and the package the
+/// editor writes beside it: `shaders/` and `.watershed/` whole, `wesl.toml`,
 /// `recipe.ron`, `terrain.ron`, and every `layer_<n>.png`. Nothing else in the
 /// directory is touched, and a file that is already missing is not a failure.
 pub fn clear_terrain(dir: &Path) -> Result<(), String> {
-    let shaders = dir.join(SHADER_DIR);
-    if shaders.is_dir() {
-        std::fs::remove_dir_all(&shaders)
-            .map_err(|error| format!("{}: {error}", shaders.display()))?;
+    for name in [SHADER_DIR, shaders::PACKAGE_DIR] {
+        let path = dir.join(name);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
     }
-    for name in [RECIPE_FILE, watershed::io::META_FILE] {
+    for name in [RECIPE_FILE, watershed::io::META_FILE, shaders::MANIFEST] {
         let path = dir.join(name);
         if path.is_file() {
             std::fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -278,8 +282,9 @@ mod tests {
     // The destructive half: every kind of file a project is made of goes, and nothing
     // else in the directory is touched.
     #[test]
-    fn clear_terrain_removes_exactly_the_four_kinds_and_leaves_the_rest() {
+    fn clear_terrain_removes_exactly_what_the_editor_writes_and_leaves_the_rest() {
         let dir = scratch("clear");
+        crate::shaders::prepare(&dir).unwrap();
         std::fs::create_dir_all(dir.join(SHADER_DIR)).unwrap();
         std::fs::write(dir.join(SHADER_DIR).join("height.wesl"), "height").unwrap();
         std::fs::write(dir.join(RECIPE_FILE), "recipe").unwrap();
@@ -291,6 +296,8 @@ mod tests {
         clear_terrain(&dir).unwrap();
 
         assert!(!dir.join(SHADER_DIR).exists());
+        assert!(!dir.join(crate::shaders::PACKAGE_DIR).exists());
+        assert!(!dir.join(crate::shaders::MANIFEST).exists());
         assert!(!dir.join(RECIPE_FILE).exists());
         assert!(!dir.join(watershed::io::META_FILE).exists());
         assert!(!dir.join("layer_000.png").exists());

@@ -22,6 +22,7 @@ mod history;
 mod material;
 mod preset;
 mod project;
+mod shaders;
 mod terrain;
 mod ui;
 mod view;

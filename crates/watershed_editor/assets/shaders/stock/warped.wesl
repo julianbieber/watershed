@@ -1,4 +1,4 @@
-import package::lib::{fbm_unit, gradient_noise};
+import watershed::lib::{fbm_unit, gradient_noise};
 
 struct Params {
     // @group Shape

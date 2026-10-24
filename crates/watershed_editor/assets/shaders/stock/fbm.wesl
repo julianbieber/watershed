@@ -1,7 +1,7 @@
 // @role moisture
 // @shift 4
 
-import package::lib::{fbm_unit, seed_offset};
+import watershed::lib::{fbm_unit, seed_offset};
 
 struct Params {
     // @group Shape

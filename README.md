@@ -58,7 +58,7 @@ the editor was started on — the name it has in whatever you are already editin
 directory with.
 
 ```wesl
-import package::lib::ridged_fbm;
+import watershed::lib::ridged_fbm;
 
 struct Params {
     // @group Shape
@@ -77,14 +77,34 @@ fn value(p: vec2<f32>) -> f32 {
 `p` is a position in **document cells**, not a normalised coordinate, so a scale means
 the same thing at every shift. The entry point is appended by the editor; the bindings,
 the noise, `cell_position`, and `uv` and `document_extent` — the 0..1 coordinate across
-the document, and the cells it spans — come from the library, `lib.wesl`.
+the document, and the cells it spans — come from the library, the module `lib` of the
+WESL package `watershed`.
 
-The editor writes `lib.wesl` into `shaders/`, with a `wesl.toml` beside it, on every new
-document and every open, overwriting both each time. A layer imports what it uses from
-`package::lib` — `import package::lib::{fbm_unit, uv};`, or `import package::lib;` and
-then `lib::uv(p)` — and nothing in the library is available without the import. Because
-the library is a file on disk, a WESL language server resolves the import too. A `.wgsl`
+The editor provides that package: it is compiled into the binary, and it is the only
+package a layer can import. A layer imports what it uses from `watershed::lib` —
+`import watershed::lib::{fbm_unit, uv};`, or `import watershed::lib;` and then
+`lib::uv(p)` — and nothing in the library is available without the import. A `.wgsl`
 file in `shaders/` is not a layer, and the log names it.
+
+So that a WESL language server resolves the same import, the editor writes a copy of
+the package into `.watershed/` beside `shaders/`, and a `wesl.toml` naming it, on every
+new document and every open, overwriting all of it each time:
+
+```toml
+edition = "2026_pre"
+root = "shaders"
+
+[dependencies]
+watershed = { path = ".watershed" }
+```
+
+The copy is always the library of the editor that last opened the terrain, so it cannot
+drift from what compiles. Keep `.watershed/` out of version control.
+
+A terrain written before the library was a package — one whose layers import
+`package::lib`, with the editor's `lib.wesl` and `wesl.toml` inside `shaders/` — is
+carried across when it is opened: the two old files are deleted, every `package::lib` in
+a layer's file becomes `watershed::lib`, and the log names each file changed.
 
 A new layer's file arrives with all of this in its own header: every library function,
 the bindings, the coordinate convention and the annotations below, so the file need
@@ -116,7 +136,7 @@ default.
 Another layer of the document, read by naming it after a texture binding's `//`:
 
 ```wesl
-import package::lib::layer_value;
+import watershed::lib::layer_value;
 
 @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 
@@ -153,16 +173,17 @@ on the layer's card and in the log, and the document is not baked until it is me
 
 ### A language server
 
-`shaders/wesl.toml` is what makes the directory a WESL package, so a language server
-resolves `package::lib` to the `lib.wesl` beside it. wgsl-analyzer looks for a manifest
-twice: walking up from the file it is asked about, which finds that one, and once at
+The terrain's `wesl.toml` is what makes `shaders/` a WESL package depending on
+`watershed`, so a language server resolves `watershed::lib` to the copy in
+`.watershed/`. wgsl-analyzer looks for a manifest twice: walking up from the file it is
+asked about, which finds that one, and once at
 whatever directory the editor hands it as the project root. The second is the game's own
 root, and there it takes the first of `wesl-project.json`, `wesl.toml` and `Cargo.toml`
 it meets — a `Cargo.toml` with no `[package.metadata.wgsl-analyzer]` table is a failed
 discovery, and a workspace's virtual manifest makes the analyzer panic and the server
-exit, after which nothing resolves, `shaders/wesl.toml` or not.
+exit, after which nothing resolves, the terrain's `wesl.toml` or not.
 
-Either point the language server at the shaders directory, which in Helix is one line
+Either point the language server at the terrain directory, which in Helix is one line
 under the `wgsl` language:
 
 ```toml
@@ -178,6 +199,9 @@ its own `Cargo.toml`:
 [package.metadata.wgsl-analyzer]
 edition = "2026_pre"
 root = "assets/terrain/shaders"
+
+[package.metadata.wgsl-analyzer.dependencies]
+watershed = { path = "assets/terrain/.watershed" }
 ```
 
 A game that is a workspace cannot — the table is read only on a package's manifest — and
@@ -206,8 +230,8 @@ A terrain is a directory.
 | `layer_<n>.png` | the values, eight bits to a channel | both |
 | `recipe.ron` | the extent, the seed, the water spec, and per layer its parameter values — written after every edit, not only on Save | the editor |
 | `shaders/*.wesl` | one file per layer | the editor |
-| `shaders/lib.wesl` | the library, overwritten by the editor | the editor |
-| `shaders/wesl.toml` | the package root, for a language server | a language server |
+| `wesl.toml` | the package root and its `watershed` dependency, overwritten by the editor | a language server |
+| `.watershed/` | the editor's copy of the `watershed` package, overwritten by the editor | a language server |
 
 A `layer_<n>.png` is not an authored layer: it is an image the library packs the values
 of every layer at one shift into, and `terrain.ron` calls the authored ones `fields`.
@@ -229,16 +253,26 @@ The split is what makes the boundary real: a reader of values never parses a sha
 so it never needs the types a layer's shader is made of. A directory whose recipe has
 been deleted is still a terrain.
 
-## Installing
+## Using it in a game
+
+A terrain lives in the game that needs it, not here. Pin the editor in that project
+with [mise](https://mise.jdx.dev); every push to `main` that passes CI is tagged
+`v0.<n>`, counting up from `v0.1`:
 
 ```console
-$ just install          # cargo install --locked --path crates/watershed_editor
+$ mise use "cargo:https://github.com/julianbieber/watershed@tag:v0.1"
 ```
 
-That puts `watershed_editor` and `watershed-ctl` in `~/.cargo/bin`. Both are
-self-contained: every stock shader, the library, the template and `wesl.toml` are
-compiled into the editor, so it reads nothing from an `assets` directory beside the
-executable and needs no checkout to run from.
+mise builds it with `cargo install`, so it needs a Rust toolchain (stable is enough) and
+bevy's system libraries (on Debian/Ubuntu: `libasound2-dev libudev-dev
+libwayland-dev libxkbcommon-dev`). It records the pin in the project's `mise.toml` and
+puts `watershed_editor` and `watershed-ctl` on the `PATH` inside the project (with
+`mise activate` in your shell; otherwise prefix the commands with `mise exec --`). Both
+are self-contained: every stock shader, the library and the template are compiled into
+the editor, so it needs no checkout of this repository to run.
+
+The game depends on the `watershed` crate to read what the editor wrote, not on the
+editor.
 
 ### A terrain inside a game
 
@@ -246,19 +280,20 @@ Make a directory in the game, run the editor in it, and edit the `.wesl` files
 beside it. With no argument the editor takes the working directory:
 
 ```console
-$ mkdir -p ~/games/lakes/assets/terrain
-$ cd ~/games/lakes/assets/terrain
+$ mkdir -p assets/terrain
+$ cd assets/terrain
 $ watershed_editor
 ```
 
 It opens on the New dialog, because the directory holds no terrain. Create writes
-`shaders/` and `recipe.ron` into it; the shaders are edited there, in the game's own
-tree, and the editor re-bakes as they are saved. Save writes the values. The game
-ends up with:
+`shaders/`, the package and `recipe.ron` into it; the shaders are edited there, in the
+game's own tree, and the editor re-bakes as they are saved. Save writes the values. The
+game ends up with:
 
 ```text
 lakes/
   Cargo.toml
+  mise.toml           <- pins watershed_editor
   src/
     main.rs           <- Terrain::load_from_dir("assets/terrain")
   assets/
@@ -266,16 +301,15 @@ lakes/
       terrain.ron     <- the extent, the fields, the water
       layer_000.png   <- the values
       recipe.ron      <- what the editor authors from
+      wesl.toml       <- overwritten by the editor
+      .watershed/     <- overwritten by the editor; keep it out of version control
       shaders/
         height.wesl   <- edited in the game's tree, re-baked as it is saved
         moisture.wesl
-        lib.wesl      <- overwritten by the editor
-        wesl.toml
 ```
 
-The game depends on the `watershed` library and reads that directory; it never
-builds a terrain at run time. `crates/watershed/examples/load_terrain.rs` is the
-worked example.
+The game reads that directory; it never builds a terrain at run time.
+`crates/watershed/examples/load_terrain.rs` is the worked example.
 
 `watershed-ctl` drives a running editor over the socket named by
 `WATERSHED_CONTROL`, and the editor opens one only when that variable is set:
@@ -285,14 +319,23 @@ $ WATERSHED_CONTROL=/tmp/watershed-control.sock watershed_editor &
 $ WATERSHED_CONTROL=/tmp/watershed-control.sock watershed-ctl observe document
 ```
 
-## Commands
+## Developing it
 
-`just --list` is the entry point.
+The `Justfile` is for working on this repository; `just --list` is the entry point. Its
+recipes build from this checkout, and a path argument resolves against the directory
+`just` is called from, so this checkout's editor opens a terrain anywhere:
+
+```console
+$ just run                       # opens example/
+$ just run ../lakes/assets/terrain
+```
+
+`example/` is a terrain made with the `ridges` preset. Running the editor on it rewrites
+its `recipe.ron` after every edit and its package on every open, as it would in a game.
 
 | | |
 |---|---|
-| `just install` | put `watershed_editor` and `watershed-ctl` on `PATH` |
-| `just run <dir>` | run the editor on a project directory (no argument to `just run` is an error; the editor itself takes the working directory) |
+| `just run [dir]` | run this checkout's editor on a terrain directory, by default `example/` |
 | `just test` | `cargo test --locked --workspace` |
 | `just clippy` | Clippy over all targets/features on the `ci` profile |
 | `just bevy-lints` | Bevy-specific lints over the editor (needs `bevy_lint`; install via `just bevy-lint-install`) |
@@ -301,6 +344,11 @@ $ WATERSHED_CONTROL=/tmp/watershed-control.sock watershed-ctl observe document
 | `just check-web` | wasm32 compile check of the library |
 | `just all` | everything, in CI order |
 | `just deps` | apt packages CI needs (alsa, udev, wayland headers) |
+| `just drive-start`, `just drive …` | run the editor with its control socket open and send it commands |
+
+The stock shaders in `crates/watershed_editor/assets/shaders/stock` resolve
+`watershed::lib` against the package source, `crates/watershed_editor/src/shaders`,
+through their own `wesl.toml`.
 
 ## Licence
 
