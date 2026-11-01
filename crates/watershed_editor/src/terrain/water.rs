@@ -27,11 +27,6 @@ pub enum WaterError {
     /// The spec names a moisture layer the document does not carry.
     #[error("moisture layer `{0}` is not in the document")]
     UnknownMoistureLayer(String),
-    /// The height layer is coarser than the document. Refused rather than
-    /// resampled: a filled surface derived from interpolated texels would route
-    /// water down slopes that are not in the document.
-    #[error("height layer `{0}` is at shift {1}; the solve reads one texel per cell")]
-    CoarseHeight(String, u8),
     /// The height layer has no baked raster at the document's size — it has not
     /// been baked, or was baked and released.
     #[error("height layer `{0}` has not been baked at the document's size")]
@@ -61,8 +56,6 @@ const D8: [(i32, i32); 8] = [
 
 const D8_DISTANCE: [f32; 8] = [1.0, SQRT_2, 1.0, SQRT_2, 1.0, SQRT_2, 1.0, SQRT_2];
 
-const ACCUM_QUANT: f32 = 3900.0;
-
 /// What a solve is to be run over, and the one threshold it takes.
 ///
 /// The height layer is named rather than found by role, so a document can solve
@@ -70,7 +63,7 @@ const ACCUM_QUANT: f32 = 3900.0;
 /// being previewed — without changing which layer its consumers read as the ground.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaterSpec {
-    /// The layer to solve over. Must be in the document, at shift 0, and baked.
+    /// The layer to solve over. Must be in the document, and baked.
     pub height: LayerId,
     /// A layer weighting how much water each cell contributes. `None` gives every
     /// cell a weight of `1.0`, so an accumulation counts cells. Sampled at cell
@@ -127,7 +120,7 @@ impl WaterSpec {
 pub struct WaterState {
     depth: Raster<f32>,
     flow_dir: Raster<u8>,
-    flow_accum: Raster<u16>,
+    flow_accum: Raster<f32>,
     lake_id: Raster<u32>,
     lakes: u32,
 }
@@ -194,9 +187,9 @@ impl WaterState {
         &self.flow_dir
     }
 
-    /// Quantized accumulation codes per cell. Comparable directly, but not a
-    /// quantity — put one through [`dequantize_accumulation`] first.
-    pub fn flow_accum(&self) -> &Raster<u16> {
+    /// The accumulation reaching each cell. For a single cell prefer
+    /// [`WaterState::accumulation`].
+    pub fn flow_accum(&self) -> &Raster<f32> {
         &self.flow_accum
     }
 
@@ -232,33 +225,16 @@ impl WaterState {
     /// How much water reaches a cell: its own weight plus everything draining
     /// through it, so with unit weights it is a count of upstream cells.
     ///
-    /// Recovered from a 16-bit log-scaled code, which costs about a part in 3900 of
-    /// the value wherever on the scale it sits. `0.0` outside the extent.
+    /// Held as an `f32`, so it does not saturate however large the document: the
+    /// precision is relative, as an `f32`'s always is. `0.0` outside the extent.
     pub fn accumulation(&self, x: u32, y: u32) -> f32 {
-        self.flow_accum
-            .get(x, y)
-            .map(|code| dequantize_accumulation(*code))
-            .unwrap_or(0.0)
-    }
-
-    /// The stored code behind [`WaterState::accumulation`], for a caller comparing
-    /// or thresholding rather than measuring.
-    ///
-    /// The quantization is monotone, so ordering codes orders accumulations and a
-    /// threshold can be converted once with [`quantize_accumulation`] instead of
-    /// decoding every cell. Nothing else about the code is a contract: it is not
-    /// proportional to the accumulation and its scale may change.
-    ///
-    /// `0` outside the extent.
-    pub fn accumulation_code(&self, x: u32, y: u32) -> u16 {
-        self.flow_accum.get(x, y).copied().unwrap_or(0)
+        self.flow_accum.get(x, y).copied().unwrap_or(0.0)
     }
 
     /// Whether at least `threshold` reaches the cell — the test that turns an
-    /// accumulation layer into a river network. Compares codes, so the quantization
-    /// costs nothing here. `false` outside the extent.
+    /// accumulation layer into a river network. `false` outside the extent.
     pub fn channel(&self, x: u32, y: u32, threshold: f32) -> bool {
-        self.accumulation_code(x, y) >= quantize_accumulation(threshold)
+        self.accumulation(x, y) >= threshold
     }
 
     /// A unit vector pointing the way water leaves a cell, reconstructed from the
@@ -345,27 +321,21 @@ impl TerrainSpec {
     /// Solves water over the layer `spec` names and stores both the answer and the
     /// spec on the document, replacing whatever was there.
     ///
-    /// The height layer must be in the document, at shift 0, and baked at the
-    /// document's size; a moisture layer, if named, must be in the document but may
-    /// be at any shift. On any [`WaterError`] the document is left exactly as it
-    /// was.
+    /// The height layer must be in the document and baked at the document's size; a
+    /// moisture layer, if named, must be in the document. The solve runs over the
+    /// whole document at once, whatever its chunks. On any [`WaterError`] the
+    /// document is left exactly as it was.
     pub fn solve_water(&mut self, spec: &WaterSpec) -> Result<(), WaterError> {
-        if self.size.x == 0 || self.size.y == 0 {
-            return Err(WaterError::ZeroSize(self.size.x, self.size.y));
+        if self.size().x == 0 || self.size().y == 0 {
+            return Err(WaterError::ZeroSize(self.size().x, self.size().y));
         }
 
         let state = {
             let height = self
                 .layer(spec.height.as_str())
                 .ok_or_else(|| WaterError::UnknownHeightLayer(spec.height.to_string()))?;
-            if height.shift != 0 {
-                return Err(WaterError::CoarseHeight(
-                    spec.height.to_string(),
-                    height.shift,
-                ));
-            }
             let raster = height.baked();
-            if raster.size() != self.size {
+            if raster.size() != self.size() {
                 return Err(WaterError::UnbakedHeight(spec.height.to_string()));
             }
 
@@ -374,8 +344,8 @@ impl TerrainSpec {
                     let layer = self
                         .layer(id.as_str())
                         .ok_or_else(|| WaterError::UnknownMoistureLayer(id.to_string()))?;
-                    let width = self.size.x as usize;
-                    (0..(width * self.size.y as usize))
+                    let width = self.size().x as usize;
+                    (0..(width * self.size().y as usize))
                         .map(|index| {
                             let x = (index % width) as f32 + 0.5;
                             let y = (index / width) as f32 + 0.5;
@@ -383,7 +353,7 @@ impl TerrainSpec {
                         })
                         .collect()
                 }
-                None => vec![1.0; self.size.x as usize * self.size.y as usize],
+                None => vec![1.0; self.size().x as usize * self.size().y as usize],
             };
 
             WaterState::solve(raster, &weight, spec.lake_min_cells)
@@ -486,7 +456,7 @@ fn directions(filled: &[f32], routing: &[f32], width: usize, rows: usize) -> Vec
     flow
 }
 
-fn accumulate(flow: &[u8], weight: &[f32], width: usize, rows: usize) -> Vec<u16> {
+fn accumulate(flow: &[u8], weight: &[f32], width: usize, rows: usize) -> Vec<f32> {
     let cells = width * rows;
     let downstream_of = |index: usize| -> Option<usize> {
         let step = direction_index(flow[index])?;
@@ -513,7 +483,7 @@ fn accumulate(flow: &[u8], weight: &[f32], width: usize, rows: usize) -> Vec<u16
         }
     }
 
-    total.into_iter().map(quantize_accumulation).collect()
+    total
 }
 
 fn label_lakes(
@@ -579,26 +549,6 @@ fn direction_index(code: u8) -> Option<usize> {
         return None;
     }
     Some(code as usize - 1)
-}
-
-/// The code an accumulation is stored as. Monotone non-decreasing in `value`, which
-/// is what lets a caller convert a threshold once and then compare codes.
-///
-/// Negative values are read as zero, and anything past the top of the scale
-/// saturates at `u16::MAX` rather than wrapping.
-pub fn quantize_accumulation(value: f32) -> u16 {
-    let code = value.max(0.0).ln_1p() * ACCUM_QUANT;
-    code.round().clamp(0.0, u16::MAX as f32) as u16
-}
-
-/// The accumulation a stored code stands for.
-///
-/// Inverse of [`quantize_accumulation`] up to the rounding, which costs about a
-/// part in 3900 of the value — a fixed *relative* error, so a large accumulation is
-/// no less accurate in proportion than a small one. The scale reaches a few tens of
-/// millions before it saturates.
-pub fn dequantize_accumulation(code: u16) -> f32 {
-    (code as f32 / ACCUM_QUANT).exp_m1()
 }
 
 fn order_key(value: f32) -> u32 {
@@ -857,56 +807,15 @@ mod tests {
         }
     }
 
-    // Walks the scale from zero to past sixteen million, which is what pins the
-    // error as relative: a linear quantization would pass at the small end and lose
-    // whole orders of magnitude at the large one.
+    // The large-area case the water-ceiling context asked for: an accumulation past
+    // where the old 16-bit code saturated has to come back as itself.
     #[test]
-    fn an_accumulation_round_trips_through_its_quantization() {
-        for value in [0.0f32, 1.0, 2.0, 17.0, 1024.0, 65_536.0, 16_777_216.0] {
-            let found = dequantize_accumulation(quantize_accumulation(value));
-            assert!(
-                (found - value).abs() <= (value * 1e-3).max(1e-3),
-                "{value} came back as {found}"
-            );
-        }
-    }
-
-    // Thresholding by code and by value have to agree, and this pins how far they
-    // may not: only where the accumulation is within a quantization step of the
-    // threshold. There the code compare is the more faithful of the two — a cell
-    // holding exactly 1.0 comes back from the round trip as 0.99985945 — so a caller
-    // wanting an exact count of upstream cells cannot get one from either and has to
-    // decide which side of the step it wants.
-    #[test]
-    fn comparing_codes_answers_what_comparing_accumulations_does() {
-        let size = UVec2::new(37, 29);
-        let height = raster_from(size, |x, y| {
-            let u = x as f32 * 0.23;
-            let v = y as f32 * 0.19;
-            (u.sin() + v.cos()) * 0.3 - (x + y) as f32 * 0.008
-        });
-        let state = solved(&height);
-
-        let mut channels = 0u32;
-        for threshold in [1.0f32, 2.5, 8.0, 40.0, 250.0] {
-            let code = quantize_accumulation(threshold);
-            for y in 0..size.y {
-                for x in 0..size.x {
-                    let value = state.accumulation(x, y);
-                    let by_code = state.accumulation_code(x, y) >= code;
-                    channels += u32::from(by_code);
-                    if by_code == (value >= threshold) {
-                        continue;
-                    }
-                    assert!(
-                        (value - threshold).abs() <= threshold * 1e-3,
-                        "cell {x},{y} at {value} disagrees about {threshold} by more than \
-                         the quantization step"
-                    );
-                }
-            }
-        }
-        assert!(channels > 0, "no cell cleared any threshold");
+    fn an_accumulation_past_twenty_million_cells_does_not_saturate() {
+        let size = UVec2::new(1, 1);
+        let height = raster_from(size, |_, _| 0.0);
+        let state = WaterState::solve(&height, &[3.0e7], 0);
+        assert_eq!(state.accumulation(0, 0), 3.0e7);
+        assert!(state.channel(0, 0, 2.9e7));
     }
 
     // The priority flood pops equal-height cells in an order the heap does not
@@ -1012,22 +921,17 @@ mod tests {
         );
     }
 
-    // Each refusal is a distinct variant a caller matches on, and all three leave
+    // Each refusal is a distinct variant a caller matches on, and both leave
     // the document untouched — a partially applied solve would be worse than none.
     #[test]
     fn a_solve_refuses_a_layer_it_cannot_read() {
-        let mut terrain = TerrainSpec::new(UVec2::new(8, 8))
-            .with_layer(Layer::new("height").held(0.5))
-            .with_layer(Layer::new("coarse").with_shift(2));
+        let mut terrain =
+            TerrainSpec::new(UVec2::new(8, 8)).with_layer(Layer::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
 
         assert!(matches!(
             terrain.solve_water(&WaterSpec::new("absent")),
             Err(WaterError::UnknownHeightLayer(_))
-        ));
-        assert!(matches!(
-            terrain.solve_water(&WaterSpec::new("coarse")),
-            Err(WaterError::CoarseHeight(_, 2))
         ));
         assert!(matches!(
             terrain.solve_water(&WaterSpec::default().with_moisture("absent")),

@@ -84,10 +84,14 @@ impl Plugin for UiPlugin {
 pub struct NewDialog {
     /// Whether the dialog is showing.
     pub open: bool,
-    /// Cells across, for the terrain Create would build.
+    /// Cells across one chunk, for the terrain Create would build.
     pub width: u32,
-    /// Cells down, for the terrain Create would build.
+    /// Cells down one chunk, for the terrain Create would build.
     pub height: u32,
+    /// Chunks across, for the terrain Create would build.
+    pub chunks_x: u32,
+    /// Chunks down, for the terrain Create would build.
+    pub chunks_y: u32,
     /// The seed the preset would be built from.
     pub seed: u32,
     /// Which preset Create would build.
@@ -100,6 +104,8 @@ impl Default for NewDialog {
             open: false,
             width: 1024,
             height: 1024,
+            chunks_x: 1,
+            chunks_y: 1,
             seed: 1,
             preset: Preset::default(),
         }

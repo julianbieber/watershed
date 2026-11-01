@@ -5,9 +5,10 @@ use glam::{UVec2, Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
 use crate::channel::{ChannelMeta, ChannelTable};
+use crate::chunk::ChunkGrid;
 use crate::field::FieldRole;
 use crate::meta::WaterInfo;
-use crate::raster::{Raster, raster_coord, step};
+use crate::raster::{CellRect, Raster};
 
 /// The texels of one image, one array per texel in row-major order.
 ///
@@ -101,7 +102,6 @@ impl LayerTexels {
 /// One image of a terrain, with everything needed to read a number out of it.
 #[derive(Clone, Debug)]
 pub struct TerrainLayer {
-    pub(crate) shift: Option<u8>,
     pub(crate) channels: Vec<ChannelMeta>,
     pub(crate) tables: Vec<ChannelTable>,
     pub(crate) texels: LayerTexels,
@@ -112,10 +112,9 @@ impl TerrainLayer {
     ///
     /// The tables are derived, not stored: they are what makes a read a lookup
     /// rather than arithmetic, and they cost 1 KiB per channel.
-    pub fn new(shift: Option<u8>, channels: Vec<ChannelMeta>, texels: LayerTexels) -> Self {
+    pub fn new(channels: Vec<ChannelMeta>, texels: LayerTexels) -> Self {
         let tables = channels.iter().map(ChannelMeta::table).collect();
         Self {
-            shift,
             channels,
             tables,
             texels,
@@ -131,12 +130,6 @@ impl TerrainLayer {
     pub fn channels(&self) -> &[ChannelMeta] {
         &self.channels
     }
-
-    /// The shift this image stands at, or `None` for a painted raster, which has an
-    /// extent of its own rather than one the document implies.
-    pub fn shift(&self) -> Option<u8> {
-        self.shift
-    }
 }
 
 /// Everything about a readable field except its values: what the bake settled once
@@ -151,9 +144,6 @@ pub struct FieldInfo {
     pub name: String,
     /// The role the field held in the spec.
     pub role: FieldRole,
-    /// The [`raster`](crate::raster) shift the field was baked at, which is what
-    /// relates a cell to a texel. Always the shift of the layer it sits in.
-    pub shift: u8,
     /// Whether values name a class rather than measure a quantity, which decides
     /// how [`FieldView::sample`] interpolates. Settled from the spec's layers at
     /// bake time, so a read does not have to re-derive it.
@@ -172,8 +162,13 @@ pub struct FieldInfo {
 /// the machinery that would let it. What it may assume instead is that every field
 /// [`Terrain::fields`] names is readable at every cell inside the extent.
 ///
-/// Values are held as the images carry them, eight bits to a channel, and are
-/// decoded as they are read.
+/// Values are held as the images carry them, eight bits to a channel, one texel per
+/// cell, and are decoded as they are read.
+///
+/// A terrain covers its own extent and every read is in its own cells: a terrain
+/// loaded as one chunk of a directory reads that chunk's first cell at `(0, 0)`,
+/// and a consumer turns a document position into a chunk and a texel with
+/// [`ChunkGrid::locate`].
 #[derive(Clone, Debug, Default)]
 pub struct Terrain {
     pub(crate) size: UVec2,
@@ -186,11 +181,11 @@ impl Terrain {
     /// A terrain from the parts a writer already holds: the extent, the fields in
     /// the order they are to be read back, the images they sit in, and the water.
     ///
-    /// Nothing is checked. Every [`FieldInfo`] must name a layer that is there, a
-    /// channel that layer has, and the shift that layer stands at, and a
-    /// [`WaterInfo`] must name a four-channel layer at the extent — the same
-    /// conditions [`Terrain::load_from_dir`] refuses a directory for. A terrain
-    /// built outside them reads wrong values or none.
+    /// Nothing is checked. Every [`FieldInfo`] must name a layer that is there and
+    /// a channel that layer has, every layer must be at the extent, and a
+    /// [`WaterInfo`] must name a four-channel layer — the same conditions
+    /// [`TerrainDir::open`](crate::io::TerrainDir::open) refuses a directory for. A
+    /// terrain built outside them reads wrong values or none.
     pub fn new(
         size: UVec2,
         fields: Vec<FieldInfo>,
@@ -215,7 +210,7 @@ impl Terrain {
         self.size.y
     }
 
-    /// The extent in cells. Every field covers all of it, whatever its own shift.
+    /// The extent in cells. Every field covers all of it, one texel per cell.
     pub fn size(&self) -> UVec2 {
         self.size
     }
@@ -278,6 +273,30 @@ impl Terrain {
         Some(WaterView { info, layer })
     }
 
+    /// The part of this terrain one chunk of `grid` covers, as a terrain of its own
+    /// over the chunk's extent, carrying the same fields, channel encodings and
+    /// water.
+    ///
+    /// `None` for a chunk outside the grid, or a grid whose extent is not this
+    /// terrain's.
+    pub fn chunk(&self, grid: &ChunkGrid, chunk: UVec2) -> Option<Terrain> {
+        if grid.extent() != self.size {
+            return None;
+        }
+        let rect = grid.rect(chunk)?;
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| layer.slice(rect))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Terrain {
+            size: grid.chunk_size(),
+            fields: self.fields.clone(),
+            layers,
+            water: self.water,
+        })
+    }
+
     fn view_of<'a>(&'a self, info: &'a FieldInfo) -> Option<FieldView<'a>> {
         let layer = self.layers.get(info.layer as usize)?;
         if info.channel as usize >= layer.channels.len() {
@@ -291,9 +310,25 @@ impl Terrain {
     }
 }
 
-fn cell_texel(x: u32, y: u32, shift: u8) -> (u32, u32) {
-    let step = step(shift);
-    (x / step, y / step)
+impl TerrainLayer {
+    fn slice(&self, rect: CellRect) -> Option<TerrainLayer> {
+        let size = UVec2::new(rect.width(), rect.height());
+        let texels = match &self.texels {
+            LayerTexels::Mono(raster) => LayerTexels::Mono(cut(raster, rect, size)?),
+            LayerTexels::Duo(raster) => LayerTexels::Duo(cut(raster, rect, size)?),
+            LayerTexels::Trio(raster) => LayerTexels::Trio(cut(raster, rect, size)?),
+            LayerTexels::Quad(raster) => LayerTexels::Quad(cut(raster, rect, size)?),
+        };
+        Some(TerrainLayer {
+            channels: self.channels.clone(),
+            tables: self.tables.clone(),
+            texels,
+        })
+    }
+}
+
+fn cut<T: Clone>(raster: &Raster<T>, rect: CellRect, size: UVec2) -> Option<Raster<T>> {
+    Raster::from_vec(size, raster.copy_rect(rect)?)
 }
 
 /// A resolved handle to one image of a [`Terrain`].
@@ -312,11 +347,6 @@ impl<'a> LayerView<'a> {
         self.layer.texels.channels()
     }
 
-    /// The shift this image stands at, or `None` for a painted raster.
-    pub fn shift(&self) -> Option<u8> {
-        self.layer.shift
-    }
-
     /// The interleaved bytes, as the image holds them — for an upload or a
     /// re-encode, not for point reads.
     pub fn bytes(&self) -> &'a [u8] {
@@ -326,15 +356,12 @@ impl<'a> LayerView<'a> {
     /// Every channel of a cell, decoded, written into `out` and returned as the
     /// part of it that was filled.
     ///
-    /// Empty outside the terrain's extent. The cell is in the terrain's own grid
-    /// whatever the image's shift, so every cell of the block a texel covers reads
-    /// that texel.
+    /// Empty outside the terrain's extent.
     pub fn channels_at<'o>(&self, x: u32, y: u32, out: &'o mut [f32; 4]) -> &'o [f32] {
         if x >= self.size.x || y >= self.size.y {
             return &out[..0];
         }
-        let (u, v) = cell_texel(x, y, self.layer.shift.unwrap_or(0));
-        let Some(texel) = self.layer.texels.texel(u, v) else {
+        let Some(texel) = self.layer.texels.texel(x, y) else {
             return &out[..0];
         };
         for (slot, (byte, table)) in out
@@ -410,8 +437,7 @@ impl ChannelView<'_> {
         self.layer.channels[self.channel]
     }
 
-    /// The value at an integer *cell*, in the terrain's own grid whatever the
-    /// image's shift: every cell of the block a texel covers reads that texel.
+    /// The value at an integer *cell* of the terrain.
     ///
     /// `None` outside the extent — this is the read that refuses rather than
     /// clamping. Use [`ChannelView::sample`] for the clamping one.
@@ -419,8 +445,7 @@ impl ChannelView<'_> {
         if x >= self.size.x || y >= self.size.y {
             return None;
         }
-        let (u, v) = cell_texel(x, y, self.layer.shift.unwrap_or(0));
-        let texel = self.layer.texels.texel(u, v)?;
+        let texel = self.layer.texels.texel(x, y)?;
         Some(self.layer.tables[self.channel].get(texel[self.channel]))
     }
 
@@ -432,9 +457,8 @@ impl ChannelView<'_> {
     /// a channel whose encoding is not a straight line — a logarithmic one — reads
     /// the same way a linear one does.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
-        let shift = self.layer.shift.unwrap_or(0);
-        let u = raster_coord(x, shift);
-        let v = raster_coord(y, shift);
+        let u = x - 0.5;
+        let v = y - 0.5;
         if self.categorical {
             return self.nearest(u, v);
         }
@@ -513,11 +537,6 @@ impl<'a> FieldView<'a> {
         self.info.role
     }
 
-    /// The shift the field was baked at: one texel per `2^shift` cells on each axis.
-    pub fn shift(&self) -> u8 {
-        self.info.shift
-    }
-
     /// Whether [`FieldView::sample`] reads the nearest texel rather than
     /// interpolating. See [`FieldInfo::categorical`].
     pub fn is_categorical(&self) -> bool {
@@ -539,18 +558,17 @@ impl<'a> FieldView<'a> {
         self.channel().meta().high
     }
 
-    /// Columns of the underlying image — the terrain's width only at shift 0.
+    /// Columns of the underlying image, which is the terrain's width.
     pub fn texel_width(&self) -> u32 {
         self.layer.texels.size().x
     }
 
-    /// Rows of the underlying image — the terrain's height only at shift 0.
+    /// Rows of the underlying image, which is the terrain's height.
     pub fn texel_height(&self) -> u32 {
         self.layer.texels.size().y
     }
 
-    /// The value at an integer *cell*, in the terrain's own grid whatever the
-    /// field's shift: every cell of the block a texel covers reads that texel.
+    /// The value at an integer *cell* of the terrain.
     ///
     /// `None` outside the extent — this is the read that refuses rather than
     /// clamping. Use [`FieldView::sample`] for the clamping one.
@@ -658,17 +676,16 @@ impl WaterView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raster::resolution;
 
     // One image of `constants.len()` channels, each holding one value everywhere. A
     // degenerate channel range reads back exactly, so a fixture states the value it
     // means rather than the nearest of 256 steps.
-    fn layer_of(size: UVec2, shift: u8, constants: &[f32]) -> TerrainLayer {
+    fn layer_of(size: UVec2, constants: &[f32]) -> TerrainLayer {
         let channels: Vec<ChannelMeta> = constants
             .iter()
             .map(|value| ChannelMeta::linear(*value, *value))
             .collect();
-        let texels = resolution(size, shift);
+        let texels = size;
         let mut bytes = Vec::with_capacity((texels.x * texels.y) as usize * channels.len());
         for _ in 0..texels.x * texels.y {
             for (channel, value) in channels.iter().zip(constants) {
@@ -676,14 +693,13 @@ mod tests {
             }
         }
         let texels = LayerTexels::from_bytes(texels, channels.len(), bytes).unwrap();
-        TerrainLayer::new(Some(shift), channels, texels)
+        TerrainLayer::new(channels, texels)
     }
 
-    fn info(name: &str, role: FieldRole, shift: u8, layer: u8, channel: u8) -> FieldInfo {
+    fn info(name: &str, role: FieldRole, layer: u8, channel: u8) -> FieldInfo {
         FieldInfo {
             name: name.to_owned(),
             role,
-            shift,
             categorical: false,
             layer,
             channel,
@@ -695,10 +711,10 @@ mod tests {
         Terrain {
             size,
             fields: vec![
-                info("height", FieldRole::Height, 0, 0, 0),
-                info("moisture", FieldRole::Moisture, 4, 1, 0),
+                info("height", FieldRole::Height, 0, 0),
+                info("moisture", FieldRole::Moisture, 1, 0),
             ],
-            layers: vec![layer_of(size, 0, &[0.25]), layer_of(size, 4, &[0.5])],
+            layers: vec![layer_of(size, &[0.25]), layer_of(size, &[0.5])],
             water: None,
         }
     }
@@ -707,16 +723,15 @@ mod tests {
         Terrain {
             size,
             fields: vec![
-                info("a", FieldRole::Custom, 0, 0, 0),
-                info("b", FieldRole::Custom, 0, 0, 1),
+                info("a", FieldRole::Custom, 0, 0),
+                info("b", FieldRole::Custom, 0, 1),
             ],
-            layers: vec![layer_of(size, 0, &[0.25, 0.75])],
+            layers: vec![layer_of(size, &[0.25, 0.75])],
             water: None,
         }
     }
 
-    // The extent is what every cell read is bounds-checked against, and it is the one
-    // thing a coarse field must not be able to change.
+    // The extent is what every cell read is bounds-checked against.
     #[test]
     fn a_terrain_answers_the_extent_it_was_written_with() {
         let terrain = baked();
@@ -755,20 +770,29 @@ mod tests {
         assert!(baked().field_with_role(FieldRole::Custom).is_none());
     }
 
-    // A cell read is in the terrain's own grid whatever the field's shift, so a
-    // coarse field answers at every cell of the block its texel covers.
+    // A chunk is read in its own cells, so slicing has to carry the texels of the
+    // chunk's rectangle and not the document's first ones.
     #[test]
-    fn every_cell_of_a_block_reads_the_texel_that_covers_it() {
-        let terrain = baked();
-        let moisture = terrain.field("moisture").unwrap();
-        assert_eq!(moisture.texel_width(), 4);
-        for (x, y) in [(0, 0), (15, 15), (3, 12)] {
-            assert_eq!(moisture.value_at(x, y), Some(0.5));
-        }
+    fn a_chunk_of_a_terrain_reads_its_own_rectangle() {
+        let size = UVec2::new(4, 2);
+        let channels = vec![ChannelMeta::linear(0.0, 255.0)];
+        let bytes: Vec<u8> = (0..8).collect();
+        let texels = LayerTexels::from_bytes(size, 1, bytes).unwrap();
+        let terrain = Terrain {
+            size,
+            fields: vec![info("v", FieldRole::Custom, 0, 0)],
+            layers: vec![TerrainLayer::new(channels, texels)],
+            water: None,
+        };
+        let grid = ChunkGrid::new(UVec2::new(2, 2), UVec2::new(2, 1)).unwrap();
+        let right = terrain.chunk(&grid, UVec2::new(1, 0)).unwrap();
+        assert_eq!(right.size(), UVec2::new(2, 2));
+        assert_eq!(right.layer(0).unwrap().bytes(), &[2, 3, 6, 7]);
+        assert!(terrain.chunk(&grid, UVec2::new(2, 0)).is_none());
     }
 
-    // `value_at` bounds-checks against the extent, not against the image, so a
-    // coarse field must not accept the cells past the last one it has a texel for.
+    // `value_at` refuses past the extent rather than clamping, which is the half of
+    // the contract a consumer walking a chunk's edge relies on.
     #[test]
     fn a_cell_outside_the_extent_reads_nothing() {
         let terrain = baked();
@@ -798,14 +822,13 @@ mod tests {
     // A view carries the metadata the write settled, so a project reading through one
     // never needs the document that produced the terrain.
     #[test]
-    fn a_view_reports_the_shift_and_role_its_field_declared() {
+    fn a_view_reports_the_role_its_field_declared() {
         let terrain = baked();
         let moisture = terrain.field("moisture").unwrap();
-        assert_eq!(moisture.shift(), 4);
         assert_eq!(moisture.role(), FieldRole::Moisture);
     }
 
-    // Two fields at one shift are packed into one image, so a field read has to pick
+    // Fields are packed into shared images, so a field read has to pick
     // its own channel out of an interleaved texel rather than assume it is alone.
     #[test]
     fn two_fields_sharing_an_image_read_their_own_channel() {

@@ -1,30 +1,51 @@
 //! Worked example of consuming a terrain from an application: opening a terrain
-//! directory and reading fields back by role, by name, by cell and by layer.
+//! directory, locating a world position as a chunk and a texel within it, loading
+//! only that chunk, and reading fields back by role, by name, by cell and by layer.
 //!
 //! Nothing here bakes. A terrain directory holds the values already, so a consuming
 //! project reads them straight out of it — which is the whole reason the format
 //! stores images beside its metadata rather than a recipe to re-derive them from.
 
-use watershed::{FieldRole, FieldView, IoError, Terrain};
+use watershed::{FieldRole, FieldView, IoError, Terrain, TerrainDir};
 
 fn main() -> Result<(), IoError> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "terrain".to_owned());
 
-    let terrain = Terrain::load_from_dir(&path)?;
+    let dir = TerrainDir::open(&path)?;
+    let grid = dir.grid();
+    println!(
+        "{}x{} chunks of {}x{} cells",
+        grid.chunks().x,
+        grid.chunks().y,
+        grid.chunk_size().x,
+        grid.chunk_size().y
+    );
+
+    let Some(at) = grid.locate(512.5, 512.5) else {
+        println!("512.5,512.5 is outside the terrain");
+        return Ok(());
+    };
+    let terrain = dir.load_chunk(at.chunk)?;
+    println!("512.5,512.5 is texel {} of chunk {}", at.texel, at.chunk);
 
     report_fields(&terrain);
     report_layers(&terrain);
-    sample_a_cell(&terrain, 512, 512);
+    sample_a_cell(&terrain, at.texel.x, at.texel.y);
 
     if let Some(fields) = WorldFields::resolve(&terrain) {
         let tile = fields.height_tile(0, 0, 32);
         println!("tile: {} heights", tile.len());
-        println!("biome at 512,512: {:?}", fields.biome_at(512, 512));
         println!(
-            "temperature at 512.5,512.5: {}",
-            fields.temperature_at(512.5, 512.5)
+            "biome at {}: {:?}",
+            at.texel,
+            fields.biome_at(at.texel.x, at.texel.y)
+        );
+        println!(
+            "temperature at {}: {}",
+            at.texel,
+            fields.temperature_at(at.texel.x as f32 + 0.5, at.texel.y as f32 + 0.5)
         );
     }
 
@@ -32,7 +53,7 @@ fn main() -> Result<(), IoError> {
 }
 
 fn report_fields(terrain: &Terrain) {
-    println!("{}x{} cells", terrain.width(), terrain.height());
+    println!("chunk of {}x{} cells", terrain.width(), terrain.height());
     for view in terrain.fields() {
         println!(
             "  {:12} {:8} {}x{} texels  {}..{}  layer {} channel {}",

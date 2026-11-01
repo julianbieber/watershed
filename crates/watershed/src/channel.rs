@@ -303,41 +303,20 @@ pub struct Placement {
     pub channel: u8,
 }
 
-/// Groups fields into images: which image each one lands in, and each image's shift.
+/// Groups `fields` fields into images: which image each one lands in, and how
+/// many images there are.
 ///
-/// Fields sharing a shift may share an image, because an image has one extent and a
-/// shift is what decides it. Buckets come in order of first appearance and are
-/// filled in declaration order, so the same document always packs the same way and
-/// a saved terrain can be compared against another save of it.
-pub fn plan_layers(shifts: &[u8]) -> (Vec<Placement>, Vec<u8>) {
-    let mut layer_shifts: Vec<u8> = Vec::new();
-    let mut open: Vec<(u8, usize, u8)> = Vec::new();
-    let mut placements = Vec::with_capacity(shifts.len());
-
-    for &shift in shifts {
-        let slot = open
-            .iter_mut()
-            .find(|(candidate, _, used)| *candidate == shift && (*used as usize) < MAX_CHANNELS);
-        let (layer, channel) = match slot {
-            Some((_, layer, used)) => {
-                let channel = *used;
-                *used += 1;
-                (*layer, channel)
-            }
-            None => {
-                let layer = layer_shifts.len();
-                layer_shifts.push(shift);
-                open.push((shift, layer, 1));
-                (layer, 0)
-            }
-        };
-        placements.push(Placement {
-            layer: layer as u8,
-            channel,
-        });
-    }
-
-    (placements, layer_shifts)
+/// Every image holds up to [`MAX_CHANNELS`] fields and is filled in declaration
+/// order, so the same document always packs the same way and a saved terrain can
+/// be compared against another save of it.
+pub fn plan_layers(fields: usize) -> (Vec<Placement>, usize) {
+    let placements = (0..fields)
+        .map(|index| Placement {
+            layer: (index / MAX_CHANNELS) as u8,
+            channel: (index % MAX_CHANNELS) as u8,
+        })
+        .collect();
+    (placements, fields.div_ceil(MAX_CHANNELS))
 }
 
 #[cfg(test)]
@@ -523,37 +502,24 @@ mod tests {
         }
     }
 
-    // The packing rule is the new logic in the format, and "stable across saves" is
-    // only a claim if the grouping is pinned against a document that interleaves
-    // shifts rather than one that happens to be sorted.
+    // "Stable across saves" is only a claim if the grouping is pinned: declaration
+    // order, four to an image, and the last image only as full as it has to be.
     #[test]
-    fn fields_pack_by_shift_in_declaration_order() {
-        let (places, shifts) = plan_layers(&[0, 4, 0, 4, 0, 0, 0]);
-        assert_eq!(shifts, vec![0, 4, 0]);
-        let layers: Vec<u8> = places.iter().map(|place| place.layer).collect();
+    fn fields_pack_four_to_an_image_in_declaration_order() {
+        let (places, layers) = plan_layers(6);
+        assert_eq!(layers, 2);
+        let images: Vec<u8> = places.iter().map(|place| place.layer).collect();
         let channels: Vec<u8> = places.iter().map(|place| place.channel).collect();
-        assert_eq!(layers, vec![0, 1, 0, 1, 0, 0, 2]);
-        assert_eq!(channels, vec![0, 0, 1, 1, 2, 3, 0]);
-    }
-
-    // A layer that ran past four channels would be an image with no colour type,
-    // so the cap is a property of the grouping rather than a later check.
-    #[test]
-    fn no_layer_is_given_more_channels_than_an_image_has() {
-        let (places, shifts) = plan_layers(&[2; 9]);
-        assert_eq!(shifts.len(), 3);
-        for layer in 0..shifts.len() as u8 {
-            let used = places.iter().filter(|place| place.layer == layer).count();
-            assert!(used <= MAX_CHANNELS, "layer {layer} holds {used}");
-        }
+        assert_eq!(images, vec![0, 0, 0, 0, 1, 1]);
+        assert_eq!(channels, vec![0, 1, 2, 3, 0, 1]);
     }
 
     // An empty document is a legitimate thing to save, and the grouping is where it
     // would otherwise divide by zero or index an empty list.
     #[test]
     fn a_document_with_no_fields_plans_no_layers() {
-        let (places, shifts) = plan_layers(&[]);
+        let (places, layers) = plan_layers(0);
         assert!(places.is_empty());
-        assert!(shifts.is_empty());
+        assert_eq!(layers, 0);
     }
 }

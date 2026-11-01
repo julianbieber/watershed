@@ -34,6 +34,8 @@ pub enum NumberBinding {
     ShaderParam(usize, usize),
     DialogWidth,
     DialogHeight,
+    DialogChunksX,
+    DialogChunksY,
     DialogSeed,
 }
 
@@ -41,7 +43,11 @@ impl NumberBinding {
     fn is_integer(self) -> bool {
         matches!(
             self,
-            Self::DialogWidth | Self::DialogHeight | Self::DialogSeed
+            Self::DialogWidth
+                | Self::DialogHeight
+                | Self::DialogChunksX
+                | Self::DialogChunksY
+                | Self::DialogSeed
         )
     }
 
@@ -50,7 +56,10 @@ impl NumberBinding {
             Self::LightAzimuth => Some((0.0, 360.0)),
             Self::ContourInterval => Some((crate::edit::MIN_CONTOUR_INTERVAL, f32::MAX)),
             Self::DialogSeed => Some((0.0, u32::MAX as f32)),
-            Self::DialogWidth | Self::DialogHeight => Some((16.0, 8192.0)),
+            Self::DialogWidth | Self::DialogHeight => {
+                Some((16.0, crate::terrain::bake::MAX_CHUNK_SIDE as f32))
+            }
+            Self::DialogChunksX | Self::DialogChunksY => Some((1.0, 64.0)),
             _ => None,
         }
     }
@@ -73,6 +82,8 @@ impl NumberBinding {
             Self::ContourInterval => layer(document)?.contour_interval,
             Self::DialogWidth => dialog.width as f32,
             Self::DialogHeight => dialog.height as f32,
+            Self::DialogChunksX => dialog.chunks_x as f32,
+            Self::DialogChunksY => dialog.chunks_y as f32,
             Self::DialogSeed => dialog.seed as f32,
             Self::ShaderParam(param, component) => *layer(document)?
                 .shader
@@ -120,6 +131,14 @@ impl NumberBinding {
             }
             Self::DialogHeight => {
                 dialog.height = value as u32;
+                Ok(())
+            }
+            Self::DialogChunksX => {
+                dialog.chunks_x = value as u32;
+                Ok(())
+            }
+            Self::DialogChunksY => {
+                dialog.chunks_y = value as u32;
                 Ok(())
             }
             Self::DialogSeed => {

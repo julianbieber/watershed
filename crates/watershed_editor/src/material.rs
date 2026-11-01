@@ -54,10 +54,11 @@ pub struct LayerMaterial {
 /// doing the same in the shader.
 #[derive(Clone, Copy, Debug, ShaderType)]
 pub struct LayerSettings {
-    /// Texel dimensions of the layer texture, so the shader can address it. Changes
-    /// when the active layer or its shift changes.
+    /// Texel dimensions of the layer texture, so the shader can address it: the
+    /// chunk on screen, one texel per cell.
     pub layer_resolution: Vec2,
-    /// The document's extent in cells, which the water texture is addressed in.
+    /// The chunk on screen's extent in cells, which the water texture is addressed
+    /// in.
     pub document_size: Vec2,
     /// The fitted low and high ends of the ramp, in the layer's own units. Refitted
     /// to what is on screen as the camera moves, so it changes most frames.

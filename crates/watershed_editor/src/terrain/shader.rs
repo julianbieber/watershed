@@ -454,7 +454,7 @@ fn parse_numbers(line: usize, text: &str) -> Result<Vec<f32>, ParamError> {
 }
 
 /// Another layer a shader reads by name: a texture binding the dispatch fills with
-/// that layer's baked raster, at the layer's own shift.
+/// that layer's baked raster over the chunk being dispatched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerRead {
     /// The variable name the WGSL declaration spells.
@@ -526,13 +526,9 @@ pub fn parse_layers(source: &str) -> Result<Vec<LayerRead>, ParamError> {
     Ok(layers)
 }
 
-/// The largest resolution shift a header may declare. A header declaring more is a
-/// fault naming the line, rather than a layer allocated down to nothing.
-pub const MAX_SHIFT: u8 = 8;
-
-/// What a layer's own file says the layer is: its role in the bake, the resolution it
-/// bakes at, the interval its values are clamped into, and whether those values are
-/// class indices rather than a quantity.
+/// What a layer's own file says the layer is: its role in the bake, the interval its
+/// values are clamped into, and whether those values are class indices rather than a
+/// quantity.
 ///
 /// The defaults are what a file that declares nothing means, not a placeholder — a
 /// shader with no header lines is a custom layer at one texel per cell over
@@ -541,8 +537,6 @@ pub const MAX_SHIFT: u8 = 8;
 pub struct LayerHeader {
     /// What the bake may do with the layer.
     pub role: LayerRole,
-    /// Resolution, as the [`raster`](watershed::raster) shift. At most [`MAX_SHIFT`].
-    pub shift: u8,
     /// The interval baked values are clamped into, in the order the file wrote it.
     pub range: (f32, f32),
     /// Whether the layer holds whole-numbered class indices, which are read to the
@@ -554,7 +548,6 @@ impl Default for LayerHeader {
     fn default() -> Self {
         Self {
             role: LayerRole::Custom,
-            shift: 0,
             range: (0.0, 1.0),
             categorical: false,
         }
@@ -565,10 +558,10 @@ impl Default for LayerHeader {
 ///
 /// A declaration is a whole line whose trimmed form starts with `// @`, the shape
 /// [`parse_retired`] reads `@reach` at — so a commented-out or indented-in-prose form
-/// declares nothing and the template's own prose can spell all four. The forms are
-/// `// @role height|moisture|custom`, `// @shift <n>`, `// @range <lo> <hi>` and
-/// `// @categorical`. Each may be declared at most once; anything the header does not
-/// declare takes its [`LayerHeader::default`].
+/// declares nothing and the template's own prose can spell all three. The forms are
+/// `// @role height|moisture|custom`, `// @range <lo> <hi>` and `// @categorical`.
+/// Each may be declared at most once; anything the header does not declare takes its
+/// [`LayerHeader::default`]. Any other word — `@shift` among them — declares nothing.
 ///
 /// Fails on the first fault and reports the line it is on.
 pub fn parse_header(source: &str) -> Result<LayerHeader, ParamError> {
@@ -583,7 +576,7 @@ pub fn parse_header(source: &str) -> Result<LayerHeader, ParamError> {
             Some((word, argument)) => (word, argument.trim()),
             None => (rest, ""),
         };
-        if !matches!(word, "role" | "shift" | "range" | "categorical") {
+        if !matches!(word, "role" | "range" | "categorical") {
             continue;
         }
         if seen.contains(&word) {
@@ -598,18 +591,6 @@ pub fn parse_header(source: &str) -> Result<LayerHeader, ParamError> {
                         format!("`{argument}` is not a role: height, moisture or custom"),
                     )
                 })?;
-            }
-            "shift" => {
-                let shift = argument
-                    .parse::<u8>()
-                    .map_err(|_| fault(number, format!("`{argument}` is not a shift")))?;
-                if shift > MAX_SHIFT {
-                    return Err(fault(
-                        number,
-                        format!("shift {shift} is over the {MAX_SHIFT} limit"),
-                    ));
-                }
-                header.shift = shift;
             }
             "range" => {
                 let bounds = parse_numbers(number, &argument.replace(char::is_whitespace, ","))?;
@@ -708,8 +689,8 @@ fn parse_input_declaration(line: usize, declaration: &str) -> Result<(String, u3
 
 /// The values a layer's WGSL shader produces, and what the document carries for it.
 ///
-/// Holds the parameter values and the layers the file reads by name, and the raster
-/// the last dispatch left. Only the parameter values are serialized: the layers read
+/// Holds the parameter values and the layers the file reads by name, the key of the
+/// last dispatch, and values held for a layer with no device to dispatch on. Only the parameter values are serialized: the layers read
 /// are re-read from the file, and the raster is derived, so a loaded document reads
 /// the layer as zero until it has been dispatched.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -748,11 +729,19 @@ impl ShaderLayer {
         self.stamp = None;
     }
 
-    /// Installs a dispatch result together with the key of the dispatch that made it,
-    /// so a later bake can tell that nothing it depends on has moved.
-    pub fn put_dispatch(&mut self, values: Raster<f32>, stamp: u64) {
-        self.values = values;
+    /// Records the key of the dispatches that just wrote the layer's whole raster, so a
+    /// later bake can tell that nothing it depends on has moved. Drops any held
+    /// values: the layer's raster is now the one copy of what the shader produced.
+    pub fn put_stamp(&mut self, stamp: u64) {
+        self.values = Raster::default();
         self.stamp = Some(stamp);
+    }
+
+    /// Forgets which dispatch the layer's raster came from, so the next bake
+    /// dispatches it again — what a bake of one chunk leaves, since the rest of the
+    /// raster no longer matches any one key.
+    pub fn forget_stamp(&mut self) {
+        self.stamp = None;
     }
 
     /// The key of the dispatch the held values came from, or `None` for values whose
@@ -1095,15 +1084,12 @@ mod tests {
         );
     }
 
-    // The four header lines are the whole of what a file says about the layer itself,
+    // The three header lines are the whole of what a file says about the layer itself,
     // so each form has to reach the field the panel and the bake read.
     #[test]
-    fn a_header_declares_the_role_shift_range_and_class() {
-        let header =
-            parse_header("// @role moisture\n// @shift 2\n// @range 0 2\n// @categorical\n")
-                .unwrap();
+    fn a_header_declares_the_role_range_and_class() {
+        let header = parse_header("// @role moisture\n// @range 0 2\n// @categorical\n").unwrap();
         assert_eq!(header.role, LayerRole::Moisture);
-        assert_eq!(header.shift, 2);
         assert_eq!(header.range, (0.0, 2.0));
         assert!(header.categorical);
     }
@@ -1111,16 +1097,15 @@ mod tests {
     // Most files declare nothing, and what they mean by that is a custom quantity at
     // one texel per cell over the unit interval — not a layer waiting to be told.
     #[test]
-    fn a_file_with_no_header_is_a_custom_quantity_at_shift_zero() {
+    fn a_file_with_no_header_is_a_custom_quantity() {
         let header = parse_header("fn main() {}\n").unwrap();
         assert_eq!(header, LayerHeader::default());
         assert_eq!(header.role, LayerRole::Custom);
-        assert_eq!(header.shift, 0);
         assert_eq!(header.range, (0.0, 1.0));
         assert!(!header.categorical);
     }
 
-    // The template documents all four in prose, so a file copied from it must declare
+    // The template documents all three in prose, so a file copied from it must declare
     // none of them: only the exact `// @` opening counts.
     #[test]
     fn a_commented_out_or_indented_header_declares_nothing() {
@@ -1137,13 +1122,19 @@ mod tests {
         assert!(error.reason.contains("elevation"), "{}", error.reason);
     }
 
-    // A shift past the limit allocates a layer down to nothing; the bound is the one
-    // the panel's number field clamped to before the file owned it.
+    // A file written while layers had a resolution of their own still declares one,
+    // and the shaders carry over unchanged (format-replace), so the line has to parse
+    // and change nothing — even twice, and even past the old limit.
     #[test]
-    fn a_shift_over_the_limit_is_a_fault() {
-        let error = parse_header("// @shift 12\n").unwrap_err();
-        assert_eq!(error.line, 1);
-        assert!(error.reason.contains("12"), "{}", error.reason);
+    fn a_shift_line_from_an_older_file_declares_nothing() {
+        let header = parse_header("// @role moisture\n// @shift 4\n// @shift 12\n").unwrap();
+        assert_eq!(
+            header,
+            LayerHeader {
+                role: LayerRole::Moisture,
+                ..LayerHeader::default()
+            }
+        );
     }
 
     // A range with one number would clamp against a bound that was never written.
@@ -1157,9 +1148,9 @@ mod tests {
     // the second is refused the way a duplicate parameter is.
     #[test]
     fn a_property_declared_twice_is_a_fault_on_the_second_line() {
-        let error = parse_header("// @shift 1\n// @shift 2\n").unwrap_err();
+        let error = parse_header("// @range 0 1\n// @range 0 2\n").unwrap_err();
         assert_eq!(error.line, 2);
-        assert!(error.reason.contains("@shift"), "{}", error.reason);
+        assert!(error.reason.contains("@range"), "{}", error.reason);
     }
 
     // `@categorical` is the one form with no argument, so a word after it is a

@@ -151,15 +151,44 @@ pub fn toolbar() -> impl Scene {
                 let Some(terrain) = document.terrain() else {
                     return;
                 };
-                let size = terrain.size;
+                let size = terrain.size();
+                let rect = document.active_rect();
                 let (mut transform, mut projection) = camera.into_inner();
-                fit_camera(&mut transform, &mut projection, size, *free);
+                fit_camera(&mut transform, &mut projection, size, rect, *free);
             })
+            --
+            @separator()
+            --
+            @chunk_button("<", IVec2::new(-1, 0))
+            --
+            @chunk_button(">", IVec2::new(1, 0))
+            --
+            @chunk_button("^", IVec2::new(0, -1))
+            --
+            @chunk_button("v", IVec2::new(0, 1))
             --
             @separator()
             --
             @widgets::text("no document") StatusLabel
         ]
+    }
+}
+
+fn chunk_button(label: &'static str, step: IVec2) -> impl Scene {
+    bsn! {
+        @FeathersButton {
+            @caption: bsn! { Text(label) ThemedText },
+            @variant: ButtonVariant::Plain,
+        }
+        on(move |_: On<Activate>, mut document: ResMut<Document>| {
+            let next = document.active_chunk().as_ivec2() + step;
+            let result = if next.x < 0 || next.y < 0 {
+                Err("there is no chunk past the edge of the document".to_owned())
+            } else {
+                document.set_active_chunk(next.as_uvec2())
+            };
+            report(&mut document, result);
+        })
     }
 }
 
@@ -239,10 +268,11 @@ pub fn sync(
         (None, Some(error)) => error.to_owned(),
         (None, None) => match document.terrain() {
             Some(terrain) => format!(
-                "{}x{}  {} layer(s){}{}",
-                terrain.size.x,
-                terrain.size.y,
+                "{}x{}  {} layer(s){}{}{}",
+                terrain.size().x,
+                terrain.size().y,
                 terrain.layers.len(),
+                chunk_label(&document),
                 if has_water { "  water" } else { "" },
                 if whole { "" } else { "  preview" },
             ),
@@ -250,6 +280,19 @@ pub fn sync(
         },
     };
     set_text(&mut status, &report);
+}
+
+fn chunk_label(document: &Document) -> String {
+    match document.grid() {
+        Some(grid) if grid.count() > 1 => format!(
+            "  chunk {},{} of {}x{}",
+            document.active_chunk().x,
+            document.active_chunk().y,
+            grid.chunks().x,
+            grid.chunks().y
+        ),
+        _ => String::new(),
+    }
 }
 
 fn enable(

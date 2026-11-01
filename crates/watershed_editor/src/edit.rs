@@ -58,8 +58,8 @@ pub enum Edit {
     /// Writes one property, named by a dotted path. See the module's grammar.
     Set {
         /// `layer.property`, where property is a display setting or a parameter the
-        /// layer's shader declares. The role, shift, range and class flag are not
-        /// here — the layer's shader file declares those.
+        /// layer's shader declares. The role, range and class flag are not here — the
+        /// layer's shader file declares those.
         path: String,
         /// The value, as words. Most properties take one; a shader parameter with
         /// several components takes several.
@@ -361,7 +361,7 @@ mod tests {
         }
         .apply(terrain)
     }
-    // Every default a new layer takes: no parameter values, shift 0, the unit range,
+    // Every default a new layer takes: no parameter values, the unit range,
     // and last in declaration order so the layer menu grows at the end.
     #[test]
     fn a_layer_added_from_the_editor_is_empty_at_shift_zero_over_the_unit_range() {
@@ -375,7 +375,6 @@ mod tests {
         assert_eq!(reply["added"], "biomes");
         let added = terrain.layer("biomes").expect("the layer was added");
         assert_eq!(added.role, LayerRole::Custom);
-        assert_eq!(added.shift, 0);
         assert_eq!(added.range, (0.0, 1.0));
         assert!(added.shader.params.is_empty());
         assert_eq!(
@@ -601,10 +600,10 @@ mod tests {
         );
     }
 
-    // A layer's role, shift and range are declared in its shader file, so the verbs
-    // that used to write them have to be gone rather than quietly overwritten by the
-    // next read of the file: a `set` that appeared to work and then reverted is worse
-    // than one that was never offered.
+    // A layer's role and range are declared in its shader file, and it has no shift
+    // at all, so the verbs that used to write them have to be gone rather than quietly
+    // overwritten by the next read of the file: a `set` that appeared to work and then
+    // reverted is worse than one that was never offered.
     #[test]
     fn the_properties_the_shader_file_declares_are_refused_as_unknown() {
         let mut terrain = document();

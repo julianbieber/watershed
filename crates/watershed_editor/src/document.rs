@@ -25,6 +25,8 @@ use crate::terrain::TerrainSpec;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use serde_json::Value;
+use watershed::chunk::ChunkGrid;
+use watershed::raster::CellRect;
 
 use crate::edit::{Edit, Slot, check_add, check_remove};
 use crate::gpu::{self, ShaderRuntime};
@@ -104,12 +106,15 @@ impl JobKind {
 
 /// Whether the document's bake still matches the shaders and settings it was cut from.
 ///
-/// An edit drops this to [`Baked::Nothing`]; every bake is of the whole document, so
-/// there is nothing in between.
+/// An edit drops this to [`Baked::Nothing`]. On a document of more than one chunk the
+/// next bake is of the active chunk alone, which is [`Baked::Chunk`], and the one
+/// after it is of the whole document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Baked {
     /// Nothing on screen can be trusted.
     Nothing,
+    /// The active chunk matches its shaders and the rest of the document does not.
+    Chunk,
     /// The whole document matches its shaders. The only state a solve will run from.
     Whole,
 }
@@ -119,6 +124,7 @@ impl Baked {
     pub fn name(self) -> &'static str {
         match self {
             Self::Nothing => "nothing",
+            Self::Chunk => "chunk",
             Self::Whole => "whole",
         }
     }
@@ -196,7 +202,11 @@ pub struct Document {
     recipe_seen: Option<(u64, u64)>,
     recipe_error: Option<String>,
     runtime: ShaderRuntime,
+    active_chunk: UVec2,
+    /// The open document's extent in cells, or the one New would build.
     pub size: UVec2,
+    /// The open document's chunk size in cells, or the one New would build.
+    pub chunk_size: UVec2,
     pub seed: u32,
     pub preset: Preset,
     pub path: Option<PathBuf>,
@@ -223,7 +233,9 @@ impl Default for Document {
             recipe_seen: None,
             recipe_error: None,
             runtime: ShaderRuntime::default(),
+            active_chunk: UVec2::ZERO,
             size: UVec2::splat(1024),
+            chunk_size: UVec2::splat(1024),
             seed: 1,
             preset: Preset::default(),
             path: None,
@@ -241,6 +253,50 @@ impl Document {
     /// one the document carries when there is.
     pub fn active(&self) -> &str {
         &self.active
+    }
+
+    /// The chunk on screen. Always one of the open document's chunks, and `(0, 0)`
+    /// with no document.
+    pub fn active_chunk(&self) -> UVec2 {
+        self.active_chunk
+    }
+
+    /// The chunk grid of the open document, or of the one New would build when none
+    /// is open. `None` only when [`Document::size`] is not a whole number of
+    /// [`Document::chunk_size`] chunks.
+    pub fn grid(&self) -> Option<ChunkGrid> {
+        let chunks = self.size.checked_div(self.chunk_size)?;
+        ChunkGrid::new(self.chunk_size, chunks).ok()
+    }
+
+    /// The cells of the chunk on screen, or the whole extent with no grid.
+    pub fn active_rect(&self) -> CellRect {
+        self.grid()
+            .and_then(|grid| grid.rect(self.active_chunk))
+            .unwrap_or(CellRect::from_size(self.size))
+    }
+
+    /// Puts another chunk on screen. Not an edit and not an undo step, and never
+    /// re-bakes: it changes what is shown, not what the document is.
+    ///
+    /// Refused for a chunk outside the open document's grid.
+    pub fn set_active_chunk(&mut self, chunk: UVec2) -> Result<(), String> {
+        let grid = self.grid().ok_or("there is no document")?;
+        if !grid.contains(chunk) {
+            return Err(format!(
+                "chunk ({}, {}) is outside the {}x{} grid",
+                chunk.x,
+                chunk.y,
+                grid.chunks().x,
+                grid.chunks().y
+            ));
+        }
+        if self.active_chunk != chunk {
+            self.active_chunk = chunk;
+            self.revision += 1;
+            self.water_revision += 1;
+        }
+        Ok(())
     }
 
     /// Bumped whenever the layer textures might need re-uploading. Compared against a
@@ -741,27 +797,43 @@ impl Document {
         if self.baked == Baked::Whole && !self.dirty {
             return self.start_solve();
         }
-        self.start_bake()?;
+        self.start_bake_of(false)?;
         self.pending_solve = true;
         Ok(())
     }
 
-    /// Starts baking the whole document. Refused while a job is running or with no
+    /// Starts baking the document. Refused while a job is running or with no
     /// document open.
+    ///
+    /// On a document of more than one chunk whose active chunk is stale this bakes
+    /// the active chunk alone, so it can be shown first; the bake that follows it
+    /// is of the whole document. Otherwise it bakes the whole document.
     pub fn start_bake(&mut self) -> Result<(), String> {
+        self.start_bake_of(true)
+    }
+
+    fn start_bake_of(&mut self, active_first: bool) -> Result<(), String> {
         let mut terrain = self.take_terrain()?;
+        let chunk = self.active_chunk;
+        let first = active_first
+            && terrain.grid().is_some_and(|grid| grid.count() > 1)
+            && terrain.stale_chunks().contains(&chunk);
 
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            let error = terrain.bake_in_place().err().map(|error| error.to_string());
+            let result = if first {
+                terrain.bake_chunk(chunk)
+            } else {
+                terrain.bake_in_place()
+            };
             Outcome {
                 terrain: Some(terrain),
-                error,
+                error: result.err().map(|error| error.to_string()),
             }
         });
         self.start(JobKind::Bake, task);
         self.dirty = false;
         self.bake_failed = false;
-        self.baking = Baked::Whole;
+        self.baking = if first { Baked::Chunk } else { Baked::Whole };
         Ok(())
     }
 
@@ -782,11 +854,14 @@ impl Document {
     pub fn start_new(
         &mut self,
         dir: PathBuf,
-        size: UVec2,
+        grid: ChunkGrid,
         seed: u32,
         preset: Preset,
     ) -> Result<(), String> {
         self.replace_check()?;
+        let mut terrain = preset
+            .build(grid, seed)
+            .map_err(|error| error.to_string())?;
         gpu::write_preset(&dir.join(SHADER_DIR), preset)?;
         let runtime = self.runtime.with_sources(
             seed,
@@ -794,11 +869,12 @@ impl Document {
                 gpu::stock_source(stock).map(|source| (format!("{layer}.wesl"), source.to_owned()))
             }),
         );
-        let mut terrain = preset.build(size, seed);
         terrain.set_shader_runtime(runtime);
         recipe::write_recipe(&dir, &terrain).map_err(|error| error.to_string())?;
 
-        self.size = size;
+        self.size = grid.extent();
+        self.chunk_size = grid.chunk_size();
+        self.active_chunk = UVec2::ZERO;
         self.seed = seed;
         self.preset = preset;
         self.path = Some(dir);
@@ -1003,7 +1079,10 @@ impl Document {
     /// `start_load` both need a task pool, and a test has none.
     #[cfg(test)]
     pub(crate) fn adopt(&mut self, terrain: TerrainSpec) {
-        self.size = terrain.size;
+        self.size = terrain.size();
+        if let Some(grid) = terrain.grid() {
+            self.chunk_size = grid.chunk_size();
+        }
         self.terrain = Some(terrain);
     }
 
@@ -1026,7 +1105,13 @@ fn finish_job(mut document: ResMut<Document>) {
 
     document.job = Job::Idle;
     if let Some(terrain) = outcome.terrain {
-        document.size = terrain.size;
+        document.size = terrain.size();
+        if let Some(grid) = terrain.grid() {
+            document.chunk_size = grid.chunk_size();
+            if !grid.contains(document.active_chunk) {
+                document.active_chunk = UVec2::ZERO;
+            }
+        }
         document.seed = terrain.seed;
         document.terrain = Some(terrain);
     }
@@ -1034,8 +1119,13 @@ fn finish_job(mut document: ResMut<Document>) {
     document.water_revision += 1;
 
     if outcome.error.is_none() {
-        if document.baking == Baked::Whole {
-            document.baked = Baked::Whole;
+        match document.baking {
+            Baked::Whole => document.baked = Baked::Whole,
+            Baked::Chunk => {
+                document.baked = Baked::Chunk;
+                document.dirty = true;
+            }
+            Baked::Nothing => {}
         }
         for fault in document.unlogged_faults() {
             warn!("{fault}");
@@ -1238,7 +1328,7 @@ mod tests {
         document
             .start_new(
                 scratch("new-target"),
-                UVec2::splat(32),
+                ChunkGrid::single(UVec2::splat(32)).unwrap(),
                 7,
                 Preset::Continents,
             )
@@ -1596,6 +1686,54 @@ mod tests {
         document
     }
 
+    // The edit-bake context: on a document of several chunks an edit shows the
+    // chunk on screen first, and the document is not settled until the whole bake
+    // that follows has landed too.
+    #[test]
+    fn an_edit_bakes_the_active_chunk_first_and_then_the_whole_document() {
+        let mut document = Document::default();
+        let grid = ChunkGrid::new(UVec2::splat(8), UVec2::new(2, 1)).unwrap();
+        let terrain = TerrainSpec::chunked(grid)
+            .unwrap()
+            .with_layer(Layer::new("height").held(0.5));
+        document.adopt(terrain);
+        document.set_active_chunk(UVec2::new(1, 0)).unwrap();
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+
+        document.start_bake().unwrap();
+        let mut document = landed(document);
+        assert_eq!(document.baked(), Baked::Chunk);
+        assert!(
+            !document.is_settled(),
+            "the rest of the document is still to bake"
+        );
+        let stale = document.terrain().unwrap().stale_chunks();
+        assert_eq!(stale, vec![UVec2::ZERO]);
+
+        document.start_bake().unwrap();
+        let document = landed(document);
+        assert_eq!(document.baked(), Baked::Whole);
+        assert!(document.terrain().unwrap().stale_chunks().is_empty());
+    }
+
+    // Switching chunks changes what is shown and nothing else, so it must neither
+    // dirty the document nor reach a chunk the grid does not have.
+    #[test]
+    fn switching_the_active_chunk_is_not_an_edit() {
+        let mut document = Document::default();
+        let grid = ChunkGrid::new(UVec2::splat(8), UVec2::new(2, 2)).unwrap();
+        document.adopt(TerrainSpec::chunked(grid).unwrap());
+        let revision = document.revision();
+
+        document.set_active_chunk(UVec2::new(1, 1)).unwrap();
+        assert_eq!(document.active_chunk(), UVec2::new(1, 1));
+        assert_eq!(document.active_rect().min, UVec2::new(8, 8));
+        assert!(!document.is_dirty());
+        assert_eq!(document.history().undo, 0);
+        assert!(document.revision() > revision, "the view has to re-upload");
+        assert!(document.set_active_chunk(UVec2::new(2, 0)).is_err());
+    }
+
     fn constant_of(document: &Document) -> f32 {
         document
             .terrain()
@@ -1709,7 +1847,12 @@ mod tests {
         AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         let root = scratch("new-empty-history");
         document
-            .start_new(root.clone(), UVec2::splat(16), 1, Preset::default())
+            .start_new(
+                root.clone(),
+                ChunkGrid::single(UVec2::splat(16)).unwrap(),
+                1,
+                Preset::default(),
+            )
             .unwrap();
 
         assert_eq!(

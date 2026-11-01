@@ -221,9 +221,17 @@ fn sync_maps(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<LayerMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    quad: Single<(&Mesh2d, &MeshMaterial2d<LayerMaterial>, &mut MapRevisions), With<LayerQuad>>,
+    quad: Single<
+        (
+            &Mesh2d,
+            &MeshMaterial2d<LayerMaterial>,
+            &mut MapRevisions,
+            &mut Transform,
+        ),
+        With<LayerQuad>,
+    >,
 ) {
-    let (mesh, material, mut revisions) = quad.into_inner();
+    let (mesh, material, mut revisions, mut placed) = quad.into_inner();
     let Some(mut material) = materials.get_mut(&material.0) else {
         return;
     };
@@ -244,57 +252,59 @@ fn sync_maps(
         let Some(layer) = terrain.layer(document.active()) else {
             return;
         };
-        let baked = layer.baked();
+        let rect = document.active_rect();
+        let shown = UVec2::new(rect.width(), rect.height());
+        let texels = layer.baked().copy_rect(rect);
 
         if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
-            *mesh = Rectangle::new(terrain.size.x as f32, terrain.size.y as f32).into();
+            *mesh = Rectangle::new(shown.x as f32, shown.y as f32).into();
         }
+        let centre = rect.min.as_vec2() + shown.as_vec2() * 0.5;
+        placed.translation = cell_to_world(centre, terrain.size()).extend(placed.translation.z);
 
-        let resolution = if baked.is_empty() {
-            UVec2::ONE
-        } else {
-            baked.size()
-        };
+        let resolution = if texels.is_some() { shown } else { UVec2::ONE };
         material.settings.layer_resolution = resolution.as_vec2();
-        material.settings.document_size = terrain.size.as_vec2();
+        material.settings.document_size = shown.as_vec2();
 
-        if baked.is_empty() {
-            material.layer = images.add(blank(TextureFormat::R32Float));
-        } else {
-            let mut bytes = Vec::with_capacity(baked.len() * size_of::<f32>());
-            for value in baked.data() {
-                bytes.extend_from_slice(&value.to_ne_bytes());
+        match texels {
+            None => material.layer = images.add(blank(TextureFormat::R32Float)),
+            Some(texels) => {
+                let mut bytes = Vec::with_capacity(texels.len() * size_of::<f32>());
+                for value in &texels {
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                let mut image = Image::new(
+                    Extent3d {
+                        width: resolution.x,
+                        height: resolution.y,
+                        depth_or_array_layers: 1,
+                    },
+                    TextureDimension::D2,
+                    bytes,
+                    TextureFormat::R32Float,
+                    RenderAssetUsages::RENDER_WORLD,
+                );
+                image.sampler = ImageSampler::nearest();
+                material.layer = images.add(image);
             }
-            let mut image = Image::new(
-                Extent3d {
-                    width: resolution.x,
-                    height: resolution.y,
-                    depth_or_array_layers: 1,
-                },
-                TextureDimension::D2,
-                bytes,
-                TextureFormat::R32Float,
-                RenderAssetUsages::RENDER_WORLD,
-            );
-            image.sampler = ImageSampler::nearest();
-            material.layer = images.add(image);
         }
     }
 
     if revisions.water != Some(document.water_revision()) {
         revisions.water = Some(document.water_revision());
+        let rect = document.active_rect();
         material.water = images.add(match terrain.water() {
-            Some(state) => water_map(state),
-            None => blank(TextureFormat::Rg8Unorm),
+            Some(state) if state.size() == terrain.size() => water_map(state, rect),
+            _ => blank(TextureFormat::Rg8Unorm),
         });
     }
 }
 
-fn water_map(state: &WaterState) -> Image {
-    let size = state.size();
+fn water_map(state: &WaterState, rect: CellRect) -> Image {
+    let size = UVec2::new(rect.width(), rect.height());
     let mut bytes = Vec::with_capacity((size.x * size.y) as usize * 2);
-    for y in 0..size.y {
-        for x in 0..size.x {
+    for y in rect.min.y..rect.max.y {
+        for x in rect.min.x..rect.max.x {
             bytes.push(if state.is_water(x, y) { 255 } else { 0 });
             bytes.push(if state.channel(x, y, CHANNEL_THRESHOLD) {
                 255
@@ -422,12 +432,14 @@ fn fit_ramp(
     }
 
     let view = visible_rect(transform, projection);
-    let low_cell = world_to_cell(view.min, terrain.size);
-    let high_cell = world_to_cell(view.max, terrain.size);
+    let low_cell = world_to_cell(view.min, terrain.size());
+    let high_cell = world_to_cell(view.max, terrain.size());
 
-    let size = terrain.size.as_vec2();
-    let min = low_cell.max(Vec2::ZERO).min(size - Vec2::ONE);
-    let max = high_cell.max(Vec2::ZERO).min(size - Vec2::ONE);
+    let rect = document.active_rect();
+    let first = rect.min.as_vec2();
+    let last = rect.max.as_vec2() - Vec2::ONE;
+    let min = low_cell.max(first).min(last);
+    let max = high_cell.max(first).min(last);
 
     let mut samples = Vec::with_capacity((FIT_SAMPLES * FIT_SAMPLES) as usize);
     for row in 0..FIT_SAMPLES {
@@ -481,13 +493,10 @@ fn track_visible_cells(
     let size = document.size;
     let view = visible_rect(transform, projection);
 
-    let bounds = size.as_vec2();
-    let low = world_to_cell(view.min, size)
-        .floor()
-        .clamp(Vec2::ZERO, bounds);
-    let high = world_to_cell(view.max, size)
-        .ceil()
-        .clamp(Vec2::ZERO, bounds);
+    let rect = document.active_rect();
+    let (first, bounds) = (rect.min.as_vec2(), rect.max.as_vec2());
+    let low = world_to_cell(view.min, size).floor().clamp(first, bounds);
+    let high = world_to_cell(view.max, size).ceil().clamp(first, bounds);
     visible.0 = if high.x <= low.x || high.y <= low.y {
         CellRect::EMPTY
     } else {
@@ -495,7 +504,8 @@ fn track_visible_cells(
     };
 }
 
-/// Puts the whole document in the space the panels have left, in one step.
+/// Puts `rect` — the chunk on screen — of a `size`-cell document in the space the
+/// panels have left, in one step.
 ///
 /// The only thing in the crate that knows the panels are there, and it has to be: the
 /// world is drawn across the whole window with the panels over it, so a document
@@ -508,6 +518,7 @@ pub fn fit_camera(
     transform: &mut Transform,
     projection: &mut Projection,
     size: UVec2,
+    rect: CellRect,
     free: FreeView,
 ) {
     let Projection::Orthographic(projection) = projection else {
@@ -523,11 +534,12 @@ pub fn fit_camera(
     if uncovered.x <= 0.0 || uncovered.y <= 0.0 {
         return;
     }
-    let document = size.as_vec2();
-    let factor = (document.x / uncovered.x).max(document.y / uncovered.y);
+    let shown = Vec2::new(rect.width() as f32, rect.height() as f32);
+    let factor = (shown.x / uncovered.x).max(shown.y / uncovered.y);
     projection.scale *= factor;
 
-    transform.translation = (-free.centre * area * factor).extend(transform.translation.z);
+    let centre = cell_to_world(rect.min.as_vec2() + shown * 0.5, size);
+    transform.translation = (centre - free.centre * area * factor).extend(transform.translation.z);
 }
 
 /// Centres the view on a document cell. Absolute rather than relative, so a caller

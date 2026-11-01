@@ -20,6 +20,7 @@ use crate::preset::Preset;
 use crate::project::{self, Project};
 use crate::ui::report;
 use crate::view::{EditorCamera, FreeView, fit_camera, look_at_cell, set_cells_across};
+use watershed::chunk::ChunkGrid;
 
 const DEFAULT_WAIT_FRAMES: u32 = 36_000;
 
@@ -56,8 +57,8 @@ pub(super) enum Command {
     },
     /// Builds a preset and waits for its bake.
     New {
-        /// Extent of the terrain to build.
-        size: UVec2,
+        /// How the terrain to build is chunked; its extent is the grid's.
+        grid: ChunkGrid,
         /// Seed the preset is built from.
         seed: u32,
         /// Which preset.
@@ -68,6 +69,8 @@ pub(super) enum Command {
     /// Puts a layer on screen. `layer add <name>` is a different thing — an
     /// [`Edit`] — and parses to [`Command::Edit`].
     Layer(String),
+    /// Puts a chunk on screen. Not an edit, and never re-bakes.
+    Chunk(UVec2),
     /// Opens or closes the new-terrain dialog. Opening is refused on a project that
     /// holds a terrain — the reason the toolbar hides its button for.
     NewDialog {
@@ -176,6 +179,7 @@ impl Command {
             Self::Wait { .. } => "wait",
             Self::New { .. } => "new",
             Self::Layer(_) => "layer",
+            Self::Chunk(_) => "chunk",
             Self::NewDialog { .. } => "new-dialog",
             Self::Edit { edit, .. } => match edit {
                 Edit::Set { .. } => "set",
@@ -216,19 +220,34 @@ impl Command {
                 })
             }
             "new" => {
-                let width = number(rest.first().ok_or("new needs a width")?)?;
-                let height = number(rest.get(1).ok_or("new needs a height")?)?;
-                let seed = optional_number(rest.get(2), 1)?;
-                let preset = match rest.get(3) {
+                let (positional, chunked) = match rest.iter().position(|word| *word == "chunk") {
+                    Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+                    None => (&rest[..], None),
+                };
+                let width = number(positional.first().ok_or("new needs a width")?)?;
+                let height = number(positional.get(1).ok_or("new needs a height")?)?;
+                let seed = optional_number(positional.get(2), 1)?;
+                let preset = match positional.get(3) {
                     Some(word) => Preset::parse(word).ok_or(format!("no preset named `{word}`"))?,
                     None => Preset::default(),
                 };
+                let size = UVec2::new(width, height);
+                let chunk_size = match chunked {
+                    Some([w, h, ..]) => UVec2::new(number(w)?, number(h)?),
+                    Some(_) => return Err("new … chunk needs a width and a height".to_owned()),
+                    None => size,
+                };
                 Ok(Self::New {
-                    size: UVec2::new(width, height),
+                    grid: grid_of(size, chunk_size)?,
                     seed,
                     preset,
                     started: false,
                 })
+            }
+            "chunk" => {
+                let x = number(rest.first().ok_or("chunk needs an x")?)?;
+                let y = number(rest.get(1).ok_or("chunk needs a y")?)?;
+                Ok(Self::Chunk(UVec2::new(x, y)))
             }
             "layer" => match rest.as_slice() {
                 ["add", name, ..] => Ok(Self::Edit {
@@ -341,7 +360,7 @@ impl Command {
             }
 
             Self::New {
-                size,
+                grid,
                 seed,
                 preset,
                 started,
@@ -357,7 +376,7 @@ impl Command {
                     }
                     let result = world
                         .resource_mut::<Document>()
-                        .start_new(dir, *size, *seed, *preset);
+                        .start_new(dir, *grid, *seed, *preset);
                     world.resource_mut::<Project>().look_again();
                     world.resource_mut::<crate::ui::NewDialog>().open = false;
                     if let Err(error) = result {
@@ -377,6 +396,14 @@ impl Command {
                 let mut document = world.resource_mut::<Document>();
                 match document.set_active(name) {
                     Ok(()) => Poll::Done(json!({ "layer": name })),
+                    Err(error) => Poll::Failed(error),
+                }
+            }
+
+            Self::Chunk(chunk) => {
+                let mut document = world.resource_mut::<Document>();
+                match document.set_active_chunk(*chunk) {
+                    Ok(()) => Poll::Done(json!({ "chunk": [chunk.x, chunk.y] })),
                     Err(error) => Poll::Failed(error),
                 }
             }
@@ -528,10 +555,9 @@ impl Command {
             }
 
             Self::Zoom(to) => {
-                let terrain_size = world
-                    .resource::<Document>()
-                    .terrain()
-                    .map(|terrain| terrain.size);
+                let document = world.resource::<Document>();
+                let terrain_size = document.terrain().map(|terrain| terrain.size());
+                let rect = document.active_rect();
                 let free = *world.resource::<FreeView>();
                 let mut query =
                     world.query_filtered::<(&mut Transform, &mut Projection), With<EditorCamera>>();
@@ -542,8 +568,8 @@ impl Command {
                 match to {
                     ZoomTo::Fit => match terrain_size {
                         Some(size) => {
-                            fit_camera(&mut transform, &mut projection, size, free);
-                            Poll::Done(json!({ "fit": [size.x, size.y] }))
+                            fit_camera(&mut transform, &mut projection, size, rect, free);
+                            Poll::Done(json!({ "fit": [rect.width(), rect.height()] }))
                         }
                         None => Poll::Failed("there is no document to fit".to_owned()),
                     },
@@ -670,6 +696,19 @@ fn owned(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| (*word).to_owned()).collect()
 }
 
+fn grid_of(size: UVec2, chunk_size: UVec2) -> Result<ChunkGrid, String> {
+    let chunks = size
+        .checked_div(chunk_size)
+        .filter(|chunks| *chunks * chunk_size == size)
+        .ok_or_else(|| {
+            format!(
+                "a {}x{} terrain is not a whole number of {}x{} chunks",
+                size.x, size.y, chunk_size.x, chunk_size.y
+            )
+        })?;
+    ChunkGrid::new(chunk_size, chunks).map_err(|error| error.to_string())
+}
+
 fn number<T: std::str::FromStr>(word: &str) -> Result<T, String> {
     word.parse().map_err(|_| format!("not a number: {word}"))
 }
@@ -725,7 +764,9 @@ mod tests {
             ("wait bake", "wait"),
             ("wait water 600", "wait"),
             ("new 256 256 7 ridges", "new"),
+            ("new 512 256 7 ridges chunk 128 128", "new"),
             ("layer height", "layer"),
+            ("chunk 1 0", "chunk"),
             ("layer add biomes", "layer"),
             ("layer rm base", "layer"),
             ("new-dialog open", "new-dialog"),
@@ -780,8 +821,22 @@ mod tests {
         assert!(Command::parse("layer").is_err());
         assert!(Command::parse("layer rm").is_err());
         assert!(Command::parse("set").is_err());
+        assert!(Command::parse("chunk 1").is_err());
         assert!(Command::parse("load /tmp/a").is_err());
         assert!(Command::parse("save /tmp/a").is_err());
+    }
+
+    // A chunk size that does not divide the extent would build a document whose last
+    // chunk is short, which uniform chunks rule out, so the socket refuses it.
+    #[test]
+    fn a_new_whose_chunks_do_not_divide_the_extent_is_refused() {
+        assert!(Command::parse("new 300 256 1 ridges chunk 128 128").is_err());
+        assert!(Command::parse("new 256 256 1 ridges chunk 0 128").is_err());
+        assert!(Command::parse("new 256 256 1 ridges chunk 128").is_err());
+        let Ok(Command::New { grid, .. }) = Command::parse("new 512 256 chunk 128 128") else {
+            panic!("a dividing chunk size was refused");
+        };
+        assert_eq!(grid.chunks(), UVec2::new(4, 2));
     }
 
     // The brush is gone rather than hidden: a script still written against it has to be

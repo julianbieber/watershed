@@ -167,7 +167,6 @@ fn fingerprint(document: &Document, expanded: &Expanded, library: &ShaderLibrary
         return key + "empty";
     };
     key.push_str(layer.role.as_str());
-    key.push_str(&format!("|shift:{}", layer.shift));
     let (low, high) = layer.bounds();
     key.push_str(&format!("|range:{low}..{high}"));
     key.push_str(&format!("|categorical:{}", layer.categorical));
@@ -324,10 +323,6 @@ fn properties(active: &str, layer: &Layer, reads: &[String], read_by: &[String])
         one(widgets::captioned(
             "role",
             one(widgets::small(layer.role.as_str())),
-        )),
-        one(widgets::captioned(
-            "shift",
-            one(widgets::small(layer.shift.to_string())),
         )),
         one(widgets::captioned(
             "range",
@@ -609,20 +604,16 @@ mod tests {
         assert_eq!(key(&document), before);
     }
 
-    // The four the file declares are drawn as text, so a file edited under the panel
+    // The three the file declares are drawn as text, so a file edited under the panel
     // has to rebuild it: nothing else would ever redraw the label.
     #[test]
     fn the_properties_the_file_declares_are_part_of_the_shape() {
         let mut document = document_with(0.5);
         let before = key(&document);
 
-        height(&mut document).shift = 2;
-        let after_shift = key(&document);
-        assert_ne!(after_shift, before, "the shift is a label");
-
         height(&mut document).range = (0.0, 2.0);
         let after_range = key(&document);
-        assert_ne!(after_range, after_shift, "so is the range");
+        assert_ne!(after_range, before, "the range is a label");
 
         height(&mut document).categorical = true;
         assert_ne!(key(&document), after_range, "so is the class");
