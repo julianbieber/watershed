@@ -28,7 +28,6 @@ const WIRE: Color = Color::srgb(0.48, 0.64, 0.86);
 const BROKEN: Color = Color::srgb(0.72, 0.24, 0.24);
 const FAULT: Color = Color::srgb(1.0, 0.74, 0.72);
 const DETAIL: Color = Color::srgb(0.72, 0.76, 0.85);
-const PARAM: Color = Color::srgb(0.62, 0.66, 0.76);
 
 const FAULT_CHARS: usize = 34;
 
@@ -196,7 +195,7 @@ pub fn layer_at<'a>(
 /// Driven by a fingerprint rather than by an event, because an edit can arrive from the
 /// panel, from the control socket, from a preset load or from a shader file changing on
 /// disk, and a fingerprint catches all of them without each having to announce itself.
-/// The key carries the names, the roles, the shifts, the relation and every fault a card
+/// The key carries the names, the roles, the relation and every fault a card
 /// shows, so a layer added, a read added and a shader broken or fixed each bring the
 /// cards up to date.
 pub(super) fn rebuild_overview(
@@ -228,7 +227,7 @@ pub(super) fn rebuild_overview(
     let (placed, cycle) = layout(terrain);
     let wires = edges_between(&placed, terrain);
     let faults = terrain.layer_faults();
-    let cards: Vec<(String, &'static str, u8, Vec2, Option<String>)> = placed
+    let cards: Vec<(String, &'static str, Vec2, Option<String>)> = placed
         .iter()
         .filter_map(|card| {
             let layer = terrain.layer(&card.layer)?;
@@ -237,13 +236,7 @@ pub(super) fn rebuild_overview(
                 .find(|(id, _)| *id == layer.id)
                 .map(|(_, fault)| fault.clone())
                 .or_else(|| library_fault(&library, &layer.file()));
-            Some((
-                card.layer.clone(),
-                layer.role.as_str(),
-                layer.shift,
-                card.at,
-                fault,
-            ))
+            Some((card.layer.clone(), layer.role.as_str(), card.at, fault))
         })
         .collect();
 
@@ -252,18 +245,9 @@ pub(super) fn rebuild_overview(
     }
 
     let font = assets.load(fonts::REGULAR);
-    for (name, role, shift, at, fault) in cards {
+    for (name, role, at, fault) in cards {
         let selected = name == active;
-        spawn_layer_card(
-            &mut commands,
-            &font,
-            &name,
-            role,
-            shift,
-            at,
-            selected,
-            fault,
-        );
+        spawn_layer_card(&mut commands, &font, &name, role, at, selected, fault);
     }
 
     let wire_material = materials.add(WIRE);
@@ -289,7 +273,6 @@ fn spawn_layer_card(
     font: &Handle<Font>,
     name: &str,
     role: &str,
-    shift: u8,
     at: Vec2,
     selected: bool,
     fault: Option<String>,
@@ -367,9 +350,8 @@ fn spawn_layer_card(
             ));
         };
         row(0, DETAIL_SIZE, DETAIL, role.to_owned());
-        row(1, PARAM_SIZE, PARAM, format!("shift {shift}"));
         if let Some(fault) = fault {
-            row(2, PARAM_SIZE, FAULT, fault_line(&fault));
+            row(1, PARAM_SIZE, FAULT, fault_line(&fault));
         }
     });
 }
@@ -510,10 +492,9 @@ fn fingerprint(document: &Document, library: &ShaderLibrary) -> String {
     };
     for layer in &terrain.layers {
         key.push_str(&format!(
-            "|{}:{}:{}:{}",
+            "|{}:{}:{}",
             layer.id,
             layer.role.as_str(),
-            layer.shift,
             crate::edit::reads_of(layer).join(","),
         ));
         if let Some(error) = library_fault(library, &layer.file()) {

@@ -6,9 +6,11 @@
 //! cover the ways layers can read each other, not to be a library of landscapes.
 
 use crate::gpu;
+use crate::terrain::bake::PlanError;
 use crate::terrain::shader::{ShaderLayer, parse_header, parse_layers, parse_params};
 use crate::terrain::{Layer, TerrainSpec, WaterSpec};
 use bevy::prelude::*;
+use watershed::chunk::ChunkGrid;
 
 /// Which starting document to build.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,18 +63,21 @@ impl Preset {
     /// none of them opens on an editor with half its display inert. The roles come
     /// from the stock files the preset copies, as every layer's do.
     ///
-    /// Every layer carries a value for every parameter its file declares and the four
+    /// Every layer carries a value for every parameter its file declares and the three
     /// properties its header declares, its hidden `seed` drawn from `seed`, and the
-    /// document's seed is `seed`. Two calls with the same arguments give equal
-    /// documents.
-    pub fn build(self, size: UVec2, seed: u32) -> TerrainSpec {
+    /// document's seed is `seed`. The document is laid out on `grid`. Two calls with
+    /// the same arguments give equal documents.
+    ///
+    /// Refused for a grid [`TerrainSpec::chunked`] refuses.
+    pub fn build(self, grid: ChunkGrid, seed: u32) -> Result<TerrainSpec, PlanError> {
+        let empty = TerrainSpec::chunked(grid)?;
         let mut terrain = match self {
-            Self::Continents => continents(size, seed),
-            Self::Ridges => ridges(size, seed),
+            Self::Continents => continents(empty, seed),
+            Self::Ridges => ridges(empty, seed),
         };
         terrain.water_spec = Some(WaterSpec::new("height").with_moisture("moisture"));
         terrain.seed = seed;
-        terrain
+        Ok(terrain)
     }
 }
 
@@ -114,14 +119,17 @@ fn moisture(seed: u32) -> Layer {
     )
 }
 
-fn continents(size: UVec2, seed: u32) -> TerrainSpec {
-    TerrainSpec::new(size)
-        .with_layer(moisture(seed))
-        .with_layer(built("height", "continents.wesl", salted(seed, 1), &[]))
+fn continents(empty: TerrainSpec, seed: u32) -> TerrainSpec {
+    empty.with_layer(moisture(seed)).with_layer(built(
+        "height",
+        "continents.wesl",
+        salted(seed, 1),
+        &[],
+    ))
 }
 
-fn ridges(size: UVec2, seed: u32) -> TerrainSpec {
-    TerrainSpec::new(size)
+fn ridges(empty: TerrainSpec, seed: u32) -> TerrainSpec {
+    empty
         .with_layer(moisture(seed))
         .with_layer(built("base", "base.wesl", salted(seed, 1), &[]))
         .with_layer(built(
@@ -138,6 +146,10 @@ mod tests {
 
     const SIZE: UVec2 = UVec2::new(96, 96);
 
+    fn grid() -> ChunkGrid {
+        ChunkGrid::single(SIZE).unwrap()
+    }
+
     fn stock_of(preset: Preset, layer: &str) -> &'static str {
         preset
             .files()
@@ -153,7 +165,7 @@ mod tests {
     #[test]
     fn every_preset_names_a_height_layer_and_a_water_spec_over_layers_it_has() {
         for preset in Preset::ALL {
-            let terrain = preset.build(SIZE, 7);
+            let terrain = preset.build(grid(), 7).unwrap();
             assert!(
                 terrain.layer("height").is_some(),
                 "{} has no height layer",
@@ -175,7 +187,7 @@ mod tests {
     #[test]
     fn every_layer_of_a_preset_has_a_shipped_file_and_every_file_a_layer() {
         for preset in Preset::ALL {
-            let terrain = preset.build(SIZE, 7);
+            let terrain = preset.build(grid(), 7).unwrap();
             for (layer, stock) in preset.files() {
                 assert!(gpu::stock_source(stock).is_some(), "{stock} is not shipped");
                 assert!(terrain.layer(layer).is_some(), "{layer} is not built");
@@ -190,7 +202,7 @@ mod tests {
     // from names `base`, and nothing else declares the dependency.
     #[test]
     fn ridges_height_reads_base_by_name() {
-        let ridges = Preset::Ridges.build(SIZE, 7);
+        let ridges = Preset::Ridges.build(grid(), 7).unwrap();
         let height = ridges.layer("height").unwrap();
         assert_eq!(
             height.shader.layers,
@@ -204,8 +216,14 @@ mod tests {
     #[test]
     fn equal_arguments_build_equal_documents_and_another_seed_builds_another() {
         for preset in Preset::ALL {
-            assert_eq!(preset.build(SIZE, 7), preset.build(SIZE, 7));
-            assert_ne!(preset.build(SIZE, 7), preset.build(SIZE, 8));
+            assert_eq!(
+                preset.build(grid(), 7).unwrap(),
+                preset.build(grid(), 7).unwrap()
+            );
+            assert_ne!(
+                preset.build(grid(), 7).unwrap(),
+                preset.build(grid(), 8).unwrap()
+            );
         }
     }
     // A parameter left for the first sweep to fill would make that sweep reconcile it
@@ -213,7 +231,7 @@ mod tests {
     #[test]
     fn every_layer_already_carries_every_parameter_its_file_declares() {
         for preset in Preset::ALL {
-            for layer in &preset.build(SIZE, 7).layers {
+            for layer in &preset.build(grid(), 7).unwrap().layers {
                 let source = gpu::stock_source(stock_of(preset, layer.id.as_str())).unwrap();
                 let mut copy = layer.shader.clone();
                 assert!(
@@ -232,7 +250,7 @@ mod tests {
     #[test]
     fn every_preset_layer_carries_what_its_stock_file_declares() {
         for preset in Preset::ALL {
-            for layer in &preset.build(SIZE, 7).layers {
+            for layer in &preset.build(grid(), 7).unwrap().layers {
                 let source = gpu::stock_source(stock_of(preset, layer.id.as_str())).unwrap();
                 let header = parse_header(source).unwrap();
                 let mut copy = layer.clone();

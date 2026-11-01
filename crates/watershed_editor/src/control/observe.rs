@@ -90,6 +90,8 @@ fn document(world: &World) -> Value {
         "bake_failed": document.bake_failed(),
         "baked": document.baked().name(),
         "size": [document.size.x, document.size.y],
+        "chunk_size": [document.chunk_size.x, document.chunk_size.y],
+        "chunk": [document.active_chunk().x, document.active_chunk().y],
         "undo": document.history().undo,
         "redo": document.history().redo,
         "seed": document.seed,
@@ -130,7 +132,6 @@ fn layer(world: &World) -> Value {
             "available": false,
             "reason": "not baked",
             "role": layer.role.as_str(),
-            "shift": layer.shift,
             "range": [low, high],
             "categorical": layer.categorical,
             "file": file,
@@ -154,7 +155,6 @@ fn layer(world: &World) -> Value {
         "available": true,
         "name": layer.id.to_string(),
         "role": layer.role.as_str(),
-        "shift": layer.shift,
         "range": [low, high],
         "categorical": layer.categorical,
         "resolution": [baked.width(), baked.height()],
@@ -205,8 +205,7 @@ fn layers(world: &World) -> Value {
             json!({
                 "name": layer.id.to_string(),
                 "role": layer.role.as_str(),
-                "shift": layer.shift,
-                "categorical": layer.categorical,
+                    "categorical": layer.categorical,
                 "reads": crate::edit::reads_of(layer),
                 "fault": faults
                     .iter()
@@ -449,10 +448,10 @@ mod tests {
 
     // Editing a header line and reading the result back is how every property this task
     // moved into the file is checked, and an unbaked layer is exactly the state a file
-    // that has just been saved is in — so the four have to be on both replies.
+    // that has just been saved is in — so the three have to be on both replies.
     #[test]
-    fn observing_a_layer_reports_the_four_its_file_declares_baked_or_not() {
-        let mut moisture = Layer::new("moisture").with_shift(2).with_range((0.0, 2.0));
+    fn observing_a_layer_reports_the_three_its_file_declares_baked_or_not() {
+        let mut moisture = Layer::new("moisture").with_range((0.0, 2.0));
         moisture.categorical = true;
         let terrain = TerrainSpec::new(UVec2::splat(16)).with_layer(moisture);
 
@@ -465,7 +464,6 @@ mod tests {
 
         let unbaked = layer(&world);
         assert_eq!(unbaked["reason"], json!("not baked"));
-        assert_eq!(unbaked["shift"], json!(2));
         assert_eq!(unbaked["range"], json!([0.0, 2.0]));
         assert_eq!(unbaked["categorical"], json!(true));
 
@@ -479,10 +477,9 @@ mod tests {
         let baked = layer(&world);
         assert_eq!(baked["available"], json!(true));
         assert_eq!(baked["role"], json!("custom"));
-        assert_eq!(baked["shift"], json!(2));
         assert_eq!(baked["range"], json!([0.0, 2.0]));
         assert_eq!(baked["categorical"], json!(true));
-        assert_eq!(baked["resolution"], json!([4, 4]));
+        assert_eq!(baked["resolution"], json!([16, 16]));
     }
 
     // Acceptance criterion seven: the whole document's shape over the socket, in the
@@ -506,7 +503,6 @@ mod tests {
         assert_eq!(listed[0]["name"], json!("base"));
         assert_eq!(listed[0]["reads"], json!([]));
         assert_eq!(listed[0]["role"], json!("custom"));
-        assert_eq!(listed[0]["shift"], json!(0));
         assert_eq!(listed[0]["categorical"], json!(false));
         assert_eq!(listed[1]["name"], json!("height"));
         assert_eq!(listed[1]["reads"], json!(["base"]));

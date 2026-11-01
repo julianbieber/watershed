@@ -320,7 +320,7 @@ pub struct ShaderEntry {
     pub layers: Vec<LayerRead>,
     /// What the file declares about the layer itself. As with the layout, the last
     /// header that parsed, so a file half-way through an edit does not put a layer
-    /// back to shift 0.
+    /// back to its defaults.
     pub header: LayerHeader,
     /// Why the file does not run: its annotations did not parse, or its source did not
     /// compile. `line N: message` against the file's own lines, or the bare message when
@@ -353,12 +353,12 @@ pub struct ShaderEntry {
 pub struct DispatchGlobals {
     /// The document's extent, in cells.
     pub document: UVec2,
-    /// The extent of this dispatch, in texels of the layer's raster.
+    /// The extent of this dispatch, in texels — one chunk.
     pub texels: UVec2,
-    /// Where the dispatch starts, in texels of the layer's raster.
+    /// The document cell this dispatch's first texel stands for: the chunk's origin.
+    /// Every layer the dispatch reads is bound as the same chunk, so it is also where
+    /// those textures start.
     pub origin: UVec2,
-    /// The layer's raster shift.
-    pub shift: u32,
     /// The document's seed.
     pub seed: u32,
 }
@@ -372,7 +372,7 @@ impl DispatchGlobals {
             self.texels.y,
             self.origin.x,
             self.origin.y,
-            self.shift,
+            0,
             self.seed,
         ];
         let mut bytes = [0u8; 32];
@@ -703,37 +703,49 @@ impl ShaderRuntime {
         self.0.as_ref()?.programs.get(file)
     }
 
-    /// Runs one program over the whole of `globals.texels` and answers its values,
-    /// row-major, or `None` when the program's source did not run: it failed to compile,
-    /// or its file was read again as another source before the dispatch started.
+    /// Runs one program once per entry of `dispatches` — one per chunk — and answers
+    /// each one's values row-major, in the order given, or `None` for one whose
+    /// source did not run: it failed to compile, or its file was read again as
+    /// another source before the dispatch started.
     ///
-    /// `layers` is one entry per [`ShaderProgram::layers`], in order; `None` is a layer
-    /// that has no raster to hand over and reads `0.0` everywhere. A shorter slice
-    /// leaves the layers after it reading `0.0`.
+    /// Each entry's layers are one per [`ShaderProgram::layers`], in order; `None` is
+    /// a layer with no raster to hand over, which reads `0.0` everywhere. The
+    /// dispatches are handed to the render world together rather than each waiting
+    /// for the last, so a layer of many chunks costs a few frames rather than a few
+    /// frames per chunk.
     ///
-    /// Blocks until the render world has dispatched and the result has been read back,
-    /// so it must not be called on the main thread. Answers an error rather than
-    /// panicking when the runtime holds no render world, and when the dispatch does not
-    /// answer within a minute.
-    pub fn run(
+    /// Blocks until every dispatch has been read back, so it must not be called on
+    /// the main thread. Answers an error rather than panicking when the runtime holds
+    /// no render world, and when any dispatch does not answer within a minute; the
+    /// first failure fails the batch.
+    pub fn run_batch(
         &self,
         program: &ShaderProgram,
         params: &[u8],
-        globals: DispatchGlobals,
-        layers: &[Option<&Raster<f32>>],
-    ) -> Result<Option<Vec<f32>>, String> {
+        dispatches: Vec<(DispatchGlobals, Vec<Option<Raster<f32>>>)>,
+    ) -> Result<Vec<Option<Vec<f32>>>, String> {
         let Some(runtime) = &self.0 else {
             return Err("there is no render world to dispatch a shader in".to_owned());
         };
-        let inputs = program
-            .layers
-            .iter()
-            .enumerate()
-            .map(|(at, read)| LayerInput::new(read.binding, layers.get(at).copied().flatten()))
+        let requests = dispatches
+            .into_iter()
+            .map(|(globals, layers)| {
+                let inputs = program
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(at, read)| {
+                        LayerInput::new(read.binding, layers.get(at).and_then(Option::as_ref))
+                    })
+                    .collect();
+                (globals, inputs)
+            })
             .collect();
         runtime
             .sender
-            .run(&program.file, program.key, params, globals, inputs)
+            .run_batch(&program.file, program.key, params, requests)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -997,16 +1009,17 @@ fn attend_shaders(
     }
 }
 
-/// A key over everything one dispatch's result depends on that a caller can cheaply
-/// re-derive: the source, the packed parameters and the extent.
+/// A key over everything a layer's dispatches depend on that a caller can cheaply
+/// re-derive: the source, the packed parameters, the extent and the chunk size.
 ///
 /// What a shader *reads* is not in it — a layer whose file reads a layer is
 /// dispatched on every bake regardless, because that layer may have moved.
-pub fn dispatch_key(source: &str, params: &[u8], texels: UVec2) -> u64 {
+pub fn dispatch_key(source: &str, params: &[u8], extent: UVec2, chunk_size: UVec2) -> u64 {
     let mut bytes = source.as_bytes().to_vec();
     bytes.extend_from_slice(params);
-    bytes.extend_from_slice(&texels.x.to_le_bytes());
-    bytes.extend_from_slice(&texels.y.to_le_bytes());
+    for word in [extent.x, extent.y, chunk_size.x, chunk_size.y] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
     fingerprint(&bytes)
 }
 
@@ -1548,14 +1561,14 @@ mod tests {
     }
 
     // The uniform is read by the shader through a struct with a fixed layout, so its
-    // size is part of the contract rather than an implementation detail.
+    // size is part of the contract rather than an implementation detail; the word
+    // that held a shift stays, as zero, so a shader reading it still compiles.
     #[test]
     fn the_globals_uniform_is_the_size_the_shader_declares() {
         let globals = DispatchGlobals {
             document: UVec2::new(256, 128),
             texels: UVec2::new(64, 32),
             origin: UVec2::new(4, 8),
-            shift: 2,
             seed: 7,
         };
         let bytes = globals.bytes();
@@ -1563,7 +1576,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 256);
         assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 64);
         assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 4);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 7);
     }
 }

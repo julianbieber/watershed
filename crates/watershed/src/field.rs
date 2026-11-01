@@ -55,17 +55,15 @@ impl fmt::Display for FieldId {
 /// What a field *is*, independently of what it is called, so that a consumer can
 /// find the height of a document it did not author.
 ///
-/// A document may hold at most one `Height` and at most one `Moisture` field, and
-/// the `Height` field must be at shift 0. Neither is enforced here — both are
-/// checked where a document is planned. `Custom` carries no such constraint and
-/// any number of fields may hold it, which is why looking a `Custom` field up by
-/// role never resolves.
+/// A document may hold at most one `Height` and at most one `Moisture` field. That
+/// is not enforced here — it is checked where a document is planned. `Custom`
+/// carries no such constraint and any number of fields may hold it, which is why
+/// looking a `Custom` field up by role never resolves.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub enum FieldRole {
-    /// The elevation of the document. A water solve cannot be planned without one,
-    /// and it must be at shift 0.
+    /// The elevation of the document. A water solve cannot be planned without one.
     Height,
     /// Wetness of the document. Carries no constraint beyond uniqueness — nothing
     /// in this crate reads a field *because* it holds this role.

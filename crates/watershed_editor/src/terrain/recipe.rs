@@ -15,8 +15,9 @@ use std::path::Path;
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use watershed::chunk::ChunkGrid;
 use watershed::io::IoError;
-use watershed::terrain::Terrain;
+use watershed::io::TerrainDir;
 
 use crate::gpu::ShaderRuntime;
 use crate::terrain::LayerId;
@@ -38,7 +39,7 @@ pub const RECIPE_FILE: &str = "recipe.ron";
 ///
 /// A recipe carrying any other version is refused outright; there is no migration
 /// path.
-pub const RECIPE_VERSION: u32 = 5;
+pub const RECIPE_VERSION: u32 = 6;
 
 /// The largest `recipe.ron` this build will read, checked before the file is read.
 pub const MAX_RECIPE_BYTES: u64 = 64 * 1024 * 1024;
@@ -95,8 +96,10 @@ pub struct RecipeMeta {
     /// The recipe format version, [`RECIPE_VERSION`] — not the version of the
     /// `terrain.ron` beside it. Checked before anything else is read.
     pub version: u32,
-    /// The document's extent in cells.
-    pub size: UVec2,
+    /// Cells of one chunk on each axis.
+    pub chunk_size: UVec2,
+    /// Chunks on each axis. The document's extent is `chunk_size * chunks`.
+    pub chunks: UVec2,
     /// The seed every shader of the document is told about.
     pub seed: u32,
     /// The spec the water was solved from, kept so a document that carries no
@@ -115,9 +118,13 @@ struct RecipeVersion {
 /// The recipe a spec would be written as, for a caller that wants to compare before
 /// writing rather than write unconditionally.
 pub fn recipe_of(spec: &TerrainSpec) -> RecipeMeta {
+    let (chunk_size, chunks) = spec.grid().map_or((spec.size(), UVec2::ONE), |grid| {
+        (grid.chunk_size(), grid.chunks())
+    });
     RecipeMeta {
         version: RECIPE_VERSION,
-        size: spec.size,
+        chunk_size,
+        chunks,
         seed: spec.seed,
         water_spec: spec.water_spec.clone(),
         layers: spec
@@ -133,28 +140,32 @@ pub fn recipe_of(spec: &TerrainSpec) -> RecipeMeta {
 }
 
 impl TerrainSpec {
-    /// Writes the document to a directory: the values as a terrain, and beside them
-    /// `recipe.ron`.
+    /// Writes the document to a directory: the values as a terrain, one set of
+    /// images per chunk, and beside them `recipe.ron`.
     ///
-    /// The document is baked first if it is not already, because a terrain that
-    /// carries no values is one no consumer can open.
+    /// Every stale chunk is baked first, because a terrain that carries no values is
+    /// one no consumer can open, and the water is solved over the whole document
+    /// when the document declares one.
     ///
-    /// **Deletes files.** The values half removes any `layer_<n>.png` it no longer
+    /// **Deletes files.** The values half removes any image file it no longer
     /// names. Nothing else is touched.
     ///
     /// Nothing about the document is changed by saving it.
     pub fn save_to_dir(&self, path: impl AsRef<Path>) -> Result<(), RecipeError> {
         let root = path.as_ref().to_path_buf();
         let mut baked = self.clone();
-        if baked
-            .layers
-            .iter()
-            .any(|layer| layer.baked().size() != layer.resolution(baked.size))
-        {
+        if !baked.stale_chunks().is_empty() {
             baked.bake_in_place()?;
         }
-        let terrain = baked.clone().bake()?;
-        terrain.save_to_dir(&root)?;
+        let mut bake = baked.begin_bake()?;
+        while bake.report().step < bake.plan().len() as u32 {
+            bake.advance()?;
+        }
+        let (terrain, baked) = bake.finish_keeping_spec()?;
+        let grid = baked
+            .grid()
+            .ok_or(PlanError::ZeroSize(baked.size().x, baked.size().y))?;
+        terrain.save_to_dir(&root, &grid)?;
 
         write_recipe(&root, &baked)
     }
@@ -168,8 +179,8 @@ impl TerrainSpec {
     /// the first time part of it was re-baked. Under a runtime holding no device every
     /// layer reads `0.0`.
     ///
-    /// A layer's role, shift, range and class come from its shader file either way —
-    /// the recipe carries none of the four — so a directory whose shaders cannot be
+    /// A layer's role, range and class come from its shader file either way — the
+    /// recipe carries none of the three — so a directory whose shaders cannot be
     /// read loads its layers at their defaults.
     ///
     /// A directory carrying no `recipe.ron` loads its layers' names from the values,
@@ -186,13 +197,12 @@ impl TerrainSpec {
         let mut spec;
         match recipe {
             Some(meta) => {
-                let size = if has_values {
-                    Terrain::load_from_dir(&root)?.size()
-                } else {
-                    meta.size
-                };
-                spec = TerrainSpec::new(size);
-                spec.size = meta.size;
+                if has_values {
+                    TerrainDir::open(&root)?;
+                }
+                let grid = ChunkGrid::new(meta.chunk_size, meta.chunks)
+                    .map_err(|error| PlanError::Grid(error.to_string()))?;
+                spec = TerrainSpec::chunked(grid)?;
                 spec.seed = meta.seed;
                 spec.water_spec = meta.water_spec.clone();
                 for entry in &meta.layers {
@@ -202,10 +212,10 @@ impl TerrainSpec {
                 }
             }
             None => {
-                let terrain = Terrain::load_from_dir(&root)?;
-                spec = TerrainSpec::new(terrain.size());
-                for view in terrain.fields() {
-                    spec.layers.push(Layer::new(view.name().to_owned()));
+                let values = TerrainDir::open(&root)?;
+                spec = TerrainSpec::chunked(values.grid())?;
+                for field in values.fields() {
+                    spec.layers.push(Layer::new(field.name.clone()));
                 }
             }
         }
@@ -286,9 +296,7 @@ mod tests {
         Raster::from_vec(SIZE, data).unwrap()
     }
     fn moisture() -> Layer {
-        Layer::new("moisture")
-            .with_shift(2)
-            .holding(Raster::new(UVec2::new(12, 8), 0.5))
+        Layer::new("moisture").holding(Raster::new(UVec2::new(12, 8), 0.5))
     }
 
     fn reading_document() -> TerrainSpec {
@@ -356,7 +364,7 @@ mod tests {
         write_recipe(&root, &spec).unwrap();
 
         let recipe = read_recipe(&root).unwrap().unwrap();
-        assert_eq!(recipe.size, spec.size);
+        assert_eq!(recipe.chunk_size * recipe.chunks, spec.size());
         assert_eq!(recipe.layers.len(), spec.layers.len());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -368,7 +376,7 @@ mod tests {
         let root = saved(&baked_document(), "no-recipe");
         std::fs::remove_file(root.join(RECIPE_FILE)).unwrap();
 
-        assert!(Terrain::load_from_dir(&root).is_ok());
+        assert!(TerrainDir::open(&root).is_ok());
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.layers.len(), 2);
         assert!(
@@ -437,7 +445,10 @@ mod tests {
         let spec = baked_document();
         let before = spec.clone().bake().unwrap();
         let root = saved(&spec, "quantise");
-        let after = Terrain::load_from_dir(&root).unwrap();
+        let after = TerrainDir::open(&root)
+            .unwrap()
+            .load_chunk(UVec2::ZERO)
+            .unwrap();
 
         for view in before.fields() {
             let mirror = after.field(view.name()).unwrap();
@@ -455,15 +466,15 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // Layers at the same shift share an image and one at another shift starts its own;
-    // this is the packing rule as the format actually applies it.
+    // Layers share images four to an image in declaration order; this is the packing
+    // rule as the format actually applies it.
     #[test]
-    fn layers_sharing_a_shift_share_an_image() {
+    fn two_layers_share_one_image() {
         let root = saved(&reading_document(), "packing");
         let meta = values_meta(&root);
 
-        assert_eq!(meta.layers.len(), 2);
-        assert!(meta.layers.iter().all(|layer| layer.shift.is_some()));
+        assert_eq!(meta.layers.len(), 1);
+        assert_eq!(meta.layers[0].channels.len(), 2);
         assert!(
             meta.layers
                 .iter()
@@ -482,7 +493,8 @@ mod tests {
 
         let loaded = load(&root).unwrap();
         assert_eq!(loaded.water_spec, Some(WaterSpec::new("height")));
-        assert!(Terrain::load_from_dir(&root).unwrap().water().is_some());
+        let values = TerrainDir::open(&root).unwrap();
+        assert!(values.load_chunk(UVec2::ZERO).unwrap().water().is_some());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -600,7 +612,7 @@ mod tests {
         assert!(!written.contains("layers:"), "{written}");
 
         let text = format!(
-            "(version: {RECIPE_VERSION}, size: (64, 64), seed: 0, water_spec: None, \
+            "(version: {RECIPE_VERSION}, chunk_size: (64, 64), chunks: (1, 1), seed: 0, water_spec: None, \
              fields: [(name: (\"height\"), params: {{}})])"
         );
         let meta: RecipeMeta = ron::from_str(&text).unwrap();

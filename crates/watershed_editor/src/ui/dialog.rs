@@ -17,6 +17,7 @@ use crate::project::Project;
 use crate::ui::bind::NumberBinding;
 use crate::ui::widgets::{self, one};
 use crate::ui::{NewDialog, report};
+use watershed::chunk::ChunkGrid;
 
 /// The dialog and the sheet that dims what is behind it. [`sync`] shows and hides the
 /// dialog through this.
@@ -74,9 +75,13 @@ pub fn dialog() -> impl Scene {
             Children [
                 @widgets::text("New terrain")
                 --
-                @widgets::number_row("width", NumberBinding::DialogWidth)
+                @widgets::number_row("chunk width", NumberBinding::DialogWidth)
                 --
-                @widgets::number_row("height", NumberBinding::DialogHeight)
+                @widgets::number_row("chunk height", NumberBinding::DialogHeight)
+                --
+                @widgets::number_row("chunks across", NumberBinding::DialogChunksX)
+                --
+                @widgets::number_row("chunks down", NumberBinding::DialogChunksY)
                 --
                 @widgets::number_row("seed", NumberBinding::DialogSeed)
                 --
@@ -126,12 +131,19 @@ pub fn dialog() -> impl Scene {
                         mut document: ResMut<Document>,
                         mut project: ResMut<Project>,
                         mut dialog: ResMut<NewDialog>| {
-                        let result = document.start_new(
-                            project.dir().to_path_buf(),
+                        let result = ChunkGrid::new(
                             UVec2::new(dialog.width, dialog.height),
-                            dialog.seed,
-                            dialog.preset,
-                        );
+                            UVec2::new(dialog.chunks_x, dialog.chunks_y),
+                        )
+                        .map_err(|error| error.to_string())
+                        .and_then(|grid| {
+                            document.start_new(
+                                project.dir().to_path_buf(),
+                                grid,
+                                dialog.seed,
+                                dialog.preset,
+                            )
+                        });
                         report(&mut document, result);
                         project.look_again();
                         dialog.open = false;

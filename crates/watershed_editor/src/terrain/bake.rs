@@ -2,7 +2,7 @@
 //! be visited in, the ways of driving that order, and what the result is handed
 //! back as.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use glam::{UVec2, Vec2};
 use serde::{Deserialize, Serialize};
@@ -14,8 +14,9 @@ use watershed::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
 use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
 use crate::terrain::layer::Layer;
 use crate::terrain::water::{WaterError, WaterSpec, WaterState};
+use watershed::chunk::ChunkGrid;
 use watershed::meta::WaterInfo;
-use watershed::raster::{Raster, raster_coord, resolution, texel_center};
+use watershed::raster::{CellRect, Raster};
 use watershed::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 
 /// Everything structurally wrong with a document, and the one fault that is not.
@@ -29,6 +30,13 @@ pub enum PlanError {
     /// The document has no cells.
     #[error("terrain size has a zero component: {0} by {1}")]
     ZeroSize(u32, u32),
+    /// The chunk grid is refused, or the document it makes would not fit the
+    /// in-memory budget.
+    #[error("{0}")]
+    Grid(String),
+    /// A chunk index outside the document's grid.
+    #[error("chunk ({0}, {1}) is outside the document")]
+    NoSuchChunk(u32, u32),
     /// Two layers carry the same id, so a reference to it is ambiguous.
     #[error("two layers share the id `{0}`")]
     DuplicateLayer(String),
@@ -51,10 +59,6 @@ pub enum PlanError {
     /// The document declares water and no layer holds `Height` to solve it over.
     #[error("water is declared and no layer holds the role `height`")]
     MissingHeightLayer,
-    /// The `Height` layer is coarser than the document; the water solve reads one
-    /// texel per cell and will not resample.
-    #[error("layer `{0}` holds the role `height` at shift {1}")]
-    CoarseHeight(String, u8),
     /// A layer's shader could not be dispatched. The one fault here that is raised
     /// during evaluation rather than before it.
     #[error("the shader of layer `{layer}` did not run: {reason}")]
@@ -95,17 +99,17 @@ pub enum BakeError {
     Channel(#[from] ChannelError),
 }
 
-/// An authored document: an extent, the layers in it, and optionally a description
-/// of the water over them.
+/// An authored document: an extent laid out as a grid of equal chunks, the layers
+/// in it, and optionally a description of the water over them.
 ///
 /// This is the editable side of a terrain and the thing that is saved. Everything
 /// derived — a layer's baked raster, the solved water — is held here too but is not
 /// part of the serialized form; the recipe that re-derives it is, which is why the
 /// water spec survives a save where the water itself does not.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerrainSpec {
-    /// The extent in cells. Every layer covers all of it, whatever its own shift.
-    pub size: UVec2,
+    size: UVec2,
+    chunk_size: UVec2,
     /// The layers, in declaration order. Not bake order — see
     /// [`TerrainSpec::bake_order`] — but the order a consumer reads them back in.
     pub layers: Vec<Layer>,
@@ -121,19 +125,79 @@ pub struct TerrainSpec {
     pub(crate) water: Option<WaterState>,
     #[serde(skip)]
     pub(crate) runtime: ShaderRuntime,
+    #[serde(skip)]
+    fresh: BTreeSet<(u32, u32)>,
 }
 
+/// The most cells, summed over every layer, a document may hold in memory: a
+/// layer is one `f32` per cell, so this is four bytes a cell.
+pub const MAX_DOCUMENT_CELLS: u64 = 1 << 32;
+
+/// The most cells one chunk may hold on an axis: what one dispatch's output and one
+/// bound layer texture are sized by.
+pub const MAX_CHUNK_SIDE: u32 = 8192;
+
 impl TerrainSpec {
-    /// An empty document of that extent — no layers, no water.
+    /// An empty document of that extent as one chunk — no layers, no water.
     pub fn new(size: UVec2) -> Self {
         Self {
             size,
+            chunk_size: size,
             layers: Vec::new(),
             water_spec: None,
             seed: 0,
             water: None,
             runtime: ShaderRuntime::default(),
+            fresh: BTreeSet::new(),
         }
+    }
+
+    /// An empty document over `grid`'s extent, chunked at its chunk size — no
+    /// layers, no water.
+    ///
+    /// Refused for a chunk over [`MAX_CHUNK_SIDE`] on an axis, and for a document
+    /// whose extent is over [`MAX_DOCUMENT_CELLS`], so neither is ever allocated.
+    pub fn chunked(grid: ChunkGrid) -> Result<Self, PlanError> {
+        check_grid(&grid, 1)?;
+        let mut spec = Self::new(grid.extent());
+        spec.chunk_size = grid.chunk_size();
+        Ok(spec)
+    }
+
+    /// The extent in cells. Every layer covers all of it, one texel per cell.
+    pub fn size(&self) -> UVec2 {
+        self.size
+    }
+
+    /// The chunk grid the extent and chunk size make. `None` only for a document
+    /// with no cells.
+    pub fn grid(&self) -> Option<ChunkGrid> {
+        let chunks = self.size.checked_div(self.chunk_size)?;
+        if chunks * self.chunk_size != self.size {
+            return None;
+        }
+        ChunkGrid::new(self.chunk_size, chunks).ok()
+    }
+
+    /// The chunks not baked against the document as it now stands, row by row.
+    ///
+    /// Every chunk is stale until a bake covers it; [`TerrainSpec::bake_chunk`]
+    /// leaves every chunk but its own stale, and a whole bake leaves none.
+    pub fn stale_chunks(&self) -> Vec<UVec2> {
+        self.grid()
+            .map(|grid| {
+                grid.iter()
+                    .filter(|chunk| !self.fresh.contains(&(chunk.x, chunk.y)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn mark_all_fresh(&mut self) {
+        self.fresh = self
+            .grid()
+            .map(|grid| grid.iter().map(|chunk| (chunk.x, chunk.y)).collect())
+            .unwrap_or_default();
     }
 
     /// Installs what a layer's shader is dispatched through. Derived state: it is not
@@ -153,7 +217,7 @@ impl TerrainSpec {
     ///
     /// A layer reading a name the document does not carry, a layer reading one of
     /// those, every layer of a cycle between layers that could otherwise bake, and
-    /// every layer whose declared role breaks one of the three rules
+    /// every layer whose declared role breaks one of the two rules
     /// [`TerrainSpec::validate_roles`] states. The first two are left unbaked by
     /// [`TerrainSpec::bake_in_place`] while the rest of the document bakes; a cycle
     /// and a role fault still fail the bake, and a cycle's layers' reason is
@@ -215,11 +279,11 @@ impl TerrainSpec {
         self.layer(id).map(|layer| layer.sample(x, y))
     }
 
-    /// Bakes every layer over the whole document, in dependency order, leaving the
-    /// results on the layers. Does not solve water.
+    /// Bakes every layer over the whole document, chunk by chunk, in dependency
+    /// order, leaving the results on the layers and no chunk stale. Does not solve
+    /// water.
     ///
-    /// Layers are reallocated to their declared resolutions first, so this also
-    /// fixes a document whose shifts have been edited.
+    /// Layers are reallocated to the document's extent first.
     ///
     /// A layer reading a name the document does not carry, and every layer reading
     /// one of those, is left unbaked — sampling as `0.0` — while the rest bakes;
@@ -227,9 +291,52 @@ impl TerrainSpec {
     /// duplicate id, a zero extent and a shader that fails to dispatch still fail the
     /// whole bake.
     pub fn bake_in_place(&mut self) -> Result<(), PlanError> {
+        let grid = self.planned_grid()?;
+        let result = self.bake_chunks(&grid.iter().collect::<Vec<_>>());
+        if result.is_ok() {
+            self.mark_all_fresh();
+        }
+        result
+    }
+
+    /// Bakes every layer over one chunk, in dependency order, so the chunk a person
+    /// is looking at can be shown before the rest of the document is baked.
+    ///
+    /// Leaves that chunk baked and every other chunk [stale](TerrainSpec::stale_chunks),
+    /// and the layers' rasters at the document's extent. Fails as
+    /// [`TerrainSpec::bake_in_place`] does, and for a chunk outside the grid.
+    pub fn bake_chunk(&mut self, chunk: UVec2) -> Result<(), PlanError> {
+        let grid = self.planned_grid()?;
+        if !grid.contains(chunk) {
+            return Err(PlanError::NoSuchChunk(chunk.x, chunk.y));
+        }
+        self.fresh.clear();
+        let result = self.bake_chunks(&[chunk]);
+        for layer in &mut self.layers {
+            layer.shader.forget_stamp();
+        }
+        if result.is_ok() {
+            self.fresh.insert((chunk.x, chunk.y));
+        }
+        result
+    }
+
+    fn planned_grid(&self) -> Result<ChunkGrid, PlanError> {
         if self.size.x == 0 || self.size.y == 0 {
             return Err(PlanError::ZeroSize(self.size.x, self.size.y));
         }
+        let grid = self.grid().ok_or_else(|| {
+            PlanError::Grid(format!(
+                "a {}x{} document is not a whole number of {}x{} chunks",
+                self.size.x, self.size.y, self.chunk_size.x, self.chunk_size.y
+            ))
+        })?;
+        check_grid(&grid, self.layers.len().max(1))?;
+        Ok(grid)
+    }
+
+    fn bake_chunks(&mut self, chunks: &[UVec2]) -> Result<(), PlanError> {
+        let grid = self.planned_grid()?;
 
         let index_of = self.index_layers()?;
         let blocked: Vec<bool> = self
@@ -250,11 +357,11 @@ impl TerrainSpec {
             .map(|layer| layer.take_baked())
             .collect();
 
-        let mut dispatched: Vec<(usize, (Raster<f32>, u64))> = Vec::new();
+        let mut dispatched: Vec<(usize, u64)> = Vec::new();
         let mut result = Ok(());
         for &target in &order {
-            match self.evaluate(target, &index_of, &mut baked) {
-                Ok(made) => dispatched.extend(made.map(|made| (target, made))),
+            match self.evaluate(target, &index_of, &mut baked, &grid, chunks) {
+                Ok(made) => dispatched.extend(made.map(|key| (target, key))),
                 Err(error) => {
                     result = Err(error);
                     break;
@@ -265,8 +372,8 @@ impl TerrainSpec {
         for (layer, raster) in self.layers.iter_mut().zip(baked) {
             layer.put_baked(raster);
         }
-        for (target, (values, key)) in dispatched {
-            self.layers[target].shader.put_dispatch(values, key);
+        for (target, key) in dispatched {
+            self.layers[target].shader.put_stamp(key);
         }
         result
     }
@@ -294,7 +401,8 @@ impl TerrainSpec {
             .map(|index| self.layers[index].id.clone())
             .collect())
     }
-    /// Bake one layer over the whole document, assuming everything it reads is baked.
+    /// Bake one layer over the whole document, chunk by chunk, assuming everything it
+    /// reads is baked.
     ///
     /// **The assumption is the caller's to keep**, and [`TerrainSpec::bake_order`] is how:
     /// walking that order calls this on a layer only after its dependencies. Called out
@@ -309,13 +417,11 @@ impl TerrainSpec {
     /// a staged bake peaks at its widest live set rather than at the sum of the
     /// document.
     pub fn bake_layer(&mut self, id: &str) -> Result<(), PlanError> {
-        if self.size.x == 0 || self.size.y == 0 {
-            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
-        }
+        let grid = self.planned_grid()?;
         let index_of = self.index_layers()?;
         let reader = LayerId::from(id);
         let target = lookup(&index_of, &reader, &reader)?;
-        let wanted = resolution(self.size, self.layers[target].shift);
+        let wanted = self.size;
         if self.layers[target].baked().size() != wanted {
             *self.layers[target].baked_mut() = Raster::new(wanted, 0.0);
         }
@@ -325,13 +431,14 @@ impl TerrainSpec {
             .map(|layer| layer.take_baked())
             .collect();
 
-        let result = self.evaluate(target, &index_of, &mut baked);
+        let chunks: Vec<UVec2> = grid.iter().collect();
+        let result = self.evaluate(target, &index_of, &mut baked, &grid, &chunks);
 
         for (layer, raster) in self.layers.iter_mut().zip(baked) {
             layer.put_baked(raster);
         }
-        if let Some((values, key)) = result? {
-            self.layers[target].shader.put_dispatch(values, key);
+        if let Some(key) = result? {
+            self.layers[target].shader.put_stamp(key);
         }
         Ok(())
     }
@@ -341,7 +448,7 @@ impl TerrainSpec {
     /// **This is what makes a staged bake affordable rather than merely visible.** A
     /// document's layers do not all have to be resident at once: an intermediate is dead
     /// as soon as everything downstream of it has been baked, and at a whole-world size a
-    /// single shift-0 layer is tens of megabytes. Releasing as the order advances turns
+    /// single layer is tens of megabytes. Releasing as the order advances turns
     /// the peak from the sum of every layer into the widest live set.
     ///
     /// A released layer samples as zero, exactly as one that has never been baked — so
@@ -376,64 +483,86 @@ impl TerrainSpec {
         target: usize,
         index_of: &HashMap<String, usize>,
         baked: &mut [Raster<f32>],
-    ) -> Result<Option<(Raster<f32>, u64)>, PlanError> {
+        grid: &ChunkGrid,
+        chunks: &[UVec2],
+    ) -> Result<Option<u64>, PlanError> {
         let layer = &self.layers[target];
-        let texels = resolution(self.size, layer.shift);
-        let mut fresh = None;
+        let bounds = layer.bounds();
         if let Some(program) = self.runtime.program(&layer.file()) {
             let params = program.layout.pack(&layer.shader.params);
-            let key = dispatch_key(&program.source, &params, texels);
-            let reusable = program.layers.is_empty()
+            let key = dispatch_key(&program.source, &params, self.size, grid.chunk_size());
+            let whole = chunks.len() as u64 == grid.count();
+            let reusable = whole
+                && program.layers.is_empty()
                 && layer.shader.stamp() == Some(key)
-                && layer.shader.values().size() == texels;
-            if !reusable {
-                let layers: Vec<Option<&Raster<f32>>> = program
-                    .layers
-                    .iter()
-                    .map(|read| index_of.get(&read.layer).map(|&at| &baked[at]))
-                    .collect();
-                let globals = DispatchGlobals {
-                    document: self.size,
-                    texels,
-                    origin: UVec2::ZERO,
-                    shift: layer.shift as u32,
-                    seed: self.runtime.seed().unwrap_or_default(),
-                };
-                let values = self
-                    .runtime
-                    .run(program, &params, globals, &layers)
-                    .and_then(|values| {
-                        values
-                            .map(|values| {
-                                Raster::from_vec(texels, values).ok_or_else(|| {
-                                    "the dispatch produced the wrong number of texels".to_owned()
-                                })
-                            })
-                            .transpose()
-                    })
-                    .map_err(|reason| PlanError::ShaderDispatch {
-                        layer: layer.id.to_string(),
-                        reason,
-                    })?;
-                fresh = values.map(|values| (values, key));
+                && baked[target].size() == self.size;
+            if reusable {
+                return Ok(Some(key));
             }
+            let seed = self.runtime.seed().unwrap_or_default();
+            let dispatches = chunks
+                .iter()
+                .map(|&chunk| {
+                    let rect = chunk_rect(grid, chunk);
+                    let reads = program
+                        .layers
+                        .iter()
+                        .map(|read| {
+                            index_of
+                                .get(&read.layer)
+                                .and_then(|&at| cut(&baked[at], rect))
+                        })
+                        .collect();
+                    let globals = DispatchGlobals {
+                        document: self.size,
+                        texels: grid.chunk_size(),
+                        origin: rect.min,
+                        seed,
+                    };
+                    (globals, reads)
+                })
+                .collect();
+            let answers = self
+                .runtime
+                .run_batch(program, &params, dispatches)
+                .map_err(|reason| PlanError::ShaderDispatch {
+                    layer: layer.id.to_string(),
+                    reason,
+                })?;
+            let mut ran = true;
+            for (&chunk, answer) in chunks.iter().zip(answers) {
+                let Some(values) = answer else {
+                    ran = false;
+                    continue;
+                };
+                let rect = chunk_rect(grid, chunk);
+                if values.len() as u64 != rect.width() as u64 * rect.height() as u64 {
+                    return Err(PlanError::ShaderDispatch {
+                        layer: layer.id.to_string(),
+                        reason: "the dispatch produced the wrong number of texels".to_owned(),
+                    });
+                }
+                let clamped: Vec<f32> = values
+                    .into_iter()
+                    .map(|value| value.clamp(bounds.0, bounds.1))
+                    .collect();
+                baked[target].paste_rect(rect, &clamped);
+            }
+            return Ok((ran && whole).then_some(key));
         }
 
-        let source = fresh
-            .as_ref()
-            .map_or(layer.shader.values(), |(values, _)| values);
-        let (low, high) = layer.bounds();
-        let shift = layer.shift;
+        let source = layer.shader.values();
         let target_raster = &mut baked[target];
-        let size = target_raster.size();
-        for j in 0..size.y {
-            let v = raster_coord(texel_center(j, shift), shift);
-            for i in 0..size.x {
-                let u = raster_coord(texel_center(i, shift), shift);
-                target_raster.set(i, j, source.sample_bilinear(u, v).clamp(low, high));
+        for &chunk in chunks {
+            let rect = chunk_rect(grid, chunk);
+            for j in rect.min.y..rect.max.y {
+                for i in rect.min.x..rect.max.x {
+                    let value = source.sample_over(self.size, i as f32 + 0.5, j as f32 + 0.5);
+                    target_raster.set(i, j, value.clamp(bounds.0, bounds.1));
+                }
             }
         }
-        Ok(fresh)
+        Ok(None)
     }
 
     fn note_role_faults(&self, index_of: &HashMap<String, usize>, faults: &mut [Option<String>]) {
@@ -456,19 +585,11 @@ impl TerrainSpec {
                 }
             }
         }
-        if let Some((at, height)) = self
+        if !self
             .layers
             .iter()
-            .enumerate()
-            .find(|(_, layer)| layer.role == LayerRole::Height)
-        {
-            if height.shift != 0 {
-                note(
-                    at,
-                    PlanError::CoarseHeight(height.id.to_string(), height.shift).to_string(),
-                );
-            }
-        } else if let Some(spec) = &self.water_spec
+            .any(|layer| layer.role == LayerRole::Height)
+            && let Some(spec) = &self.water_spec
             && let Some(&at) = index_of.get(spec.height.as_str())
         {
             note(at, PlanError::MissingHeightLayer.to_string());
@@ -558,18 +679,46 @@ impl TerrainSpec {
     }
 
     fn reallocate_rasters(&mut self, blocked: &[bool]) {
-        let size = self.size;
+        let wanted = self.size;
         for (layer, &blocked) in self.layers.iter_mut().zip(blocked) {
             if blocked {
                 *layer.baked_mut() = Raster::default();
                 continue;
             }
-            let wanted = resolution(size, layer.shift);
             if layer.baked().size() != wanted {
                 *layer.baked_mut() = Raster::new(wanted, 0.0);
             }
         }
     }
+}
+
+fn check_grid(grid: &ChunkGrid, layers: usize) -> Result<(), PlanError> {
+    let chunk = grid.chunk_size();
+    if chunk.x > MAX_CHUNK_SIDE || chunk.y > MAX_CHUNK_SIDE {
+        return Err(PlanError::Grid(format!(
+            "a {}x{} chunk is over the {MAX_CHUNK_SIDE} cell limit on an axis",
+            chunk.x, chunk.y
+        )));
+    }
+    let extent = grid.extent();
+    let cells = (extent.x as u64 * extent.y as u64).saturating_mul(layers as u64);
+    if cells > MAX_DOCUMENT_CELLS {
+        return Err(PlanError::Grid(format!(
+            "a {}x{} document of {layers} layer(s) is over the {MAX_DOCUMENT_CELLS} cell budget",
+            extent.x, extent.y
+        )));
+    }
+    Ok(())
+}
+
+fn chunk_rect(grid: &ChunkGrid, chunk: UVec2) -> CellRect {
+    grid.rect(chunk)
+        .expect("a chunk index comes from the grid it is looked up in")
+}
+
+fn cut(raster: &Raster<f32>, rect: CellRect) -> Option<Raster<f32>> {
+    let size = UVec2::new(rect.width(), rect.height());
+    Raster::from_vec(size, raster.copy_rect(rect)?)
 }
 
 fn lookup(
@@ -806,6 +955,7 @@ impl Bake {
         self.next_step += 1;
         self.last_layer = step.layer;
         if self.next_step as usize >= self.plan.steps.len() {
+            self.spec.mark_all_fresh();
             Ok(BakeProgress::Finished)
         } else {
             Ok(BakeProgress::Advanced)
@@ -845,16 +995,12 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
     let readable: Vec<&Layer> = spec
         .layers
         .iter()
-        .filter(|authored| authored.baked().size() == authored.resolution(spec.size))
+        .filter(|authored| authored.baked().size() == spec.size)
         .collect();
 
-    let shifts: Vec<u8> = readable.iter().map(|authored| authored.shift).collect();
-    let (placements, layer_shifts) = plan_layers(&shifts);
+    let (placements, images) = plan_layers(readable.len());
 
-    let mut layers: Vec<LayerBuild> = layer_shifts
-        .iter()
-        .map(|shift| LayerBuild::new(Some(*shift), resolution(spec.size, *shift)))
-        .collect();
+    let mut layers: Vec<LayerBuild> = (0..images).map(|_| LayerBuild::new(spec.size)).collect();
 
     let mut infos = Vec::with_capacity(readable.len());
     for (authored, place) in readable.iter().zip(&placements) {
@@ -884,7 +1030,6 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
         infos.push(FieldInfo {
             name: authored.id.to_string(),
             role: authored.role,
-            shift: authored.shift,
             categorical: authored.categorical,
             layer: place.layer,
             channel: place.channel,
@@ -926,16 +1071,14 @@ fn value_range(values: &[f32]) -> ChannelMeta {
 }
 
 struct LayerBuild {
-    shift: Option<u8>,
     size: UVec2,
     channels: Vec<ChannelMeta>,
     columns: Vec<Vec<u8>>,
 }
 
 impl LayerBuild {
-    fn new(shift: Option<u8>, size: UVec2) -> Self {
+    fn new(size: UVec2) -> Self {
         Self {
-            shift,
             size,
             channels: Vec::new(),
             columns: Vec::new(),
@@ -958,12 +1101,12 @@ impl LayerBuild {
         }
         let texels = LayerTexels::from_bytes(self.size, channels, interleaved)
             .expect("a layer is built at its own extent with one byte per channel");
-        TerrainLayer::new(self.shift, self.channels, texels)
+        TerrainLayer::new(self.channels, texels)
     }
 }
 
 fn water_layer(state: &WaterState, size: UVec2) -> LayerBuild {
-    let mut layer = LayerBuild::new(Some(0), size);
+    let mut layer = LayerBuild::new(size);
 
     let deepest = state
         .depth()
@@ -1012,19 +1155,18 @@ impl TerrainSpec {
     /// is allocated, so a document that plans can be baked and a running bake fails
     /// only on the water solve or on an edit made since.
     pub fn plan_bake(&self) -> Result<BakePlan, PlanError> {
-        if self.size.x == 0 || self.size.y == 0 {
-            return Err(PlanError::ZeroSize(self.size.x, self.size.y));
-        }
+        self.planned_grid()?;
         self.validate_roles()?;
 
         let index_of = self.index_layers()?;
         let dependencies = self.resolve_dependencies(&index_of)?;
         let order = topological_order(&dependencies, &self.layers)?;
 
+        let stale = !self.stale_chunks().is_empty();
         let mut steps: Vec<BakeStep> = Vec::with_capacity(order.len() + 1);
         for &index in &order {
             let layer = &self.layers[index];
-            if layer.baked().size() == resolution(self.size, layer.shift) {
+            if !stale && layer.baked().size() == self.size {
                 continue;
             }
             steps.push(BakeStep {
@@ -1085,12 +1227,11 @@ impl TerrainSpec {
         self.layers.iter().find(|layer| layer.role == role)
     }
 
-    /// Checks the three things a role assignment has to satisfy: at most one layer
-    /// per named role, a `Height` layer at shift 0, and a `Height` layer present if
-    /// water is declared.
+    /// Checks the two things a role assignment has to satisfy: at most one layer per
+    /// named role, and a `Height` layer present if water is declared.
     ///
     /// Called by [`TerrainSpec::plan_bake`], which is what keeps a document with a
-    /// role conflict unbaked. [`TerrainSpec::layer_faults`] reports the same three
+    /// role conflict unbaked. [`TerrainSpec::layer_faults`] reports the same two
     /// against the layers they belong to, so the conflict also reaches the cards and
     /// the log rather than only failing the bake.
     pub fn validate_roles(&self) -> Result<(), PlanError> {
@@ -1098,11 +1239,6 @@ impl TerrainSpec {
             if self.layers.iter().filter(|f| f.role == role).count() > 1 {
                 return Err(PlanError::DuplicateRole(role));
             }
-        }
-        if let Some(height) = self.layer_with_role(LayerRole::Height)
-            && height.shift != 0
-        {
-            return Err(PlanError::CoarseHeight(height.id.to_string(), height.shift));
         }
         if self.water_spec.is_some() && self.layer_with_role(LayerRole::Height).is_none() {
             return Err(PlanError::MissingHeightLayer);
@@ -1128,14 +1264,9 @@ mod tests {
 
     fn two_layer_document() -> TerrainSpec {
         TerrainSpec::new(UVec2::new(96, 80))
-            .with_layer(
-                Layer::new("moisture")
-                    .with_shift(3)
-                    .holding(ramp(UVec2::new(12, 10))),
-            )
+            .with_layer(Layer::new("moisture").holding(ramp(UVec2::new(12, 10))))
             .with_layer(
                 Layer::new("height")
-                    .with_shift(0)
                     .holding(ramp(UVec2::new(96, 80)))
                     .reading(&["moisture"]),
             )
@@ -1263,16 +1394,16 @@ mod tests {
         ));
     }
 
-    // The baseline the staging tests compare against: two layers
-    // at different shifts, one reading the other, each allocated at its own resolution
-    // and filled with finite values that actually vary.
+    // The baseline the staging tests compare against: two layers, one reading the
+    // other, each allocated at one texel per cell (no-shift) and filled with finite
+    // values that actually vary.
     #[test]
-    fn a_two_layer_document_bakes_each_layer_at_its_own_resolution() {
+    fn a_two_layer_document_bakes_every_layer_at_one_texel_per_cell() {
         let mut terrain = two_layer_document();
         terrain.bake_in_place().unwrap();
 
         let moisture = terrain.layer("moisture").unwrap();
-        assert_eq!(moisture.baked().size(), UVec2::new(12, 10));
+        assert_eq!(moisture.baked().size(), UVec2::new(96, 80));
         let height = terrain.layer("height").unwrap();
         assert_eq!(height.baked().size(), UVec2::new(96, 80));
 
@@ -1357,17 +1488,75 @@ mod tests {
         assert_eq!(terrain.sample("height", 4.5, 4.5).unwrap(), 1.0);
     }
 
-    // An extent that is not a multiple of the shift rounds up to a raster whose last
-    // row and column are only partly covered by the document; those texels still have
-    // to be written, or a sample near the far edge reads whatever the allocation held.
+    // A whole bake is one pass per chunk, so a chunk the loop missed would be texels
+    // still holding whatever the allocation did; every texel has to be written.
     #[test]
-    fn a_bake_leaves_no_texel_of_a_layer_untouched() {
-        let mut terrain = TerrainSpec::new(UVec2::new(37, 23))
-            .with_layer(Layer::new("height").with_shift(2).held(0.5));
+    fn a_chunked_bake_leaves_no_texel_of_a_layer_untouched() {
+        let grid = ChunkGrid::new(UVec2::new(5, 3), UVec2::new(3, 2)).unwrap();
+        let mut terrain = TerrainSpec::chunked(grid)
+            .unwrap()
+            .with_layer(Layer::new("height").held(0.5));
         terrain.bake_in_place().unwrap();
         let layer = terrain.layer("height").unwrap();
-        assert_eq!(layer.baked().size(), UVec2::new(10, 6));
+        assert_eq!(layer.baked().size(), UVec2::new(15, 6));
         assert!(layer.baked().data().iter().all(|value| *value == 0.5));
+        assert!(terrain.stale_chunks().is_empty());
+    }
+
+    // The edit-bake context: an edit bakes the chunk being looked at first, so baking
+    // one chunk has to write that chunk only and leave every other one stale for the
+    // background bake to pick up.
+    #[test]
+    fn baking_one_chunk_writes_it_and_leaves_the_others_stale() {
+        let grid = ChunkGrid::new(UVec2::new(4, 4), UVec2::new(2, 2)).unwrap();
+        let mut terrain = TerrainSpec::chunked(grid)
+            .unwrap()
+            .with_layer(Layer::new("height").held(0.5));
+        terrain.bake_chunk(UVec2::new(1, 0)).unwrap();
+
+        let height = terrain.layer("height").unwrap();
+        assert_eq!(height.baked().size(), UVec2::new(8, 8));
+        assert_eq!(height.baked().get(5, 1), Some(&0.5));
+        assert_eq!(height.baked().get(1, 1), Some(&0.0));
+        assert_eq!(
+            terrain.stale_chunks(),
+            vec![UVec2::new(0, 0), UVec2::new(0, 1), UVec2::new(1, 1)]
+        );
+        assert!(matches!(
+            terrain.bake_chunk(UVec2::new(2, 0)),
+            Err(PlanError::NoSuchChunk(2, 0))
+        ));
+    }
+
+    // A save bakes whatever is stale, so a plan for a document with a stale chunk has
+    // to carry every layer even though each one's raster is already at the extent.
+    #[test]
+    fn a_stale_chunk_puts_every_layer_back_in_the_plan() {
+        let grid = ChunkGrid::new(UVec2::new(4, 4), UVec2::new(2, 1)).unwrap();
+        let mut terrain = TerrainSpec::chunked(grid)
+            .unwrap()
+            .with_layer(Layer::new("height").held(0.5));
+        terrain.bake_in_place().unwrap();
+        assert!(terrain.plan_bake().unwrap().is_empty());
+
+        terrain.bake_chunk(UVec2::ZERO).unwrap();
+        assert_eq!(terrain.plan_bake().unwrap().len(), 1);
+    }
+
+    // The budget is what stands between a recipe or a socket command and an
+    // allocation that aborts the editor, so it is checked before any raster exists.
+    #[test]
+    fn a_document_over_the_budget_or_a_chunk_over_the_side_is_refused() {
+        let huge = ChunkGrid::new(UVec2::new(8192, 8192), UVec2::new(64, 64)).unwrap();
+        assert!(matches!(
+            TerrainSpec::chunked(huge),
+            Err(PlanError::Grid(_))
+        ));
+        let wide = ChunkGrid::new(UVec2::new(MAX_CHUNK_SIDE + 1, 1), UVec2::ONE).unwrap();
+        assert!(matches!(
+            TerrainSpec::chunked(wide),
+            Err(PlanError::Grid(_))
+        ));
     }
     // The baked rasters, a shader's values and the layers its file reads are skipped by
     // serde, so this pins that everything else survives and that a decoded document is
@@ -1392,7 +1581,6 @@ mod tests {
             .with_layer(
                 Layer::new("moisture")
                     .with_role(LayerRole::Moisture)
-                    .with_shift(3)
                     .holding(ramp(UVec2::new(8, 8))),
             )
             .with_layer(
@@ -1494,19 +1682,6 @@ mod tests {
         ));
     }
 
-    // The solve reads its height one texel per cell and will not resample one, so a coarse
-    // height is refused at plan time rather than discovered at the water step.
-    #[test]
-    fn a_coarse_height_layer_is_refused_at_plan_time() {
-        let mut spec = roled_document();
-        spec.layers[1].shift = 2;
-
-        assert!(matches!(
-            spec.plan_bake().unwrap_err(),
-            PlanError::CoarseHeight(_, 2)
-        ));
-    }
-
     // The water step names the height layer by role, so a document declaring water
     // with no `Height` layer would otherwise plan happily and fail part way through
     // the bake.
@@ -1535,19 +1710,6 @@ mod tests {
         for (_, reason) in &faults {
             assert!(reason.contains("claim the role `height`"), "{reason}");
         }
-    }
-
-    // A coarse height layer is one file's mistake, and the card is where the person who
-    // wrote `@shift` is looking.
-    #[test]
-    fn a_coarse_height_layer_faults_on_its_own_card() {
-        let mut spec = roled_document();
-        spec.layers[1].shift = 2;
-
-        let faults = spec.layer_faults();
-        assert_eq!(faults.len(), 1, "{faults:?}");
-        assert_eq!(faults[0].0.as_str(), "height");
-        assert!(faults[0].1.contains("shift 2"), "{}", faults[0].1);
     }
 
     // Removing `@role height` from a file leaves the water spec pointing at a layer
@@ -1654,11 +1816,7 @@ mod tests {
     #[test]
     fn a_layer_naming_no_layer_is_left_unbaked_while_the_rest_bakes() {
         let mut terrain = TerrainSpec::new(UVec2::new(96, 80))
-            .with_layer(
-                Layer::new("moisture")
-                    .with_shift(3)
-                    .holding(ramp(UVec2::new(12, 10))),
-            )
+            .with_layer(Layer::new("moisture").holding(ramp(UVec2::new(12, 10))))
             .with_layer(
                 Layer::new("height")
                     .holding(ramp(UVec2::new(96, 80)))
@@ -1668,7 +1826,7 @@ mod tests {
 
         assert_eq!(
             terrain.layer("moisture").unwrap().baked().size(),
-            UVec2::new(12, 10)
+            UVec2::new(96, 80)
         );
         assert!(terrain.layer("height").unwrap().baked().is_empty());
         let faults = terrain.layer_faults();

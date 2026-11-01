@@ -18,9 +18,9 @@ use glam::UVec2;
 use thiserror::Error;
 
 use crate::channel::{ChannelError, MAX_CHANNELS};
+use crate::chunk::ChunkGrid;
 use crate::meta::{LayerMeta, TerrainMeta, VERSION};
-use crate::raster::{MAX_SHIFT, resolution};
-use crate::terrain::{LayerTexels, Terrain, TerrainLayer};
+use crate::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
 
 /// The metadata file every terrain directory holds, and the only name a reader
 /// knows without being told it.
@@ -83,10 +83,21 @@ pub enum IoError {
         /// Why.
         source: png::DecodingError,
     },
+    /// An image file is larger than its declared shape could encode to. Checked
+    /// before the file is read.
+    #[error("`{file}` is {found} bytes, over the {limit} bytes its image could encode to")]
+    FileTooLarge {
+        /// The file that was refused.
+        file: String,
+        /// Its size on disk.
+        found: u64,
+        /// The most its declared image could take.
+        limit: u64,
+    },
     /// The metadata is well-formed but does not hang together — an index past the
-    /// layers that were loaded, a field whose shift is not its layer's, a water
-    /// image that is not four channels, an extent or a shift outside what this
-    /// build will carry.
+    /// images it declares, a water image that is not four channels, a chunk grid
+    /// that is zero or overflows, a chunk index outside the grid, or a chunk
+    /// outside what this build will carry.
     #[error("the terrain does not hang together: {0}")]
     Inconsistent(String),
     /// A terrain with no readable field. Nothing re-derives a bake on the way in,
@@ -99,13 +110,14 @@ pub enum IoError {
 }
 
 trait Store {
-    fn read(&self, name: &str) -> Result<Vec<u8>, IoError>;
+    fn read(&self, name: &str, limit: u64) -> Result<Vec<u8>, IoError>;
     fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), IoError>;
     fn remove(&mut self, name: &str) -> Result<(), IoError>;
     fn list(&self) -> Result<Vec<String>, IoError>;
     fn exists(&self, name: &str) -> bool;
 }
 
+#[derive(Debug)]
 struct DirStore {
     root: PathBuf,
 }
@@ -118,14 +130,14 @@ impl DirStore {
 }
 
 impl Store for DirStore {
-    fn read(&self, name: &str) -> Result<Vec<u8>, IoError> {
+    fn read(&self, name: &str, limit: u64) -> Result<Vec<u8>, IoError> {
         let path = self.path(name)?;
         let meta = std::fs::symlink_metadata(&path)?;
         if !meta.is_file() {
             return Err(IoError::BadFileName(name.to_owned()));
         }
-        if meta.len() > MAX_META_BYTES && name == META_FILE {
-            return Err(IoError::MetaTooLarge(meta.len()));
+        if meta.len() > limit {
+            return Err(too_large(name, meta.len(), limit));
         }
         Ok(std::fs::read(&path)?)
     }
@@ -164,6 +176,18 @@ impl Store for DirStore {
     }
 }
 
+fn too_large(name: &str, found: u64, limit: u64) -> IoError {
+    if name == META_FILE {
+        IoError::MetaTooLarge(found)
+    } else {
+        IoError::FileTooLarge {
+            file: name.to_owned(),
+            found,
+            limit,
+        }
+    }
+}
+
 fn check_file_name(name: &str) -> Result<(), IoError> {
     let bad = name.is_empty()
         || name.contains('/')
@@ -181,10 +205,6 @@ fn check_file_name(name: &str) -> Result<(), IoError> {
         return Err(IoError::BadFileName(name.to_owned()));
     }
     Ok(())
-}
-
-fn layer_file(index: usize) -> String {
-    format!("layer_{index:03}.png")
 }
 
 fn png_color(channels: usize) -> Option<png::ColorType> {
@@ -265,71 +285,138 @@ fn decode_png(file: &str, bytes: &[u8], size: UVec2, channels: usize) -> Result<
     Ok(out)
 }
 
-impl Terrain {
-    /// Reads a terrain from a directory: `terrain.ron` and the images it names.
+/// A terrain directory opened for reading: `terrain.ron` read and checked, and no
+/// image read yet.
+///
+/// What a consumer holds to load a large terrain a chunk at a time: the grid says
+/// where a position falls, and [`TerrainDir::load_chunk`] reads only that chunk's
+/// files.
+#[derive(Debug)]
+pub struct TerrainDir {
+    store: DirStore,
+    grid: ChunkGrid,
+    meta: TerrainMeta,
+}
+
+impl TerrainDir {
+    /// Opens a terrain directory: reads `terrain.ron` and checks it hangs together,
+    /// reading no image.
     ///
-    /// Runs no bake and no water solve — everything a consumer reads was settled
-    /// when the directory was written, which is the point of the format. A
-    /// directory carrying no readable field is [refused](IoError::NoFields) rather
-    /// than loaded as a terrain that answers nothing.
-    ///
-    /// Fails on the first fault, in the order the metadata lists things, and
-    /// returns no terrain.
-    pub fn load_from_dir(path: impl AsRef<Path>) -> Result<Self, IoError> {
+    /// Refused for metadata over [`MAX_META_BYTES`], at any version but
+    /// [`VERSION`], with a zero or overflowing chunk grid, a chunk over
+    /// [`MAX_CELLS`] cells, more than [`MAX_LAYERS`] images, one chunk's images
+    /// decoding to more than [`MAX_DECODED_BYTES`], a field or water naming an
+    /// image or channel that is not there, or no field at all. Fails on the first
+    /// fault, in the order the metadata lists things.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, IoError> {
         let store = DirStore {
             root: path.as_ref().to_path_buf(),
         };
-        let (terrain, _) = read(&store)?;
-        Ok(terrain)
+        let (grid, meta) = read_meta(&store)?;
+        Ok(Self { store, grid, meta })
     }
 
-    /// Writes the terrain's values to a directory.
+    /// How the terrain is laid out in chunks, for a consumer to
+    /// [locate](ChunkGrid::locate) a position with.
+    pub fn grid(&self) -> ChunkGrid {
+        self.grid
+    }
+
+    /// Every field the terrain carries, in the order the document declared them.
+    pub fn fields(&self) -> &[FieldInfo] {
+        &self.meta.fields
+    }
+
+    /// Reads one chunk: a [`Terrain`] over that chunk's extent, read in the chunk's
+    /// own cells, carrying the same fields, value ranges and water as every other
+    /// chunk.
     ///
-    /// **Deletes images.** Once `terrain.ron` is written, any `layer_<n>.png` the
-    /// new metadata does not name is removed, so a save over a larger terrain
-    /// leaves nothing stale behind. That sweep runs only if this call created the
-    /// directory or found a `terrain.ron` already in it; otherwise the files are
-    /// written and the stale ones are left alone. Nothing outside that naming
-    /// scheme is touched, so a recipe beside the values survives a save.
+    /// Reads that chunk's files and no other. Refused for a chunk outside the grid,
+    /// a file larger than its image could encode to, or an image whose header is not
+    /// the chunk's extent and the declared channels; returns no terrain on any
+    /// fault.
+    pub fn load_chunk(&self, chunk: UVec2) -> Result<Terrain, IoError> {
+        load_chunk(&self.store, &self.grid, &self.meta, chunk)
+    }
+}
+
+impl Terrain {
+    /// Writes the terrain's values to a directory, one set of images per chunk of
+    /// `grid`.
+    ///
+    /// Refused unless `grid`'s extent is the terrain's.
+    ///
+    /// **Deletes images.** Once `terrain.ron` is written, any image file the new
+    /// metadata does not name — of this format or of the one before it — is
+    /// removed, so a save over a larger terrain leaves nothing stale behind. That
+    /// sweep runs only if this call created the directory or found a `terrain.ron`
+    /// already in it; otherwise the files are written and the stale ones are left
+    /// alone. Nothing outside those naming schemes is touched, so a recipe beside
+    /// the values survives a save.
     ///
     /// A failure part way through leaves the directory partly written.
-    pub fn save_to_dir(&self, path: impl AsRef<Path>) -> Result<(), IoError> {
+    pub fn save_to_dir(&self, path: impl AsRef<Path>, grid: &ChunkGrid) -> Result<(), IoError> {
         let root = path.as_ref().to_path_buf();
         let fresh = !root.exists();
         std::fs::create_dir_all(&root)?;
         let mut store = DirStore { root };
         let pruning = fresh || store.exists(META_FILE);
-        write(&mut store, self, pruning)
+        write(&mut store, self, grid, pruning)
     }
 }
 
-fn meta_of(terrain: &Terrain) -> TerrainMeta {
-    TerrainMeta {
+fn write(
+    store: &mut impl Store,
+    terrain: &Terrain,
+    grid: &ChunkGrid,
+    pruning: bool,
+) -> Result<(), IoError> {
+    if grid.extent() != terrain.size() {
+        return Err(IoError::Inconsistent(format!(
+            "a {}x{} grid of {}x{} chunks does not cover a {}x{} terrain",
+            grid.chunks().x,
+            grid.chunks().y,
+            grid.chunk_size().x,
+            grid.chunk_size().y,
+            terrain.size().x,
+            terrain.size().y
+        )));
+    }
+    let chunk_size = grid.chunk_size();
+    let meta = TerrainMeta {
         version: VERSION,
-        size_x: terrain.size().x,
-        size_y: terrain.size().y,
-        layers: Vec::new(),
+        chunk_size,
+        chunks: grid.chunks(),
+        layers: terrain
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| LayerMeta {
+                file: layer_stem(index),
+                width: chunk_size.x,
+                height: chunk_size.y,
+                channels: layer.channels().to_vec(),
+            })
+            .collect(),
         fields: terrain.fields.clone(),
         water: terrain.water,
-    }
-}
+    };
 
-fn write(store: &mut impl Store, terrain: &Terrain, pruning: bool) -> Result<(), IoError> {
-    let mut meta = meta_of(terrain);
-
-    for (index, layer) in terrain.layers.iter().enumerate() {
-        let size = layer.texels().size();
-        let channels = layer.texels().channels();
-        let file = layer_file(index);
-        let bytes = encode_png(size, channels, layer.texels().bytes())?;
-        store.write(&file, &bytes)?;
-        meta.layers.push(LayerMeta {
-            file,
-            width: size.x,
-            height: size.y,
-            shift: layer.shift(),
-            channels: layer.channels().to_vec(),
-        });
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    for chunk in grid.iter() {
+        let part = terrain
+            .chunk(grid, chunk)
+            .ok_or_else(|| IoError::Inconsistent("a chunk could not be cut".to_owned()))?;
+        for (layer, declared) in part.layers.iter().zip(&meta.layers) {
+            let file = chunk_file(chunk, &declared.file);
+            let bytes = encode_png(
+                chunk_size,
+                layer.texels().channels(),
+                layer.texels().bytes(),
+            )?;
+            store.write(&file, &bytes)?;
+            named.insert(file);
+        }
     }
 
     let text = ron::ser::to_string_pretty(&meta, ron::ser::PrettyConfig::default())
@@ -337,14 +424,8 @@ fn write(store: &mut impl Store, terrain: &Terrain, pruning: bool) -> Result<(),
     store.write(META_FILE, text.as_bytes())?;
 
     if pruning {
-        let named: BTreeSet<&str> = meta
-            .layers
-            .iter()
-            .map(|layer| layer.file.as_str())
-            .chain(std::iter::once(META_FILE))
-            .collect();
         for name in store.list()? {
-            if !named.contains(name.as_str()) && is_layer_file(&name) {
+            if is_layer_file(&name) && !named.contains(&name) {
                 store.remove(&name)?;
             }
         }
@@ -353,21 +434,44 @@ fn write(store: &mut impl Store, terrain: &Terrain, pruning: bool) -> Result<(),
     Ok(())
 }
 
-/// Whether `name` is one of the images a terrain's values are written as:
-/// `layer_<n>.png` with at least one digit.
-pub fn is_layer_file(name: &str) -> bool {
-    name.strip_prefix("layer_")
-        .and_then(|rest| rest.strip_suffix(".png"))
-        .is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-        })
+fn layer_stem(index: usize) -> String {
+    format!("layer_{index:03}")
 }
 
-fn read(store: &impl Store) -> Result<(Terrain, TerrainMeta), IoError> {
-    let bytes = store.read(META_FILE)?;
-    if bytes.len() as u64 > MAX_META_BYTES {
-        return Err(IoError::MetaTooLarge(bytes.len() as u64));
+fn chunk_file(chunk: UVec2, stem: &str) -> String {
+    format!("chunk_{}_{}_{stem}.png", chunk.x, chunk.y)
+}
+
+fn digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_layer_stem(stem: &str) -> bool {
+    stem.strip_prefix("layer_").is_some_and(digits)
+}
+
+/// Whether `name` is one of the images a terrain's values are written as:
+/// `chunk_<x>_<y>_layer_<n>.png`, or the `layer_<n>.png` of the format before
+/// chunks, each number at least one digit.
+pub fn is_layer_file(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".png") else {
+        return false;
+    };
+    if is_layer_stem(stem) {
+        return true;
     }
+    let Some(rest) = stem.strip_prefix("chunk_") else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '_');
+    let (Some(x), Some(y), Some(layer)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    digits(x) && digits(y) && is_layer_stem(layer)
+}
+
+fn read_meta(store: &impl Store) -> Result<(ChunkGrid, TerrainMeta), IoError> {
+    let bytes = store.read(META_FILE, MAX_META_BYTES)?;
     let text = std::str::from_utf8(&bytes).map_err(|error| IoError::Meta(error.to_string()))?;
     let meta: TerrainMeta =
         ron::from_str(text).map_err(|error| IoError::Meta(error.to_string()))?;
@@ -375,17 +479,14 @@ fn read(store: &impl Store) -> Result<(Terrain, TerrainMeta), IoError> {
     if meta.version != VERSION {
         return Err(IoError::UnsupportedVersion(meta.version));
     }
-    let size = UVec2::new(meta.size_x, meta.size_y);
-    if size.x == 0 || size.y == 0 {
+    let grid = ChunkGrid::new(meta.chunk_size, meta.chunks)
+        .map_err(|error| IoError::Inconsistent(error.to_string()))?;
+    let chunk_size = grid.chunk_size();
+    let chunk_cells = chunk_size.x as u64 * chunk_size.y as u64;
+    if chunk_cells > MAX_CELLS {
         return Err(IoError::Inconsistent(format!(
-            "the extent is {}x{}",
-            size.x, size.y
-        )));
-    }
-    if (size.x as u64) * (size.y as u64) > MAX_CELLS {
-        return Err(IoError::Inconsistent(format!(
-            "the extent {}x{} is over the {MAX_CELLS} cell limit",
-            size.x, size.y
+            "a chunk of {}x{} is over the {MAX_CELLS} cell limit",
+            chunk_size.x, chunk_size.y
         )));
     }
     if meta.layers.len() > MAX_LAYERS {
@@ -396,8 +497,10 @@ fn read(store: &impl Store) -> Result<(Terrain, TerrainMeta), IoError> {
     }
 
     let mut budget = MAX_DECODED_BYTES;
-    let mut layers = Vec::with_capacity(meta.layers.len());
     for declared in &meta.layers {
+        if !is_layer_stem(&declared.file) {
+            return Err(IoError::BadFileName(declared.file.clone()));
+        }
         let channels = declared.channels.len();
         if channels == 0 || channels > MAX_CHANNELS {
             return Err(IoError::Inconsistent(format!(
@@ -408,108 +511,99 @@ fn read(store: &impl Store) -> Result<(Terrain, TerrainMeta), IoError> {
         for channel in &declared.channels {
             channel.validate()?;
         }
-        if let Some(shift) = declared.shift {
-            if shift > MAX_SHIFT {
-                return Err(IoError::Inconsistent(format!(
-                    "`{}` declares shift {shift}, over the {MAX_SHIFT} limit",
-                    declared.file
-                )));
-            }
-            let expected = resolution(size, shift);
-            if UVec2::new(declared.width, declared.height) != expected {
-                return Err(IoError::ImageShape {
-                    file: declared.file.clone(),
-                    found: format!("{}x{}", declared.width, declared.height),
-                    expected: format!("{}x{} for shift {shift}", expected.x, expected.y),
-                });
-            }
-        }
-
-        let declared_size = UVec2::new(declared.width, declared.height);
-        let cost = (declared.width as u64)
-            .saturating_mul(declared.height as u64)
-            .saturating_mul(channels as u64);
-        budget = budget.checked_sub(cost).ok_or_else(|| {
-            IoError::Inconsistent(format!(
-                "the terrain's images are over the {MAX_DECODED_BYTES} byte limit"
-            ))
-        })?;
-
-        let bytes = store.read(&declared.file)?;
-        let pixels = decode_png(&declared.file, &bytes, declared_size, channels)?;
-        let texels = LayerTexels::from_bytes(declared_size, channels, pixels).ok_or_else(|| {
-            IoError::ImageShape {
+        if UVec2::new(declared.width, declared.height) != chunk_size {
+            return Err(IoError::ImageShape {
                 file: declared.file.clone(),
-                found: "a different number of texels".to_owned(),
-                expected: format!("{}x{} of {channels}", declared_size.x, declared_size.y),
-            }
-        })?;
-        layers.push(TerrainLayer::new(
-            declared.shift,
-            declared.channels.clone(),
-            texels,
-        ));
+                found: format!("{}x{}", declared.width, declared.height),
+                expected: format!("{}x{}, the chunk size", chunk_size.x, chunk_size.y),
+            });
+        }
+        budget = budget
+            .checked_sub(chunk_cells.saturating_mul(channels as u64))
+            .ok_or_else(|| {
+                IoError::Inconsistent(format!(
+                    "one chunk's images are over the {MAX_DECODED_BYTES} byte limit"
+                ))
+            })?;
     }
 
     for field in &meta.fields {
-        let layer = layers.get(field.layer as usize).ok_or_else(|| {
+        let layer = meta.layers.get(field.layer as usize).ok_or_else(|| {
             IoError::Inconsistent(format!(
                 "field `{}` names layer {}, of {}",
                 field.name,
                 field.layer,
-                layers.len()
+                meta.layers.len()
             ))
         })?;
-        if field.channel as usize >= layer.channels().len() {
+        if field.channel as usize >= layer.channels.len() {
             return Err(IoError::Inconsistent(format!(
                 "field `{}` names channel {} of {}",
                 field.name,
                 field.channel,
-                layer.channels().len()
-            )));
-        }
-        if layer.shift() != Some(field.shift) {
-            return Err(IoError::Inconsistent(format!(
-                "field `{}` is at shift {} but its layer is at {:?}",
-                field.name,
-                field.shift,
-                layer.shift()
+                layer.channels.len()
             )));
         }
     }
 
     if let Some(water) = meta.water {
-        let layer = layers.get(water.layer as usize).ok_or_else(|| {
+        let layer = meta.layers.get(water.layer as usize).ok_or_else(|| {
             IoError::Inconsistent(format!(
                 "the water names layer {}, of {}",
                 water.layer,
-                layers.len()
+                meta.layers.len()
             ))
         })?;
-        if layer.channels().len() != MAX_CHANNELS {
+        if layer.channels.len() != MAX_CHANNELS {
             return Err(IoError::Inconsistent(format!(
                 "the water layer holds {} channels, not {MAX_CHANNELS}",
-                layer.channels().len()
+                layer.channels.len()
             )));
-        }
-        if layer.texels().size() != size {
-            return Err(IoError::Inconsistent(
-                "the water layer is not at the document's extent".to_owned(),
-            ));
         }
     }
 
     if meta.fields.is_empty() {
         return Err(IoError::NoFields);
     }
+    Ok((grid, meta))
+}
 
-    let terrain = Terrain {
-        size,
-        fields: meta.fields.clone(),
-        layers,
-        water: meta.water,
-    };
-    Ok((terrain, meta))
+fn load_chunk(
+    store: &impl Store,
+    grid: &ChunkGrid,
+    meta: &TerrainMeta,
+    chunk: UVec2,
+) -> Result<Terrain, IoError> {
+    if !grid.contains(chunk) {
+        return Err(IoError::Inconsistent(format!(
+            "chunk ({}, {}) is outside the {}x{} grid",
+            chunk.x,
+            chunk.y,
+            grid.chunks().x,
+            grid.chunks().y
+        )));
+    }
+    let size = grid.chunk_size();
+    let mut layers = Vec::with_capacity(meta.layers.len());
+    for declared in &meta.layers {
+        let channels = declared.channels.len();
+        let file = chunk_file(chunk, &declared.file);
+        let bytes = store.read(&file, encoded_bound(size, channels))?;
+        let pixels = decode_png(&file, &bytes, size, channels)?;
+        let texels =
+            LayerTexels::from_bytes(size, channels, pixels).ok_or_else(|| IoError::ImageShape {
+                file: file.clone(),
+                found: "a different number of texels".to_owned(),
+                expected: format!("{}x{} of {channels}", size.x, size.y),
+            })?;
+        layers.push(TerrainLayer::new(declared.channels.clone(), texels));
+    }
+    Ok(Terrain::new(size, meta.fields.clone(), layers, meta.water))
+}
+
+fn encoded_bound(size: UVec2, channels: usize) -> u64 {
+    let raw = (size.x as u64 * channels as u64 + 1) * size.y as u64;
+    raw.saturating_mul(2).saturating_add(64 * 1024)
 }
 
 #[cfg(test)]
@@ -530,14 +624,18 @@ mod tests {
     }
 
     impl Store for MemStore {
-        fn read(&self, name: &str) -> Result<Vec<u8>, IoError> {
+        fn read(&self, name: &str, limit: u64) -> Result<Vec<u8>, IoError> {
             check_file_name(name)?;
-            self.files.get(name).cloned().ok_or_else(|| {
+            let bytes = self.files.get(name).cloned().ok_or_else(|| {
                 IoError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     name.to_owned(),
                 ))
-            })
+            })?;
+            if bytes.len() as u64 > limit {
+                return Err(too_large(name, bytes.len() as u64, limit));
+            }
+            Ok(bytes)
         }
 
         fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), IoError> {
@@ -560,59 +658,81 @@ mod tests {
         }
     }
 
-    fn layer_of(shift: u8, channels: usize) -> TerrainLayer {
-        let texels = resolution(SIZE, shift);
+    fn layer_of(channels: usize) -> TerrainLayer {
         let meta: Vec<ChannelMeta> = (0..channels)
             .map(|channel| ChannelMeta::linear(0.0, 1.0 + channel as f32))
             .collect();
-        let mut bytes = Vec::with_capacity((texels.x * texels.y) as usize * channels);
-        for index in 0..texels.x * texels.y {
+        let mut bytes = Vec::with_capacity((SIZE.x * SIZE.y) as usize * channels);
+        for index in 0..SIZE.x * SIZE.y {
             for channel in &meta {
                 bytes.push(channel.encode((index % 17) as f32 / 17.0));
             }
         }
-        let texels = LayerTexels::from_bytes(texels, channels, bytes).unwrap();
-        TerrainLayer::new(Some(shift), meta, texels)
+        let texels = LayerTexels::from_bytes(SIZE, channels, bytes).unwrap();
+        TerrainLayer::new(meta, texels)
     }
 
-    fn info(name: &str, role: FieldRole, shift: u8, layer: u8) -> FieldInfo {
+    fn info(name: &str, role: FieldRole, layer: u8) -> FieldInfo {
         FieldInfo {
             name: name.to_owned(),
             role,
-            shift,
             categorical: false,
             layer,
             channel: 0,
         }
     }
 
+    fn grid() -> ChunkGrid {
+        ChunkGrid::new(UVec2::new(24, 16), UVec2::new(2, 2)).unwrap()
+    }
+
     fn terrain() -> Terrain {
         Terrain {
             size: SIZE,
             fields: vec![
-                info("height", FieldRole::Height, 0, 0),
-                info("moisture", FieldRole::Moisture, 2, 1),
+                info("height", FieldRole::Height, 0),
+                info("moisture", FieldRole::Moisture, 1),
             ],
-            layers: vec![layer_of(0, 1), layer_of(2, 1)],
+            layers: vec![layer_of(1), layer_of(1)],
             water: None,
         }
     }
 
     fn watered() -> Terrain {
         let mut terrain = terrain();
-        terrain.layers.push(layer_of(0, MAX_CHANNELS));
+        terrain.layers.push(layer_of(MAX_CHANNELS));
         terrain.water = Some(WaterInfo { lakes: 3, layer: 2 });
         terrain
     }
 
     fn saved(terrain: &Terrain) -> MemStore {
         let mut store = MemStore::default();
-        write(&mut store, terrain, true).unwrap();
+        write(&mut store, terrain, &grid(), true).unwrap();
         store
+    }
+
+    fn load(store: &MemStore, chunk: UVec2) -> Result<Terrain, IoError> {
+        let (grid, meta) = read_meta(store)?;
+        load_chunk(store, &grid, &meta, chunk)
+    }
+
+    fn load_all(store: &MemStore) -> Result<Vec<Terrain>, IoError> {
+        let (grid, meta) = read_meta(store)?;
+        grid.iter()
+            .map(|chunk| load_chunk(store, &grid, &meta, chunk))
+            .collect()
     }
 
     fn meta_of_store(store: &MemStore) -> TerrainMeta {
         ron::from_str(std::str::from_utf8(&store.files[META_FILE]).unwrap()).unwrap()
+    }
+
+    fn first_file(meta: &TerrainMeta) -> String {
+        chunk_file(UVec2::ZERO, &meta.layers[0].file)
+    }
+
+    fn stale() -> String {
+        chunk_file(UVec2::new(9, 9), &layer_stem(0))
     }
 
     fn put_meta(store: &mut MemStore, meta: &TerrainMeta) {
@@ -621,18 +741,24 @@ mod tests {
     }
 
     // The shape of the format, and the one thing a person opening the directory sees
-    // first: metadata plus the images it names, and nothing that has to be guessed at.
+    // first: metadata plus one image per chunk per layer, and nothing to guess at.
     #[test]
-    fn a_terrain_is_one_metadata_file_and_the_images_it_names() {
+    fn a_terrain_is_one_metadata_file_and_one_image_per_chunk_per_layer() {
         let store = saved(&terrain());
         let meta = meta_of_store(&store);
 
         assert!(store.files.contains_key(META_FILE));
-        assert!(!meta.layers.is_empty());
-        for layer in &meta.layers {
-            assert!(store.files.contains_key(&layer.file), "{}", layer.file);
+        assert_eq!(
+            (meta.chunk_size, meta.chunks),
+            (grid().chunk_size(), grid().chunks())
+        );
+        for chunk in grid().iter() {
+            for layer in &meta.layers {
+                let file = chunk_file(chunk, &layer.file);
+                assert!(store.files.contains_key(&file), "{file}");
+            }
         }
-        assert_eq!(store.files.len(), meta.layers.len() + 1);
+        assert_eq!(store.files.len(), meta.layers.len() * 4 + 1);
     }
 
     // The metadata is meant to be read and edited by hand, so it must stay a
@@ -646,22 +772,49 @@ mod tests {
         assert!(text.len() < 4096, "the metadata is {} bytes", text.len());
     }
 
-    // The whole point of the format: what is written is what is read, with no bake
-    // and no solve on the way in.
+    // The consumer contract the chunk-consumer context asked for: one chunk loads
+    // on its own, in its own cells, holding the same values the document had there.
     #[test]
-    fn a_consumer_reads_values_without_baking() {
+    fn a_chunk_reads_the_documents_values_in_its_own_cells() {
         let store = saved(&terrain());
-        let (loaded, _) = read(&store).unwrap();
+        let chunk = UVec2::new(1, 1);
+        let loaded = load(&store, chunk).unwrap();
+        let origin = grid().origin(chunk).unwrap();
 
-        assert_eq!(loaded.size(), SIZE);
-        assert_eq!(loaded.field("height").unwrap().shift(), 0);
-        assert_eq!(loaded.field("moisture").unwrap().shift(), 2);
-        for (x, y) in [(0, 0), (7, 11), (47, 31)] {
+        assert_eq!(loaded.size(), grid().chunk_size());
+        for (x, y) in [(0, 0), (7, 11), (23, 15)] {
             assert_eq!(
                 loaded.field("height").unwrap().value_at(x, y),
-                terrain().field("height").unwrap().value_at(x, y)
+                terrain()
+                    .field("height")
+                    .unwrap()
+                    .value_at(origin.x + x, origin.y + y)
             );
         }
+    }
+
+    // Loading a chunk must not depend on any other chunk's files, or a consumer
+    // streaming chunks pays for the whole terrain.
+    #[test]
+    fn a_chunk_loads_with_every_other_chunks_files_gone() {
+        let mut store = saved(&terrain());
+        store
+            .files
+            .retain(|name, _| name == META_FILE || name.starts_with("chunk_0_1_"));
+
+        assert!(load(&store, UVec2::new(0, 1)).is_ok());
+        assert!(load(&store, UVec2::new(1, 1)).is_err());
+    }
+
+    // A chunk index comes from the consumer, so one past the grid has to be a
+    // refusal rather than a file name that happens not to exist.
+    #[test]
+    fn a_chunk_outside_the_grid_is_refused() {
+        let store = saved(&terrain());
+        assert!(matches!(
+            load(&store, UVec2::new(2, 0)),
+            Err(IoError::Inconsistent(_))
+        ));
     }
 
     // A png is lossless over the bytes it carries, so a value that survives the
@@ -669,15 +822,31 @@ mod tests {
     #[test]
     fn a_written_value_reads_back_byte_for_byte() {
         let before = terrain();
-        let (after, _) = read(&saved(&before)).unwrap();
-
-        for index in 0..before.layer_count() {
-            assert_eq!(
-                before.layer(index).unwrap().bytes(),
-                after.layer(index).unwrap().bytes(),
-                "layer {index}"
-            );
+        let store = saved(&before);
+        for chunk in grid().iter() {
+            let expected = before.chunk(&grid(), chunk).unwrap();
+            let after = load(&store, chunk).unwrap();
+            for index in 0..before.layer_count() {
+                assert_eq!(
+                    expected.layer(index).unwrap().bytes(),
+                    after.layer(index).unwrap().bytes(),
+                    "chunk {chunk} layer {index}"
+                );
+            }
         }
+    }
+
+    // A grid that does not cover the terrain would write chunks that slice past its
+    // edge, so it is refused before anything is written.
+    #[test]
+    fn a_grid_that_does_not_cover_the_terrain_is_refused() {
+        let mut store = MemStore::default();
+        let wrong = ChunkGrid::new(UVec2::new(16, 16), UVec2::new(2, 2)).unwrap();
+        assert!(matches!(
+            write(&mut store, &terrain(), &wrong, true),
+            Err(IoError::Inconsistent(_))
+        ));
+        assert!(store.files.is_empty());
     }
 
     // Saving over a terrain that had more images has to remove the ones it no longer
@@ -686,13 +855,31 @@ mod tests {
     fn a_save_removes_an_image_it_no_longer_names() {
         let mut store = saved(&watered());
         let before = store.files.len();
-        store.files.insert(layer_file(99), b"stale".to_vec());
+        store.files.insert(stale(), b"stale".to_vec());
 
-        write(&mut store, &terrain(), true).unwrap();
+        write(&mut store, &terrain(), &grid(), true).unwrap();
 
-        assert!(!store.files.contains_key(&layer_file(99)));
+        assert!(!store.files.contains_key(&stale()));
         assert!(store.files.len() < before);
-        read(&store).unwrap();
+        load_all(&store).unwrap();
+    }
+
+    // No migration is offered (format-replace), so a save over a directory of the
+    // old format has to sweep its images without being able to read its metadata.
+    #[test]
+    fn a_save_over_the_old_format_removes_its_images() {
+        let mut store = MemStore::default();
+        store
+            .files
+            .insert(META_FILE.to_owned(), b"(version: 2, size_x: 4)".to_vec());
+        store
+            .files
+            .insert("layer_000.png".to_owned(), b"old".to_vec());
+
+        write(&mut store, &terrain(), &grid(), true).unwrap();
+
+        assert!(!store.files.contains_key("layer_000.png"));
+        load_all(&store).unwrap();
     }
 
     // The sweep must never touch a file this writer would not itself have produced:
@@ -708,7 +895,7 @@ mod tests {
             .files
             .insert("paint_000.png".to_owned(), b"mine".to_vec());
 
-        write(&mut store, &terrain(), true).unwrap();
+        write(&mut store, &terrain(), &grid(), true).unwrap();
 
         assert_eq!(store.files.get("notes.txt").unwrap(), b"mine");
         assert_eq!(store.files.get("recipe.ron").unwrap(), b"mine");
@@ -720,23 +907,49 @@ mod tests {
     #[test]
     fn a_save_that_is_not_pruning_removes_nothing() {
         let mut store = saved(&watered());
-        store.files.insert(layer_file(99), b"stale".to_vec());
+        store.files.insert(stale(), b"stale".to_vec());
 
-        write(&mut store, &terrain(), false).unwrap();
+        write(&mut store, &terrain(), &grid(), false).unwrap();
 
-        assert_eq!(store.files.get(&layer_file(99)).unwrap(), b"stale");
+        assert_eq!(store.files.get(&stale()).unwrap(), b"stale");
     }
 
-    // There is no migration path, so a newer terrain has to be refused outright
+    // The sweep decides deletion by name alone, so the name test has to accept
+    // exactly what a writer of either format produces.
+    #[test]
+    fn only_names_a_writer_produces_are_layer_files() {
+        for name in [
+            "chunk_0_0_layer_000.png",
+            "chunk_12_3_layer_7.png",
+            "layer_000.png",
+        ] {
+            assert!(is_layer_file(name), "{name}");
+        }
+        for name in [
+            "chunk_0_layer_000.png",
+            "chunk_a_0_layer_000.png",
+            "chunk_0_0_paint_000.png",
+            "chunk_0_0_layer_.png",
+            "layer_000.ron",
+            "notes.txt",
+        ] {
+            assert!(!is_layer_file(name), "{name}");
+        }
+    }
+
+    // There is no migration path, so another version has to be refused outright
     // rather than read as far as it happens to agree.
     #[test]
-    fn a_terrain_from_a_later_version_is_refused() {
+    fn a_terrain_from_another_version_is_refused() {
         let mut store = saved(&terrain());
         let mut meta = meta_of_store(&store);
         meta.version = 99;
         put_meta(&mut store, &meta);
 
-        assert!(matches!(read(&store), Err(IoError::UnsupportedVersion(99))));
+        assert!(matches!(
+            read_meta(&store),
+            Err(IoError::UnsupportedVersion(99))
+        ));
     }
 
     // A directory that is not a terrain has to be refused rather than read as one
@@ -744,7 +957,7 @@ mod tests {
     #[test]
     fn a_directory_that_is_not_a_terrain_is_refused() {
         let store = MemStore::default();
-        assert!(matches!(read(&store), Err(IoError::Io(_))));
+        assert!(matches!(read_meta(&store), Err(IoError::Io(_))));
     }
 
     // Nothing re-derives a bake on the way in, so a terrain with no fields would
@@ -757,7 +970,38 @@ mod tests {
         meta.water = None;
         put_meta(&mut store, &meta);
 
-        assert!(matches!(read(&store), Err(IoError::NoFields)));
+        assert!(matches!(read_meta(&store), Err(IoError::NoFields)));
+    }
+
+    // The grid comes out of an untrusted file, and a zero in it is a division by
+    // zero for every consumer that locates a position.
+    #[test]
+    fn a_zero_chunk_grid_is_refused() {
+        for (chunk_size, chunks) in [(UVec2::new(0, 16), UVec2::ONE), (UVec2::ONE, UVec2::ZERO)] {
+            let mut store = saved(&terrain());
+            let mut meta = meta_of_store(&store);
+            meta.chunk_size = chunk_size;
+            meta.chunks = chunks;
+            put_meta(&mut store, &meta);
+
+            assert!(matches!(read_meta(&store), Err(IoError::Inconsistent(_))));
+        }
+    }
+
+    // The cell limit bounds one chunk's allocation now that the document as a whole
+    // has none, so a chunk past it is refused before any image is read.
+    #[test]
+    fn a_chunk_over_the_cell_limit_is_refused() {
+        let mut store = saved(&terrain());
+        let mut meta = meta_of_store(&store);
+        meta.chunk_size = UVec2::new(1 << 16, 1 << 15);
+        for layer in &mut meta.layers {
+            layer.width = meta.chunk_size.x;
+            layer.height = meta.chunk_size.y;
+        }
+        put_meta(&mut store, &meta);
+
+        assert!(matches!(read_meta(&store), Err(IoError::Inconsistent(_))));
     }
 
     // Joining a name like this onto the directory would discard the directory
@@ -775,7 +1019,19 @@ mod tests {
         ] {
             assert!(check_file_name(name).is_err(), "{name:?} was accepted");
         }
-        assert!(check_file_name("layer_000.png").is_ok());
+        assert!(check_file_name("chunk_0_0_layer_000.png").is_ok());
+    }
+
+    // The stem is spliced into every chunk file name, so anything but the shape a
+    // writer produces is refused before a name is built from it.
+    #[test]
+    fn a_layer_stem_that_is_not_one_a_writer_produces_is_refused() {
+        let mut store = saved(&terrain());
+        let mut meta = meta_of_store(&store);
+        meta.layers[0].file = "../escape".to_owned();
+        put_meta(&mut store, &meta);
+
+        assert!(matches!(read_meta(&store), Err(IoError::BadFileName(_))));
     }
 
     // The metadata names every file the loader opens, so a name it cannot open has
@@ -784,21 +1040,21 @@ mod tests {
     fn an_image_the_metadata_names_but_the_directory_lacks_is_refused() {
         let mut store = saved(&terrain());
         let meta = meta_of_store(&store);
-        store.files.remove(&meta.layers[0].file);
+        store.files.remove(&first_file(&meta));
 
-        assert!(matches!(read(&store), Err(IoError::Io(_))));
+        assert!(matches!(load(&store, UVec2::ZERO), Err(IoError::Io(_))));
     }
 
-    // The extent is checked against the image's own header before its pixels are
-    // allocated, which is what stops a small file claiming an enormous one.
+    // Every image is the chunk's extent, and the metadata saying otherwise is refused
+    // before the image's pixels are allocated.
     #[test]
-    fn an_image_at_the_wrong_extent_is_refused() {
+    fn an_image_not_at_the_chunk_size_is_refused() {
         let mut store = saved(&terrain());
         let mut meta = meta_of_store(&store);
         meta.layers[0].width += 1;
         put_meta(&mut store, &meta);
 
-        assert!(matches!(read(&store), Err(IoError::ImageShape { .. })));
+        assert!(matches!(read_meta(&store), Err(IoError::ImageShape { .. })));
     }
 
     // A channel count the image does not have would otherwise be read as a different
@@ -810,32 +1066,26 @@ mod tests {
         meta.layers[0].channels.push(ChannelMeta::linear(0.0, 1.0));
         put_meta(&mut store, &meta);
 
-        assert!(matches!(read(&store), Err(IoError::ImageShape { .. })));
+        assert!(matches!(
+            load(&store, UVec2::ZERO),
+            Err(IoError::ImageShape { .. })
+        ));
     }
 
-    // Two shifts can imply the same image extent, so a shift out of range is not
-    // caught by the extent check and needs refusing on its own.
+    // A file is checked against what its image could encode to before it is read
+    // into memory, so a huge file named by a small chunk is never read whole.
     #[test]
-    fn a_shift_past_what_the_grid_honours_is_refused() {
+    fn an_image_file_larger_than_its_chunk_could_encode_to_is_refused() {
         let mut store = saved(&terrain());
-        let mut meta = meta_of_store(&store);
-        meta.layers[0].shift = Some(200);
-        put_meta(&mut store, &meta);
+        let meta = meta_of_store(&store);
+        store
+            .files
+            .insert(first_file(&meta), vec![0; 4 * 1024 * 1024]);
 
-        assert!(matches!(read(&store), Err(IoError::Inconsistent(_))));
-    }
-
-    // A field's shift decides how a cell maps to a texel; if it disagrees with the
-    // image it points at, the read is bounds-checked against one grid and performed
-    // against another.
-    #[test]
-    fn a_field_whose_shift_is_not_its_layers_is_refused() {
-        let mut store = saved(&terrain());
-        let mut meta = meta_of_store(&store);
-        meta.fields[0].shift = meta.fields[0].shift.wrapping_add(1);
-        put_meta(&mut store, &meta);
-
-        assert!(matches!(read(&store), Err(IoError::Inconsistent(_))));
+        assert!(matches!(
+            load(&store, UVec2::ZERO),
+            Err(IoError::FileTooLarge { .. })
+        ));
     }
 
     // An index out of a hand-edited file has to be refused rather than panicking or
@@ -846,13 +1096,13 @@ mod tests {
         let mut meta = meta_of_store(&store);
         meta.fields[0].layer = 200;
         put_meta(&mut store, &meta);
-        assert!(matches!(read(&store), Err(IoError::Inconsistent(_))));
+        assert!(matches!(read_meta(&store), Err(IoError::Inconsistent(_))));
 
         let mut store = saved(&terrain());
         let mut meta = meta_of_store(&store);
         meta.fields[0].channel = 200;
         put_meta(&mut store, &meta);
-        assert!(matches!(read(&store), Err(IoError::Inconsistent(_))));
+        assert!(matches!(read_meta(&store), Err(IoError::Inconsistent(_))));
     }
 
     // A range that is not finite and ordered makes every read through it a NaN, so
@@ -877,7 +1127,7 @@ mod tests {
             put_meta(&mut store, &meta);
 
             assert!(
-                matches!(read(&store), Err(IoError::Channel(_))),
+                matches!(read_meta(&store), Err(IoError::Channel(_))),
                 "{broken:?}"
             );
         }
@@ -889,11 +1139,11 @@ mod tests {
     fn a_truncated_image_is_refused_rather_than_read_short() {
         let mut store = saved(&terrain());
         let meta = meta_of_store(&store);
-        let file = meta.layers[0].file.clone();
+        let file = first_file(&meta);
         let bytes = store.files[&file].clone();
         store.files.insert(file, bytes[..bytes.len() / 2].to_vec());
 
-        assert!(read(&store).is_err());
+        assert!(load(&store, UVec2::ZERO).is_err());
     }
 
     // A truncated metadata file fails to parse rather than being read as a terrain
@@ -906,21 +1156,23 @@ mod tests {
             .files
             .insert(META_FILE.to_owned(), bytes[..bytes.len() / 2].to_vec());
 
-        assert!(matches!(read(&store), Err(IoError::Meta(_))));
+        assert!(matches!(read_meta(&store), Err(IoError::Meta(_))));
     }
 
-    // All of the water is one image, which is what four channels bought; a reader
-    // validates one index rather than five.
+    // All of the water is one image, chunked like every other, which is what four
+    // channels bought; a reader validates one index rather than five.
     #[test]
-    fn the_water_is_a_single_four_channel_image() {
+    fn the_water_is_a_single_four_channel_image_in_every_chunk() {
         let store = saved(&watered());
         let meta = meta_of_store(&store);
 
         let water = meta.water.unwrap();
         let layer = &meta.layers[water.layer as usize];
         assert_eq!(layer.channels.len(), MAX_CHANNELS);
-        assert_eq!((layer.width, layer.height), (SIZE.x, SIZE.y));
-        assert!(read(&store).unwrap().0.water().is_some());
+        assert_eq!(UVec2::new(layer.width, layer.height), grid().chunk_size());
+        for chunk in load_all(&store).unwrap() {
+            assert!(chunk.water().is_some());
+        }
     }
 
     // The water indices come out of the same untrusted file as everything else.
@@ -931,14 +1183,19 @@ mod tests {
         meta.water = Some(WaterInfo { lakes: 1, layer: 0 });
         put_meta(&mut store, &meta);
 
-        assert!(matches!(read(&store), Err(IoError::Inconsistent(_))));
+        assert!(matches!(read_meta(&store), Err(IoError::Inconsistent(_))));
     }
 
     // A terrain that carries no water must load as one that has none, not as one
     // that acquires an empty solve.
     #[test]
     fn a_terrain_with_no_water_image_loads_with_no_water() {
-        assert!(read(&saved(&terrain())).unwrap().0.water().is_none());
+        assert!(
+            load(&saved(&terrain()), UVec2::ZERO)
+                .unwrap()
+                .water()
+                .is_none()
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -952,16 +1209,26 @@ mod tests {
     }
 
     // Every other test here runs over the in-memory store, so this is the one that
-    // exercises the real thing: creating the directory and reading it back off a disk.
+    // exercises the real thing: creating the directory and reading a chunk back off a
+    // disk through the consumer's own path.
     #[test]
     fn a_terrain_round_trips_through_a_real_directory() {
         let root = scratch("round-trip");
-        watered().save_to_dir(&root).unwrap();
+        watered().save_to_dir(&root, &grid()).unwrap();
 
         assert!(root.join(META_FILE).is_file());
-        let loaded = Terrain::load_from_dir(&root).unwrap();
-        assert_eq!(loaded.size(), SIZE);
-        assert!(loaded.field("height").unwrap().value_at(1, 1).is_some());
+        let dir = TerrainDir::open(&root).unwrap();
+        assert_eq!(dir.grid(), grid());
+        let at = dir.grid().locate(30.5, 20.5).unwrap();
+        assert_eq!(at.chunk, UVec2::new(1, 1));
+        let loaded = dir.load_chunk(at.chunk).unwrap();
+        assert!(
+            loaded
+                .field("height")
+                .unwrap()
+                .value_at(at.texel.x, at.texel.y)
+                .is_some()
+        );
         assert!(loaded.water().is_some());
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -972,15 +1239,18 @@ mod tests {
     #[test]
     fn a_real_save_prunes_its_own_stale_images_only() {
         let root = scratch("prune");
-        watered().save_to_dir(&root).unwrap();
-        std::fs::write(root.join(layer_file(99)), b"stale").unwrap();
+        watered().save_to_dir(&root, &grid()).unwrap();
+        std::fs::write(root.join(stale()), b"stale").unwrap();
         std::fs::write(root.join("notes.txt"), b"mine").unwrap();
 
-        terrain().save_to_dir(&root).unwrap();
+        terrain().save_to_dir(&root, &grid()).unwrap();
 
-        assert!(!root.join(layer_file(99)).exists());
+        assert!(!root.join(stale()).exists());
         assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), b"mine");
-        Terrain::load_from_dir(&root).unwrap();
+        TerrainDir::open(&root)
+            .unwrap()
+            .load_chunk(UVec2::ZERO)
+            .unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -990,12 +1260,12 @@ mod tests {
     fn a_save_into_a_foreign_directory_deletes_nothing() {
         let root = scratch("foreign");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join(layer_file(7)), b"someone else's").unwrap();
+        std::fs::write(root.join(stale()), b"someone else's").unwrap();
 
-        terrain().save_to_dir(&root).unwrap();
+        terrain().save_to_dir(&root, &grid()).unwrap();
 
         assert_eq!(
-            std::fs::read(root.join(layer_file(7))).unwrap(),
+            std::fs::read(root.join(stale())).unwrap(),
             b"someone else's"
         );
         std::fs::remove_dir_all(&root).unwrap();

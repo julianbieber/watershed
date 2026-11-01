@@ -5,6 +5,7 @@
 //! editing a terrain by hand reads, so it holds names and indices rather than data,
 //! and it never carries a texel.
 
+use glam::UVec2;
 use serde::{Deserialize, Serialize};
 
 use crate::channel::ChannelMeta;
@@ -14,25 +15,22 @@ use crate::terrain::FieldInfo;
 ///
 /// A terrain carrying any other version is refused outright; there is no migration
 /// path, exactly as there was none for the format this replaced.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
-/// One image in a terrain: what it is called, how big it is, and how to read the
-/// channels in it.
+/// One image in a terrain: what it is called, how big each chunk of it is, and how
+/// to read the channels in it.
+///
+/// An image is stored as one file per chunk, `chunk_<x>_<y>_<file>.png`, the name
+/// built from the chunk's index and this stem.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerMeta {
-    /// The file, as a plain name inside the terrain's own directory. Never a path:
-    /// a reader refuses anything with a separator in it.
+    /// The stem every chunk file of this image is named from: `layer_<n>`. A
+    /// reader refuses any other shape.
     pub file: String,
-    /// Columns in the image.
+    /// Columns in each chunk's image, which is the chunk size.
     pub width: u32,
-    /// Rows in the image.
+    /// Rows in each chunk's image, which is the chunk size.
     pub height: u32,
-    /// The [`raster`](crate::raster) shift this image stands at, for one whose
-    /// extent is derived from the document — a bake, or the water.
-    ///
-    /// `None` for a painted raster, which is stretched over the document from
-    /// whatever size it was authored at and so has an extent of its own.
-    pub shift: Option<u8>,
     /// One per channel, in the order they appear in a texel. Between one and
     /// [`MAX_CHANNELS`](crate::channel::MAX_CHANNELS) of them.
     pub channels: Vec<ChannelMeta>,
@@ -40,7 +38,8 @@ pub struct LayerMeta {
 
 /// A solved water, as a terrain carries it.
 ///
-/// All of it is one image at the document's extent, in a fixed channel order:
+/// All of it is one image at the document's extent, chunked like every other, in a
+/// fixed channel order:
 /// depth, the two components of the flow direction, then accumulation. One image
 /// rather than three, and one index to check rather than five.
 ///
@@ -75,10 +74,10 @@ impl WaterInfo {
 pub struct TerrainMeta {
     /// [`VERSION`]. Checked before anything else is read.
     pub version: u32,
-    /// Columns of the document, in cells.
-    pub size_x: u32,
-    /// Rows of the document, in cells.
-    pub size_y: u32,
+    /// Cells of one chunk on each axis.
+    pub chunk_size: UVec2,
+    /// Chunks on each axis. The document's extent is `chunk_size * chunks`.
+    pub chunks: UVec2,
     /// Every image, in the order a reader loads them.
     pub layers: Vec<LayerMeta>,
     /// Every readable field, in the order the document declared them.

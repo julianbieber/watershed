@@ -44,7 +44,7 @@ impl Snapshot {
     /// history does not own — bakes, shader values, the layers a file reads — stays
     /// with the live layer.
     ///
-    /// The role, shift, range and class flag are among what it does not own: the
+    /// The role, range and class flag are among what it does not own: the
     /// shader file declares them, and an undo that put an old one back would be
     /// overwritten by the next read of the file.
     pub fn restore(self, terrain: &mut TerrainSpec) {

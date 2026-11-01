@@ -42,8 +42,8 @@ observe water
 # the numbers above cannot disagree.
 capture /tmp/watershed-scenario/water.png
 
-# Moisture is baked four shifts down, so switching to it is what proves a coarse layer is
-# drawn at its own resolution rather than the document's.
+# Every layer is one texel per cell, so moisture is drawn at the document's resolution
+# like the height it is solved with.
 layer moisture
 observe layer
 capture /tmp/watershed-scenario/moisture.png

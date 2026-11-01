@@ -93,52 +93,86 @@ struct DispatchRequest {
 pub(crate) struct DispatchSender(Sender<DispatchRequest>);
 
 impl DispatchSender {
-    /// Runs `file`, as the source whose fingerprint is `key`, over the whole of
-    /// `globals.texels`, and answers its values row-major — or `None` when that source
-    /// did not run: its pipeline failed to compile, or the file was read again as another
+    /// Runs `file`, as the source whose fingerprint is `key`, once per entry of
+    /// `dispatches`, each over the whole of its `globals.texels`, and answers each
+    /// one's values row-major in the order given — or `None` for one whose source did
+    /// not run: its pipeline failed to compile, or the file was read again as another
     /// source before the dispatch started.
     ///
-    /// Blocks until the render world has dispatched and the values have been read back.
-    /// Answers an error when the editor stops first, or when no pipeline for that source
-    /// is ready within a minute, which is what a file removed mid-bake gets.
-    pub(crate) fn run(
+    /// Up to [`IN_FLIGHT`] are handed over before any is waited on, so the render
+    /// world dispatches them in the same frames rather than one after another.
+    /// Blocks until each has been read back. An entry answers an error when the
+    /// editor stops first, or when no pipeline for that source is ready within a
+    /// minute, which is what a file removed mid-bake gets.
+    pub(crate) fn run_batch(
+        &self,
+        file: &str,
+        key: u64,
+        params: &[u8],
+        dispatches: Vec<(DispatchGlobals, Vec<LayerInput>)>,
+    ) -> Vec<Answer> {
+        let params = if params.is_empty() {
+            vec![0; 16]
+        } else {
+            params.to_vec()
+        };
+        let mut answers = Vec::with_capacity(dispatches.len());
+        let mut pending = dispatches.into_iter().peekable();
+        while pending.peek().is_some() {
+            let waiting: Vec<_> = pending
+                .by_ref()
+                .take(IN_FLIGHT)
+                .map(|(globals, inputs)| self.send(file, key, &params, globals, inputs))
+                .collect();
+            answers.extend(waiting.into_iter().map(|sent| wait(file, sent)));
+        }
+        answers
+    }
+
+    fn send(
         &self,
         file: &str,
         key: u64,
         params: &[u8],
         globals: DispatchGlobals,
         inputs: Vec<LayerInput>,
-    ) -> Answer {
+    ) -> Result<Option<Receiver<Answer>>, String> {
         if globals.texels.x == 0 || globals.texels.y == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(None);
         }
         let (reply, answer) = mpsc::channel();
-        let params = if params.is_empty() {
-            vec![0; 16]
-        } else {
-            params.to_vec()
-        };
         self.0
             .send(DispatchRequest {
                 file: file.to_owned(),
                 key,
-                params,
+                params: params.to_vec(),
                 globals,
                 inputs,
                 sent: Instant::now(),
                 reply,
             })
             .map_err(|_| format!("{file}: the editor stopped before the shader was dispatched"))?;
-        match answer.recv_timeout(DISPATCH_TIMEOUT) {
-            Ok(answer) => answer,
-            Err(RecvTimeoutError::Timeout) => Err(format!(
-                "{file}: the shader dispatch did not answer within {} seconds",
-                DISPATCH_TIMEOUT.as_secs()
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(format!(
-                "{file}: the shader dispatch was dropped before it answered"
-            )),
-        }
+        Ok(Some(answer))
+    }
+}
+
+/// The most dispatches of one batch handed to the render world before the first of
+/// them is waited on, which bounds the output buffers alive at once.
+pub(crate) const IN_FLIGHT: usize = 16;
+
+fn wait(file: &str, sent: Result<Option<Receiver<Answer>>, String>) -> Answer {
+    let Some(answer) = sent? else {
+        return Ok(Some(Vec::new()));
+    };
+    match answer.recv_timeout(DISPATCH_TIMEOUT) {
+        Ok(answer) => answer,
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "{file}: the shader dispatch did not answer within {} seconds",
+            DISPATCH_TIMEOUT.as_secs()
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(format!(
+            "{file}: the shader dispatch was dropped before it answered"
+        )),
     }
 }
 

@@ -6,16 +6,17 @@
 // `Globals` out as `DispatchGlobals`. A change here is a change there.
 
 // Everything a shader is told about where it is being evaluated. Positions are in
-// document cells, not in a normalised coordinate, so a scale means the same thing at
-// every shift.
+// document cells, not in a normalised coordinate, so a scale means the same thing in
+// every chunk.
 struct Globals {
     // The document's extent, in cells.
     document: vec2<u32>,
-    // The extent of this dispatch, in texels of the layer's own raster.
+    // The extent of this dispatch, in texels: one chunk, one texel per cell.
     texels: vec2<u32>,
-    // Where this dispatch starts, in texels of the layer's own raster.
+    // The document cell this dispatch's first texel stands for, which is also where
+    // every layer texture bound to it starts.
     origin: vec2<u32>,
-    // The layer's raster shift: one texel per cell at 0, per 2^shift cells above.
+    // Always 0. Kept so a shader that reads it still compiles.
     shift: u32,
     // The document's seed.
     seed: u32,
@@ -120,8 +121,7 @@ fn seed_offset(seed: u32, salt: u32) -> vec2<f32> {
 // The document position, in cells, of the texel this invocation writes.
 fn cell_position(id: vec2<u32>) -> vec2<f32> {
     let texel = id + globals.origin;
-    let step = f32(1u << globals.shift);
-    return (vec2<f32>(texel) + vec2<f32>(0.5, 0.5)) * step;
+    return vec2<f32>(texel) + vec2<f32>(0.5, 0.5);
 }
 
 // The document's extent, in cells.
@@ -137,11 +137,12 @@ fn uv(p: vec2<f32>) -> vec2<f32> {
     return p / document_extent();
 }
 
-// The texel of this layer's own raster a document position falls in — the inverse of
-// `cell_position`, and how a shader turns a neighbour's position into an index into
-// a layer.
+// The texel of a bound layer texture a document position falls in — the inverse of
+// `cell_position`, and how a shader turns a position into an index into a layer. A
+// layer texture holds only this dispatch's chunk, so the index is counted from the
+// chunk's origin.
 fn layer_texel(p: vec2<f32>) -> vec2<i32> {
-    return vec2<i32>(floor(p / f32(1u << globals.shift)));
+    return vec2<i32>(floor(p)) - vec2<i32>(globals.origin);
 }
 
 // One texel of a layer texture, clamped to its edge — so a neighbourhood read at the
@@ -152,28 +153,19 @@ fn input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32 {
     return textureLoad(source, clamp(at, vec2<i32>(0, 0), last), 0).r;
 }
 
-// The shift a bound layer was baked at: the smallest one whose raster covers the
-// document at the layer texture's own extent. Every shift reads a one-texel layer the
-// same way, so which one answers for it does not matter.
+// Always 0: every layer holds one texel per cell. Kept so a shader that calls it
+// still compiles.
 fn layer_shift(layer: texture_2d<f32>) -> u32 {
-    let size = textureDimensions(layer);
-    for (var shift = 0u; shift < 16u; shift = shift + 1u) {
-        let step = 1u << shift;
-        let fits = max((globals.document + vec2<u32>(step - 1u)) / step, vec2<u32>(1u, 1u));
-        if all(fits == size) {
-            return shift;
-        }
-    }
-    return 16u;
+    return 0u;
 }
 
 // Another layer's value at a document position, interpolated between its texels and
-// clamped to its edge, whatever shift it was baked at — the same read a layer
+// clamped to the edge of the chunk this dispatch is bound to — the same read a layer
 // reference makes.
 fn layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
-    let step = f32(1u << layer_shift(layer));
     let last = vec2<f32>(textureDimensions(layer)) - vec2<f32>(1.0, 1.0);
-    let at = clamp(p / step - vec2<f32>(0.5, 0.5), vec2<f32>(0.0, 0.0), last);
+    let local = p - vec2<f32>(globals.origin);
+    let at = clamp(local - vec2<f32>(0.5, 0.5), vec2<f32>(0.0, 0.0), last);
     let low = floor(at);
     let f = at - low;
     let i0 = vec2<i32>(low);
@@ -189,6 +181,5 @@ fn layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
 // what a layer declaring `@categorical` holds, where a blend of two class indices
 // would be a third class the layer never had.
 fn layer_class(layer: texture_2d<f32>, p: vec2<f32>) -> f32 {
-    let step = f32(1u << layer_shift(layer));
-    return input_texel(layer, vec2<i32>(floor(p / step)));
+    return input_texel(layer, layer_texel(p));
 }

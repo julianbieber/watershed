@@ -10,7 +10,7 @@ import package::lib::fbm_unit;
 // COORDINATES
 //
 // `p` is in document cells, not a normalised coordinate, so a scale means the same
-// thing at every raster shift. For the 0..1 reading, `uv(p)` divides by
+// thing in every chunk. For the 0..1 reading, `uv(p)` divides by
 // `document_extent()`, the cells the document spans; on a document wider than it is
 // tall that stretches, because it runs 0..1 on both axes.
 //
@@ -29,9 +29,9 @@ import package::lib::fbm_unit;
 // is used twice, and at most 8 are declared. `globals` carries:
 //
 //   document: vec2<u32>  the document's extent, in cells
-//   texels:   vec2<u32>  the extent of this dispatch, in texels of this raster
-//   origin:   vec2<u32>  where this dispatch starts; always zero, every bake is whole
-//   shift:    u32        the raster shift: one texel per cell at 0, per 2^shift above
+//   texels:   vec2<u32>  the extent of this dispatch: one chunk, one texel per cell
+//   origin:   vec2<u32>  the document cell this dispatch starts at, the chunk's origin
+//   shift:    u32        always 0; every layer is one texel per cell
 //   seed:     u32        the document's seed
 //
 // THE LIBRARY
@@ -71,9 +71,9 @@ import package::lib::fbm_unit;
 //   input_texel(source: texture_2d<f32>, at: vec2<i32>) -> f32
 //       one texel of a layer texture, clamped to its edge
 //   layer_value(layer: texture_2d<f32>, p: vec2<f32>) -> f32
-//       another layer's value at a document position, interpolated, whatever its shift
+//       another layer's value at a document position, interpolated
 //   layer_shift(layer: texture_2d<f32>) -> u32
-//       the shift that layer was baked at
+//       always 0; kept for files written when layers had a resolution of their own
 //   layer_class(layer: texture_2d<f32>, p: vec2<f32>) -> f32
 //       another layer's value read whole, to the nearest texel — how a `@categorical`
 //       layer is read, where an interpolated class index is a class nothing holds
@@ -86,15 +86,15 @@ import package::lib::fbm_unit;
 // nothing and neither does a copy of this file.
 //
 //   @role height|moisture|custom   what the bake does with the layer; custom
-//   @shift <n>                     one texel per 2^n cells, 0 to 8; 0
 //   @range <low> <high>            what baked values are clamped into; 0 1
 //   @categorical                   the layer holds whole class indices, not a
 //                                  quantity: it is read to the nearest texel and
 //                                  exported as a class channel, and a value in it
 //                                  that is not whole is refused at save
 //
-// A document has at most one height layer and at most one moisture layer, and the
-// height layer is at shift 0. A water spec needs a height layer. Breaking one of
+// Every layer holds one texel per cell; an `@shift` line from an older file is read
+// as nothing. A document has at most one height layer and at most one moisture
+// layer. A water spec needs a height layer. Breaking one of
 // those is a fault on the layer's card, and the document is not baked until it is
 // mended.
 //
@@ -119,9 +119,10 @@ import package::lib::fbm_unit;
 //
 //   @group(0) @binding(3) var base: texture_2d<f32>; // @layer base
 //
-// The binding holds that layer's baked raster, at the layer's own shift. Import
-// `layer_value` and read it with `layer_value(base, p)`, or one texel at a time with
-// `input_texel(base, layer_texel(p))` when both layers share a shift. The layer named
+// The binding holds that layer's baked raster over the chunk being dispatched, and
+// nothing outside it, so read it at this texel's own position: `layer_value(base, p)`,
+// or `input_texel(base, layer_texel(p))` for the one texel. A read further away
+// clamps to the chunk's edge. The layer named
 // is baked first. A name that is no layer, or one that makes layers read each other in
 // a circle, leaves this layer unbaked with the reason on its card.
 

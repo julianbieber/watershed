@@ -2,7 +2,7 @@
 
 | crate | what it is |
 |---|---|
-| `watershed` | library: reading a terrain — named fields over an extent, and a solved water state |
+| `watershed` | library: reading a terrain — named fields over a grid of chunks, and a solved water state |
 | `watershed_editor` | bevy editor: authoring a terrain, baking it, and writing it out |
 
 ## The two halves
@@ -12,8 +12,11 @@
 `watershed` is the read side. It holds `Terrain` — the values and nothing that made
 them — its channels and metadata, and the loader that opens a terrain directory. It
 bakes nothing, solves nothing and evaluates nothing: everything a consuming project
-reads was settled when the directory was written, so `Terrain::load_from_dir` is the
-only way to obtain one. It needs no GPU and no thread pool, and builds for the web.
+reads was settled when the directory was written. A consumer opens the directory with
+`TerrainDir::open`, which reads only `terrain.ron`, turns a position into a chunk and a
+texel within it with `grid().locate(x, y)`, and reads one chunk with `load_chunk` — a
+`Terrain` over that chunk, read in the chunk's own cells. It needs no GPU and no thread
+pool, and builds for the web.
 
 `watershed_editor` is the author side, and it carries the whole model a document is
 made of: the layers and their shader files, the water solve, and the bake. A project
@@ -22,17 +25,22 @@ time.
 
 ## The terrain model
 
-A terrain is an extent in cells and a set of named layers over it. A layer is one WGSL
-file in the document's `shaders` directory, named after the layer, and its values are
-what that shader produces, clamped to the layer's declared range. The file declares the
-layer as well as its values: its role in the bake, its resolution shift, that range and
-whether it holds classes are four header lines in the file itself. A layer reads another
-by naming it in its file with `@layer`, so baking is ordered: every layer after the ones
-it reads. Every edit re-bakes the whole document.
+A terrain is an extent in cells, laid out as a grid of equal chunks, and a set of named
+layers over it. A layer is one WGSL file in the document's `shaders` directory, named
+after the layer, and its values are what that shader produces, clamped to the layer's
+declared range. The file declares the layer as well as its values: its role in the
+bake, that range and whether it holds classes are three header lines in the file
+itself. A layer reads another by naming it in its file with `@layer`, so baking is
+ordered: every layer after the ones it reads.
 
-A layer is evaluated onto a raster of its own resolution, chosen as a *shift*: one
-texel per cell at 0, one per `2^shift` cells above that. A coarse layer still answers
-at every cell of the document, interpolated between its texels.
+Every layer holds one texel per cell. A chunk's size is its resolution: a larger area
+is more chunks, not coarser texels. Each layer is evaluated one chunk at a time — one
+shader dispatch per chunk — and the whole document is held in memory, so the water can
+be solved over all of it at once.
+
+An edit bakes the chunk on screen first and shows it, then bakes the rest of the
+document. The editor shows one chunk at a time; the toolbar's arrows and `chunk <x> <y>`
+on the socket switch which.
 
 Two types carry all of this. `TerrainSpec` is the authored document: it holds each
 layer's settings and parameter values, it is what an editor mutates, and it lives in the
@@ -75,7 +83,7 @@ fn value(p: vec2<f32>) -> f32 {
 ```
 
 `p` is a position in **document cells**, not a normalised coordinate, so a scale means
-the same thing at every shift. The entry point is appended by the editor; the bindings,
+the same thing in every chunk. The entry point is appended by the editor; the bindings,
 the noise, `cell_position`, and `uv` and `document_extent` — the 0..1 coordinate across
 the document, and the cells it spans — come from the library, `lib.wesl`.
 
@@ -126,8 +134,9 @@ fn value(p: vec2<f32>) -> f32 {
 ```
 
 Bindings start at 3, since 0, 1 and 2 are the globals, the output and the parameters.
-The binding holds the named layer's baked raster at that layer's own shift, and
-`layer_value` reads it at a document position whatever the shift. The layer named is
+The binding holds the named layer's baked raster over the chunk being dispatched, and
+`layer_value` reads it at a document position; a shader reads another layer at its own
+position, and a read further away clamps to the chunk's edge. The layer named is
 baked first; a name that is no layer, or files that read each other in a circle, leave
 the reading layer unbaked with the reason on its card.
 
@@ -139,7 +148,6 @@ written once; a line the file does not declare takes the default.
 | line | what it says | default |
 | --- | --- | --- |
 | `// @role height\|moisture\|custom` | what the bake does with the layer | `custom` |
-| `// @shift <n>` | one texel per `2^n` cells, 0 to 8 | `0` |
 | `// @range <low> <high>` | what baked values are clamped into | `0 1` |
 | `// @categorical` | the layer holds whole class indices, not a quantity | a quantity |
 
@@ -147,8 +155,9 @@ A categorical layer is read to the nearest texel rather than interpolated — `l
 is the library's read of one — and is exported as a class channel; a value in it that is
 not whole is refused when the document is saved.
 
-A document has at most one height layer and at most one moisture layer, and the height
-layer is at shift 0. A water spec needs a height layer. Breaking one of those is a fault
+An `@shift` line from a file written before every layer was one texel per cell is read
+as nothing. A document has at most one height layer and at most one moisture layer. A
+water spec needs a height layer. Breaking one of those is a fault
 on the layer's card and in the log, and the document is not baked until it is mended.
 
 ### A language server
@@ -186,8 +195,8 @@ which is what lets a terrain made inside it be edited.
 
 ## The water solve
 
-Water is a whole-grid answer over one layer — the one holding the `Height` role, at
-shift 0. Depressions are flooded to their outlets, every cell is given a downhill
+Water is a whole-grid answer over one layer — the one holding the `Height` role — and
+over the whole document, whatever its chunks. Depressions are flooded to their outlets, every cell is given a downhill
 neighbour on the filled surface, and the weight each cell contributes (`1.0`, or a
 moisture layer's value) is accumulated downstream. What comes back is a depth, a flow
 direction, an accumulation and a lake id per cell.
@@ -202,15 +211,20 @@ A terrain is a directory.
 
 | file | what it is | who reads it |
 |---|---|---|
-| `terrain.ron` | the extent, the fields, the images, the water | both |
-| `layer_<n>.png` | the values, eight bits to a channel | both |
-| `recipe.ron` | the extent, the seed, the water spec, and per layer its parameter values — written after every edit, not only on Save | the editor |
+| `terrain.ron` | the chunk size and count, the fields, the images, the water | both |
+| `chunk_<x>_<y>_layer_<n>.png` | one chunk of the values, eight bits to a channel | both |
+| `recipe.ron` | the chunk size and count, the seed, the water spec, and per layer its parameter values — written after every edit, not only on Save | the editor |
 | `shaders/*.wesl` | one file per layer | the editor |
 | `shaders/lib.wesl` | the library, overwritten by the editor | the editor |
 | `shaders/wesl.toml` | the package root, for a language server | a language server |
 
-A `layer_<n>.png` is not an authored layer: it is an image the library packs the values
-of every layer at one shift into, and `terrain.ron` calls the authored ones `fields`.
+An image is not an authored layer: the library packs the values of up to four layers
+into each one, in declaration order, and `terrain.ron` calls the authored ones `fields`.
+Every image is stored once per chunk, at the chunk's extent, and a field reads with the
+same value range in every chunk.
+
+There is no migration from the format before chunks: a directory in it is refused, and
+the shaders beside it regenerate the terrain once a new document is made.
 
 The two files move at two speeds: the recipe is rewritten after every edit that
 settles, so quitting without Save loses nothing authored, and the values are written
@@ -260,11 +274,11 @@ ends up with:
 lakes/
   Cargo.toml
   src/
-    main.rs           <- Terrain::load_from_dir("assets/terrain")
+    main.rs           <- TerrainDir::open("assets/terrain"), then load_chunk
   assets/
     terrain/          <- the editor is run in this directory
-      terrain.ron     <- the extent, the fields, the water
-      layer_000.png   <- the values
+      terrain.ron     <- the chunk grid, the fields, the water
+      chunk_0_0_layer_000.png  <- one chunk of the values
       recipe.ron      <- what the editor authors from
       shaders/
         height.wesl   <- edited in the game's tree, re-baked as it is saved

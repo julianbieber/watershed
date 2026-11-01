@@ -4,44 +4,6 @@
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 
-/// The largest shift [`step`] will honour. A larger shift is silently treated as
-/// this one, which keeps `1 << shift` inside a `u32` for every `u8` a caller can
-/// pass; there is no error path for an out-of-range shift.
-pub const MAX_SHIFT: u8 = 16;
-
-/// Cells covered by one texel of a field at `shift`: one at shift 0, `2^shift`
-/// above that, saturating at `2^MAX_SHIFT`.
-///
-/// The field holding [`FieldRole::Height`](crate::field::FieldRole::Height) is
-/// rejected at plan time unless its shift is 0; every other field is free.
-pub fn step(shift: u8) -> u32 {
-    1u32 << shift.min(MAX_SHIFT)
-}
-
-/// Texel dimensions of a `size`-cell document rasterised at `shift`.
-///
-/// Rounds up, so the raster always covers the whole document, and never returns a
-/// zero component — a shift coarser than the document still yields one texel.
-pub fn resolution(size: UVec2, shift: u8) -> UVec2 {
-    let step = step(shift);
-    UVec2::new(size.x.div_ceil(step).max(1), size.y.div_ceil(step).max(1))
-}
-
-/// Cell position a texel stands for: the centre of the block of cells it covers,
-/// not the block's corner. Inverse of [`raster_coord`].
-pub fn texel_center(index: u32, shift: u8) -> f32 {
-    (index as f32 + 0.5) * step(shift) as f32
-}
-
-/// Texel coordinate a cell position reads at, in the convention
-/// [`Raster::sample_bilinear`] expects: texel centres sit on the integers.
-///
-/// Inverse of [`texel_center`]. At shift 0 a cell centre (`x + 0.5`) therefore
-/// lands exactly on texel `x`.
-pub fn raster_coord(position: f32, shift: u8) -> f32 {
-    position / step(shift) as f32 - 0.5
-}
-
 /// A value a [`Raster`] can be sampled through.
 ///
 /// `to_f32` is what every sample returns. An implementation covering a fixed range
@@ -64,8 +26,7 @@ impl Texel for u8 {
 }
 
 /// A row-major grid of texels with its own dimensions and nothing else: a raster
-/// does not know which field it belongs to, where it sits in a document, or at
-/// what shift it was produced.
+/// does not know which field it belongs to or where it sits in a document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Raster<T> {
     size: UVec2,
@@ -378,24 +339,6 @@ impl CellRect {
             max: UVec2::new(self.max.x.saturating_add(by), self.max.y.saturating_add(by)),
         }
     }
-
-    /// The texels at `shift` covering this rectangle of cells, clipped to
-    /// `resolution`.
-    ///
-    /// Rounds outwards, so the result covers every cell the rectangle names and
-    /// may cover cells outside it. An empty rectangle gives [`CellRect::EMPTY`].
-    pub fn to_texels(self, shift: u8, resolution: UVec2) -> Self {
-        if self.is_empty() {
-            return Self::EMPTY;
-        }
-        let step = step(shift);
-        let min = UVec2::new(self.min.x / step, self.min.y / step);
-        let max = UVec2::new(self.max.x.div_ceil(step), self.max.y.div_ceil(step));
-        Self {
-            min: min.min(resolution),
-            max: max.min(resolution),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -510,8 +453,8 @@ mod tests {
     }
 
     // `sample_over` composes two half-texel offsets, and the composition is only
-    // right if they cancel at the document's own resolution — the case every
-    // shift-0 field takes.
+    // right if they cancel at the document's own resolution — the case every field
+    // takes.
     #[test]
     fn a_raster_at_the_documents_own_size_reads_cell_centres_exactly() {
         let raster = Raster::from_vec(UVec2::new(2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
@@ -519,43 +462,6 @@ mod tests {
         assert_eq!(raster.sample_over(size, 0.5, 0.5), 1.0);
         assert_eq!(raster.sample_over(size, 1.5, 0.5), 2.0);
         assert_eq!(raster.sample_over(size, 1.5, 1.5), 4.0);
-    }
-
-    // Both guards in `resolution` are load-bearing for allocation: rounding down
-    // would drop the last partial texel, and a zero would make an empty raster out
-    // of a document that has cells. The last case pins the `MAX_SHIFT` saturation.
-    #[test]
-    fn a_shift_divides_the_resolution_and_never_falls_below_one_texel() {
-        let size = UVec2::new(4096, 4096);
-        assert_eq!(resolution(size, 0), UVec2::new(4096, 4096));
-        assert_eq!(resolution(size, 4), UVec2::new(256, 256));
-        assert_eq!(resolution(UVec2::new(3, 3), 4), UVec2::new(1, 1));
-        assert_eq!(resolution(UVec2::new(5, 5), 1), UVec2::new(3, 3));
-        assert_eq!(resolution(size, 200), UVec2::new(1, 1));
-    }
-
-    // The two halves of the shift convention are written independently, so nothing
-    // but this forces them to agree; a sign error in the half-texel offset survives
-    // either one read alone.
-    #[test]
-    fn a_texel_centre_and_a_raster_coordinate_are_inverses() {
-        for shift in [0u8, 1, 4, 8] {
-            for index in [0u32, 1, 7, 100] {
-                let position = texel_center(index, shift);
-                assert_eq!(raster_coord(position, shift), index as f32);
-            }
-        }
-    }
-
-    // Dirty rectangles drive which texels get rebaked, so rounding inwards on
-    // either edge leaves stale texels in a baked field. Pins the outward rounding
-    // against a rectangle unaligned to the shift on both edges.
-    #[test]
-    fn a_texel_rectangle_covers_every_cell_the_rectangle_names() {
-        let rect = CellRect::new(UVec2::new(3, 3), UVec2::new(9, 9));
-        let texels = rect.to_texels(2, UVec2::new(4, 4));
-        assert_eq!(texels.min, UVec2::new(0, 0));
-        assert_eq!(texels.max, UVec2::new(3, 3));
     }
 
     // Dirty rectangles accumulate by union from an empty start, so treating empty
