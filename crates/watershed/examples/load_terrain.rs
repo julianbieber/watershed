@@ -56,13 +56,14 @@ fn report_fields(terrain: &Terrain) {
     println!("chunk of {}x{} cells", terrain.width(), terrain.height());
     for view in terrain.fields() {
         println!(
-            "  {:12} {:8} {}x{} texels  {}..{}  layer {} channel {}",
+            "  {:12} {:8} {}x{} texels  {}..{}  {:?} at byte {} of every {}",
             view.name(),
             view.role(),
             view.texel_width(),
             view.texel_height(),
             view.range_low(),
             view.range_high(),
+            view.format(),
             view.offset(),
             view.stride(),
         );
@@ -75,8 +76,9 @@ fn report_layers(terrain: &Terrain) {
             continue;
         };
         println!(
-            "  layer {index}: {} channel(s), {} bytes",
+            "  layer {index}: {} {:?} channel(s), {} bytes",
             layer.channels(),
+            layer.format(),
             layer.bytes().len(),
         );
     }
@@ -90,6 +92,10 @@ fn sample_a_cell(terrain: &Terrain, x: u32, y: u32) {
         return;
     };
     println!("cell {x},{y}: ground {ground}");
+    println!(
+        "  {} distinct heights in this chunk",
+        distinct_levels(&height, terrain.width(), terrain.height())
+    );
 
     for view in terrain
         .fields()
@@ -109,6 +115,18 @@ fn sample_a_cell(terrain: &Terrain, x: u32, y: u32) {
             println!("  flowing towards {flow}");
         }
     }
+}
+
+fn distinct_levels(field: &FieldView, width: u32, height: u32) -> usize {
+    let mut levels = std::collections::BTreeSet::new();
+    for y in 0..height {
+        for x in 0..width {
+            if let Some(value) = field.value_at(x, y) {
+                levels.insert(value.to_bits());
+            }
+        }
+    }
+    levels.len()
 }
 
 struct WorldFields<'a> {

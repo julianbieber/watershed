@@ -8,20 +8,23 @@
 use glam::UVec2;
 use serde::{Deserialize, Serialize};
 
-use crate::channel::ChannelMeta;
+use crate::channel::{ChannelMeta, TexelFormat};
 use crate::terrain::FieldInfo;
 
 /// The format this build writes, and the only one it reads.
 ///
 /// A terrain carrying any other version is refused outright; there is no migration
-/// path, exactly as there was none for the format this replaced.
-pub const VERSION: u32 = 3;
+/// path.
+pub const VERSION: u32 = 4;
 
 /// One image in a terrain: what it is called, how big each chunk of it is, and how
 /// to read the channels in it.
 ///
-/// An image is stored as one file per chunk, `chunk_<x>_<y>_<file>.png`, the name
-/// built from the chunk's index and this stem.
+/// An image is stored as one file per chunk, named from the chunk's index, this
+/// stem and the image's [format](LayerMeta::format): `chunk_<x>_<y>_<file>.png`
+/// for a byte image, and `chunk_<x>_<y>_<file>.f32.zz` for a float one: its
+/// interleaved little-endian texels split into byte planes — byte `k` of every
+/// texel, in row-major order, then byte `k + 1` — as one zlib stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerMeta {
     /// The stem every chunk file of this image is named from: `layer_<n>`. A
@@ -36,16 +39,28 @@ pub struct LayerMeta {
     pub channels: Vec<ChannelMeta>,
 }
 
+impl LayerMeta {
+    /// The width every channel of this image shares, or `None` if it has no
+    /// channel or its channels disagree — an image a reader refuses.
+    pub fn format(&self) -> Option<TexelFormat> {
+        let first = self.channels.first()?.format();
+        self.channels
+            .iter()
+            .all(|channel| channel.format() == first)
+            .then_some(first)
+    }
+}
+
 /// A solved water, as a terrain carries it.
 ///
-/// All of it is one image at the document's extent, chunked like every other, in a
-/// fixed channel order:
+/// All of it is one four-channel image at the document's extent, chunked like every
+/// other, in a fixed channel order:
 /// depth, the two components of the flow direction, then accumulation. One image
 /// rather than three, and one index to check rather than five.
 ///
-/// The solver's own output cannot be rebuilt from this — lake ids do not survive
-/// quantisation and the direction codes became a vector — so it stays with the
-/// document that produced it.
+/// The solver's own output cannot be rebuilt from this — lake ids are not carried
+/// and the direction codes became a vector — so it stays with the document that
+/// produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaterInfo {
     /// How many lakes the solve found. The ids themselves are not carried.

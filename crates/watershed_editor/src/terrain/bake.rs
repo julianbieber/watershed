@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::terrain::{LayerId, LayerRole};
-use watershed::channel::{ChannelError, ChannelMeta, plan_layers, stray_class};
+use watershed::channel::{ChannelError, ChannelMeta, TexelFormat, plan_layers, stray_class};
 
 use crate::gpu::{DispatchGlobals, ShaderRuntime, dispatch_key};
 use crate::terrain::layer::Layer;
@@ -998,12 +998,8 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
         .filter(|authored| authored.baked().size() == spec.size)
         .collect();
 
-    let (placements, images) = plan_layers(readable.len());
-
-    let mut layers: Vec<LayerBuild> = (0..images).map(|_| LayerBuild::new(spec.size)).collect();
-
-    let mut infos = Vec::with_capacity(readable.len());
-    for (authored, place) in readable.iter().zip(&placements) {
+    let mut metas = Vec::with_capacity(readable.len());
+    for authored in &readable {
         let meta = if authored.categorical {
             if let Some(value) = stray_class(authored.baked().data()) {
                 return Err(ChannelError::StrayClass {
@@ -1014,19 +1010,21 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
             }
             ChannelMeta::categorical()
         } else {
-            value_range(authored.baked().data())
+            value_range(authored.baked().data().iter().copied())
         };
+        metas.push(meta);
+    }
 
-        let layer = &mut layers[place.layer as usize];
-        layer.push(
-            meta,
-            authored
-                .baked()
-                .data()
-                .iter()
-                .map(|value| meta.encode(*value)),
-        );
+    let formats: Vec<TexelFormat> = metas.iter().map(ChannelMeta::format).collect();
+    let (placements, images) = plan_layers(&formats);
+    let mut layers: Vec<LayerBuild> = images
+        .iter()
+        .map(|format| LayerBuild::new(spec.size, *format))
+        .collect();
 
+    let mut infos = Vec::with_capacity(readable.len());
+    for ((authored, place), meta) in readable.iter().zip(&placements).zip(&metas) {
+        layers[place.layer as usize].push(*meta, authored.baked().data().iter().copied());
         infos.push(FieldInfo {
             name: authored.id.to_string(),
             role: authored.role,
@@ -1057,92 +1055,78 @@ fn quantize(spec: &TerrainSpec) -> Result<Terrain, BakeError> {
     ))
 }
 
-fn value_range(values: &[f32]) -> ChannelMeta {
+fn value_range(values: impl Iterator<Item = f32>) -> ChannelMeta {
     let mut low = f32::INFINITY;
     let mut high = f32::NEG_INFINITY;
-    for value in values.iter().copied().filter(|value| value.is_finite()) {
+    for value in values.filter(|value| value.is_finite()) {
         low = low.min(value);
         high = high.max(value);
     }
     if low > high {
-        return ChannelMeta::linear(0.0, 0.0);
+        return ChannelMeta::float(0.0, 0.0);
     }
-    ChannelMeta::linear(low, high)
+    ChannelMeta::float(low, high)
 }
 
 struct LayerBuild {
     size: UVec2,
+    format: TexelFormat,
     channels: Vec<ChannelMeta>,
     columns: Vec<Vec<u8>>,
 }
 
 impl LayerBuild {
-    fn new(size: UVec2) -> Self {
+    fn new(size: UVec2, format: TexelFormat) -> Self {
         Self {
             size,
+            format,
             channels: Vec::new(),
             columns: Vec::new(),
         }
     }
 
-    fn push(&mut self, meta: ChannelMeta, bytes: impl Iterator<Item = u8>) {
+    fn push(&mut self, meta: ChannelMeta, values: impl Iterator<Item = f32>) {
+        let mut column = Vec::new();
+        for value in values {
+            meta.encode(value, &mut column);
+        }
         self.channels.push(meta);
-        self.columns.push(bytes.collect());
+        self.columns.push(column);
     }
 
     fn finish(self) -> TerrainLayer {
+        let width = self.format.size();
         let channels = self.columns.len();
         let texels = (self.size.x as usize) * (self.size.y as usize);
-        let mut interleaved = vec![0u8; texels * channels];
+        let mut interleaved = vec![0u8; texels * channels * width];
         for (index, column) in self.columns.iter().enumerate() {
-            for (texel, byte) in column.iter().enumerate() {
-                interleaved[texel * channels + index] = *byte;
+            for (texel, value) in column.chunks_exact(width).enumerate() {
+                let at = (texel * channels + index) * width;
+                interleaved[at..at + width].copy_from_slice(value);
             }
         }
-        let texels = LayerTexels::from_bytes(self.size, channels, interleaved)
-            .expect("a layer is built at its own extent with one byte per channel");
+        let texels = LayerTexels::from_bytes(self.size, channels, self.format, interleaved)
+            .expect("a layer is built at its own extent with one value per channel");
         TerrainLayer::new(self.channels, texels)
     }
 }
 
 fn water_layer(state: &WaterState, size: UVec2) -> LayerBuild {
-    let mut layer = LayerBuild::new(size);
+    let mut layer = LayerBuild::new(size, TexelFormat::F32);
+    let cells = || (0..size.y).flat_map(move |y| (0..size.x).map(move |x| (x, y)));
 
-    let deepest = state
-        .depth()
-        .data()
-        .iter()
-        .copied()
-        .filter(|depth| depth.is_finite())
-        .fold(0.0f32, f32::max);
-    let depth_meta = ChannelMeta::log(deepest);
-    layer.push(
-        depth_meta,
-        state.depth().data().iter().map(|depth| {
-            let byte = depth_meta.encode(*depth);
-            if *depth > 0.0 { byte.max(1) } else { byte }
-        }),
-    );
+    let depth = state.depth().data().iter().copied();
+    layer.push(value_range(depth.clone()), depth);
 
-    let unit = ChannelMeta::unit();
-    let flow: Vec<Vec2> = (0..size.y)
-        .flat_map(|y| (0..size.x).map(move |x| (x, y)))
+    let flow: Vec<Vec2> = cells()
         .map(|(x, y)| state.flow_vector(x, y).unwrap_or(Vec2::ZERO))
         .collect();
-    layer.push(unit, flow.iter().map(|vector| unit.encode(vector.x)));
-    layer.push(unit, flow.iter().map(|vector| unit.encode(vector.y)));
+    let unit = ChannelMeta::float(-1.0, 1.0);
+    layer.push(unit, flow.iter().map(|vector| vector.x));
+    layer.push(unit, flow.iter().map(|vector| vector.y));
 
-    let largest = (0..size.y)
-        .flat_map(|y| (0..size.x).map(move |x| (x, y)))
-        .map(|(x, y)| state.accumulation(x, y))
-        .fold(0.0f32, f32::max);
-    let accum_meta = ChannelMeta::log(largest);
-    layer.push(
-        accum_meta,
-        (0..size.y)
-            .flat_map(|y| (0..size.x).map(move |x| (x, y)))
-            .map(|(x, y)| accum_meta.encode(state.accumulation(x, y))),
-    );
+    let accumulation = cells().map(|(x, y)| state.accumulation(x, y));
+    layer.push(value_range(accumulation.clone()), accumulation);
 
     layer
 }
@@ -1741,6 +1725,37 @@ mod tests {
         let field = terrain.field("biome").unwrap();
         assert!(field.is_categorical());
         assert_eq!(field.bytes(), [0, 3, 7, 3]);
+    }
+
+    #[test]
+    fn a_smooth_layer_keeps_every_baked_value_and_shares_no_image_with_a_class() {
+        let size = UVec2::new(64, 64);
+        let mut spec = TerrainSpec::new(size);
+        let heights: Vec<f32> = (0..size.x * size.y)
+            .map(|index| index as f32 * 0.1)
+            .collect();
+        let mut height = Layer::new("height");
+        height.put_baked(Raster::from_vec(size, heights.clone()).unwrap());
+        let mut biome = Layer::new("biome");
+        biome.categorical = true;
+        biome.put_baked(Raster::from_vec(size, vec![2.0; heights.len()]).unwrap());
+        spec.layers.push(height);
+        spec.layers.push(biome);
+
+        let terrain = quantize(&spec).unwrap();
+        let field = terrain.field("height").unwrap();
+        assert_eq!(field.format(), TexelFormat::F32);
+        assert_eq!(field.stride(), 4);
+        let mut levels = std::collections::BTreeSet::new();
+        for (index, wanted) in heights.iter().enumerate() {
+            let (x, y) = (index as u32 % size.x, index as u32 / size.x);
+            let found = field.value_at(x, y).unwrap();
+            assert_eq!(found.to_bits(), wanted.to_bits());
+            levels.insert(found.to_bits());
+        }
+        assert_eq!(levels.len(), heights.len());
+        assert_eq!(terrain.field("biome").unwrap().format(), TexelFormat::U8);
+        assert_eq!(terrain.layer_count(), 2);
     }
 
     // A shader that computes a class as a fraction would otherwise be rounded into a

@@ -438,10 +438,8 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // A saved value has to land within the quantisation bound of the value that was
-    // baked, or the format is losing more than the eight bits it admits to.
     #[test]
-    fn a_baked_value_survives_the_round_trip_within_a_step() {
+    fn a_baked_value_survives_the_round_trip_exactly() {
         let spec = baked_document();
         let before = spec.clone().bake().unwrap();
         let root = saved(&spec, "quantise");
@@ -452,12 +450,12 @@ mod tests {
 
         for view in before.fields() {
             let mirror = after.field(view.name()).unwrap();
-            let step = (view.range_high() - view.range_low()) / 255.0;
             for (x, y) in [(0, 0), (17, 9), (47, 31)] {
                 let left = view.value_at(x, y).unwrap();
                 let right = mirror.value_at(x, y).unwrap();
-                assert!(
-                    (left - right).abs() <= step / 2.0 + 1e-4,
+                assert_eq!(
+                    left.to_bits(),
+                    right.to_bits(),
                     "{} at {x},{y}: {left} became {right}",
                     view.name()
                 );

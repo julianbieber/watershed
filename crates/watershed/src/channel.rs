@@ -1,8 +1,8 @@
 //! Turning a field's floats into the bytes an image carries, and back.
 //!
-//! A channel is eight bits, so a stored value is one of 256 levels of a declared
-//! interval. Both halves of that trade live here — the encoding a bake writes and
-//! the table a read goes through — because a writer and a reader that disagree
+//! A channel either holds its value itself, as an `f32`, or one of 256 levels a byte
+//! can name. Both halves of that trade live here — what a bake writes and how a
+//! read turns it back into a number — because a writer and a reader that disagree
 //! about it produce wrong numbers rather than an error. The rule deciding which
 //! fields share an image lives here too, for the same reason.
 
@@ -16,8 +16,7 @@ use thiserror::Error;
 /// accumulation — sit in a single image.
 pub const MAX_CHANNELS: usize = 4;
 
-/// The largest value a byte holds: the top of the scale every spread encoding
-/// divides by, and so also the largest class index a
+/// The largest value a byte holds, and so the largest class index a
 /// [`ChannelEncoding::Categorical`] channel can carry.
 pub const MAX_CLASS: f32 = 255.0;
 
@@ -43,15 +42,6 @@ pub enum ChannelError {
         /// High end as it was read.
         high: f32,
     },
-    /// A logarithmic channel needs an interval with room in it, and one that does
-    /// not reach below zero.
-    #[error("a log channel cannot span ({low}, {high})")]
-    RangeNotLoggable {
-        /// Low end as it was read.
-        low: f32,
-        /// High end as it was read.
-        high: f32,
-    },
     /// A categorical field carried a value that is not a class index: not a whole
     /// number, negative, or past [`MAX_CLASS`]. Refused when the terrain is
     /// written rather than silently rounded, because a smeared class is a wrong
@@ -65,50 +55,66 @@ pub enum ChannelError {
     },
 }
 
+/// How wide one channel of a texel is, which every channel of an image shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TexelFormat {
+    /// One byte per channel, read through a [`ChannelTable`].
+    U8,
+    /// One little-endian `f32` per channel: the value itself.
+    F32,
+}
+
+impl TexelFormat {
+    /// Bytes one channel of a texel takes.
+    pub fn size(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::F32 => 4,
+        }
+    }
+}
+
 /// How a channel's bytes turn back into numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelEncoding {
-    /// The declared interval spread evenly over the byte.
-    Linear,
-    /// The class index itself, stored and returned unchanged, so a class never
-    /// lands between two of its neighbours.
+    /// The value itself, as a little-endian `f32`, so a read returns exactly what
+    /// the bake produced.
+    Float,
+    /// The class index itself, stored in a byte and returned unchanged, so a class
+    /// never lands between two of its neighbours.
     Categorical,
-    /// The interval spread over the byte through `log1p`, for a quantity whose
-    /// interesting values crowd the bottom of its range.
-    Log,
-    /// One signed component of a direction, centred rather than spread: the
-    /// midpoint byte is exactly zero and the ends are exactly minus one and one.
-    ///
-    /// That exactness is load-bearing. It makes a zero-length vector
-    /// representable, which is what lets a cell with no outflow be told from one
-    /// flowing somewhere without spending a channel on a flag.
-    Unit,
-    /// The byte itself. For data that was already bytes, which therefore comes
-    /// back exactly rather than approximately.
-    Raw,
+}
+
+impl ChannelEncoding {
+    pub fn format(self) -> TexelFormat {
+        match self {
+            Self::Float => TexelFormat::F32,
+            Self::Categorical => TexelFormat::U8,
+        }
+    }
 }
 
 /// A channel's interval and how the bytes in it are read.
 ///
-/// The interval is the *quantisation* range, which is not the same number as the
-/// range a field declares: a field's range is the clamp
-/// its bake applies, and this is what the byte then spreads over. They coincide
-/// for an ordinary field and deliberately do not for water.
+/// For a [`ChannelEncoding::Float`] channel the interval is the extent of the
+/// values it holds, which is not the same number as the range a field declares:
+/// a field's range is the clamp its bake applies, and this is what the values then
+/// actually span.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelMeta {
-    /// Low end of the interval. A value that cannot be represented — a NaN, an
-    /// infinity, or anything at all in a degenerate interval — reads back as this.
+    /// Low end of the interval. A value that cannot be stored — a NaN or an
+    /// infinity — reads back as this.
     pub low: f32,
     /// High end of the interval.
     pub high: f32,
-    /// How a byte in this channel is read.
+    /// How the bytes in this channel are read.
     pub encoding: ChannelEncoding,
 }
 
 impl ChannelMeta {
-    /// A channel spreading `(low, high)` evenly over the byte. The pair is sorted,
-    /// so a caller may pass it in either order.
-    pub fn linear(low: f32, high: f32) -> Self {
+    /// A channel holding values inside `(low, high)` as themselves. The pair is
+    /// sorted, so a caller may pass it in either order.
+    pub fn float(low: f32, high: f32) -> Self {
         let (low, high) = if low <= high {
             (low, high)
         } else {
@@ -117,7 +123,7 @@ impl ChannelMeta {
         Self {
             low,
             high,
-            encoding: ChannelEncoding::Linear,
+            encoding: ChannelEncoding::Float,
         }
     }
 
@@ -130,40 +136,8 @@ impl ChannelMeta {
         }
     }
 
-    /// A channel carrying `0..=high` through `log1p`.
-    pub fn log(high: f32) -> Self {
-        Self {
-            low: 0.0,
-            high,
-            encoding: ChannelEncoding::Log,
-        }
-    }
-
-    /// A channel carrying one signed component of a direction.
-    pub fn unit() -> Self {
-        Self {
-            low: -1.0,
-            high: 1.0,
-            encoding: ChannelEncoding::Unit,
-        }
-    }
-
-    /// A channel carrying bytes unchanged.
-    pub fn raw() -> Self {
-        Self {
-            low: 0.0,
-            high: MAX_CLASS,
-            encoding: ChannelEncoding::Raw,
-        }
-    }
-
-    /// Whether the interval has no width, in which case every value in it encodes
-    /// to zero and reads back as [`ChannelMeta::low`].
-    ///
-    /// Reachable rather than theoretical: a constant field, a document that ponds
-    /// nowhere, and a solve whose accumulation is everywhere zero all produce one.
-    pub fn is_degenerate(&self) -> bool {
-        self.high <= self.low
+    pub fn format(&self) -> TexelFormat {
+        self.encoding.format()
     }
 
     /// Whether this channel can be read at all.
@@ -183,94 +157,58 @@ impl ChannelMeta {
                 high: self.high,
             });
         }
-        if self.encoding == ChannelEncoding::Log && (self.low < 0.0 || self.high <= self.low) {
-            return Err(ChannelError::RangeNotLoggable {
-                low: self.low,
-                high: self.high,
-            });
-        }
         Ok(())
     }
 
-    /// The byte a value is stored as.
+    /// Appends the bytes `value` is stored as: [`TexelFormat::size`] of them.
     ///
-    /// Total: every `f32` encodes to something. A value outside the interval
-    /// saturates at the nearer end, and one that is not finite encodes to zero,
-    /// which reads back as [`ChannelMeta::low`] — the format carries no NaN, and a
-    /// caller that needs one cannot use this to move it.
-    pub fn encode(&self, value: f32) -> u8 {
-        if !value.is_finite() {
-            return 0;
-        }
+    /// Total: every `f32` encodes to something. A value that is not finite is
+    /// stored as [`ChannelMeta::low`] — the format carries no NaN. A float channel
+    /// stores every finite value exactly; a categorical one rounds to the nearest
+    /// class and saturates at zero and [`MAX_CLASS`].
+    pub fn encode(&self, value: f32, out: &mut Vec<u8>) {
         match self.encoding {
-            ChannelEncoding::Raw | ChannelEncoding::Categorical => {
-                value.round().clamp(0.0, MAX_CLASS) as u8
+            ChannelEncoding::Float => {
+                let stored = if value.is_finite() { value } else { self.low };
+                out.extend_from_slice(&stored.to_le_bytes());
             }
-            ChannelEncoding::Unit => {
-                let scaled = value.clamp(-1.0, 1.0) * UNIT_SCALE + UNIT_ZERO;
-                scaled.round().clamp(0.0, MAX_CLASS) as u8
-            }
-            ChannelEncoding::Linear => {
-                if self.is_degenerate() {
-                    return 0;
-                }
-                let t = (value - self.low) / (self.high - self.low);
-                (t.clamp(0.0, 1.0) * MAX_CLASS).round() as u8
-            }
-            ChannelEncoding::Log => {
-                if self.is_degenerate() {
-                    return 0;
-                }
-                let span = (self.high - self.low).ln_1p();
-                let t = (value - self.low).max(0.0).ln_1p() / span;
-                (t.clamp(0.0, 1.0) * MAX_CLASS).round() as u8
-            }
+            ChannelEncoding::Categorical => out.push(class_byte(value)),
         }
     }
 
-    /// The value a byte stands for. Inverse of [`ChannelMeta::encode`] up to the
-    /// rounding, which costs at most half a step of whatever scale the encoding
-    /// spreads over the byte — half of `(high - low) / 255` for a linear channel,
-    /// and a fixed *proportion* of the value rather than a fixed amount for a
-    /// logarithmic one.
-    pub fn decode(&self, byte: u8) -> f32 {
+    /// The value the first [`TexelFormat::size`] bytes of `bytes` stand for, or
+    /// `None` if there are fewer. Inverse of [`ChannelMeta::encode`], exactly, for
+    /// a finite value and for a class index.
+    pub fn decode(&self, bytes: &[u8]) -> Option<f32> {
         match self.encoding {
-            ChannelEncoding::Raw | ChannelEncoding::Categorical => byte as f32,
-            ChannelEncoding::Unit => ((byte as f32 - UNIT_ZERO) / UNIT_SCALE).clamp(-1.0, 1.0),
-            ChannelEncoding::Linear => {
-                if self.is_degenerate() {
-                    return self.low;
-                }
-                self.low + (byte as f32 / MAX_CLASS) * (self.high - self.low)
-            }
-            ChannelEncoding::Log => {
-                if self.is_degenerate() {
-                    return self.low;
-                }
-                let span = (self.high - self.low).ln_1p();
-                self.low + (byte as f32 / MAX_CLASS * span).exp_m1()
-            }
+            ChannelEncoding::Float => Some(f32::from_le_bytes(bytes.get(..4)?.try_into().ok()?)),
+            ChannelEncoding::Categorical => bytes.first().map(|byte| *byte as f32),
         }
     }
 
-    /// Every value this channel can return, indexed by the byte that returns it.
-    ///
-    /// A channel has 256 possible bytes, so a read is a lookup rather than
-    /// arithmetic, and every encoding costs the same to read however expensive it
-    /// was to write. Built when a terrain is loaded; it is not part of the file.
-    pub fn table(&self) -> ChannelTable {
+    /// Every value a byte channel can return, indexed by the byte that returns it,
+    /// so a read is a lookup rather than arithmetic. `None` for a float channel,
+    /// which is read as itself.
+    pub fn table(&self) -> Option<ChannelTable> {
+        if self.format() != TexelFormat::U8 {
+            return None;
+        }
         let mut values = [0.0f32; 256];
         for (byte, slot) in values.iter_mut().enumerate() {
-            *slot = self.decode(byte as u8);
+            *slot = byte as f32;
         }
-        ChannelTable(values)
+        Some(ChannelTable(values))
     }
 }
 
-const UNIT_SCALE: f32 = 127.0;
-const UNIT_ZERO: f32 = 128.0;
+fn class_byte(value: f32) -> u8 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.round().clamp(0.0, MAX_CLASS) as u8
+}
 
-/// The 256 values one channel can return, in byte order.
+/// The 256 values one byte channel can return, in byte order.
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelTable([f32; 256]);
 
@@ -303,90 +241,117 @@ pub struct Placement {
     pub channel: u8,
 }
 
-/// Groups `fields` fields into images: which image each one lands in, and how
-/// many images there are.
+/// Groups fields of the given formats into images: where each field lands, and
+/// the format of every image, in image order.
 ///
-/// Every image holds up to [`MAX_CHANNELS`] fields and is filled in declaration
-/// order, so the same document always packs the same way and a saved terrain can
-/// be compared against another save of it.
-pub fn plan_layers(fields: usize) -> (Vec<Placement>, usize) {
-    let placements = (0..fields)
-        .map(|index| Placement {
-            layer: (index / MAX_CHANNELS) as u8,
-            channel: (index % MAX_CHANNELS) as u8,
+/// An image holds fields of one format only, up to [`MAX_CHANNELS`] of them. Fields
+/// are placed in declaration order, each into the newest image of its format that
+/// has room, so the same document always packs the same way and a saved terrain
+/// can be compared against another save of it.
+pub fn plan_layers(fields: &[TexelFormat]) -> (Vec<Placement>, Vec<TexelFormat>) {
+    let mut images: Vec<(TexelFormat, usize)> = Vec::new();
+    let placements = fields
+        .iter()
+        .map(|format| {
+            let open = images
+                .iter()
+                .rposition(|(kind, used)| kind == format && *used < MAX_CHANNELS);
+            let layer = open.unwrap_or_else(|| {
+                images.push((*format, 0));
+                images.len() - 1
+            });
+            let channel = images[layer].1;
+            images[layer].1 += 1;
+            Placement {
+                layer: layer as u8,
+                channel: channel as u8,
+            }
         })
         .collect();
-    (placements, fields.div_ceil(MAX_CHANNELS))
+    (
+        placements,
+        images.into_iter().map(|(kind, _)| kind).collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The round-trip bound is the whole contract of an eight-bit channel, and it is
-    // what replaces the old format's promise of bit-exact floats.
+    fn round_trip(meta: &ChannelMeta, value: f32) -> f32 {
+        let mut bytes = Vec::new();
+        meta.encode(value, &mut bytes);
+        assert_eq!(bytes.len(), meta.format().size());
+        meta.decode(&bytes).unwrap()
+    }
+
     #[test]
-    fn a_finite_value_comes_back_within_half_a_step() {
-        let meta = ChannelMeta::linear(-20.0, 1200.0);
-        let step = (meta.high - meta.low) / MAX_CLASS;
-        for i in 0..=1000 {
-            let value = meta.low + (meta.high - meta.low) * (i as f32 / 1000.0);
-            let found = meta.decode(meta.encode(value));
-            assert!(
-                (found - value).abs() <= step / 2.0 + 1e-3,
-                "{value} came back as {found}"
+    fn a_float_channel_returns_every_finite_value_exactly() {
+        let meta = ChannelMeta::float(-20.0, 8000.0);
+        for value in [
+            -20.0,
+            0.0,
+            0.1,
+            1234.5678,
+            7999.9,
+            8000.0,
+            -0.0,
+            f32::MIN_POSITIVE / 3.0,
+        ] {
+            assert_eq!(
+                round_trip(&meta, value).to_bits(),
+                value.to_bits(),
+                "{value}"
             );
         }
     }
 
-    // A range with no width is reachable from an ordinary document — a constant
-    // field is the common one — so it has to be a defined answer rather than a
-    // division by zero.
     #[test]
-    fn a_degenerate_range_reads_back_as_its_own_endpoint() {
-        let meta = ChannelMeta::linear(0.25, 0.25);
-        assert!(meta.is_degenerate());
-        assert_eq!(meta.encode(0.25), 0);
-        assert_eq!(meta.decode(0), 0.25);
-        assert_eq!(meta.decode(200), 0.25);
+    fn a_float_channel_resolves_a_tenth_of_a_metre_over_eight_kilometres() {
+        let meta = ChannelMeta::float(0.0, 8000.0);
+        let levels: std::collections::BTreeSet<u32> = (0..80_000)
+            .map(|step| round_trip(&meta, step as f32 * 0.1).to_bits())
+            .collect();
+        assert_eq!(levels.len(), 80_000);
     }
 
-    // A bake clamps into the field's range but `f32::clamp` passes NaN through, so
-    // these reach the encoder from an ordinary painted document rather than only
-    // from a hostile file.
     #[test]
-    fn a_value_that_is_not_finite_encodes_to_the_low_end() {
-        let meta = ChannelMeta::linear(-1.0, 1.0);
+    fn a_float_channel_is_little_endian() {
+        let mut bytes = Vec::new();
+        ChannelMeta::float(0.0, 2.0).encode(1.5, &mut bytes);
+        assert_eq!(bytes, 1.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn a_value_that_is_not_finite_is_stored_as_the_low_end() {
+        let meta = ChannelMeta::float(-1.0, 1.0);
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert_eq!(meta.encode(value), 0, "{value}");
-            assert_eq!(meta.decode(meta.encode(value)), meta.low);
+            assert_eq!(round_trip(&meta, value), meta.low, "{value}");
         }
+        let class = ChannelMeta::categorical();
+        assert_eq!(round_trip(&class, f32::NAN), class.low);
     }
 
-    // The subnormal and the negative zero from the old format's fixture: they no
-    // longer survive as bits, but they must still encode to something rather than
-    // panicking or landing outside the range.
     #[test]
-    fn awkward_finite_values_still_encode_inside_the_range() {
-        let meta = ChannelMeta::linear(0.0, 1.0);
-        for value in [-0.0f32, f32::MIN_POSITIVE / 3.0] {
-            let found = meta.decode(meta.encode(value));
-            assert!((0.0..=1.0).contains(&found), "{value} came back as {found}");
-        }
+    fn a_float_channel_has_no_table_and_a_byte_channel_has_one() {
+        assert!(ChannelMeta::float(0.0, 1.0).table().is_none());
+        assert!(ChannelMeta::categorical().table().is_some());
     }
 
-    // The reason `Categorical` exists: a class index is an identity, so it has to
-    // come back as itself rather than within a tolerance of itself.
+    #[test]
+    fn a_short_buffer_decodes_to_nothing() {
+        assert_eq!(ChannelMeta::float(0.0, 1.0).decode(&[0, 0, 0]), None);
+        assert_eq!(ChannelMeta::categorical().decode(&[]), None);
+    }
+
     #[test]
     fn a_class_index_comes_back_exactly() {
         let meta = ChannelMeta::categorical();
         for class in [0.0, 1.0, 7.0, 128.0, 255.0] {
-            assert_eq!(meta.decode(meta.encode(class)), class);
+            assert_eq!(round_trip(&meta, class), class);
         }
     }
 
-    // Values that cannot be a class have to be caught when the terrain is written;
-    // by read time the damage is a plausible wrong answer.
     #[test]
     fn a_value_that_is_not_a_class_index_is_found() {
         assert_eq!(stray_class(&[0.0, 3.0, 255.0]), None);
@@ -396,105 +361,33 @@ mod tests {
         assert_eq!(stray_class(&[f32::NAN]).map(f32::is_nan), Some(true));
     }
 
-    // This is what lets the flow texture drop its flag channel: a sink is the exact
-    // zero vector, and a spread range has no byte that lands on zero.
-    #[test]
-    fn a_unit_channel_represents_zero_exactly() {
-        let meta = ChannelMeta::unit();
-        assert_eq!(meta.decode(meta.encode(0.0)), 0.0);
-        assert_eq!(meta.decode(meta.encode(1.0)), 1.0);
-        assert_eq!(meta.decode(meta.encode(-1.0)), -1.0);
-        assert!(
-            (0..=255).filter(|byte| meta.decode(*byte) == 0.0).count() == 1,
-            "exactly one byte may mean no flow"
-        );
-    }
-
-    // The eight compass directions are what actually gets stored, so the bound that
-    // matters is the one over them rather than over the whole interval.
-    #[test]
-    fn the_diagonal_directions_survive_the_unit_channel() {
-        let meta = ChannelMeta::unit();
-        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
-        for value in [diagonal, -diagonal, 1.0, -1.0, 0.0] {
-            let found = meta.decode(meta.encode(value));
-            assert!(
-                (found - value).abs() < 0.005,
-                "{value} came back as {found}"
-            );
-        }
-    }
-
-    // A mask is already bytes, so it is the one thing in the new format that still
-    // round-trips exactly — by encoding, not by arithmetic coincidence.
-    #[test]
-    fn a_raw_channel_round_trips_every_byte() {
-        let meta = ChannelMeta::raw();
-        for byte in 0..=255u8 {
-            assert_eq!(meta.encode(meta.decode(byte)), byte);
-        }
-    }
-
-    // Log exists because accumulation crowds the bottom of its range; the property
-    // worth pinning is that small values stay distinguishable where a linear spread
-    // would put them all in one bucket.
-    #[test]
-    fn a_log_channel_keeps_small_values_apart() {
-        let meta = ChannelMeta::log(10_000_000.0);
-        let small: Vec<u8> = [0.0, 1.0, 2.0, 5.0, 20.0]
-            .iter()
-            .map(|value| meta.encode(*value))
-            .collect();
-        let mut sorted = small.clone();
-        sorted.dedup();
-        assert_eq!(small.len(), sorted.len(), "{small:?} collapsed");
-        assert_eq!(meta.encode(0.0), 0);
-        assert_eq!(meta.decode(0), 0.0);
-    }
-
-    // The table is what every read actually goes through, so it has to agree with
-    // the arithmetic it replaces rather than merely resemble it.
     #[test]
     fn the_table_agrees_with_decoding_a_byte() {
-        for meta in [
-            ChannelMeta::linear(-3.0, 9.0),
-            ChannelMeta::categorical(),
-            ChannelMeta::log(1000.0),
-            ChannelMeta::unit(),
-            ChannelMeta::raw(),
-        ] {
-            let table = meta.table();
-            for byte in 0..=255u8 {
-                assert_eq!(table.get(byte), meta.decode(byte));
-            }
+        let meta = ChannelMeta::categorical();
+        let table = meta.table().unwrap();
+        for byte in 0..=255u8 {
+            assert_eq!(Some(table.get(byte)), meta.decode(&[byte]));
         }
     }
 
-    // A range out of a file is untrusted, and each of these produces a channel
-    // whose reads would be NaN rather than an error.
     #[test]
     fn an_unreadable_range_is_refused() {
-        assert!(ChannelMeta::linear(0.0, 1.0).validate().is_ok());
+        assert!(ChannelMeta::float(0.0, 1.0).validate().is_ok());
         let cases = [
             ChannelMeta {
                 low: f32::NAN,
                 high: 1.0,
-                encoding: ChannelEncoding::Linear,
+                encoding: ChannelEncoding::Float,
             },
             ChannelMeta {
                 low: 0.0,
                 high: f32::INFINITY,
-                encoding: ChannelEncoding::Linear,
+                encoding: ChannelEncoding::Float,
             },
             ChannelMeta {
                 low: 1.0,
                 high: 0.0,
-                encoding: ChannelEncoding::Linear,
-            },
-            ChannelMeta {
-                low: -1.0,
-                high: 5.0,
-                encoding: ChannelEncoding::Log,
+                encoding: ChannelEncoding::Float,
             },
         ];
         for meta in cases {
@@ -502,24 +395,29 @@ mod tests {
         }
     }
 
-    // "Stable across saves" is only a claim if the grouping is pinned: declaration
-    // order, four to an image, and the last image only as full as it has to be.
     #[test]
-    fn fields_pack_four_to_an_image_in_declaration_order() {
-        let (places, layers) = plan_layers(6);
-        assert_eq!(layers, 2);
-        let images: Vec<u8> = places.iter().map(|place| place.layer).collect();
+    fn fields_of_one_format_pack_four_to_an_image_in_declaration_order() {
+        let (places, images) = plan_layers(&[TexelFormat::F32; 6]);
+        assert_eq!(images, vec![TexelFormat::F32, TexelFormat::F32]);
+        let layers: Vec<u8> = places.iter().map(|place| place.layer).collect();
         let channels: Vec<u8> = places.iter().map(|place| place.channel).collect();
-        assert_eq!(images, vec![0, 0, 0, 0, 1, 1]);
+        assert_eq!(layers, vec![0, 0, 0, 0, 1, 1]);
         assert_eq!(channels, vec![0, 1, 2, 3, 0, 1]);
     }
 
-    // An empty document is a legitimate thing to save, and the grouping is where it
-    // would otherwise divide by zero or index an empty list.
+    #[test]
+    fn fields_of_different_formats_never_share_an_image() {
+        use TexelFormat::{F32, U8};
+        let (places, images) = plan_layers(&[F32, U8, F32, U8]);
+        assert_eq!(images, vec![F32, U8]);
+        let placed: Vec<(u8, u8)> = places.iter().map(|p| (p.layer, p.channel)).collect();
+        assert_eq!(placed, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
     #[test]
     fn a_document_with_no_fields_plans_no_layers() {
-        let (places, layers) = plan_layers(0);
+        let (places, images) = plan_layers(&[]);
         assert!(places.is_empty());
-        assert_eq!(layers, 0);
+        assert!(images.is_empty());
     }
 }
