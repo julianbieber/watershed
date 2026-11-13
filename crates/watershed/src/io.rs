@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use glam::UVec2;
 use thiserror::Error;
 
-use crate::channel::{ChannelError, MAX_CHANNELS};
+use crate::channel::{ChannelError, MAX_CHANNELS, TexelFormat};
 use crate::chunk::ChunkGrid;
 use crate::meta::{LayerMeta, TerrainMeta, VERSION};
 use crate::terrain::{FieldInfo, LayerTexels, Terrain, TerrainLayer};
@@ -39,6 +39,8 @@ pub const MAX_CELLS: u64 = 1 << 30;
 
 /// The most image data one load will decode, across every image together.
 pub const MAX_DECODED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+const F32_COMPRESSION: u8 = 9;
 
 /// Why a terrain could not be written or read.
 ///
@@ -83,6 +85,10 @@ pub enum IoError {
         /// Why.
         source: png::DecodingError,
     },
+    /// A float image could not be inflated: not a zlib stream, cut short, or
+    /// inflating to more than its declared shape holds.
+    #[error("`{file}` could not be inflated: {reason}")]
+    Inflate { file: String, reason: String },
     /// An image file is larger than its declared shape could encode to. Checked
     /// before the file is read.
     #[error("`{file}` is {found} bytes, over the {limit} bytes its image could encode to")]
@@ -95,7 +101,8 @@ pub enum IoError {
         limit: u64,
     },
     /// The metadata is well-formed but does not hang together — an index past the
-    /// images it declares, a water image that is not four channels, a chunk grid
+    /// images it declares, an image whose channels differ in width, a water image
+    /// that is not four channels, a chunk grid
     /// that is zero or overflows, a chunk index outside the grid, or a chunk
     /// outside what this build will carry.
     #[error("the terrain does not hang together: {0}")]
@@ -236,6 +243,66 @@ fn encode_png(size: UVec2, channels: usize, bytes: &[u8]) -> Result<Vec<u8>, IoE
         .finish()
         .map_err(|error| IoError::Meta(error.to_string()))?;
     Ok(out)
+}
+
+fn encode_texels(texels: &LayerTexels) -> Result<Vec<u8>, IoError> {
+    match texels.format() {
+        TexelFormat::U8 => encode_png(texels.size(), texels.channels(), texels.bytes()),
+        TexelFormat::F32 => Ok(miniz_oxide::deflate::compress_to_vec_zlib(
+            &split_planes(texels.bytes(), texels.texel_bytes()),
+            F32_COMPRESSION,
+        )),
+    }
+}
+
+fn decode_texels(
+    file: &str,
+    bytes: &[u8],
+    size: UVec2,
+    channels: usize,
+    format: TexelFormat,
+) -> Result<Vec<u8>, IoError> {
+    match format {
+        TexelFormat::U8 => decode_png(file, bytes, size, channels),
+        TexelFormat::F32 => {
+            let expected = size.x as usize * size.y as usize * channels * format.size();
+            let texels = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(bytes, expected)
+                .map_err(|error| IoError::Inflate {
+                file: file.to_owned(),
+                reason: error.to_string(),
+            })?;
+            if texels.len() != expected {
+                return Err(IoError::ImageShape {
+                    file: file.to_owned(),
+                    found: format!("{} bytes", texels.len()),
+                    expected: format!("{expected} bytes"),
+                });
+            }
+            Ok(join_planes(&texels, channels * format.size()))
+        }
+    }
+}
+
+fn split_planes(texels: &[u8], texel_bytes: usize) -> Vec<u8> {
+    let count = texels.len() / texel_bytes;
+    let mut planes = vec![0u8; texels.len()];
+    for (index, texel) in texels.chunks_exact(texel_bytes).enumerate() {
+        for (plane, byte) in texel.iter().enumerate() {
+            planes[plane * count + index] = *byte;
+        }
+    }
+    planes
+}
+
+fn join_planes(planes: &[u8], texel_bytes: usize) -> Vec<u8> {
+    let count = planes.len() / texel_bytes;
+    let mut texels = vec![0u8; planes.len()];
+    for (plane, bytes) in planes.chunks_exact(count.max(1)).enumerate() {
+        for (index, byte) in bytes.iter().enumerate() {
+            texels[index * texel_bytes + plane] = *byte;
+        }
+    }
+    texels
 }
 
 fn decode_png(file: &str, bytes: &[u8], size: UVec2, channels: usize) -> Result<Vec<u8>, IoError> {
@@ -408,12 +475,14 @@ fn write(
             .chunk(grid, chunk)
             .ok_or_else(|| IoError::Inconsistent("a chunk could not be cut".to_owned()))?;
         for (layer, declared) in part.layers.iter().zip(&meta.layers) {
-            let file = chunk_file(chunk, &declared.file);
-            let bytes = encode_png(
-                chunk_size,
-                layer.texels().channels(),
-                layer.texels().bytes(),
-            )?;
+            if declared.format() != Some(layer.texels().format()) {
+                return Err(IoError::Inconsistent(format!(
+                    "`{}` holds channels whose width is not its texels'",
+                    declared.file
+                )));
+            }
+            let file = chunk_file(chunk, &declared.file, layer.texels().format());
+            let bytes = encode_texels(layer.texels())?;
             store.write(&file, &bytes)?;
             named.insert(file);
         }
@@ -438,8 +507,15 @@ fn layer_stem(index: usize) -> String {
     format!("layer_{index:03}")
 }
 
-fn chunk_file(chunk: UVec2, stem: &str) -> String {
-    format!("chunk_{}_{}_{stem}.png", chunk.x, chunk.y)
+fn chunk_file(chunk: UVec2, stem: &str, format: TexelFormat) -> String {
+    format!("chunk_{}_{}_{stem}{}", chunk.x, chunk.y, extension(format))
+}
+
+fn extension(format: TexelFormat) -> &'static str {
+    match format {
+        TexelFormat::U8 => ".png",
+        TexelFormat::F32 => ".f32.zz",
+    }
 }
 
 fn digits(text: &str) -> bool {
@@ -451,15 +527,16 @@ fn is_layer_stem(stem: &str) -> bool {
 }
 
 /// Whether `name` is one of the images a terrain's values are written as:
-/// `chunk_<x>_<y>_layer_<n>.png`, or the `layer_<n>.png` of the format before
-/// chunks, each number at least one digit.
+/// `chunk_<x>_<y>_layer_<n>.png` or `chunk_<x>_<y>_layer_<n>.f32.zz`, or the
+/// `layer_<n>.png` of the format before chunks, each number at least one digit.
 pub fn is_layer_file(name: &str) -> bool {
-    let Some(stem) = name.strip_suffix(".png") else {
-        return false;
-    };
-    if is_layer_stem(stem) {
+    let png = name.strip_suffix(".png");
+    if png.is_some_and(is_layer_stem) {
         return true;
     }
+    let Some(stem) = png.or_else(|| name.strip_suffix(".f32.zz")) else {
+        return false;
+    };
     let Some(rest) = stem.strip_prefix("chunk_") else {
         return false;
     };
@@ -470,15 +547,22 @@ pub fn is_layer_file(name: &str) -> bool {
     digits(x) && digits(y) && is_layer_stem(layer)
 }
 
+#[derive(serde::Deserialize)]
+struct Versioned {
+    version: u32,
+}
+
 fn read_meta(store: &impl Store) -> Result<(ChunkGrid, TerrainMeta), IoError> {
     let bytes = store.read(META_FILE, MAX_META_BYTES)?;
     let text = std::str::from_utf8(&bytes).map_err(|error| IoError::Meta(error.to_string()))?;
+    let versioned: Versioned =
+        ron::from_str(text).map_err(|error| IoError::Meta(error.to_string()))?;
+    if versioned.version != VERSION {
+        return Err(IoError::UnsupportedVersion(versioned.version));
+    }
     let meta: TerrainMeta =
         ron::from_str(text).map_err(|error| IoError::Meta(error.to_string()))?;
 
-    if meta.version != VERSION {
-        return Err(IoError::UnsupportedVersion(meta.version));
-    }
     let grid = ChunkGrid::new(meta.chunk_size, meta.chunks)
         .map_err(|error| IoError::Inconsistent(error.to_string()))?;
     let chunk_size = grid.chunk_size();
@@ -511,6 +595,12 @@ fn read_meta(store: &impl Store) -> Result<(ChunkGrid, TerrainMeta), IoError> {
         for channel in &declared.channels {
             channel.validate()?;
         }
+        let format = declared.format().ok_or_else(|| {
+            IoError::Inconsistent(format!(
+                "`{}` mixes channels of different widths",
+                declared.file
+            ))
+        })?;
         if UVec2::new(declared.width, declared.height) != chunk_size {
             return Err(IoError::ImageShape {
                 file: declared.file.clone(),
@@ -519,7 +609,7 @@ fn read_meta(store: &impl Store) -> Result<(ChunkGrid, TerrainMeta), IoError> {
             });
         }
         budget = budget
-            .checked_sub(chunk_cells.saturating_mul(channels as u64))
+            .checked_sub(chunk_cells.saturating_mul((channels * format.size()) as u64))
             .ok_or_else(|| {
                 IoError::Inconsistent(format!(
                     "one chunk's images are over the {MAX_DECODED_BYTES} byte limit"
@@ -587,22 +677,29 @@ fn load_chunk(
     let mut layers = Vec::with_capacity(meta.layers.len());
     for declared in &meta.layers {
         let channels = declared.channels.len();
-        let file = chunk_file(chunk, &declared.file);
-        let bytes = store.read(&file, encoded_bound(size, channels))?;
-        let pixels = decode_png(&file, &bytes, size, channels)?;
-        let texels =
-            LayerTexels::from_bytes(size, channels, pixels).ok_or_else(|| IoError::ImageShape {
+        let format = declared.format().ok_or_else(|| {
+            IoError::Inconsistent(format!(
+                "`{}` mixes channels of different widths",
+                declared.file
+            ))
+        })?;
+        let file = chunk_file(chunk, &declared.file, format);
+        let bytes = store.read(&file, encoded_bound(size, channels * format.size()))?;
+        let pixels = decode_texels(&file, &bytes, size, channels, format)?;
+        let texels = LayerTexels::from_bytes(size, channels, format, pixels).ok_or_else(|| {
+            IoError::ImageShape {
                 file: file.clone(),
                 found: "a different number of texels".to_owned(),
                 expected: format!("{}x{} of {channels}", size.x, size.y),
-            })?;
+            }
+        })?;
         layers.push(TerrainLayer::new(declared.channels.clone(), texels));
     }
     Ok(Terrain::new(size, meta.fields.clone(), layers, meta.water))
 }
 
-fn encoded_bound(size: UVec2, channels: usize) -> u64 {
-    let raw = (size.x as u64 * channels as u64 + 1) * size.y as u64;
+fn encoded_bound(size: UVec2, texel_bytes: usize) -> u64 {
+    let raw = (size.x as u64 * texel_bytes as u64 + 1) * size.y as u64;
     raw.saturating_mul(2).saturating_add(64 * 1024)
 }
 
@@ -660,16 +757,34 @@ mod tests {
 
     fn layer_of(channels: usize) -> TerrainLayer {
         let meta: Vec<ChannelMeta> = (0..channels)
-            .map(|channel| ChannelMeta::linear(0.0, 1.0 + channel as f32))
+            .map(|channel| ChannelMeta::float(0.0, 1.0 + channel as f32))
             .collect();
-        let mut bytes = Vec::with_capacity((SIZE.x * SIZE.y) as usize * channels);
+        let mut bytes = Vec::new();
         for index in 0..SIZE.x * SIZE.y {
             for channel in &meta {
-                bytes.push(channel.encode((index % 17) as f32 / 17.0));
+                channel.encode((index % 1009) as f32 / 1009.0, &mut bytes);
             }
         }
-        let texels = LayerTexels::from_bytes(SIZE, channels, bytes).unwrap();
+        let texels = LayerTexels::from_bytes(SIZE, channels, TexelFormat::F32, bytes).unwrap();
         TerrainLayer::new(meta, texels)
+    }
+
+    fn class_layer() -> TerrainLayer {
+        let bytes = (0..SIZE.x * SIZE.y)
+            .map(|index| (index % 5) as u8)
+            .collect();
+        let texels = LayerTexels::from_bytes(SIZE, 1, TexelFormat::U8, bytes).unwrap();
+        TerrainLayer::new(vec![ChannelMeta::categorical()], texels)
+    }
+
+    fn classed() -> Terrain {
+        let mut terrain = terrain();
+        terrain.layers.push(class_layer());
+        terrain.fields.push(FieldInfo {
+            categorical: true,
+            ..info("biome", FieldRole::Custom, 2)
+        });
+        terrain
     }
 
     fn info(name: &str, role: FieldRole, layer: u8) -> FieldInfo {
@@ -728,11 +843,11 @@ mod tests {
     }
 
     fn first_file(meta: &TerrainMeta) -> String {
-        chunk_file(UVec2::ZERO, &meta.layers[0].file)
+        chunk_file(UVec2::ZERO, &meta.layers[0].file, TexelFormat::F32)
     }
 
     fn stale() -> String {
-        chunk_file(UVec2::new(9, 9), &layer_stem(0))
+        chunk_file(UVec2::new(9, 9), &layer_stem(0), TexelFormat::F32)
     }
 
     fn put_meta(store: &mut MemStore, meta: &TerrainMeta) {
@@ -754,7 +869,7 @@ mod tests {
         );
         for chunk in grid().iter() {
             for layer in &meta.layers {
-                let file = chunk_file(chunk, &layer.file);
+                let file = chunk_file(chunk, &layer.file, layer.format().unwrap());
                 assert!(store.files.contains_key(&file), "{file}");
             }
         }
@@ -921,6 +1036,7 @@ mod tests {
         for name in [
             "chunk_0_0_layer_000.png",
             "chunk_12_3_layer_7.png",
+            "chunk_0_0_layer_000.f32.zz",
             "layer_000.png",
         ] {
             assert!(is_layer_file(name), "{name}");
@@ -931,6 +1047,8 @@ mod tests {
             "chunk_0_0_paint_000.png",
             "chunk_0_0_layer_.png",
             "layer_000.ron",
+            "layer_000.f32.zz",
+            "chunk_0_0_layer_000.zz",
             "notes.txt",
         ] {
             assert!(!is_layer_file(name), "{name}");
@@ -1063,7 +1181,7 @@ mod tests {
     fn an_image_with_the_wrong_channel_count_is_refused() {
         let mut store = saved(&terrain());
         let mut meta = meta_of_store(&store);
-        meta.layers[0].channels.push(ChannelMeta::linear(0.0, 1.0));
+        meta.layers[0].channels.push(ChannelMeta::float(0.0, 1.0));
         put_meta(&mut store, &meta);
 
         assert!(matches!(
@@ -1113,12 +1231,12 @@ mod tests {
             ChannelMeta {
                 low: f32::NAN,
                 high: 1.0,
-                encoding: ChannelEncoding::Linear,
+                encoding: ChannelEncoding::Float,
             },
             ChannelMeta {
                 low: 1.0,
                 high: 0.0,
-                encoding: ChannelEncoding::Linear,
+                encoding: ChannelEncoding::Float,
             },
         ] {
             let mut store = saved(&terrain());
@@ -1173,6 +1291,127 @@ mod tests {
         for chunk in load_all(&store).unwrap() {
             assert!(chunk.water().is_some());
         }
+    }
+
+    #[test]
+    fn a_float_image_is_its_texels_byte_planes_as_one_zlib_stream() {
+        let before = watered();
+        let store = saved(&before);
+        let meta = meta_of_store(&store);
+        let water = meta.water.unwrap().layer as usize;
+        let file = chunk_file(UVec2::ZERO, &meta.layers[water].file, TexelFormat::F32);
+        assert!(file.ends_with(".f32.zz"), "{file}");
+
+        let inflated = miniz_oxide::inflate::decompress_to_vec_zlib(&store.files[&file]).unwrap();
+        let expected = before.chunk(&grid(), UVec2::ZERO).unwrap();
+        let texels = expected.layer(water).unwrap().bytes();
+        let count = texels.len() / 16;
+        assert_eq!(inflated.len(), texels.len());
+        for (index, texel) in texels.chunks_exact(16).enumerate() {
+            for (plane, byte) in texel.iter().enumerate() {
+                assert_eq!(inflated[plane * count + index], *byte);
+            }
+        }
+    }
+
+    #[test]
+    fn splitting_and_joining_planes_returns_the_texels() {
+        let texels: Vec<u8> = (0..=255).cycle().take(12 * 7).collect();
+        for texel_bytes in [4, 12] {
+            assert_eq!(
+                join_planes(&split_planes(&texels, texel_bytes), texel_bytes),
+                texels
+            );
+        }
+    }
+
+    #[test]
+    fn a_float_value_reads_back_exactly() {
+        let before = terrain();
+        let store = saved(&before);
+        let loaded = load(&store, UVec2::new(1, 0)).unwrap();
+        let origin = grid().origin(UVec2::new(1, 0)).unwrap();
+        let mut levels = BTreeSet::new();
+        for y in 0..16 {
+            for x in 0..24 {
+                let found = loaded.field("height").unwrap().value_at(x, y).unwrap();
+                let wanted = before
+                    .field("height")
+                    .unwrap()
+                    .value_at(origin.x + x, origin.y + y)
+                    .unwrap();
+                assert_eq!(found.to_bits(), wanted.to_bits());
+                levels.insert(found.to_bits());
+            }
+        }
+        assert!(levels.len() > 256, "{} levels", levels.len());
+    }
+
+    #[test]
+    fn a_class_field_stays_a_png_beside_the_float_images() {
+        let store = saved(&classed());
+        let meta = meta_of_store(&store);
+        assert_eq!(meta.layers[2].format(), Some(TexelFormat::U8));
+        assert!(store.files.contains_key(&chunk_file(
+            UVec2::ZERO,
+            &meta.layers[2].file,
+            TexelFormat::U8
+        )));
+        let loaded = load(&store, UVec2::ZERO).unwrap();
+        assert_eq!(loaded.field("biome").unwrap().value_at(3, 0), Some(3.0));
+    }
+
+    #[test]
+    fn an_image_mixing_channel_widths_is_refused() {
+        let mut store = saved(&terrain());
+        let mut meta = meta_of_store(&store);
+        meta.layers[0].channels.push(ChannelMeta::categorical());
+        put_meta(&mut store, &meta);
+
+        assert!(matches!(read_meta(&store), Err(IoError::Inconsistent(_))));
+    }
+
+    #[test]
+    fn a_float_image_inflating_past_its_shape_is_refused() {
+        let mut store = saved(&terrain());
+        let meta = meta_of_store(&store);
+        let oversized = vec![0u8; (SIZE.x * SIZE.y * 4) as usize];
+        store.files.insert(
+            first_file(&meta),
+            miniz_oxide::deflate::compress_to_vec_zlib(&oversized, 6),
+        );
+
+        assert!(matches!(
+            load(&store, UVec2::ZERO),
+            Err(IoError::Inflate { .. })
+        ));
+    }
+
+    #[test]
+    fn a_float_image_that_is_not_zlib_is_refused() {
+        let mut store = saved(&terrain());
+        let meta = meta_of_store(&store);
+        store.files.insert(first_file(&meta), b"not zlib".to_vec());
+
+        assert!(matches!(
+            load(&store, UVec2::ZERO),
+            Err(IoError::Inflate { .. })
+        ));
+    }
+
+    #[test]
+    fn a_terrain_of_the_previous_format_is_refused_for_its_version() {
+        let mut store = saved(&terrain());
+        let text = std::str::from_utf8(&store.files[META_FILE])
+            .unwrap()
+            .replace("version: 4", "version: 3")
+            .replace("Float", "Linear");
+        store.files.insert(META_FILE.to_owned(), text.into_bytes());
+
+        assert!(matches!(
+            read_meta(&store),
+            Err(IoError::UnsupportedVersion(3))
+        ));
     }
 
     // The water indices come out of the same untrusted file as everything else.

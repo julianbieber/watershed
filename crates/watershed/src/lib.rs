@@ -20,7 +20,7 @@ pub mod meta;
 pub mod raster;
 pub mod terrain;
 
-pub use channel::{ChannelEncoding, ChannelMeta, ChannelTable, MAX_CHANNELS};
+pub use channel::{ChannelEncoding, ChannelMeta, ChannelTable, MAX_CHANNELS, TexelFormat};
 pub use chunk::{ChunkError, ChunkGrid, ChunkTexel};
 pub use field::{FieldId, FieldRole};
 pub use io::{IoError, TerrainDir};

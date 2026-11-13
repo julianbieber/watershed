@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 glam.workspace = true
+miniz_oxide.workspace = true
 png.workspace = true
 ron.workspace = true
 serde.workspace = true
